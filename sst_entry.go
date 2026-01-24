@@ -22,9 +22,9 @@ const (
 )
 
 const (
-	// InlineThreshold is the maximum size for which the value is inlined
-	InlineThreshold = 256
-	KSUIDSize       = 20
+	// DefaultInlineThreshold is the maximum value size stored directly in SST.
+	DefaultInlineThreshold = 16 * 1024
+	KSUIDSize              = 20
 )
 
 // VLogEntryHeaderSize is the size of the VLog entry header.
