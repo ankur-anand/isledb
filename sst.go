@@ -21,6 +21,7 @@ type SSTWriterOptions struct {
 	BloomBitsPerKey int
 	BlockSize       int
 	Compression     string
+	Signer          SSTHashSigner
 }
 
 // VLogRef tracks how many bytes an SSTable references in a specific VLog.
@@ -39,6 +40,7 @@ type SSTMeta struct {
 	MaxKey    []byte
 	Size      int64
 	Checksum  string
+	Signature *SSTSignature
 	Bloom     BloomMeta
 	CreatedAt time.Time
 
@@ -148,7 +150,8 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		return result, err
 	}
 
-	hashStr := writable.checksum()
+	hashBytes := writable.sumBytes()
+	hashStr := hex.EncodeToString(hashBytes)
 
 	result.SSTData = sstBuf.Bytes()
 	result.VLogData = vlog.Bytes()
@@ -175,6 +178,18 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		VLogID:    vlogID,
 		VLogSize:  vlog.Size(),
 		VLogRefs:  vlogRefs,
+	}
+	if opts.Signer != nil {
+		sig, err := opts.Signer.SignHash(hashBytes)
+		if err != nil {
+			return result, err
+		}
+		result.Meta.Signature = &SSTSignature{
+			Algorithm: opts.Signer.Algorithm(),
+			KeyID:     opts.Signer.KeyID(),
+			Hash:      hashStr,
+			Signature: sig,
+		}
 	}
 
 	return result, nil
@@ -353,4 +368,8 @@ func (h *hashingWritable) Abort() { h.aborted = true }
 
 func (h *hashingWritable) checksum() string {
 	return hex.EncodeToString(h.hash.Sum(nil))
+}
+
+func (h *hashingWritable) sumBytes() []byte {
+	return h.hash.Sum(nil)
 }
