@@ -36,6 +36,10 @@ func (it *sliceSSTIter) Err() error {
 	return it.err
 }
 
+func (it *sliceSSTIter) Close() error {
+	return nil
+}
+
 type memReadable struct {
 	data []byte
 	r    *bytes.Reader

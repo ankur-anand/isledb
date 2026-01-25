@@ -70,6 +70,7 @@ type SSTIterator interface {
 	Next() bool
 	Entry() MemEntry
 	Err() error
+	Close() error
 }
 
 type WriteSSTResult struct {
@@ -81,6 +82,8 @@ type WriteSSTResult struct {
 
 // WriteSST builds a Key SST from memtable entries.
 func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (WriteSSTResult, error) {
+	defer it.Close()
+
 	var result WriteSSTResult
 
 	sstBuf := new(bytes.Buffer)
