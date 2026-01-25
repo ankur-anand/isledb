@@ -158,12 +158,12 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 
 	result.SSTData = sstBuf.Bytes()
 	result.VLogData = vlog.Bytes()
-	result.VLogID = vlog.ID()
 
 	var vlogID ksuid.KSUID
 	vlogRefs := state.vlogRefs()
 	if len(result.VLogData) > 0 {
 		vlogID = vlog.ID()
+		result.VLogID = vlogID
 	}
 
 	result.Meta = SSTMeta{
@@ -288,6 +288,10 @@ func buildKeyEntry(e MemEntry, key []byte, vlog *VLogWriter, state *sstBuildStat
 		keyEntry.VChecksum = e.VLogPtr.Checksum
 		state.addVLogRef(e.VLogPtr.VLogID, e.VLogPtr.Length)
 		return keyEntry, nil
+	}
+
+	if len(e.PendingValue) == 0 {
+		return KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-pointer with empty pending value for key %q", key)
 	}
 
 	ptr, err := vlog.Append(e.PendingValue)
