@@ -1,15 +1,6 @@
 package isledb
 
-import "github.com/segmentio/ksuid"
-
-// VLogMeta describes a VLog file in the manifest.
-type VLogMeta struct {
-	ID   ksuid.KSUID `json:"id"`
-	Size int64       `json:"size"`
-	// ReferencedBy tracks which SST IDs reference this VLog.
-	// each VLog is only referenced by one SST.
-	ReferencedBy []string `json:"referenced_by"`
-}
+import "github.com/ankur-anand/isledb/manifest"
 
 // DirectWriteThreshold is the value size above which values are written
 // directly to VLog, bypassing memtable buffering.
@@ -18,3 +9,16 @@ const DirectWriteThreshold = 1 * 1024 * 1024
 
 // MaxKeySize is the maximum allowed key size.
 const MaxKeySize = 8 * 1024
+
+type Manifest = manifest.Manifest
+type LevelConfig = manifest.LevelConfig
+type SSTMeta = manifest.SSTMeta
+type VLogMeta = manifest.VLogMeta
+type VLogRef = manifest.VLogRef
+type BloomMeta = manifest.BloomMeta
+type SSTSignature = manifest.SSTSignature
+type CompactionLogPayload = manifest.CompactionLogPayload
+
+func DefaultLevelConfig() LevelConfig {
+	return manifest.DefaultLevelConfig()
+}

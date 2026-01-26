@@ -217,8 +217,9 @@ func TestPathHelpers(t *testing.T) {
 		}{
 			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/seg1.sst"},
 			{"VLogPath", store.VLogPath("abc123"), "vlogs/abc123.vlog"},
-			{"ManifestPath", store.ManifestPath(), "manifest.json"},
-			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/001.json"},
+			{"ManifestPath", store.ManifestPath(), "manifest/CURRENT"},
+			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/log/001.json"},
+			{"ManifestSnapshotPath", store.ManifestSnapshotPath("001"), "manifest/snapshots/001.manifest"},
 		}
 
 		for _, tt := range tests {

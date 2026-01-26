@@ -83,11 +83,15 @@ func (s *Store) VLogPath(id string) string {
 }
 
 func (s *Store) ManifestPath() string {
-	return s.path("manifest.json")
+	return s.path("manifest", "CURRENT")
 }
 
 func (s *Store) ManifestLogPath(id string) string {
-	return s.path("manifest", id+".json")
+	return s.path("manifest", "log", id+".json")
+}
+
+func (s *Store) ManifestSnapshotPath(id string) string {
+	return s.path("manifest", "snapshots", id+".manifest")
 }
 
 // Attributes contains object metadata.
@@ -291,7 +295,7 @@ func (s *Store) ListVLogFiles(ctx context.Context) ([]ObjectInfo, error) {
 
 // ListManifestLogs returns all manifest log files.
 func (s *Store) ListManifestLogs(ctx context.Context) ([]ObjectInfo, error) {
-	result, err := s.List(ctx, ListOptions{Prefix: "manifest/"})
+	result, err := s.List(ctx, ListOptions{Prefix: "manifest/log/"})
 	if err != nil {
 		return nil, err
 	}

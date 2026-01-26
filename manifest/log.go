@@ -29,10 +29,10 @@ type ManifestLogEntry struct {
 }
 
 type CompactionLogPayload struct {
-	RemoveSSTableIDs []string  `json:"remove_sstable_ids"`
-	AddSSTables      []SSTMeta `json:"add_sstables"`
+	RemoveSSTableIDs []string   `json:"remove_sstable_ids"`
+	AddSSTables      []SSTMeta  `json:"add_sstables"`
 	AddVLogs         []VLogMeta `json:"add_vlogs,omitempty"`
-	RemoveVLogIDs    []string  `json:"remove_vlog_ids,omitempty"`
+	RemoveVLogIDs    []string   `json:"remove_vlog_ids,omitempty"`
 }
 
 func EncodeLogEntry(entry *ManifestLogEntry) ([]byte, error) {

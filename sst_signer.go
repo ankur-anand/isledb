@@ -6,11 +6,3 @@ type SSTHashSigner interface {
 	KeyID() string
 	SignHash(hash []byte) ([]byte, error)
 }
-
-// SSTSignature stores the signature metadata for an SST.
-type SSTSignature struct {
-	Algorithm string
-	KeyID     string
-	Hash      string
-	Signature []byte
-}

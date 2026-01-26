@@ -24,44 +24,6 @@ type SSTWriterOptions struct {
 	Signer          SSTHashSigner
 }
 
-// VLogRef tracks how many bytes an SSTable references in a specific VLog.
-type VLogRef struct {
-	VLogID    ksuid.KSUID `json:"vlog_id"`
-	LiveBytes int64       `json:"live_bytes"`
-}
-
-// SSTMeta describes a SSTable
-type SSTMeta struct {
-	ID        string
-	Epoch     uint64
-	SeqLo     uint64
-	SeqHi     uint64
-	MinKey    []byte
-	MaxKey    []byte
-	Size      int64
-	Checksum  string
-	Signature *SSTSignature
-	Bloom     BloomMeta
-	CreatedAt time.Time
-
-	Level int
-
-	VLogID   ksuid.KSUID
-	VLogSize int64
-
-	// VLogRefs tracks which VLogs this SSTable references and how many bytes.
-	VLogRefs []VLogRef
-}
-
-func (m SSTMeta) HasVLog() bool {
-	return !m.VLogID.IsNil()
-}
-
-type BloomMeta struct {
-	BitsPerKey int
-	K          int
-}
-
 var ErrEmptyIterator = errors.New("iterator produced no entries")
 
 var ErrOutOfOrder = errors.New("iterator out of order")

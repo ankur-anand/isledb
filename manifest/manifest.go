@@ -8,10 +8,10 @@ import (
 )
 
 type Manifest struct {
-	Version     int        `json:"version"`
-	SSTables    []SSTMeta  `json:"sstables"`
-	VLogs       []VLogMeta `json:"vlogs,omitempty"`
-	NextEpoch   uint64     `json:"next_epoch"`
+	Version     int         `json:"version"`
+	SSTables    []SSTMeta   `json:"sstables"`
+	VLogs       []VLogMeta  `json:"vlogs,omitempty"`
+	NextEpoch   uint64      `json:"next_epoch"`
 	LevelConfig LevelConfig `json:"level_config,omitempty"`
 }
 
