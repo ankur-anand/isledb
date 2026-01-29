@@ -291,3 +291,81 @@ func TestCompactor_Refresh(t *testing.T) {
 		t.Error("compactor didn't see new L0 SST after refresh")
 	}
 }
+
+func TestCompactor_MultipleSSTs(t *testing.T) {
+	store := blobstore.NewMemory("test")
+	ctx := context.Background()
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.FlushInterval = 0
+	writerOpts.MemtableSize = 1024
+
+	writer, err := newWriter(ctx, store, writerOpts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+
+	for batch := 0; batch < 10; batch++ {
+		for i := 0; i < 100; i++ {
+			key := make([]byte, 32)
+			key[0] = byte(batch)
+			key[1] = byte(i)
+			value := make([]byte, 512)
+			for j := range value {
+				value[j] = byte(batch ^ i ^ j)
+			}
+			if err := writer.put(key, value); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+		}
+		if err := writer.flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	}
+	writer.close()
+
+	compactorOpts := DefaultCompactorOptions()
+	compactorOpts.L0CompactionThreshold = 4
+	compactorOpts.TargetSSTSize = 4 * 1024
+	compactorOpts.CheckInterval = time.Hour
+
+	var outputSSTCount int
+	compactorOpts.OnCompactionEnd = func(job CompactionJob, err error) {
+		if err == nil && job.OutputRun != nil {
+			outputSSTCount = len(job.OutputRun.SSTs)
+			t.Logf("Compaction produced %d SSTs in sorted run", outputSSTCount)
+		}
+	}
+
+	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	if err != nil {
+		t.Fatalf("NewCompactor: %v", err)
+	}
+	defer compactor.Close()
+
+	if err := compactor.RunCompaction(ctx); err != nil {
+		t.Fatalf("RunCompaction: %v", err)
+	}
+
+	if err := compactor.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	compactor.mu.Lock()
+	m := compactor.manifest.Clone()
+	compactor.mu.Unlock()
+
+	if m.SortedRunCount() == 0 {
+		t.Fatal("no sorted runs created after compaction")
+	}
+
+	totalSSTs := 0
+	for _, sr := range m.SortedRuns {
+		totalSSTs += len(sr.SSTs)
+		t.Logf("Sorted run %d has %d SSTs", sr.ID, len(sr.SSTs))
+	}
+
+	if totalSSTs <= 1 {
+		t.Errorf("expected multiple SSTs in sorted runs, got %d", totalSSTs)
+	}
+}

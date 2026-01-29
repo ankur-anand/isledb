@@ -75,6 +75,7 @@ type CompactorOptions struct {
 	BloomBitsPerKey int
 	BlockSize       int
 	Compression     string
+	TargetSSTSize   int64
 
 	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
@@ -93,6 +94,7 @@ func DefaultCompactorOptions() CompactorOptions {
 		BloomBitsPerKey:         10,
 		BlockSize:               4096,
 		Compression:             "snappy",
+		TargetSSTSize:           64 * 1024 * 1024,
 		CheckInterval:           time.Second * 5,
 	}
 }

@@ -75,6 +75,9 @@ func NewCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOpt
 	if opts.CheckInterval == 0 {
 		opts.CheckInterval = defaults.CheckInterval
 	}
+	if opts.TargetSSTSize == 0 {
+		opts.TargetSSTSize = defaults.TargetSSTSize
+	}
 
 	manifestLog := manifest.NewStore(store)
 	m, err := manifestLog.Replay(ctx)
@@ -251,7 +254,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 	mergeIter := NewMergeIterator(iters)
 
 	newEpoch := m.NextEpoch
-	result, err := c.writeCompactedSST(ctx, mergeIter, newEpoch)
+	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
 	if err != nil {
 		if c.opts.OnCompactionEnd != nil {
 			c.opts.OnCompactionEnd(job, err)
@@ -259,7 +262,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 		return err
 	}
 
-	if result == nil {
+	if len(results) == 0 {
 
 		if c.opts.OnCompactionEnd != nil {
 			c.opts.OnCompactionEnd(job, nil)
@@ -270,8 +273,14 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 	newRunID := m.NextSortedRunID
 	newRun := &SortedRun{
 		ID:   newRunID,
-		SSTs: []SSTMeta{result.Meta},
+		SSTs: make([]SSTMeta, len(results)),
 	}
+	for i, r := range results {
+		newRun.SSTs[i] = r.Meta
+	}
+	sort.Slice(newRun.SSTs, func(i, j int) bool {
+		return bytes.Compare(newRun.SSTs[i].MinKey, newRun.SSTs[j].MinKey) < 0
+	})
 	job.OutputRun = newRun
 
 	payload := manifest.CompactionLogPayload{
@@ -494,7 +503,7 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 	return iters, readers, nil
 }
 
-func (c *Compactor) writeCompactedSST(ctx context.Context, iter *KMergeIterator, epoch uint64) (*WriteSSTResult, error) {
+func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
 	defer iter.Close()
 
 	sstOpts := SSTWriterOptions{
@@ -504,34 +513,26 @@ func (c *Compactor) writeCompactedSST(ctx context.Context, iter *KMergeIterator,
 	}
 
 	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
-	result, err := WriteSST(ctx, adapter, sstOpts, epoch)
+
+	uploadFn := func(result *WriteSSTResult) error {
+		sstPath := c.store.SSTPath(result.Meta.ID)
+		if _, err := c.store.Write(ctx, sstPath, result.SSTData); err != nil {
+			return fmt.Errorf("upload sst: %w", err)
+		}
+		result.Meta.Level = 1
+		result.SSTData = nil
+		return nil
+	}
+
+	results, err := writeMultipleSSTs(ctx, adapter, sstOpts, epoch, c.opts.TargetSSTSize, uploadFn)
 	if err != nil {
-		if err == ErrEmptyIterator {
+		if errors.Is(err, ErrEmptyIterator) {
 			return nil, nil
 		}
 		return nil, err
 	}
 
-	sstPath := c.store.SSTPath(result.Meta.ID)
-	if _, err := c.store.Write(ctx, sstPath, result.SSTData); err != nil {
-		return nil, fmt.Errorf("upload sst: %w", err)
-	}
-
-	result.Meta.Level = 1
-
-	return &result, nil
-}
-
-func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
-
-	result, err := c.writeCompactedSST(ctx, iter, epoch)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return nil, nil
-	}
-	return []WriteSSTResult{*result}, nil
+	return results, nil
 }
 
 type mergeIteratorAdapter struct {
