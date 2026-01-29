@@ -22,31 +22,12 @@ func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms 
 	if _, err := store.Write(ctx, store.SSTPath(res.Meta.ID), res.SSTData); err != nil {
 		t.Fatalf("write sst: %v", err)
 	}
-	if len(res.VLogData) > 0 {
-		if _, err := store.Write(ctx, store.VLogPath(res.VLogID.String()), res.VLogData); err != nil {
-			t.Fatalf("write vlog: %v", err)
-		}
-	}
 
-	if _, err := ms.AppendAddSSTableWithVLogs(ctx, res.Meta, nil); err != nil {
+	if _, err := ms.AppendAddSSTable(ctx, res.Meta); err != nil {
 		t.Fatalf("append manifest log: %v", err)
 	}
 
 	return res
-}
-
-func writeExternalVLog(t *testing.T, ctx context.Context, store *blobstore.Store, value []byte) VLogPointer {
-	t.Helper()
-
-	vw := NewVLogWriter()
-	ptr, err := vw.Append(value)
-	if err != nil {
-		t.Fatalf("append vlog: %v", err)
-	}
-	if _, err := store.Write(ctx, store.VLogPath(vw.ID().String()), vw.Bytes()); err != nil {
-		t.Fatalf("write external vlog: %v", err)
-	}
-	return ptr
 }
 
 func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
@@ -56,18 +37,16 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	store := blobstore.NewMemory("reader-test")
 	ms := manifest.NewStore(store)
 
-	ptr := writeExternalVLog(t, ctx, store, []byte("ptr-value"))
-
 	l1Entries := []MemEntry{
 		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-a")},
-		{Key: []byte("c"), Seq: 1, Kind: OpPut, VLogPtr: &ptr},
+		{Key: []byte("c"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-c")},
 		{Key: []byte("d"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-d")},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 1)
 
 	l0Entries := []MemEntry{
 		{Key: []byte("a"), Seq: 3, Kind: OpDelete},
-		{Key: []byte("b"), Seq: 2, Kind: OpPut, PendingValue: []byte("l0-b")},
+		{Key: []byte("b"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("l0-b")},
 		{Key: []byte("e"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("l0-e")},
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
@@ -103,7 +82,7 @@ func TestReader_Get_MultiLevelValues(t *testing.T) {
 
 	if value, found, err := reader.Get(ctx, []byte("c")); err != nil {
 		t.Fatalf("Get c: %v", err)
-	} else if !found || !bytes.Equal(value, []byte("ptr-value")) {
+	} else if !found || !bytes.Equal(value, []byte("l1-c")) {
 		t.Fatalf("unexpected c value: %q found=%v", value, found)
 	}
 
@@ -131,7 +110,7 @@ func TestReader_Scan_Range(t *testing.T) {
 
 	expected := []KV{
 		{Key: []byte("b"), Value: []byte("l0-b")},
-		{Key: []byte("c"), Value: []byte("ptr-value")},
+		{Key: []byte("c"), Value: []byte("l1-c")},
 		{Key: []byte("d"), Value: []byte("l1-d")},
 	}
 	if len(results) != len(expected) {

@@ -22,17 +22,16 @@ type ManifestLogEntry struct {
 	Timestamp        time.Time             `json:"ts"`
 	Op               LogOpType             `json:"op"`
 	SSTable          *SSTMeta              `json:"sstable,omitempty"`
-	AddVLogs         []VLogMeta            `json:"add_vlogs,omitempty"`
 	RemoveSSTableIDs []string              `json:"remove_sstable_ids,omitempty"`
 	Checkpoint       *Manifest             `json:"checkpoint,omitempty"`
 	Compaction       *CompactionLogPayload `json:"compaction,omitempty"`
 }
 
 type CompactionLogPayload struct {
-	RemoveSSTableIDs []string   `json:"remove_sstable_ids"`
-	AddSSTables      []SSTMeta  `json:"add_sstables"`
-	AddVLogs         []VLogMeta `json:"add_vlogs,omitempty"`
-	RemoveVLogIDs    []string   `json:"remove_vlog_ids,omitempty"`
+	RemoveSSTableIDs   []string   `json:"remove_sstable_ids"`
+	RemoveSortedRunIDs []uint32   `json:"remove_sorted_run_ids,omitempty"`
+	AddSSTables        []SSTMeta  `json:"add_sstables"`
+	AddSortedRun       *SortedRun `json:"add_sorted_run,omitempty"`
 }
 
 func EncodeLogEntry(entry *ManifestLogEntry) ([]byte, error) {
@@ -66,20 +65,25 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 	switch entry.Op {
 	case LogOpAddSSTable:
 		if entry.SSTable != nil {
-			m.SSTables = append(m.SSTables, *entry.SSTable)
-			if entry.SSTable.Epoch >= m.NextEpoch {
-				m.NextEpoch = entry.SSTable.Epoch + 1
+			sst := *entry.SSTable
+
+			if sst.Level == 0 {
+
+				m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+			} else {
+
+				sr := SortedRun{
+					ID:   m.NextSortedRunID,
+					SSTs: []SSTMeta{sst},
+				}
+				m.NextSortedRunID++
+
+				m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
 			}
-			if entry.SSTable.HasVLog() && entry.SSTable.VLogSize > 0 {
-				addOrMergeVLog(m, VLogMeta{
-					ID:           entry.SSTable.VLogID,
-					Size:         entry.SSTable.VLogSize,
-					ReferencedBy: []string{entry.SSTable.ID},
-				})
+
+			if sst.Epoch >= m.NextEpoch {
+				m.NextEpoch = sst.Epoch + 1
 			}
-		}
-		for _, vlog := range entry.AddVLogs {
-			addOrMergeVLog(m, vlog)
 		}
 
 	case LogOpRemoveSSTable:
@@ -89,28 +93,31 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 				removeSet[id] = true
 			}
 
-			vlogRemoveSet := make(map[string]bool)
-			var newSSTables []SSTMeta
-			for _, sst := range m.SSTables {
-				if removeSet[sst.ID] {
-					if sst.HasVLog() {
-						vlogRemoveSet[sst.VLogID.String()] = true
-					}
-				} else {
-					newSSTables = append(newSSTables, sst)
+			var newL0 []SSTMeta
+			for _, sst := range m.L0SSTs {
+				if !removeSet[sst.ID] {
+					newL0 = append(newL0, sst)
 				}
 			}
-			m.SSTables = newSSTables
+			m.L0SSTs = newL0
 
-			if len(vlogRemoveSet) > 0 {
-				var newVLogs []VLogMeta
-				for _, vlog := range m.VLogs {
-					if !vlogRemoveSet[vlog.ID.String()] {
-						newVLogs = append(newVLogs, vlog)
+			for i := range m.SortedRuns {
+				var newSSTs []SSTMeta
+				for _, sst := range m.SortedRuns[i].SSTs {
+					if !removeSet[sst.ID] {
+						newSSTs = append(newSSTs, sst)
 					}
 				}
-				m.VLogs = newVLogs
+				m.SortedRuns[i].SSTs = newSSTs
 			}
+
+			var newRuns []SortedRun
+			for _, sr := range m.SortedRuns {
+				if len(sr.SSTs) > 0 {
+					newRuns = append(newRuns, sr)
+				}
+			}
+			m.SortedRuns = newRuns
 		}
 
 	case LogOpCheckpoint:
@@ -121,83 +128,54 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 	case LogOpCompaction:
 		if entry.Compaction != nil {
 			c := entry.Compaction
-			removeSet := make(map[string]bool, len(c.RemoveSSTableIDs))
-			for _, id := range c.RemoveSSTableIDs {
-				removeSet[id] = true
-			}
 
-			var newSSTables []SSTMeta
-			for _, sst := range m.SSTables {
-				if !removeSet[sst.ID] {
-					newSSTables = append(newSSTables, sst)
+			if len(c.RemoveSSTableIDs) > 0 {
+				removeSet := make(map[string]bool, len(c.RemoveSSTableIDs))
+				for _, id := range c.RemoveSSTableIDs {
+					removeSet[id] = true
 				}
+
+				var newL0 []SSTMeta
+				for _, sst := range m.L0SSTs {
+					if !removeSet[sst.ID] {
+						newL0 = append(newL0, sst)
+					}
+				}
+				m.L0SSTs = newL0
+
+				m.RemoveSSTsFromSortedRuns(c.RemoveSSTableIDs)
 			}
 
-			for i := len(c.AddSSTables) - 1; i >= 0; i-- {
-				sst := c.AddSSTables[i]
-				newSSTables = append([]SSTMeta{sst}, newSSTables...)
+			if len(c.RemoveSortedRunIDs) > 0 {
+				m.RemoveSortedRuns(c.RemoveSortedRunIDs)
+			}
+
+			if c.AddSortedRun != nil {
+
+				sr := *c.AddSortedRun
+				if sr.ID >= m.NextSortedRunID {
+					m.NextSortedRunID = sr.ID + 1
+				}
+				m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+			}
+
+			for _, sst := range c.AddSSTables {
+				if sst.Level == 0 {
+					m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+				} else {
+					sr := SortedRun{
+						ID:   m.NextSortedRunID,
+						SSTs: []SSTMeta{sst},
+					}
+					m.NextSortedRunID++
+					m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+				}
 				if sst.Epoch >= m.NextEpoch {
 					m.NextEpoch = sst.Epoch + 1
 				}
-			}
-			m.SSTables = newSSTables
-
-			for _, vlog := range c.AddVLogs {
-				addOrMergeVLog(m, vlog)
-			}
-
-			if len(c.RemoveVLogIDs) > 0 {
-				removeVLogSet := make(map[string]bool, len(c.RemoveVLogIDs))
-				for _, id := range c.RemoveVLogIDs {
-					removeVLogSet[id] = true
-				}
-				var newVLogs []VLogMeta
-				for _, vlog := range m.VLogs {
-					if !removeVLogSet[vlog.ID.String()] {
-						newVLogs = append(newVLogs, vlog)
-					}
-				}
-				m.VLogs = newVLogs
 			}
 		}
 	}
 
 	return m
-}
-
-func (m SSTMeta) HasVLog() bool {
-	return !m.VLogID.IsNil()
-}
-
-func addOrMergeVLog(m *Manifest, vlog VLogMeta) {
-	for i := range m.VLogs {
-		if m.VLogs[i].ID == vlog.ID {
-			if vlog.Size != 0 {
-				m.VLogs[i].Size = vlog.Size
-			}
-			if len(vlog.ReferencedBy) > 0 {
-				m.VLogs[i].ReferencedBy = appendUniqueStrings(m.VLogs[i].ReferencedBy, vlog.ReferencedBy)
-			}
-			return
-		}
-	}
-	m.VLogs = append(m.VLogs, vlog)
-}
-
-func appendUniqueStrings(dst []string, src []string) []string {
-	if len(src) == 0 {
-		return dst
-	}
-	seen := make(map[string]struct{}, len(dst)+len(src))
-	for _, v := range dst {
-		seen[v] = struct{}{}
-	}
-	for _, v := range src {
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		dst = append(dst, v)
-	}
-	return dst
 }

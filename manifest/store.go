@@ -13,20 +13,190 @@ import (
 	"github.com/segmentio/ksuid"
 )
 
-// Store manages manifest log IO using snapshot + log segments + CURRENT pointer.
+var (
+	ErrFenced = errors.New("fenced: epoch superseded by newer owner")
+
+	ErrFenceConflict = errors.New("fence conflict: concurrent claim detected")
+)
+
+type FenceRole int
+
+const (
+	FenceRoleWriter FenceRole = iota
+	FenceRoleCompactor
+)
+
 type Store struct {
 	store   *blobstore.Store
 	mu      sync.Mutex
 	nextSeq uint64
+
+	writerFence    *FenceToken
+	compactorFence *FenceToken
 }
 
-// NewStore creates a new manifest store.
 func NewStore(store *blobstore.Store) *Store {
 	return &Store{store: store}
 }
 
-// Append writes a new log entry to storage and updates CURRENT.
+func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
+	return s.claimFence(ctx, FenceRoleWriter, ownerID)
+}
+
+func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken, error) {
+	return s.claimFence(ctx, FenceRoleCompactor, ownerID)
+}
+
+func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) (*FenceToken, error) {
+	const maxRetries = 5
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+
+		current, etag, err := s.readCurrentWithETag(ctx)
+		if err != nil && !errors.Is(err, blobstore.ErrNotFound) {
+			return nil, err
+		}
+		if current == nil {
+			current = &Current{NextEpoch: 1}
+		}
+
+		var existingFence *FenceToken
+		switch role {
+		case FenceRoleWriter:
+			existingFence = current.WriterFence
+		case FenceRoleCompactor:
+			existingFence = current.CompactorFence
+		}
+
+		var newEpoch uint64 = 1
+		if existingFence != nil {
+			newEpoch = existingFence.Epoch + 1
+		}
+
+		newFence := &FenceToken{
+			Epoch:     newEpoch,
+			Owner:     ownerID,
+			ClaimedAt: time.Now().UTC(),
+		}
+
+		switch role {
+		case FenceRoleWriter:
+			current.WriterFence = newFence
+		case FenceRoleCompactor:
+			current.CompactorFence = newFence
+		}
+
+		if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
+			if errors.Is(err, blobstore.ErrPreconditionFailed) {
+
+				time.Sleep(time.Millisecond * 10 * time.Duration(attempt+1))
+				continue
+			}
+			return nil, err
+		}
+
+		s.mu.Lock()
+		switch role {
+		case FenceRoleWriter:
+			s.writerFence = newFence
+		case FenceRoleCompactor:
+			s.compactorFence = newFence
+		}
+		s.mu.Unlock()
+
+		return newFence, nil
+	}
+
+	return nil, ErrFenceConflict
+}
+
+func (s *Store) CheckWriterFence(ctx context.Context) error {
+	return s.checkFence(ctx, FenceRoleWriter)
+}
+
+func (s *Store) CheckCompactorFence(ctx context.Context) error {
+	return s.checkFence(ctx, FenceRoleCompactor)
+}
+
+func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
+	s.mu.Lock()
+	var localFence *FenceToken
+	switch role {
+	case FenceRoleWriter:
+		localFence = s.writerFence
+	case FenceRoleCompactor:
+		localFence = s.compactorFence
+	}
+	s.mu.Unlock()
+
+	if localFence == nil {
+		return ErrFenced
+	}
+
+	current, _, err := s.readCurrentWithETag(ctx)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return ErrFenced
+	}
+
+	var remoteFence *FenceToken
+	switch role {
+	case FenceRoleWriter:
+		remoteFence = current.WriterFence
+	case FenceRoleCompactor:
+		remoteFence = current.CompactorFence
+	}
+
+	if remoteFence == nil {
+		return ErrFenced
+	}
+
+	if remoteFence.Epoch > localFence.Epoch {
+		return ErrFenced
+	}
+
+	return nil
+}
+
+func (s *Store) WriterEpoch() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writerFence == nil {
+		return 0
+	}
+	return s.writerFence.Epoch
+}
+
+func (s *Store) CompactorEpoch() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.compactorFence == nil {
+		return 0
+	}
+	return s.compactorFence.Epoch
+}
+
 func (s *Store) Append(ctx context.Context, entry *ManifestLogEntry) error {
+	return s.appendInternal(ctx, entry, FenceRole(-1))
+}
+
+func (s *Store) AppendWithWriterFence(ctx context.Context, entry *ManifestLogEntry) error {
+	if err := s.CheckWriterFence(ctx); err != nil {
+		return err
+	}
+	return s.appendInternal(ctx, entry, FenceRoleWriter)
+}
+
+func (s *Store) AppendWithCompactorFence(ctx context.Context, entry *ManifestLogEntry) error {
+	if err := s.CheckCompactorFence(ctx); err != nil {
+		return err
+	}
+	return s.appendInternal(ctx, entry, FenceRoleCompactor)
+}
+
+func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, role FenceRole) error {
 	s.mu.Lock()
 	entry.Seq = s.nextSeq
 	s.nextSeq++
@@ -53,12 +223,10 @@ func (s *Store) Append(ctx context.Context, entry *ManifestLogEntry) error {
 	return s.appendCurrent(ctx, path, entry)
 }
 
-// AppendAddSSTableWithVLogs logs an SSTable addition with optional VLogs.
-func (s *Store) AppendAddSSTableWithVLogs(ctx context.Context, sst SSTMeta, vlogs []VLogMeta) (*ManifestLogEntry, error) {
+func (s *Store) AppendAddSSTable(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
-		Op:       LogOpAddSSTable,
-		SSTable:  &sst,
-		AddVLogs: vlogs,
+		Op:      LogOpAddSSTable,
+		SSTable: &sst,
 	}
 	if err := s.Append(ctx, entry); err != nil {
 		return nil, err
@@ -66,7 +234,17 @@ func (s *Store) AppendAddSSTableWithVLogs(ctx context.Context, sst SSTMeta, vlog
 	return entry, nil
 }
 
-// AppendRemoveSSTables logs SSTable removals.
+func (s *Store) AppendAddSSTableWithFence(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
+	entry := &ManifestLogEntry{
+		Op:      LogOpAddSSTable,
+		SSTable: &sst,
+	}
+	if err := s.AppendWithWriterFence(ctx, entry); err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
 func (s *Store) AppendRemoveSSTables(ctx context.Context, sstableIDs []string) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
 		Op:               LogOpRemoveSSTable,
@@ -78,7 +256,6 @@ func (s *Store) AppendRemoveSSTables(ctx context.Context, sstableIDs []string) (
 	return entry, nil
 }
 
-// AppendCheckpoint logs a full manifest checkpoint.
 func (s *Store) AppendCheckpoint(ctx context.Context, manifest *Manifest) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
 		Op:         LogOpCheckpoint,
@@ -90,7 +267,6 @@ func (s *Store) AppendCheckpoint(ctx context.Context, manifest *Manifest) (*Mani
 	return entry, nil
 }
 
-// AppendCompaction logs an atomic compaction operation.
 func (s *Store) AppendCompaction(ctx context.Context, payload CompactionLogPayload) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
 		Op:         LogOpCompaction,
@@ -102,7 +278,17 @@ func (s *Store) AppendCompaction(ctx context.Context, payload CompactionLogPaylo
 	return entry, nil
 }
 
-// Replay reads CURRENT, snapshot, and logs to rebuild the manifest.
+func (s *Store) AppendCompactionWithFence(ctx context.Context, payload CompactionLogPayload) (*ManifestLogEntry, error) {
+	entry := &ManifestLogEntry{
+		Op:         LogOpCompaction,
+		Compaction: &payload,
+	}
+	if err := s.AppendWithCompactorFence(ctx, entry); err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
 func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	current, err := s.readCurrent(ctx)
 	if err != nil {
@@ -162,7 +348,6 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	return m, nil
 }
 
-// List returns all log entry paths in sequence order (oldest first).
 func (s *Store) List(ctx context.Context) ([]string, error) {
 	objects, err := s.store.ListManifestLogs(ctx)
 	if err != nil {
@@ -180,7 +365,6 @@ func (s *Store) List(ctx context.Context) ([]string, error) {
 	return entries, nil
 }
 
-// Read loads a single log entry by path.
 func (s *Store) Read(ctx context.Context, path string) (*ManifestLogEntry, error) {
 	data, _, err := s.store.Read(ctx, path)
 	if err != nil {
@@ -192,7 +376,6 @@ func (s *Store) Read(ctx context.Context, path string) (*ManifestLogEntry, error
 	return DecodeLogEntry(data)
 }
 
-// WriteSnapshot writes a snapshot and updates CURRENT to point to it.
 func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) {
 	if m == nil {
 		return "", errors.New("nil manifest")
@@ -240,18 +423,23 @@ func formatLogSeq(seq uint64) string {
 }
 
 func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
-	data, _, err := s.store.Read(ctx, s.store.ManifestPath())
+	current, _, err := s.readCurrentWithETag(ctx)
+	return current, err
+}
+
+func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, error) {
+	data, attr, err := s.store.Read(ctx, s.store.ManifestPath())
 	if err != nil {
 		if errors.Is(err, blobstore.ErrNotFound) {
-			return nil, nil
+			return nil, "", nil
 		}
-		return nil, err
+		return nil, "", err
 	}
 	var current Current
 	if err := json.Unmarshal(data, &current); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return &current, nil
+	return &current, attr.ETag, nil
 }
 
 func (s *Store) writeCurrent(ctx context.Context, current *Current) error {
@@ -263,6 +451,15 @@ func (s *Store) writeCurrent(ctx context.Context, current *Current) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expectedETag string) error {
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		return err
+	}
+	_, err = s.store.WriteIfMatch(ctx, s.store.ManifestPath(), data, expectedETag)
+	return err
 }
 
 func (s *Store) appendCurrent(ctx context.Context, logPath string, entry *ManifestLogEntry) error {

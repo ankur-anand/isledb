@@ -1,0 +1,599 @@
+package isledb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/manifest"
+	"github.com/cockroachdb/pebble/v2/sstable"
+)
+
+type CompactionJobType int
+
+const (
+	CompactionL0ToTier1 CompactionJobType = iota
+	CompactionTierMerge
+)
+
+type CompactionJob struct {
+	Type      CompactionJobType
+	Tier      int
+	InputSSTs []string
+	InputRuns []uint32
+	OutputRun *SortedRun
+}
+
+type Compactor struct {
+	store       *blobstore.Store
+	manifestLog *manifest.Store
+	opts        CompactorOptions
+
+	mu       sync.Mutex
+	manifest *Manifest
+
+	ticker *time.Ticker
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+
+	fenced     atomic.Bool
+	fenceToken *manifest.FenceToken
+
+	running atomic.Bool
+	closed  atomic.Bool
+}
+
+func NewCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOptions) (*Compactor, error) {
+
+	defaults := DefaultCompactorOptions()
+	if opts.L0CompactionThreshold == 0 {
+		opts.L0CompactionThreshold = defaults.L0CompactionThreshold
+	}
+	if opts.TierCompactionThreshold == 0 {
+		opts.TierCompactionThreshold = defaults.TierCompactionThreshold
+	}
+	if opts.MaxTiers == 0 {
+		opts.MaxTiers = defaults.MaxTiers
+	}
+	if opts.BloomBitsPerKey == 0 {
+		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
+	}
+	if opts.BlockSize == 0 {
+		opts.BlockSize = defaults.BlockSize
+	}
+	if opts.Compression == "" {
+		opts.Compression = defaults.Compression
+	}
+	if opts.CheckInterval == 0 {
+		opts.CheckInterval = defaults.CheckInterval
+	}
+
+	manifestLog := manifest.NewStore(store)
+	m, err := manifestLog.Replay(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("replay manifest: %w", err)
+	}
+
+	c := &Compactor{
+		store:       store,
+		manifestLog: manifestLog,
+		opts:        opts,
+		manifest:    m,
+		stopCh:      make(chan struct{}),
+	}
+
+	if opts.EnableFencing {
+		ownerID := opts.OwnerID
+		if ownerID == "" {
+			ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+		}
+		token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim compactor fence: %w", err)
+		}
+		c.fenceToken = token
+	}
+
+	return c, nil
+}
+
+func (c *Compactor) Start() {
+	if c.running.Load() {
+		return
+	}
+	c.running.Store(true)
+	c.ticker = time.NewTicker(c.opts.CheckInterval)
+	c.wg.Add(1)
+	go c.compactionLoop()
+}
+
+func (c *Compactor) Stop() {
+
+	if !c.running.CompareAndSwap(true, false) {
+		return
+	}
+	close(c.stopCh)
+	if c.ticker != nil {
+		c.ticker.Stop()
+	}
+	c.wg.Wait()
+}
+
+func (c *Compactor) Close() error {
+
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.Stop()
+	return nil
+}
+
+func (c *Compactor) Refresh(ctx context.Context) error {
+	m, err := c.manifestLog.Replay(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.manifest = m
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Compactor) compactionLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.ticker.C:
+			if err := c.RunCompaction(context.Background()); err != nil {
+
+				if errors.Is(err, manifest.ErrFenced) {
+					slog.Error("isledb: compactor fenced, stopping background compaction")
+					return
+				}
+				slog.Error("isledb: compaction error", "error", err)
+			}
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+func (c *Compactor) RunCompaction(ctx context.Context) error {
+	const maxIterations = 100
+
+	for i := 0; i < maxIterations; i++ {
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if c.fenced.Load() {
+			return manifest.ErrFenced
+		}
+
+		if err := c.Refresh(ctx); err != nil {
+			return fmt.Errorf("refresh manifest: %w", err)
+		}
+
+		c.mu.Lock()
+		m := c.manifest.Clone()
+		c.mu.Unlock()
+
+		if m.L0SSTCount() >= c.opts.L0CompactionThreshold {
+			if err := c.compactL0(ctx, m); err != nil {
+
+				if errors.Is(err, manifest.ErrFenced) {
+					c.fenced.Store(true)
+					return err
+				}
+				return fmt.Errorf("L0 compaction: %w", err)
+			}
+			continue
+		}
+
+		if job := c.findTierCompaction(m); job != nil {
+			if err := c.compactTier(ctx, m, job); err != nil {
+
+				if errors.Is(err, manifest.ErrFenced) {
+					c.fenced.Store(true)
+					return err
+				}
+				return fmt.Errorf("tier compaction: %w", err)
+			}
+			continue
+		}
+
+		return nil
+	}
+
+	return nil
+}
+
+func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
+	if len(m.L0SSTs) == 0 {
+		return nil
+	}
+
+	job := CompactionJob{
+		Type:      CompactionL0ToTier1,
+		Tier:      0,
+		InputSSTs: make([]string, len(m.L0SSTs)),
+	}
+	for i, sst := range m.L0SSTs {
+		job.InputSSTs[i] = sst.ID
+	}
+
+	if c.opts.OnCompactionStart != nil {
+		c.opts.OnCompactionStart(job)
+	}
+
+	iters, readers, err := c.openSSTs(ctx, m.L0SSTs)
+	if err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(job, err)
+		}
+		return err
+	}
+	defer func() {
+		for _, r := range readers {
+			_ = r.Close()
+		}
+	}()
+
+	mergeIter := NewMergeIterator(iters)
+
+	newEpoch := m.NextEpoch
+	result, err := c.writeCompactedSST(ctx, mergeIter, newEpoch)
+	if err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(job, err)
+		}
+		return err
+	}
+
+	if result == nil {
+
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(job, nil)
+		}
+		return nil
+	}
+
+	newRunID := m.NextSortedRunID
+	newRun := &SortedRun{
+		ID:   newRunID,
+		SSTs: []SSTMeta{result.Meta},
+	}
+	job.OutputRun = newRun
+
+	payload := manifest.CompactionLogPayload{
+		RemoveSSTableIDs: job.InputSSTs,
+		AddSortedRun:     newRun,
+	}
+	if err := c.appendCompaction(ctx, payload); err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(job, err)
+		}
+		return err
+	}
+
+	if c.opts.OnCompactionEnd != nil {
+		c.opts.OnCompactionEnd(job, nil)
+	}
+
+	return nil
+}
+
+func (c *Compactor) findTierCompaction(m *Manifest) *CompactionJob {
+	if len(m.SortedRuns) < c.opts.TierCompactionThreshold {
+		return nil
+	}
+
+	tiers := m.SortedRunsByTier(manifest.TieredConfig{
+		L0CompactionThreshold:   c.opts.L0CompactionThreshold,
+		TierCompactionThreshold: c.opts.TierCompactionThreshold,
+		MaxTiers:                c.opts.MaxTiers,
+		LazyLeveling:            c.opts.LazyLeveling,
+	})
+
+	for tierIdx := 0; tierIdx < len(tiers)-1; tierIdx++ {
+		tier := tiers[tierIdx]
+		if len(tier) >= c.opts.TierCompactionThreshold {
+
+			runsToMerge := tier
+			if len(runsToMerge) > c.opts.TierCompactionThreshold {
+
+				runsToMerge = tier[:c.opts.TierCompactionThreshold]
+			}
+
+			job := &CompactionJob{
+				Type:      CompactionTierMerge,
+				Tier:      tierIdx,
+				InputRuns: make([]uint32, len(runsToMerge)),
+				InputSSTs: make([]string, 0),
+			}
+			for i, run := range runsToMerge {
+				job.InputRuns[i] = run.ID
+				for _, sst := range run.SSTs {
+					job.InputSSTs = append(job.InputSSTs, sst.ID)
+				}
+			}
+			return job
+		}
+	}
+
+	if c.opts.LazyLeveling && len(tiers) > 0 {
+		finalTier := tiers[len(tiers)-1]
+		if len(finalTier) > 1 {
+			job := &CompactionJob{
+				Type:      CompactionTierMerge,
+				Tier:      len(tiers) - 1,
+				InputRuns: make([]uint32, len(finalTier)),
+				InputSSTs: make([]string, 0),
+			}
+			for i, run := range finalTier {
+				job.InputRuns[i] = run.ID
+				for _, sst := range run.SSTs {
+					job.InputSSTs = append(job.InputSSTs, sst.ID)
+				}
+			}
+			return job
+		}
+	}
+
+	return nil
+}
+
+func (c *Compactor) compactTier(ctx context.Context, m *Manifest, job *CompactionJob) error {
+	if c.opts.OnCompactionStart != nil {
+		c.opts.OnCompactionStart(*job)
+	}
+
+	var sstsToMerge []SSTMeta
+	for _, runID := range job.InputRuns {
+		run := m.GetSortedRun(runID)
+		if run != nil {
+			sstsToMerge = append(sstsToMerge, run.SSTs...)
+		}
+	}
+
+	if len(sstsToMerge) == 0 {
+		return nil
+	}
+
+	iters, readers, err := c.openSSTs(ctx, sstsToMerge)
+	if err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(*job, err)
+		}
+		return err
+	}
+	defer func() {
+		for _, r := range readers {
+			_ = r.Close()
+		}
+	}()
+
+	mergeIter := NewMergeIterator(iters)
+
+	newEpoch := m.NextEpoch
+	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
+	if err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(*job, err)
+		}
+		return err
+	}
+
+	if len(results) == 0 {
+
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(*job, nil)
+		}
+		return nil
+	}
+
+	newRunID := m.NextSortedRunID
+	newRun := &SortedRun{
+		ID:   newRunID,
+		SSTs: make([]SSTMeta, len(results)),
+	}
+	for i, r := range results {
+		newRun.SSTs[i] = r.Meta
+	}
+
+	sort.Slice(newRun.SSTs, func(i, j int) bool {
+		return bytes.Compare(newRun.SSTs[i].MinKey, newRun.SSTs[j].MinKey) < 0
+	})
+	job.OutputRun = newRun
+
+	payload := manifest.CompactionLogPayload{
+		RemoveSSTableIDs:   job.InputSSTs,
+		RemoveSortedRunIDs: job.InputRuns,
+		AddSortedRun:       newRun,
+	}
+	if err := c.appendCompaction(ctx, payload); err != nil {
+		if c.opts.OnCompactionEnd != nil {
+			c.opts.OnCompactionEnd(*job, err)
+		}
+		return err
+	}
+
+	if c.opts.OnCompactionEnd != nil {
+		c.opts.OnCompactionEnd(*job, nil)
+	}
+
+	return nil
+}
+
+func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
+	var err error
+	if c.opts.EnableFencing {
+		_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload)
+	} else {
+		_, err = c.manifestLog.AppendCompaction(ctx, payload)
+	}
+	if err != nil && errors.Is(err, manifest.ErrFenced) {
+		c.fenced.Store(true)
+	}
+	return err
+}
+
+func (c *Compactor) IsFenced() bool {
+	return c.fenced.Load()
+}
+
+func (c *Compactor) FenceToken() *manifest.FenceToken {
+	return c.fenceToken
+}
+
+func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Iterator, []*sstable.Reader, error) {
+	iters := make([]sstable.Iterator, 0, len(ssts))
+	readers := make([]*sstable.Reader, 0, len(ssts))
+
+	cleanup := func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+		for _, r := range readers {
+			_ = r.Close()
+		}
+	}
+
+	for _, sst := range ssts {
+		path := c.store.SSTPath(sst.ID)
+		data, _, err := c.store.Read(ctx, path)
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("read sst %s: %w", sst.ID, err)
+		}
+
+		reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		readers = append(readers, reader)
+
+		iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		iters = append(iters, iter)
+	}
+
+	return iters, readers, nil
+}
+
+func (c *Compactor) writeCompactedSST(ctx context.Context, iter *KMergeIterator, epoch uint64) (*WriteSSTResult, error) {
+	defer iter.Close()
+
+	sstOpts := SSTWriterOptions{
+		BloomBitsPerKey: c.opts.BloomBitsPerKey,
+		BlockSize:       c.opts.BlockSize,
+		Compression:     c.opts.Compression,
+	}
+
+	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
+	result, err := WriteSST(ctx, adapter, sstOpts, epoch)
+	if err != nil {
+		if err == ErrEmptyIterator {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	sstPath := c.store.SSTPath(result.Meta.ID)
+	if _, err := c.store.Write(ctx, sstPath, result.SSTData); err != nil {
+		return nil, fmt.Errorf("upload sst: %w", err)
+	}
+
+	result.Meta.Level = 1
+
+	return &result, nil
+}
+
+func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
+
+	result, err := c.writeCompactedSST(ctx, iter, epoch)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return []WriteSSTResult{*result}, nil
+}
+
+type mergeIteratorAdapter struct {
+	iter    *KMergeIterator
+	current *MemEntry
+	done    bool
+	err     error
+	nowMs   int64
+}
+
+func (a *mergeIteratorAdapter) Next() bool {
+	if a.done {
+		return false
+	}
+	if !a.iter.Next() {
+		a.done = true
+		return false
+	}
+
+	entry, err := a.iter.Entry()
+	if err != nil {
+		a.err = err
+		a.done = true
+		return false
+	}
+
+	a.current = &MemEntry{
+		Key:      entry.Key,
+		Seq:      entry.Seq,
+		Kind:     entry.Kind,
+		Inline:   entry.Inline,
+		Value:    entry.Value,
+		BlobID:   entry.BlobID,
+		ExpireAt: entry.ExpireAt,
+	}
+
+	if entry.ExpireAt > 0 && entry.ExpireAt <= a.nowMs {
+		a.current.Kind = OpDelete
+		a.current.Inline = false
+		a.current.Value = nil
+		a.current.BlobID = [32]byte{}
+
+		a.current.ExpireAt = 0
+	}
+
+	return true
+}
+
+func (a *mergeIteratorAdapter) Entry() MemEntry {
+	if a.current == nil {
+		return MemEntry{}
+	}
+	return *a.current
+}
+
+func (a *mergeIteratorAdapter) Err() error {
+	if a.err != nil {
+		return a.err
+	}
+	return a.iter.Err()
+}
+
+func (a *mergeIteratorAdapter) Close() error {
+
+	return nil
+}

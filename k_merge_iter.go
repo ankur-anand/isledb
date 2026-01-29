@@ -8,7 +8,6 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-// KMergeIterator merges multiple SSTable iterators, yielding entries in sorted order.
 type KMergeIterator struct {
 	iters   []*sstIterWrapper
 	heap    mergeHeap
@@ -17,7 +16,6 @@ type KMergeIterator struct {
 	err     error
 }
 
-// mergeEntry represents an entry from one of the source iterators.
 type mergeEntry struct {
 	key     []byte
 	seq     uint64
@@ -32,14 +30,12 @@ type sstIterWrapper struct {
 	source int
 }
 
-// mergeHeap implements heap.Interface for merge entries.
 type mergeHeap []*mergeEntry
 
 func (h mergeHeap) Len() int { return len(h) }
 
 func (h mergeHeap) Less(i, j int) bool {
-	// first lexicographically small and then
-	// we compare version wise.
+
 	cmp := bytes.Compare(h[i].key, h[j].key)
 	if cmp != 0 {
 		return cmp < 0
@@ -63,7 +59,6 @@ func (h *mergeHeap) Pop() interface{} {
 	return x
 }
 
-// NewMergeIterator creates a merge iterator from SSTable iterators.
 func NewMergeIterator(iters []sstable.Iterator) *KMergeIterator {
 	mi := &KMergeIterator{
 		iters: make([]*sstIterWrapper, len(iters)),
@@ -79,7 +74,6 @@ func NewMergeIterator(iters []sstable.Iterator) *KMergeIterator {
 	return mi
 }
 
-// advanceIter moves iterator i to the first entry and pushes to heap.
 func (mi *KMergeIterator) advanceIter(i int) {
 	wrapper := mi.iters[i]
 	kv := wrapper.iter.First()
@@ -88,7 +82,6 @@ func (mi *KMergeIterator) advanceIter(i int) {
 	}
 }
 
-// advanceIterNext calls Next() and pushes if valid.
 func (mi *KMergeIterator) advanceIterNext(i int) {
 	wrapper := mi.iters[i]
 	kv := wrapper.iter.Next()
@@ -120,7 +113,6 @@ func (mi *KMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, sourc
 	heap.Push(&mi.heap, entry)
 }
 
-// Next advances to the next unique key, skipping older versions.
 func (mi *KMergeIterator) Next() bool {
 	for mi.heap.Len() > 0 {
 		entry := heap.Pop(&mi.heap).(*mergeEntry)
@@ -178,6 +170,13 @@ func (mi *KMergeIterator) Entry() (CompactionEntry, error) {
 
 	if mi.current.kind == sstable.InternalKeyKindDelete {
 		entry.Kind = OpDelete
+
+		if len(mi.current.value) > 0 {
+			keyEntry, err := DecodeKeyEntry(mi.current.key, mi.current.value)
+			if err == nil {
+				entry.ExpireAt = keyEntry.ExpireAt
+			}
+		}
 		return entry, nil
 	}
 
@@ -189,10 +188,8 @@ func (mi *KMergeIterator) Entry() (CompactionEntry, error) {
 	entry.Kind = keyEntry.Kind
 	entry.Inline = keyEntry.Inline
 	entry.Value = keyEntry.Value
-	entry.VLogID = keyEntry.VLogID
-	entry.VOffset = keyEntry.VOffset
-	entry.VLength = keyEntry.VLength
-	entry.VChecksum = keyEntry.VChecksum
+	entry.BlobID = keyEntry.BlobID
+	entry.ExpireAt = keyEntry.ExpireAt
 
 	return entry, nil
 }

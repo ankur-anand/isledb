@@ -15,7 +15,6 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	w, err := NewWriter(ctx, store, WriterOptions{
 		MemtableSize:    1 << 20,
 		FlushInterval:   0,
-		InlineThreshold: 4,
 		BloomBitsPerKey: 0,
 		BlockSize:       4096,
 		Compression:     "none",
@@ -63,11 +62,10 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	defer store.Close()
 
 	w, err := NewWriter(ctx, store, WriterOptions{
-		MemtableSize:    1 << 20,
-		FlushInterval:   0,
-		InlineThreshold: 4,
-		BlockSize:       4096,
-		Compression:     "none",
+		MemtableSize:  1 << 20,
+		FlushInterval: 0,
+		BlockSize:     4096,
+		Compression:   "none",
 	})
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
@@ -83,11 +81,10 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	}
 
 	w2, err := NewWriter(ctx, store, WriterOptions{
-		MemtableSize:    1 << 20,
-		FlushInterval:   0,
-		InlineThreshold: 4,
-		BlockSize:       4096,
-		Compression:     "none",
+		MemtableSize:  1 << 20,
+		FlushInterval: 0,
+		BlockSize:     4096,
+		Compression:   "none",
 	})
 	if err != nil {
 		t.Fatalf("NewWriter(2): %v", err)

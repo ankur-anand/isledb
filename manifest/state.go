@@ -2,75 +2,58 @@ package manifest
 
 import (
 	"bytes"
-	"math"
 	"sort"
-
-	"github.com/segmentio/ksuid"
 )
 
-// DefaultLevelConfig returns sensible defaults for level configuration.
-func DefaultLevelConfig() LevelConfig {
-	return LevelConfig{
-		MaxLevels:             7,
-		L0CompactionThreshold: 8,
-		L1TargetSize:          256 << 20,
-		LevelSizeMultiplier:   10,
-		VLogGarbageThreshold:  0.5,
+func DefaultTieredConfig() TieredConfig {
+	return TieredConfig{
+		L0CompactionThreshold:   8,
+		TierCompactionThreshold: 8,
+		TierMaxRuns:             16,
+		MaxTiers:                4,
+		LazyLeveling:            true,
 	}
 }
 
-// TargetSize returns the target size for a given level.
-// for l0 we will use file count not size.
-func (c LevelConfig) TargetSize(level int) int64 {
-	if level == 0 {
-		return 0
-	}
-	// lowest has no limit.
-	if level >= c.MaxLevels-1 {
-		return math.MaxInt64
-	}
-
-	multiplier := int64(1)
-	for i := 1; i < level; i++ {
-		multiplier *= int64(c.LevelSizeMultiplier)
-	}
-	return c.L1TargetSize * multiplier
-}
-
-// Clone returns a deep copy of the manifest.
-// Safe to use concurrently after refresh.
 func (m *Manifest) Clone() *Manifest {
 	if m == nil {
 		return nil
 	}
 	clone := &Manifest{
-		Version:     m.Version,
-		NextEpoch:   m.NextEpoch,
-		LevelConfig: m.LevelConfig,
+		Version:         m.Version,
+		NextEpoch:       m.NextEpoch,
+		NextSortedRunID: m.NextSortedRunID,
+		TieredConfig:    m.TieredConfig,
 	}
 
-	if len(m.SSTables) > 0 {
-		clone.SSTables = make([]SSTMeta, len(m.SSTables))
-		for i, sst := range m.SSTables {
-			clone.SSTables[i] = sst
+	if len(m.L0SSTs) > 0 {
+		clone.L0SSTs = make([]SSTMeta, len(m.L0SSTs))
+		for i, sst := range m.L0SSTs {
+			clone.L0SSTs[i] = sst
 			if len(sst.MinKey) > 0 {
-				clone.SSTables[i].MinKey = append([]byte(nil), sst.MinKey...)
+				clone.L0SSTs[i].MinKey = append([]byte(nil), sst.MinKey...)
 			}
 			if len(sst.MaxKey) > 0 {
-				clone.SSTables[i].MaxKey = append([]byte(nil), sst.MaxKey...)
-			}
-			if len(sst.VLogRefs) > 0 {
-				clone.SSTables[i].VLogRefs = append([]VLogRef(nil), sst.VLogRefs...)
+				clone.L0SSTs[i].MaxKey = append([]byte(nil), sst.MaxKey...)
 			}
 		}
 	}
 
-	if len(m.VLogs) > 0 {
-		clone.VLogs = make([]VLogMeta, len(m.VLogs))
-		for i, vlog := range m.VLogs {
-			clone.VLogs[i] = vlog
-			if len(vlog.ReferencedBy) > 0 {
-				clone.VLogs[i].ReferencedBy = append([]string(nil), vlog.ReferencedBy...)
+	if len(m.SortedRuns) > 0 {
+		clone.SortedRuns = make([]SortedRun, len(m.SortedRuns))
+		for i, sr := range m.SortedRuns {
+			clone.SortedRuns[i] = SortedRun{
+				ID:   sr.ID,
+				SSTs: make([]SSTMeta, len(sr.SSTs)),
+			}
+			for j, sst := range sr.SSTs {
+				clone.SortedRuns[i].SSTs[j] = sst
+				if len(sst.MinKey) > 0 {
+					clone.SortedRuns[i].SSTs[j].MinKey = append([]byte(nil), sst.MinKey...)
+				}
+				if len(sst.MaxKey) > 0 {
+					clone.SortedRuns[i].SSTs[j].MaxKey = append([]byte(nil), sst.MaxKey...)
+				}
 			}
 		}
 	}
@@ -78,108 +61,6 @@ func (m *Manifest) Clone() *Manifest {
 	return clone
 }
 
-// Level returns all SSTables at the given level, properly sorted.
-func (m *Manifest) Level(n int) []SSTMeta {
-	var result []SSTMeta
-	for _, sst := range m.SSTables {
-		if sst.Level == n {
-			result = append(result, sst)
-		}
-	}
-
-	if n == 0 {
-		// L0: newest first (by SeqHi descending).
-		sort.Slice(result, func(i, j int) bool {
-			return result[i].SeqHi > result[j].SeqHi
-		})
-	} else {
-		// L1+: by MinKey ascending
-		sort.Slice(result, func(i, j int) bool {
-			return bytes.Compare(result[i].MinKey, result[j].MinKey) < 0
-		})
-	}
-
-	return result
-}
-
-// LevelCount returns the number of SSTables at the given level.
-func (m *Manifest) LevelCount(n int) int {
-	count := 0
-	for _, sst := range m.SSTables {
-		if sst.Level == n {
-			count++
-		}
-	}
-	return count
-}
-
-// LevelSize returns the total size of SSTables at the given level.
-func (m *Manifest) LevelSize(n int) int64 {
-	var total int64
-	for _, sst := range m.SSTables {
-		if sst.Level == n {
-			total += sst.Size
-		}
-	}
-	return total
-}
-
-// MaxLevel returns the highest level number that contains any SSTables.
-func (m *Manifest) MaxLevel() int {
-	maxLevel := 0
-	for _, sst := range m.SSTables {
-		if sst.Level > maxLevel {
-			maxLevel = sst.Level
-		}
-	}
-	return maxLevel
-}
-
-// ComputeVLogLiveness calculates live bytes for each VLog by summing VLogRefs.
-func (m *Manifest) ComputeVLogLiveness() map[ksuid.KSUID]int64 {
-	live := make(map[ksuid.KSUID]int64)
-	for _, sst := range m.SSTables {
-		for _, ref := range sst.VLogRefs {
-			live[ref.VLogID] += ref.LiveBytes
-		}
-	}
-	return live
-}
-
-// VLogGarbageRatio returns the garbage ratio for a VLog (1 - live/total).
-func (m *Manifest) VLogGarbageRatio(vlogID ksuid.KSUID) float64 {
-	var totalSize int64
-	for _, vlog := range m.VLogs {
-		if vlog.ID == vlogID {
-			totalSize = vlog.Size
-			break
-		}
-	}
-	if totalSize == 0 {
-		return 1.0
-	}
-
-	liveness := m.ComputeVLogLiveness()
-	liveBytes := liveness[vlogID]
-
-	return 1.0 - (float64(liveBytes) / float64(totalSize))
-}
-
-// OverlappingSSTs returns SSTables at the given level that overlap with [minKey, maxKey].
-func (m *Manifest) OverlappingSSTs(level int, minKey, maxKey []byte) []SSTMeta {
-	levelSSTs := m.Level(level)
-	var result []SSTMeta
-
-	for _, sst := range levelSSTs {
-		if overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			result = append(result, sst)
-		}
-	}
-
-	return result
-}
-
-// overlapsRange returns true if [aMin, aMax] overlaps with [bMin, bMax].
 func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
 	if len(aMin) == 0 || len(aMax) == 0 {
 		return false
@@ -194,4 +75,244 @@ func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
 		return bytes.Compare(bMin, aMax) <= 0
 	}
 	return bytes.Compare(aMin, bMax) <= 0 && bytes.Compare(bMin, aMax) <= 0
+}
+
+func (m *Manifest) L0SSTCount() int {
+	return len(m.L0SSTs)
+}
+
+func (m *Manifest) AddL0SST(sst SSTMeta) {
+	m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+}
+
+func (m *Manifest) RemoveL0SSTs(ids []string) {
+	idSet := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+
+	newL0 := make([]SSTMeta, 0, len(m.L0SSTs))
+	for _, sst := range m.L0SSTs {
+		if !idSet[sst.ID] {
+			newL0 = append(newL0, sst)
+		}
+	}
+	m.L0SSTs = newL0
+}
+
+func (m *Manifest) SortedRunCount() int {
+	return len(m.SortedRuns)
+}
+
+func (m *Manifest) SortedRunsByTier(config TieredConfig) [][]SortedRun {
+	if len(m.SortedRuns) == 0 {
+		return nil
+	}
+
+	tiers := make([][]SortedRun, config.MaxTiers)
+	for i := range tiers {
+		tiers[i] = make([]SortedRun, 0)
+	}
+
+	for _, sr := range m.SortedRuns {
+		tier := m.determineTier(sr, config)
+		if tier >= config.MaxTiers {
+			tier = config.MaxTiers - 1
+		}
+		tiers[tier] = append(tiers[tier], sr)
+	}
+
+	return tiers
+}
+
+func (m *Manifest) determineTier(sr SortedRun, config TieredConfig) int {
+	if len(m.SortedRuns) == 0 {
+		return 0
+	}
+
+	position := 0
+	for i, run := range m.SortedRuns {
+		if run.ID == sr.ID {
+			position = i
+			break
+		}
+	}
+
+	runsPerTier := config.TierCompactionThreshold
+	tier := position / runsPerTier
+	if tier >= config.MaxTiers {
+		tier = config.MaxTiers - 1
+	}
+
+	return tier
+}
+
+func (m *Manifest) GetSortedRun(id uint32) *SortedRun {
+	for i := range m.SortedRuns {
+		if m.SortedRuns[i].ID == id {
+			return &m.SortedRuns[i]
+		}
+	}
+	return nil
+}
+
+func (m *Manifest) AddSortedRun(ssts []SSTMeta) uint32 {
+	id := m.NextSortedRunID
+	m.NextSortedRunID++
+
+	sr := SortedRun{
+		ID:   id,
+		SSTs: make([]SSTMeta, len(ssts)),
+	}
+	copy(sr.SSTs, ssts)
+
+	sort.Slice(sr.SSTs, func(i, j int) bool {
+		return bytes.Compare(sr.SSTs[i].MinKey, sr.SSTs[j].MinKey) < 0
+	})
+
+	m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+	return id
+}
+
+func (m *Manifest) RemoveSortedRuns(ids []uint32) {
+	idSet := make(map[uint32]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+
+	newRuns := make([]SortedRun, 0, len(m.SortedRuns))
+	for _, sr := range m.SortedRuns {
+		if !idSet[sr.ID] {
+			newRuns = append(newRuns, sr)
+		}
+	}
+	m.SortedRuns = newRuns
+}
+
+func (m *Manifest) RemoveSSTsFromSortedRuns(sstIDs []string) {
+	idSet := make(map[string]bool, len(sstIDs))
+	for _, id := range sstIDs {
+		idSet[id] = true
+	}
+
+	for i := range m.SortedRuns {
+		newSSTs := make([]SSTMeta, 0, len(m.SortedRuns[i].SSTs))
+		for _, sst := range m.SortedRuns[i].SSTs {
+			if !idSet[sst.ID] {
+				newSSTs = append(newSSTs, sst)
+			}
+		}
+		m.SortedRuns[i].SSTs = newSSTs
+	}
+
+	newRuns := make([]SortedRun, 0, len(m.SortedRuns))
+	for _, sr := range m.SortedRuns {
+		if len(sr.SSTs) > 0 {
+			newRuns = append(newRuns, sr)
+		}
+	}
+	m.SortedRuns = newRuns
+}
+
+func (sr *SortedRun) FindSST(key []byte) *SSTMeta {
+	if len(sr.SSTs) == 0 {
+		return nil
+	}
+
+	idx := sort.Search(len(sr.SSTs), func(i int) bool {
+		return bytes.Compare(sr.SSTs[i].MaxKey, key) >= 0
+	})
+
+	if idx >= len(sr.SSTs) {
+		return nil
+	}
+
+	sst := &sr.SSTs[idx]
+	if bytes.Compare(key, sst.MinKey) >= 0 {
+		return sst
+	}
+
+	return nil
+}
+
+func (sr *SortedRun) OverlappingSSTs(minKey, maxKey []byte) []SSTMeta {
+	if len(sr.SSTs) == 0 {
+		return nil
+	}
+
+	var result []SSTMeta
+	for _, sst := range sr.SSTs {
+		if overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+			result = append(result, sst)
+		}
+	}
+	return result
+}
+
+func (sr *SortedRun) TotalSize() int64 {
+	var total int64
+	for _, sst := range sr.SSTs {
+		total += sst.Size
+	}
+	return total
+}
+
+func (sr *SortedRun) MinKey() []byte {
+	if len(sr.SSTs) == 0 {
+		return nil
+	}
+	return sr.SSTs[0].MinKey
+}
+
+func (sr *SortedRun) MaxKey() []byte {
+	if len(sr.SSTs) == 0 {
+		return nil
+	}
+	return sr.SSTs[len(sr.SSTs)-1].MaxKey
+}
+
+func (sr *SortedRun) InRange(key []byte) bool {
+	if len(sr.SSTs) == 0 {
+		return false
+	}
+	minKey := sr.SSTs[0].MinKey
+	maxKey := sr.SSTs[len(sr.SSTs)-1].MaxKey
+
+	return bytes.Compare(key, minKey) >= 0 && bytes.Compare(key, maxKey) <= 0
+}
+
+func (m *Manifest) MaxSeqNum() uint64 {
+	var maxSeq uint64
+
+	for _, sst := range m.L0SSTs {
+		if sst.SeqHi > maxSeq {
+			maxSeq = sst.SeqHi
+		}
+	}
+
+	for _, sr := range m.SortedRuns {
+		for _, sst := range sr.SSTs {
+			if sst.SeqHi > maxSeq {
+				maxSeq = sst.SeqHi
+			}
+		}
+	}
+
+	return maxSeq
+}
+
+func (m *Manifest) AllSSTIDs() []string {
+	var ids []string
+
+	for _, sst := range m.L0SSTs {
+		ids = append(ids, sst.ID)
+	}
+
+	for _, sr := range m.SortedRuns {
+		for _, sst := range sr.SSTs {
+			ids = append(ids, sst.ID)
+		}
+	}
+
+	return ids
 }

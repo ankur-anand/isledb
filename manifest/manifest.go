@@ -3,29 +3,38 @@ package manifest
 import (
 	"encoding/json"
 	"time"
-
-	"github.com/segmentio/ksuid"
 )
 
 type Manifest struct {
-	Version     int         `json:"version"`
-	SSTables    []SSTMeta   `json:"sstables"`
-	VLogs       []VLogMeta  `json:"vlogs,omitempty"`
-	NextEpoch   uint64      `json:"next_epoch"`
-	LevelConfig LevelConfig `json:"level_config,omitempty"`
+	Version   int    `json:"version"`
+	NextEpoch uint64 `json:"next_epoch"`
+
+	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
+	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
+
+	L0SSTs          []SSTMeta    `json:"l0_ssts,omitempty"`
+	SortedRuns      []SortedRun  `json:"sorted_runs,omitempty"`
+	NextSortedRunID uint32       `json:"next_sorted_run_id,omitempty"`
+	TieredConfig    TieredConfig `json:"tiered_config,omitempty"`
 }
 
-type LevelConfig struct {
-	MaxLevels             int     `json:"max_levels,omitempty"`
-	L0CompactionThreshold int     `json:"l0_compaction_threshold,omitempty"`
-	L1TargetSize          int64   `json:"l1_target_size,omitempty"`
-	LevelSizeMultiplier   int     `json:"level_size_multiplier,omitempty"`
-	VLogGarbageThreshold  float64 `json:"vlog_garbage_threshold,omitempty"`
+type FenceToken struct {
+	Epoch     uint64    `json:"epoch"`
+	Owner     string    `json:"owner"`
+	ClaimedAt time.Time `json:"claimed_at"`
 }
 
-type VLogRef struct {
-	VLogID    ksuid.KSUID `json:"vlog_id"`
-	LiveBytes int64       `json:"live_bytes"`
+type SortedRun struct {
+	ID   uint32    `json:"id"`
+	SSTs []SSTMeta `json:"ssts"`
+}
+
+type TieredConfig struct {
+	L0CompactionThreshold   int  `json:"l0_compaction_threshold,omitempty"`
+	TierCompactionThreshold int  `json:"tier_compaction_threshold,omitempty"`
+	TierMaxRuns             int  `json:"tier_max_runs,omitempty"`
+	MaxTiers                int  `json:"max_tiers,omitempty"`
+	LazyLeveling            bool `json:"lazy_leveling,omitempty"`
 }
 
 type SSTSignature struct {
@@ -54,17 +63,6 @@ type SSTMeta struct {
 	CreatedAt time.Time
 
 	Level int
-
-	VLogID   ksuid.KSUID
-	VLogSize int64
-
-	VLogRefs []VLogRef
-}
-
-type VLogMeta struct {
-	ID           ksuid.KSUID `json:"id"`
-	Size         int64       `json:"size"`
-	ReferencedBy []string    `json:"referenced_by"`
 }
 
 type Current struct {
@@ -72,6 +70,9 @@ type Current struct {
 	Logs      []string `json:"logs,omitempty"`
 	NextSeq   uint64   `json:"next_seq"`
 	NextEpoch uint64   `json:"next_epoch"`
+
+	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
+	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
 }
 
 func EncodeSnapshot(m *Manifest) ([]byte, error) {

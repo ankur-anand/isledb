@@ -15,15 +15,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/segmentio/ksuid"
 )
-
-type SSTWriterOptions struct {
-	BloomBitsPerKey int
-	BlockSize       int
-	Compression     string
-	Signer          SSTHashSigner
-}
 
 var ErrEmptyIterator = errors.New("iterator produced no entries")
 
@@ -37,13 +29,10 @@ type SSTIterator interface {
 }
 
 type WriteSSTResult struct {
-	Meta     SSTMeta
-	SSTData  []byte
-	VLogData []byte
-	VLogID   ksuid.KSUID
+	Meta    SSTMeta
+	SSTData []byte
 }
 
-// WriteSST builds a Key SST from memtable entries.
 func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (WriteSSTResult, error) {
 	defer it.Close()
 
@@ -61,7 +50,6 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 	}
 
 	sst := sstable.NewWriter(writable, wo)
-	vlog := NewVLogWriter()
 
 	state := newSSTBuildState()
 	abort := func(err error) (WriteSSTResult, error) {
@@ -78,7 +66,7 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		e := it.Entry()
 		k := append([]byte(nil), e.Key...)
 
-		keyEntry, err := buildKeyEntry(e, k, vlog, state)
+		keyEntry, err := buildKeyEntry(e, k)
 		if err != nil {
 			return abort(err)
 		}
@@ -94,9 +82,9 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 			kind = pebble.InternalKeyKindDelete
 		}
 
-		iKey := pebble.MakeInternalKey(k, pebble.SeqNum(e.Seq), kind)
+		ikey := pebble.MakeInternalKey(k, pebble.SeqNum(e.Seq), kind)
 
-		if err := sst.Raw().Add(iKey, encodedValue, false); err != nil {
+		if err := sst.Raw().Add(ikey, encodedValue, false); err != nil {
 			return abort(err)
 		}
 
@@ -117,14 +105,6 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 	hashStr := hex.EncodeToString(hashBytes)
 
 	result.SSTData = sstBuf.Bytes()
-	result.VLogData = vlog.Bytes()
-
-	var vlogID ksuid.KSUID
-	vlogRefs := state.vlogRefs()
-	if len(result.VLogData) > 0 {
-		vlogID = vlog.ID()
-		result.VLogID = vlogID
-	}
 
 	result.Meta = SSTMeta{
 		ID:        buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
@@ -138,9 +118,6 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		Bloom:     BloomMeta{BitsPerKey: opts.BloomBitsPerKey},
 		CreatedAt: time.Now().UTC(),
 		Level:     0,
-		VLogID:    vlogID,
-		VLogSize:  vlog.Size(),
-		VLogRefs:  vlogRefs,
 	}
 	if opts.Signer != nil {
 		sig, err := opts.Signer.SignHash(hashBytes)
@@ -159,20 +136,18 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 }
 
 type sstBuildState struct {
-	minKey       []byte
-	maxKey       []byte
-	found        bool
-	seqLo        uint64
-	seqHi        uint64
-	prevKey      []byte
-	prevSeq      uint64
-	vlogRefBytes map[ksuid.KSUID]int64
+	minKey  []byte
+	maxKey  []byte
+	found   bool
+	seqLo   uint64
+	seqHi   uint64
+	prevKey []byte
+	prevSeq uint64
 }
 
 func newSSTBuildState() *sstBuildState {
 	return &sstBuildState{
-		vlogRefBytes: make(map[ksuid.KSUID]int64),
-		seqLo:        ^uint64(0),
+		seqLo: ^uint64(0),
 	}
 }
 
@@ -205,29 +180,12 @@ func (s *sstBuildState) updateBounds(key []byte, seq uint64) {
 	}
 }
 
-func (s *sstBuildState) addVLogRef(id ksuid.KSUID, length uint32) {
-	s.vlogRefBytes[id] += vlogEntrySize(length)
-}
-
-func (s *sstBuildState) vlogRefs() []VLogRef {
-	if len(s.vlogRefBytes) == 0 {
-		return nil
-	}
-	refs := make([]VLogRef, 0, len(s.vlogRefBytes))
-	for id, liveBytes := range s.vlogRefBytes {
-		refs = append(refs, VLogRef{
-			VLogID:    id,
-			LiveBytes: liveBytes,
-		})
-	}
-	return refs
-}
-
-func buildKeyEntry(e MemEntry, key []byte, vlog *VLogWriter, state *sstBuildState) (KeyEntry, error) {
+func buildKeyEntry(e MemEntry, key []byte) (KeyEntry, error) {
 	keyEntry := KeyEntry{
-		Key:  key,
-		Seq:  e.Seq,
-		Kind: e.Kind,
+		Key:      key,
+		Seq:      e.Seq,
+		Kind:     e.Kind,
+		ExpireAt: e.ExpireAt,
 	}
 
 	if e.Kind == OpDelete {
@@ -240,35 +198,14 @@ func buildKeyEntry(e MemEntry, key []byte, vlog *VLogWriter, state *sstBuildStat
 		return keyEntry, nil
 	}
 
-	if e.VLogPtr != nil {
+	var zeroBlobID [32]byte
+	if e.BlobID != zeroBlobID {
 		keyEntry.Inline = false
-		keyEntry.VLogID = e.VLogPtr.VLogID
-		keyEntry.VOffset = e.VLogPtr.Offset
-		keyEntry.VLength = e.VLogPtr.Length
-		keyEntry.VChecksum = e.VLogPtr.Checksum
-		state.addVLogRef(e.VLogPtr.VLogID, e.VLogPtr.Length)
+		keyEntry.BlobID = e.BlobID
 		return keyEntry, nil
 	}
 
-	if len(e.PendingValue) == 0 {
-		return KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-pointer with empty pending value for key %q", key)
-	}
-
-	ptr, err := vlog.Append(e.PendingValue)
-	if err != nil {
-		return KeyEntry{}, err
-	}
-	keyEntry.Inline = false
-	keyEntry.VLogID = ptr.VLogID
-	keyEntry.VOffset = ptr.Offset
-	keyEntry.VLength = ptr.Length
-	keyEntry.VChecksum = ptr.Checksum
-	state.addVLogRef(ptr.VLogID, ptr.Length)
-	return keyEntry, nil
-}
-
-func vlogEntrySize(length uint32) int64 {
-	return int64(VLogEntryHeaderSize) + int64(length)
+	return KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-blob for key %q", key)
 }
 
 func buildSSTID(epoch, seqLo, seqHi uint64, hashHex string) string {

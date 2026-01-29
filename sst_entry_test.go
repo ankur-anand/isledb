@@ -2,52 +2,8 @@ package isledb
 
 import (
 	"bytes"
-	"encoding/binary"
-	"errors"
-	"hash/crc32"
 	"testing"
-
-	"github.com/segmentio/ksuid"
 )
-
-type VLogEntry struct {
-	Length   uint32
-	Checksum uint32
-	Value    []byte
-}
-
-func EncodeVLogEntry(value []byte) []byte {
-	buf := make([]byte, VLogEntryHeaderSize+len(value))
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(value)))
-	binary.LittleEndian.PutUint32(buf[4:8], crc32.Checksum(value, crcTable))
-	copy(buf[8:], value)
-	return buf
-}
-
-func DecodeVLogEntry(data []byte) (VLogEntry, error) {
-	if len(data) < VLogEntryHeaderSize {
-		return VLogEntry{}, errors.New("vlog entry too short")
-	}
-
-	length := binary.LittleEndian.Uint32(data[0:4])
-	checksum := binary.LittleEndian.Uint32(data[4:8])
-
-	if len(data) < int(VLogEntryHeaderSize+length) {
-		return VLogEntry{}, errors.New("vlog entry truncated")
-	}
-
-	value := data[8 : 8+length]
-
-	if crc32.Checksum(value, crcTable) != checksum {
-		return VLogEntry{}, errors.New("vlog checksum mismatch")
-	}
-
-	return VLogEntry{
-		Length:   length,
-		Checksum: checksum,
-		Value:    value,
-	}, nil
-}
 
 func assertKeyEntry(t *testing.T, got, want KeyEntry) {
 	t.Helper()
@@ -75,17 +31,8 @@ func assertKeyEntry(t *testing.T, got, want KeyEntry) {
 	if got.Inline {
 		t.Errorf("expected inline=false")
 	}
-	if got.VLogID != want.VLogID {
-		t.Errorf("VLogID mismatch: got %v, want %v", got.VLogID, want.VLogID)
-	}
-	if got.VOffset != want.VOffset {
-		t.Errorf("VOffset mismatch: got %d, want %d", got.VOffset, want.VOffset)
-	}
-	if got.VLength != want.VLength {
-		t.Errorf("VLength mismatch: got %d, want %d", got.VLength, want.VLength)
-	}
-	if got.VChecksum != want.VChecksum {
-		t.Errorf("VChecksum mismatch: got %d, want %d", got.VChecksum, want.VChecksum)
+	if got.BlobID != want.BlobID {
+		t.Errorf("BlobID mismatch: got %v, want %v", got.BlobID, want.BlobID)
 	}
 }
 
@@ -99,7 +46,9 @@ func patternValue(size int) []byte {
 
 func TestEncodeDecodeKeyEntry(t *testing.T) {
 	key := []byte("testkey")
-	vlogID := ksuid.New()
+
+	var blobID [32]byte
+	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
 
 	cases := []struct {
 		name    string
@@ -132,18 +81,21 @@ func TestEncodeDecodeKeyEntry(t *testing.T) {
 			},
 		},
 		{
-			name: "pointer",
+			name: "blob_reference",
 			entry: KeyEntry{
-				Key:       key,
-				Kind:      OpPut,
-				Inline:    false,
-				VLogID:    vlogID,
-				VOffset:   123456789,
-				VLength:   1024,
-				VChecksum: 0xDEADBEEF,
+				Key:    key,
+				Kind:   OpPut,
+				Inline: false,
+				BlobID: blobID,
 			},
-			marker:  MarkerPointer,
-			wantLen: 1 + PointerSize,
+			marker:  MarkerBlob,
+			wantLen: 1 + 32,
+			check: func(t *testing.T, encoded []byte, entry KeyEntry) {
+				t.Helper()
+				if !bytes.Equal(encoded[1:33], entry.BlobID[:]) {
+					t.Fatalf("blob ID mismatch in encoded bytes")
+				}
+			},
 		},
 	}
 
@@ -176,7 +128,7 @@ func TestDecodeKeyEntry_Errors(t *testing.T) {
 	}{
 		{name: "empty", encoded: []byte{}},
 		{name: "unknown_marker", encoded: []byte{0xFF}},
-		{name: "pointer_too_short", encoded: []byte{MarkerPointer, 0x01, 0x02}},
+		{name: "blob_too_short", encoded: []byte{MarkerBlob, 0x01, 0x02}},
 	}
 
 	for _, tc := range cases {
@@ -189,64 +141,50 @@ func TestDecodeKeyEntry_Errors(t *testing.T) {
 	}
 }
 
-func TestEncodeDecodeVLogEntry(t *testing.T) {
-	cases := []struct {
-		name  string
-		value []byte
-	}{
-		{name: "small", value: []byte("this is a test value for vlog")},
-		{name: "empty", value: []byte{}},
-		{name: "large", value: patternValue(1024 * 1024)},
+func TestKeyEntry_HasBlobID(t *testing.T) {
+
+	entry1 := KeyEntry{
+		Key:    []byte("key1"),
+		Kind:   OpPut,
+		Inline: true,
+		Value:  []byte("value"),
+	}
+	if entry1.HasBlobID() {
+		t.Error("expected HasBlobID=false for inline entry")
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			encoded := EncodeVLogEntry(tc.value)
-			if len(encoded) != VLogEntryHeaderSize+len(tc.value) {
-				t.Fatalf("expected length %d, got %d", VLogEntryHeaderSize+len(tc.value), len(encoded))
-			}
-
-			decoded, err := DecodeVLogEntry(encoded)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if decoded.Length != uint32(len(tc.value)) {
-				t.Errorf("length mismatch: got %d, want %d", decoded.Length, len(tc.value))
-			}
-			if decoded.Checksum != crc32.Checksum(tc.value, crcTable) {
-				t.Errorf("checksum mismatch")
-			}
-			if !bytes.Equal(decoded.Value, tc.value) {
-				t.Errorf("value mismatch: got %v, want %v", decoded.Value, tc.value)
-			}
-		})
+	var blobID [32]byte
+	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
+	entry2 := KeyEntry{
+		Key:    []byte("key2"),
+		Kind:   OpPut,
+		BlobID: blobID,
+	}
+	if !entry2.HasBlobID() {
+		t.Error("expected HasBlobID=true for blob reference entry")
 	}
 }
 
-func TestDecodeVLogEntry_Errors(t *testing.T) {
-	cases := []struct {
-		name string
-		data func() []byte
-	}{
-		{name: "too_short", data: func() []byte { return []byte{0x01, 0x02, 0x03} }},
-		{name: "truncated", data: func() []byte {
-			encoded := EncodeVLogEntry([]byte("ab"))
-			return encoded[:VLogEntryHeaderSize+1]
-		}},
-		{name: "checksum_mismatch", data: func() []byte {
-			encoded := EncodeVLogEntry([]byte("test value"))
-			encoded[len(encoded)-1] ^= 0xFF
-			return encoded
-		}},
+func TestCompactionEntry_HasBlobID(t *testing.T) {
+
+	entry1 := CompactionEntry{
+		Key:    []byte("key1"),
+		Kind:   OpPut,
+		Inline: true,
+		Value:  []byte("value"),
+	}
+	if entry1.HasBlobID() {
+		t.Error("expected HasBlobID=false for inline entry")
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := DecodeVLogEntry(tc.data())
-			if err == nil {
-				t.Errorf("expected error for %s", tc.name)
-			}
-		})
+	var blobID [32]byte
+	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
+	entry2 := CompactionEntry{
+		Key:    []byte("key2"),
+		Kind:   OpPut,
+		BlobID: blobID,
+	}
+	if !entry2.HasBlobID() {
+		t.Error("expected HasBlobID=true for blob reference entry")
 	}
 }

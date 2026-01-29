@@ -3,122 +3,109 @@ package isledb
 import (
 	"encoding/binary"
 	"errors"
-	"sync"
 
 	"github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
-	"github.com/segmentio/ksuid"
 )
 
 const (
 	memEntryInline  byte = 1
-	memEntryPending byte = 0
-	memEntryPointer byte = 2
+	memEntryBlob    byte = 3
+	memEntryTTLFlag byte = 0x80
 )
 
 const (
-	pointerVlogSize = 2 + KSUIDSize + 8 + 4 + 4
+	blobRefSize    = 2 + 32
+	blobRefSizeTTL = 2 + 8 + 32
 )
 
 type Memtable struct {
 	sl *skl.Skiplist
-
-	inlineThreshold int
-
-	mu           sync.RWMutex
-	pendingSize  int64
-	pendingCount int64
-	pointerCount int64
 }
 
-// NewMemtable creates a memtable with the given arena size and inline threshold.
 func NewMemtable(arenaBytes int64, inlineThreshold int) *Memtable {
-	if inlineThreshold <= 0 {
-		inlineThreshold = DefaultInlineThreshold
-	}
 	return &Memtable{
-		sl:              skl.NewSkiplist(arenaBytes),
-		inlineThreshold: inlineThreshold,
+		sl: skl.NewSkiplist(arenaBytes),
 	}
 }
 
-// Put inserts or overwrites a value with the provided sequence number.
-// If the value is smaller than or equal to inlineThreshold we store inline,
-// else larger values are marked as pending for VLog storage at flush time.
 func (m *Memtable) Put(key, value []byte, seq uint64) {
+	m.PutWithTTL(key, value, seq, 0)
+}
+
+func (m *Memtable) PutWithTTL(key, value []byte, seq uint64, expireAt int64) {
 	ikey := y.KeyWithTs(key, seq)
 
-	var encoded []byte
-	if len(value) <= m.inlineThreshold {
-		encoded = make([]byte, 2+len(value))
+	if expireAt > 0 {
+		encoded := make([]byte, 2+8+len(value))
+		encoded[0] = byte(OpPut)
+		encoded[1] = memEntryInline | memEntryTTLFlag
+		binary.BigEndian.PutUint64(encoded[2:10], uint64(expireAt))
+		copy(encoded[10:], value)
+		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
+	} else {
+		encoded := make([]byte, 2+len(value))
 		encoded[0] = byte(OpPut)
 		encoded[1] = memEntryInline
 		copy(encoded[2:], value)
-	} else {
-		encoded = make([]byte, 2+4+len(value))
-		encoded[0] = byte(OpPut)
-		encoded[1] = memEntryPending
-		binary.LittleEndian.PutUint32(encoded[2:6], uint32(len(value)))
-		copy(encoded[6:], value)
-
-		m.mu.Lock()
-		m.pendingSize += int64(len(value))
-		m.pendingCount++
-		m.mu.Unlock()
+		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
 	}
-
-	m.sl.Put(ikey, y.ValueStruct{
-		Value: encoded,
-	})
 }
 
-// PutPointer stores a pointer to a large value already written to Vlog file.
-func (m *Memtable) PutPointer(key []byte, ptr *VLogPointer, seq uint64) {
+func (m *Memtable) PutBlobRef(key []byte, blobID [32]byte, seq uint64) {
+	m.PutBlobRefWithTTL(key, blobID, seq, 0)
+}
+
+func (m *Memtable) PutBlobRefWithTTL(key []byte, blobID [32]byte, seq uint64, expireAt int64) {
 	iKey := y.KeyWithTs(key, seq)
-	encoded := make([]byte, pointerVlogSize)
-	encoded[0] = byte(OpPut)
-	encoded[1] = memEntryPointer
-	copy(encoded[2:22], ptr.VLogID[:])
-	binary.LittleEndian.PutUint64(encoded[22:30], ptr.Offset)
-	binary.LittleEndian.PutUint32(encoded[30:34], ptr.Length)
-	binary.LittleEndian.PutUint32(encoded[34:38], ptr.Checksum)
-	m.mu.Lock()
-	m.pointerCount++
-	m.mu.Unlock()
-	m.sl.Put(iKey, y.ValueStruct{
-		Value: encoded,
-	})
+
+	if expireAt > 0 {
+		encoded := make([]byte, blobRefSizeTTL)
+		encoded[0] = byte(OpPut)
+		encoded[1] = memEntryBlob | memEntryTTLFlag
+		binary.BigEndian.PutUint64(encoded[2:10], uint64(expireAt))
+		copy(encoded[10:42], blobID[:])
+		m.sl.Put(iKey, y.ValueStruct{Value: encoded})
+	} else {
+		encoded := make([]byte, blobRefSize)
+		encoded[0] = byte(OpPut)
+		encoded[1] = memEntryBlob
+		copy(encoded[2:34], blobID[:])
+		m.sl.Put(iKey, y.ValueStruct{Value: encoded})
+	}
 }
 
-// Delete adds a tombstone with the provided sequence number.
 func (m *Memtable) Delete(key []byte, seq uint64) {
+	m.DeleteWithTTL(key, seq, 0)
+}
+
+func (m *Memtable) DeleteWithTTL(key []byte, seq uint64, expireAt int64) {
 	ikey := y.KeyWithTs(key, seq)
-	encoded := []byte{byte(OpDelete), 0}
-	m.sl.Put(ikey, y.ValueStruct{
-		Value: encoded,
-	})
+
+	if expireAt > 0 {
+		encoded := make([]byte, 2+8)
+		encoded[0] = byte(OpDelete)
+		encoded[1] = memEntryTTLFlag
+		binary.BigEndian.PutUint64(encoded[2:10], uint64(expireAt))
+		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
+	} else {
+		encoded := []byte{byte(OpDelete), 0}
+		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
+	}
 }
 
 func (m *Memtable) ApproxSize() int64 {
 	return m.sl.MemSize()
 }
 
-func (m *Memtable) PendingValueSize() int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.pendingSize
-}
-
 func (m *Memtable) TotalSize() int64 {
-	return m.ApproxSize() + m.PendingValueSize()
+	return m.ApproxSize()
 }
 
-// Iterator returns an ordered iterator over the memtable.
 func (m *Memtable) Iterator() *MemtableIterator {
 	return &MemtableIterator{it: m.sl.NewUniIterator(false)}
 }
 
-// MemtableIterator iterates over memtable entries.
 type MemtableIterator struct {
 	it     *skl.UniIterator
 	inited bool
@@ -126,7 +113,6 @@ type MemtableIterator struct {
 	err    error
 }
 
-// Next moves to the next entry in sorted order.
 func (it *MemtableIterator) Next() bool {
 	if it.err != nil {
 		return false
@@ -168,12 +154,23 @@ func decodeMemEntry(key []byte, vs y.ValueStruct) (MemEntry, error) {
 	userKey := append([]byte(nil), y.ParseKey(key)...)
 
 	kind := OpKind(vs.Value[0])
-	entryType := vs.Value[1]
+	flags := vs.Value[1]
+	hasTTL := (flags & memEntryTTLFlag) != 0
+	entryType := flags & ^memEntryTTLFlag
 
 	entry := MemEntry{
 		Key:  userKey,
 		Seq:  seq,
 		Kind: kind,
+	}
+
+	offset := 2
+	if hasTTL {
+		if len(vs.Value) < 10 {
+			return MemEntry{}, errors.New("memtable TTL entry too short")
+		}
+		entry.ExpireAt = int64(binary.BigEndian.Uint64(vs.Value[2:10]))
+		offset = 10
 	}
 
 	if kind == OpDelete {
@@ -183,29 +180,14 @@ func decodeMemEntry(key []byte, vs y.ValueStruct) (MemEntry, error) {
 	switch entryType {
 	case memEntryInline:
 		entry.Inline = true
-		entry.Value = append([]byte(nil), vs.Value[2:]...)
-	case memEntryPending:
-		if len(vs.Value) < 6 {
-			return MemEntry{}, errors.New("pending value header too short")
+		entry.Value = append([]byte(nil), vs.Value[offset:]...)
+	case memEntryBlob:
+		if len(vs.Value) < offset+32 {
+			return MemEntry{}, errors.New("blob entry too short")
 		}
-		length := binary.LittleEndian.Uint32(vs.Value[2:6])
-		if len(vs.Value) < int(6+length) {
-			return MemEntry{}, errors.New("pending value truncated")
-		}
-		entry.PendingValue = append([]byte(nil), vs.Value[6:int(6+length)]...)
-	case memEntryPointer:
-		if len(vs.Value) < pointerVlogSize {
-			return MemEntry{}, errors.New("pointer entry too sort")
-		}
-
-		var vLogID ksuid.KSUID
-		copy(vLogID[:], vs.Value[2:22])
-		entry.VLogPtr = &VLogPointer{
-			VLogID:   vLogID,
-			Offset:   binary.LittleEndian.Uint64(vs.Value[22:30]),
-			Length:   binary.LittleEndian.Uint32(vs.Value[30:34]),
-			Checksum: binary.LittleEndian.Uint32(vs.Value[34:38]),
-		}
+		copy(entry.BlobID[:], vs.Value[offset:offset+32])
+	default:
+		return MemEntry{}, errors.New("unknown entry type")
 	}
 
 	return entry, nil

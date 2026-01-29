@@ -4,66 +4,67 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
-	"github.com/segmentio/ksuid"
 )
 
-// WriterOptions configures the writer.
-type WriterOptions struct {
-	MemtableSize    int64
-	FlushInterval   time.Duration
-	InlineThreshold int
-
-	BloomBitsPerKey int
-	BlockSize       int
-	Compression     string
-
-	OnFlushError func(error)
-}
-
-// DefaultWriterOptions returns sensible defaults.
-func DefaultWriterOptions() WriterOptions {
-	return WriterOptions{
-		MemtableSize:    4 * 1024 * 1024,
-		FlushInterval:   time.Second,
-		InlineThreshold: DefaultInlineThreshold,
-		BloomBitsPerKey: 10,
-		BlockSize:       4096,
-		Compression:     "snappy",
-	}
-}
-
-// Writer is a writer for a single tenant with WiscKey-style key-value separation.
 type Writer struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
 	opts        WriterOptions
+	valueConfig ValueStorageConfig
 
-	mu           sync.Mutex
-	memtable     *Memtable
-	seq          uint64
-	epoch        uint64
-	streamVLog   *StreamingVLogWriter
-	pendingVLogs map[ksuid.KSUID]VLogMeta
+	mu                      sync.Mutex
+	memtable                *Memtable
+	memtableInlineThreshold int
+	seq                     uint64
+	epoch                   uint64
+	blobStorage             *BlobStorage
 
 	flushMu     sync.Mutex
 	flushTicker *time.Ticker
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 
+	fenced     atomic.Bool
+	fenceToken *manifest.FenceToken
+
 	closed atomic.Bool
 }
 
-// NewWriter creates a new writer for a tenant.
 func NewWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) (*Writer, error) {
+
+	defaults := DefaultWriterOptions()
 	if opts.MemtableSize == 0 {
-		opts = DefaultWriterOptions()
+		opts.MemtableSize = defaults.MemtableSize
+	}
+	if opts.FlushInterval == 0 {
+		opts.FlushInterval = defaults.FlushInterval
+	}
+	if opts.BloomBitsPerKey == 0 {
+		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
+	}
+	if opts.BlockSize == 0 {
+		opts.BlockSize = defaults.BlockSize
+	}
+	if opts.Compression == "" {
+		opts.Compression = defaults.Compression
+	}
+
+	valueConfig := opts.ValueStorage
+	if valueConfig.BlobThreshold == 0 {
+		valueConfig = DefaultValueStorageConfig()
+	}
+	if valueConfig.MaxKeySize == 0 {
+		valueConfig.MaxKeySize = 64 * 1024
+	}
+	if valueConfig.MaxValueSize == 0 {
+		valueConfig.MaxValueSize = 256 * 1024 * 1024
 	}
 
 	manifestLog := manifest.NewStore(store)
@@ -72,23 +73,31 @@ func NewWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) 
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
 
-	var maxSeq uint64
-	for _, sst := range m.SSTables {
-		if sst.SeqHi > maxSeq {
-			maxSeq = sst.SeqHi
-		}
-	}
+	memtableInlineThreshold := valueConfig.BlobThreshold
 
 	w := &Writer{
-		store:        store,
-		manifestLog:  manifestLog,
-		opts:         opts,
-		memtable:     NewMemtable(opts.MemtableSize*2, opts.InlineThreshold),
-		seq:          maxSeq,
-		epoch:        m.NextEpoch,
-		streamVLog:   NewStreamingVLogWriter(store),
-		pendingVLogs: make(map[ksuid.KSUID]VLogMeta),
-		stopCh:       make(chan struct{}),
+		store:                   store,
+		manifestLog:             manifestLog,
+		opts:                    opts,
+		valueConfig:             valueConfig,
+		memtable:                NewMemtable(opts.MemtableSize*2, memtableInlineThreshold),
+		memtableInlineThreshold: memtableInlineThreshold,
+		seq:                     m.MaxSeqNum(),
+		epoch:                   m.NextEpoch,
+		blobStorage:             NewBlobStorage(store, valueConfig),
+		stopCh:                  make(chan struct{}),
+	}
+
+	if opts.EnableFencing {
+		ownerID := opts.OwnerID
+		if ownerID == "" {
+			ownerID = fmt.Sprintf("writer-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+		}
+		token, err := manifestLog.ClaimWriter(ctx, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim writer fence: %w", err)
+		}
+		w.fenceToken = token
 	}
 
 	if opts.FlushInterval > 0 {
@@ -100,30 +109,44 @@ func NewWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) 
 	return w, nil
 }
 
-// Put inserts or updates a key-value pair.
 func (w *Writer) Put(key, value []byte) error {
+	return w.PutWithTTL(key, value, 0)
+}
+
+func (w *Writer) PutWithTTL(key, value []byte, ttl time.Duration) error {
 	if w.closed.Load() {
 		return errors.New("writer closed")
+	}
+	if w.fenced.Load() {
+		return manifest.ErrFenced
 	}
 
 	if len(key) == 0 {
 		return errors.New("empty key")
 	}
-	if len(key) > MaxKeySize {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), MaxKeySize)
+	if len(key) > w.valueConfig.MaxKeySize {
+		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
+	}
+	if int64(len(value)) > w.valueConfig.MaxValueSize {
+		return fmt.Errorf("value size %d exceeds max %d", len(value), w.valueConfig.MaxValueSize)
 	}
 
-	if len(value) > DirectWriteThreshold {
-		return w.putLarge(key, value)
+	var expireAt int64
+	if ttl > 0 {
+		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
-	return w.putSmallOrMedium(key, value)
+
+	if len(value) >= w.valueConfig.BlobThreshold {
+		return w.putBlob(key, value, expireAt)
+	}
+	return w.putInline(key, value, expireAt)
 }
 
-func (w *Writer) putSmallOrMedium(key, value []byte) error {
+func (w *Writer) putInline(key, value []byte, expireAt int64) error {
 	w.mu.Lock()
 	w.seq++
 	seq := w.seq
-	w.memtable.Put(key, value, seq)
+	w.memtable.PutWithTTL(key, value, seq, expireAt)
 	size := w.memtable.TotalSize()
 	w.mu.Unlock()
 
@@ -133,60 +156,67 @@ func (w *Writer) putSmallOrMedium(key, value []byte) error {
 	return nil
 }
 
-func (w *Writer) putLarge(key, value []byte) error {
+func (w *Writer) putBlob(key, value []byte, expireAt int64) error {
+	ctx := context.Background()
 
-	ptr, err := w.streamVLog.WriteValue(context.Background(), value)
+	blobID, err := w.blobStorage.Write(ctx, value)
 	if err != nil {
-		return fmt.Errorf("stream large value to vlog: %w", err)
+		return fmt.Errorf("write blob: %w", err)
 	}
 
 	w.mu.Lock()
 	w.seq++
 	seq := w.seq
-	w.memtable.PutPointer(key, &ptr, seq)
-	w.pendingVLogs[ptr.VLogID] = VLogMeta{
-		ID:   ptr.VLogID,
-		Size: int64(VLogEntryHeaderSize + len(value)),
-	}
+	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
 	size := w.memtable.TotalSize()
 	w.mu.Unlock()
 
 	if size >= w.opts.MemtableSize {
-		return w.Flush(context.Background())
+		return w.Flush(ctx)
 	}
 	return nil
 }
 
-// Delete removes a key.
 func (w *Writer) Delete(key []byte) error {
+	return w.DeleteWithTTL(key, 0)
+}
+
+func (w *Writer) DeleteWithTTL(key []byte, ttl time.Duration) error {
 	if w.closed.Load() {
 		return errors.New("writer closed")
+	}
+	if w.fenced.Load() {
+		return manifest.ErrFenced
 	}
 
 	if len(key) == 0 {
 		return errors.New("empty key")
 	}
-	if len(key) > MaxKeySize {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), MaxKeySize)
+	if len(key) > w.valueConfig.MaxKeySize {
+		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
+	}
+
+	var expireAt int64
+	if ttl > 0 {
+		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 
 	w.mu.Lock()
 	w.seq++
 	seq := w.seq
-	w.memtable.Delete(key, seq)
+	w.memtable.DeleteWithTTL(key, seq, expireAt)
 	w.mu.Unlock()
 
 	return nil
 }
 
-// Flush writes the current memtable to object storage.
 func (w *Writer) Flush(ctx context.Context) error {
-	if w.closed.Load() {
-		return errors.New("writer closed")
-	}
-
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
+
+	if w.fenced.Load() {
+		return manifest.ErrFenced
+	}
 
 	w.mu.Lock()
 	if w.memtable.ApproxSize() == 0 {
@@ -195,13 +225,10 @@ func (w *Writer) Flush(ctx context.Context) error {
 	}
 
 	oldMemtable := w.memtable
-	w.memtable = NewMemtable(w.opts.MemtableSize*2, w.opts.InlineThreshold)
-	oldPendingVLogs := w.pendingVLogs
-	w.pendingVLogs = make(map[ksuid.KSUID]VLogMeta)
+	w.memtable = NewMemtable(w.opts.MemtableSize*2, w.memtableInlineThreshold)
 	epoch := w.epoch
 	w.epoch++
 	w.mu.Unlock()
-	w.streamVLog.Reset()
 
 	sstOpts := SSTWriterOptions{
 		BloomBitsPerKey: w.opts.BloomBitsPerKey,
@@ -212,16 +239,9 @@ func (w *Writer) Flush(ctx context.Context) error {
 	result, err := WriteSST(ctx, oldMemtable.Iterator(), sstOpts, epoch)
 	if err != nil {
 		if errors.Is(err, ErrEmptyIterator) {
-			return nil // Nothing to write
+			return nil
 		}
 		return fmt.Errorf("build sst: %w", err)
-	}
-
-	if len(result.VLogData) > 0 {
-		vlogPath := w.store.VLogPath(result.VLogID.String())
-		if _, err := w.store.Write(ctx, vlogPath, result.VLogData); err != nil {
-			return fmt.Errorf("upload vlog: %w", err)
-		}
 	}
 
 	sstPath := w.store.SSTPath(result.Meta.ID)
@@ -229,32 +249,38 @@ func (w *Writer) Flush(ctx context.Context) error {
 		return fmt.Errorf("upload sst: %w", err)
 	}
 
-	var addVLogs []VLogMeta
-	if len(oldPendingVLogs) > 0 {
-		addVLogs = make([]VLogMeta, 0, len(oldPendingVLogs))
-		for _, vlog := range oldPendingVLogs {
-			vlog.ReferencedBy = []string{result.Meta.ID}
-			addVLogs = append(addVLogs, vlog)
-		}
+	var appendErr error
+	if w.opts.EnableFencing {
+		_, appendErr = w.manifestLog.AppendAddSSTableWithFence(ctx, result.Meta)
+	} else {
+		_, appendErr = w.manifestLog.AppendAddSSTable(ctx, result.Meta)
 	}
-	if _, err := w.manifestLog.AppendAddSSTableWithVLogs(ctx, result.Meta, addVLogs); err != nil {
-		return fmt.Errorf("update manifest: %w", err)
+
+	if appendErr != nil {
+		if errors.Is(appendErr, manifest.ErrFenced) {
+			w.fenced.Store(true)
+		}
+		return fmt.Errorf("update manifest: %w", appendErr)
 	}
 
 	return nil
 }
 
-// flushLoop runs periodic flushes.
 func (w *Writer) flushLoop() {
 	defer w.wg.Done()
 	for {
 		select {
 		case <-w.flushTicker.C:
 			if err := w.Flush(context.Background()); err != nil {
+
+				if errors.Is(err, manifest.ErrFenced) {
+					slog.Error("isledb: writer fenced, stopping background flush")
+					return
+				}
 				if w.opts.OnFlushError != nil {
 					w.opts.OnFlushError(err)
 				} else {
-					log.Printf("segmentdb: background flush failed: %v", err)
+					slog.Error("isledb: background flush failed", "error", err)
 				}
 			}
 		case <-w.stopCh:
@@ -263,10 +289,18 @@ func (w *Writer) flushLoop() {
 	}
 }
 
-// Close flushes any remaining data and closes the writer.
+func (w *Writer) IsFenced() bool {
+	return w.fenced.Load()
+}
+
+func (w *Writer) FenceToken() *manifest.FenceToken {
+	return w.fenceToken
+}
+
 func (w *Writer) Close() error {
-	if w.closed.Load() {
-		return nil // Already closed
+
+	if !w.closed.CompareAndSwap(false, true) {
+		return nil
 	}
 
 	close(w.stopCh)
@@ -275,11 +309,7 @@ func (w *Writer) Close() error {
 	}
 	w.wg.Wait()
 
-	err := w.Flush(context.Background())
-
-	w.closed.Store(true)
-
-	return err
+	return w.Flush(context.Background())
 }
 
 func (w *Writer) Seq() uint64 {

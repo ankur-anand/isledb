@@ -3,11 +3,8 @@ package isledb
 import (
 	"encoding/binary"
 	"errors"
-
-	"github.com/segmentio/ksuid"
 )
 
-// OpKind represents the type of operation.
 type OpKind byte
 
 const (
@@ -16,74 +13,66 @@ const (
 )
 
 const (
-	MarkerInline  byte = 0x00
-	MarkerPointer byte = 0x01
-	MarkerDelete  byte = 0x02
+	MarkerInline byte = 0x00
+	MarkerDelete byte = 0x02
+	MarkerBlob   byte = 0x03
+
+	MarkerTTLFlag byte = 0x80
 )
 
-const (
-	// DefaultInlineThreshold is the maximum value size stored directly in SST.
-	DefaultInlineThreshold = 16 * 1024
-	KSUIDSize              = 20
-)
-
-// VLogEntryHeaderSize is the size of the VLog entry header.
-// length:4 + checksum:4
-const VLogEntryHeaderSize = 8
-
-// KeyEntry represents a single key in the LSM tree. This is what gets stored in as the value for the key in SST.
-// If Inline is true Value is Stored Inline in SST File.
-// If Inline is false Check the Vlog Pointer which is where the Value is.
-// Vlog pointer is basically a KSUID File name.
 type KeyEntry struct {
 	Key  []byte
 	Seq  uint64
 	Kind OpKind
 
-	// Inline value
 	Inline bool
 	Value  []byte
 
-	// VLog pointer
-	VLogID    ksuid.KSUID
-	VOffset   uint64
-	VLength   uint32
-	VChecksum uint32
+	BlobID [32]byte
+
+	ExpireAt int64
 }
 
-// PointerSize is the size of an encoded VLog pointer (without marker).
-// ksuid:20 + offset:8 + length:4 + checksum:4 = 36 bytes
-const PointerSize = KSUIDSize + 8 + 4 + 4
-
-// EncodeKeyEntry encodes a KeyEntry to bytes for storage in SST.
-//
-// format:
-//
-//	if Inline:  [0x00][value bytes...]
-//	if Pointer: [0x01][ksuid:20][offset:8][length:4][checksum:4]
-//	if Delete:  [0x02]
 func EncodeKeyEntry(e KeyEntry) []byte {
+	hasTTL := e.ExpireAt > 0
+
 	if e.Kind == OpDelete {
+		if hasTTL {
+			buf := make([]byte, 1+8)
+			buf[0] = MarkerDelete | MarkerTTLFlag
+			binary.BigEndian.PutUint64(buf[1:], uint64(e.ExpireAt))
+			return buf
+		}
 		return []byte{MarkerDelete}
 	}
 
 	if e.Inline {
+		if hasTTL {
+			buf := make([]byte, 1+8+len(e.Value))
+			buf[0] = MarkerInline | MarkerTTLFlag
+			binary.BigEndian.PutUint64(buf[1:], uint64(e.ExpireAt))
+			copy(buf[9:], e.Value)
+			return buf
+		}
 		buf := make([]byte, 1+len(e.Value))
 		buf[0] = MarkerInline
 		copy(buf[1:], e.Value)
 		return buf
 	}
 
-	buf := make([]byte, 1+PointerSize)
-	buf[0] = MarkerPointer
-	copy(buf[1:21], e.VLogID[:])
-	binary.LittleEndian.PutUint64(buf[21:29], e.VOffset)
-	binary.LittleEndian.PutUint32(buf[29:33], e.VLength)
-	binary.LittleEndian.PutUint32(buf[33:37], e.VChecksum)
+	if hasTTL {
+		buf := make([]byte, 1+8+32)
+		buf[0] = MarkerBlob | MarkerTTLFlag
+		binary.BigEndian.PutUint64(buf[1:], uint64(e.ExpireAt))
+		copy(buf[9:], e.BlobID[:])
+		return buf
+	}
+	buf := make([]byte, 1+32)
+	buf[0] = MarkerBlob
+	copy(buf[1:], e.BlobID[:])
 	return buf
 }
 
-// DecodeKeyEntry decodes a KeyEntry from SST value bytes.
 func DecodeKeyEntry(key, encoded []byte) (KeyEntry, error) {
 	if len(encoded) == 0 {
 		return KeyEntry{}, errors.New("empty encoded entry")
@@ -93,27 +82,33 @@ func DecodeKeyEntry(key, encoded []byte) (KeyEntry, error) {
 		Key: key,
 	}
 
-	switch encoded[0] {
+	marker := encoded[0]
+	hasTTL := (marker & MarkerTTLFlag) != 0
+	baseMarker := marker & ^MarkerTTLFlag
+
+	offset := 1
+	if hasTTL {
+		if len(encoded) < 9 {
+			return KeyEntry{}, errors.New("ttl entry too short")
+		}
+		e.ExpireAt = int64(binary.BigEndian.Uint64(encoded[1:9]))
+		offset = 9
+	}
+
+	switch baseMarker {
 	case MarkerDelete:
 		e.Kind = OpDelete
 	case MarkerInline:
 		e.Kind = OpPut
 		e.Inline = true
-		e.Value = encoded[1:]
-	case MarkerPointer:
-		if len(encoded) < 1+PointerSize {
-			return KeyEntry{}, errors.New("pointer entry too short")
+		e.Value = encoded[offset:]
+	case MarkerBlob:
+		if len(encoded) < offset+32 {
+			return KeyEntry{}, errors.New("blob entry too short")
 		}
 		e.Kind = OpPut
 		e.Inline = false
-
-		var id ksuid.KSUID
-		copy(id[:], encoded[1:21])
-		e.VLogID = id
-
-		e.VOffset = binary.LittleEndian.Uint64(encoded[21:29])
-		e.VLength = binary.LittleEndian.Uint32(encoded[29:33])
-		e.VChecksum = binary.LittleEndian.Uint32(encoded[33:37])
+		copy(e.BlobID[:], encoded[offset:offset+32])
 	default:
 		return KeyEntry{}, errors.New("unknown marker byte")
 	}
@@ -121,13 +116,9 @@ func DecodeKeyEntry(key, encoded []byte) (KeyEntry, error) {
 	return e, nil
 }
 
-// VLogPointer references a value in a VLog file.
-type VLogPointer struct {
-	VLogID ksuid.KSUID
-	// Byte offset within file
-	Offset   uint64
-	Length   uint32
-	Checksum uint32
+func (e *KeyEntry) HasBlobID() bool {
+	var zeroBlobID [32]byte
+	return e.BlobID != zeroBlobID
 }
 
 type MemEntry struct {
@@ -137,8 +128,37 @@ type MemEntry struct {
 	Inline bool
 	Value  []byte
 
-	// 256B-1MB: buffered until flush
-	PendingValue []byte
-	// >1MB: Individual *VLogPointer
-	VLogPtr *VLogPointer
+	BlobID [32]byte
+
+	ExpireAt int64
+}
+
+type CompactionEntry struct {
+	Key  []byte
+	Seq  uint64
+	Kind OpKind
+
+	Inline bool
+	Value  []byte
+
+	BlobID [32]byte
+
+	ExpireAt int64
+}
+
+func (e *KeyEntry) IsExpired(nowMs int64) bool {
+	return e.ExpireAt > 0 && e.ExpireAt <= nowMs
+}
+
+func (e *MemEntry) IsExpired(nowMs int64) bool {
+	return e.ExpireAt > 0 && e.ExpireAt <= nowMs
+}
+
+func (e *CompactionEntry) IsExpired(nowMs int64) bool {
+	return e.ExpireAt > 0 && e.ExpireAt <= nowMs
+}
+
+func (e *CompactionEntry) HasBlobID() bool {
+	var zeroBlobID [32]byte
+	return e.BlobID != zeroBlobID
 }

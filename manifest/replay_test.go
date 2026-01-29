@@ -8,11 +8,11 @@ import (
 )
 
 func TestReplaySnapshotAndLogs(t *testing.T) {
+
 	snap := &Manifest{
 		Version:   1,
 		NextEpoch: 2,
-		SSTables:  []SSTMeta{{ID: "a.sst", Epoch: 1}},
-		VLogs:     []VLogMeta{{ID: ksuid.New(), Size: 10}},
+		L0SSTs:    []SSTMeta{{ID: "a.sst", Epoch: 1, Level: 0}},
 	}
 	snapBytes, err := EncodeSnapshot(snap)
 	if err != nil {
@@ -24,7 +24,7 @@ func TestReplaySnapshotAndLogs(t *testing.T) {
 		Seq:       5,
 		Timestamp: time.Unix(1700000100, 0).UTC(),
 		Op:        LogOpAddSSTable,
-		SSTable:   &SSTMeta{ID: "b.sst", Epoch: 2},
+		SSTable:   &SSTMeta{ID: "b.sst", Epoch: 2, Level: 0},
 	}
 	entryBytes, err := EncodeLogEntry(entry)
 	if err != nil {
@@ -35,8 +35,9 @@ func TestReplaySnapshotAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if len(got.SSTables) != 2 {
-		t.Fatalf("sstables mismatch: %d", len(got.SSTables))
+
+	if len(got.L0SSTs) != 2 {
+		t.Fatalf("L0SSTs mismatch: %d", len(got.L0SSTs))
 	}
 	if got.NextEpoch != 3 {
 		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
@@ -48,7 +49,7 @@ func TestReplayEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if got == nil || len(got.SSTables) != 0 {
+	if got == nil || len(got.L0SSTs) != 0 || len(got.SortedRuns) != 0 {
 		t.Fatalf("expected empty manifest")
 	}
 }

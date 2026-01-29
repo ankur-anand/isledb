@@ -35,73 +35,51 @@ func singleEntry(t *testing.T, mt *Memtable) MemEntry {
 
 func TestMemtable_PutAndIterator(t *testing.T) {
 	key := []byte("key1")
-	large := make([]byte, DefaultInlineThreshold+100)
-	for i := range large {
-		large[i] = byte(i % 256)
+	value := []byte("test value")
+
+	mt := NewMemtable(1<<20, 0)
+	mt.Put(key, value, 1)
+
+	entry := singleEntry(t, mt)
+	if !bytes.Equal(entry.Key, key) {
+		t.Errorf("key mismatch: got %s, want %s", entry.Key, key)
 	}
-
-	cases := []struct {
-		name            string
-		value           []byte
-		seq             uint64
-		wantInline      bool
-		wantPendingSize int64
-		check           func(t *testing.T, entry MemEntry, value []byte)
-	}{
-		{
-			name:            "inline",
-			value:           []byte("small value"),
-			seq:             1,
-			wantInline:      true,
-			wantPendingSize: 0,
-			check: func(t *testing.T, entry MemEntry, value []byte) {
-				t.Helper()
-				if !bytes.Equal(entry.Value, value) {
-					t.Errorf("value mismatch: got %s, want %s", entry.Value, value)
-				}
-			},
-		},
-		{
-			name:            "pending",
-			value:           large,
-			seq:             2,
-			wantInline:      false,
-			wantPendingSize: int64(len(large)),
-			check: func(t *testing.T, entry MemEntry, value []byte) {
-				t.Helper()
-				if !bytes.Equal(entry.PendingValue, value) {
-					t.Error("pending value mismatch")
-				}
-			},
-		},
+	if entry.Seq != 1 {
+		t.Errorf("seq mismatch: got %d, want 1", entry.Seq)
 	}
+	if entry.Kind != OpPut {
+		t.Errorf("kind mismatch: got %v, want OpPut", entry.Kind)
+	}
+	if !entry.Inline {
+		t.Errorf("expected inline")
+	}
+	if !bytes.Equal(entry.Value, value) {
+		t.Errorf("value mismatch: got %s, want %s", entry.Value, value)
+	}
+}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			mt := NewMemtable(1<<20, 0)
-			mt.Put(key, tc.value, tc.seq)
+func TestMemtable_PutBlobRef(t *testing.T) {
+	key := []byte("blobkey")
+	blobID := ComputeBlobID([]byte("large-blob-content"))
 
-			if mt.PendingValueSize() != tc.wantPendingSize {
-				t.Errorf("pending size mismatch: got %d, want %d", mt.PendingValueSize(), tc.wantPendingSize)
-			}
+	mt := NewMemtable(1<<20, 0)
+	mt.PutBlobRef(key, blobID, 1)
 
-			entry := singleEntry(t, mt)
-			if !bytes.Equal(entry.Key, key) {
-				t.Errorf("key mismatch: got %s, want %s", entry.Key, key)
-			}
-			if entry.Seq != tc.seq {
-				t.Errorf("seq mismatch: got %d, want %d", entry.Seq, tc.seq)
-			}
-			if entry.Kind != OpPut {
-				t.Errorf("kind mismatch: got %v, want OpPut", entry.Kind)
-			}
-			if entry.Inline != tc.wantInline {
-				t.Errorf("inline mismatch: got %v, want %v", entry.Inline, tc.wantInline)
-			}
-			if tc.check != nil {
-				tc.check(t, entry, tc.value)
-			}
-		})
+	entry := singleEntry(t, mt)
+	if !bytes.Equal(entry.Key, key) {
+		t.Errorf("key mismatch: got %s, want %s", entry.Key, key)
+	}
+	if entry.Seq != 1 {
+		t.Errorf("seq mismatch: got %d, want 1", entry.Seq)
+	}
+	if entry.Kind != OpPut {
+		t.Errorf("kind mismatch: got %v, want OpPut", entry.Kind)
+	}
+	if entry.Inline {
+		t.Errorf("expected non-inline for blob ref")
+	}
+	if entry.BlobID != blobID {
+		t.Errorf("blob id mismatch: got %x, want %x", entry.BlobID, blobID)
 	}
 }
 
@@ -205,16 +183,11 @@ func TestMemtable_TotalSize(t *testing.T) {
 	mt.Put([]byte("small"), []byte("tiny"), 1)
 	smallTotal := mt.TotalSize()
 
-	largeValue := make([]byte, DefaultInlineThreshold+500)
+	largeValue := make([]byte, 10000)
 	mt.Put([]byte("large"), largeValue, 2)
 
 	if mt.TotalSize() <= smallTotal {
 		t.Error("expected total size to increase with large value")
-	}
-
-	expectedPending := int64(len(largeValue))
-	if mt.PendingValueSize() != expectedPending {
-		t.Errorf("pending size: got %d, want %d", mt.PendingValueSize(), expectedPending)
 	}
 }
 
@@ -255,7 +228,7 @@ func TestMemtable_ConcurrentPuts(t *testing.T) {
 	}
 }
 
-func TestMemtable_ConcurrentPutsWithLargeValues(t *testing.T) {
+func TestMemtable_ConcurrentBlobRefs(t *testing.T) {
 	mt := NewMemtable(10<<20, 0)
 
 	var wg sync.WaitGroup
@@ -268,18 +241,18 @@ func TestMemtable_ConcurrentPutsWithLargeValues(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < entriesPerGoroutine; i++ {
 				key := []byte(fmt.Sprintf("g%d-k%d", gid, i))
-				value := make([]byte, DefaultInlineThreshold+100)
-				mt.Put(key, value, uint64(gid*1000+i))
+				blobID := ComputeBlobID([]byte(fmt.Sprintf("blob-content-%d-%d", gid, i)))
+				mt.PutBlobRef(key, blobID, uint64(gid*1000+i))
 			}
 		}(g)
 	}
 
 	wg.Wait()
 
-	expectedPendingCount := numGoroutines * entriesPerGoroutine
-	expectedPendingSize := int64(expectedPendingCount * (DefaultInlineThreshold + 100))
-	if mt.PendingValueSize() != expectedPendingSize {
-		t.Errorf("pending size: got %d, want %d", mt.PendingValueSize(), expectedPendingSize)
+	entries := readEntries(t, mt)
+	expected := numGoroutines * entriesPerGoroutine
+	if len(entries) != expected {
+		t.Errorf("expected %d entries, got %d", expected, len(entries))
 	}
 }
 
@@ -302,27 +275,6 @@ func TestMemtable_Iterator_MultipleRewinds(t *testing.T) {
 	}
 	if it.Err() != nil {
 		t.Errorf("unexpected error: %v", it.Err())
-	}
-}
-
-func TestMemtable_BoundaryValueSize(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
-
-	cases := []struct {
-		key         string
-		value       []byte
-		seq         uint64
-		wantPending int64
-	}{
-		{key: "exact", value: make([]byte, DefaultInlineThreshold), seq: 1, wantPending: 0},
-		{key: "over", value: make([]byte, DefaultInlineThreshold+1), seq: 2, wantPending: int64(DefaultInlineThreshold + 1)},
-	}
-
-	for _, tc := range cases {
-		mt.Put([]byte(tc.key), tc.value, tc.seq)
-		if mt.PendingValueSize() != tc.wantPending {
-			t.Errorf("expected pending size %d, got %d", tc.wantPending, mt.PendingValueSize())
-		}
 	}
 }
 
@@ -352,7 +304,7 @@ func BenchmarkMemtable_Put_Small(b *testing.B) {
 func BenchmarkMemtable_Put_Large(b *testing.B) {
 	mt := NewMemtable(64<<20, 0)
 	key := []byte("benchmark-key")
-	value := make([]byte, DefaultInlineThreshold+1000)
+	value := make([]byte, 10000)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

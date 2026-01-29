@@ -1,0 +1,251 @@
+package isledb
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ankur-anand/isledb/blobstore"
+)
+
+type TailingReader struct {
+	reader *Reader
+	opts   TailingReaderOptions
+
+	mu          sync.RWMutex
+	lastSeq     uint64
+	lastRefresh time.Time
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+
+	running atomic.Bool
+	closed  atomic.Bool
+}
+
+func NewTailingReader(ctx context.Context, store *blobstore.Store, opts TailingReaderOptions) (*TailingReader, error) {
+
+	if opts.RefreshInterval == 0 {
+		opts.RefreshInterval = 100 * time.Millisecond
+	}
+
+	reader, err := NewReader(ctx, store, opts.ReaderOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	tr := &TailingReader{
+		reader: reader,
+		opts:   opts,
+		stopCh: make(chan struct{}),
+	}
+
+	return tr, nil
+}
+
+func (tr *TailingReader) Start() {
+	if tr.running.Swap(true) {
+		return
+	}
+
+	tr.wg.Add(1)
+	go tr.refreshLoop()
+}
+
+func (tr *TailingReader) Stop() {
+	if !tr.running.Swap(false) {
+		return
+	}
+
+	close(tr.stopCh)
+	tr.wg.Wait()
+}
+
+func (tr *TailingReader) Close() error {
+	if !tr.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	tr.Stop()
+	return tr.reader.Close()
+}
+
+func (tr *TailingReader) refreshLoop() {
+	defer tr.wg.Done()
+
+	ticker := time.NewTicker(tr.opts.RefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), tr.opts.RefreshInterval*2)
+			err := tr.reader.Refresh(ctx)
+			cancel()
+
+			if err != nil {
+				if tr.opts.OnRefreshError != nil {
+					tr.opts.OnRefreshError(err)
+				}
+				continue
+			}
+
+			tr.mu.Lock()
+			tr.lastRefresh = time.Now()
+			tr.mu.Unlock()
+
+			if tr.opts.OnRefresh != nil {
+				tr.opts.OnRefresh()
+			}
+
+		case <-tr.stopCh:
+			return
+		}
+	}
+}
+
+func (tr *TailingReader) Refresh(ctx context.Context) error {
+	err := tr.reader.Refresh(ctx)
+	if err == nil {
+		tr.mu.Lock()
+		tr.lastRefresh = time.Now()
+		tr.mu.Unlock()
+	}
+	return err
+}
+
+func (tr *TailingReader) LastRefresh() time.Time {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	return tr.lastRefresh
+}
+
+func (tr *TailingReader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
+	return tr.reader.Get(ctx, key)
+}
+
+func (tr *TailingReader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
+	return tr.reader.Scan(ctx, minKey, maxKey)
+}
+
+func (tr *TailingReader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error) {
+	return tr.reader.ScanLimit(ctx, minKey, maxKey, limit)
+}
+
+func (tr *TailingReader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
+	return tr.reader.NewIterator(ctx, opts)
+}
+
+func (tr *TailingReader) Manifest() *Manifest {
+	return tr.reader.Manifest()
+}
+
+func (tr *TailingReader) Reader() *Reader {
+	return tr.reader
+}
+
+func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler func(KV) error) error {
+	if opts.PollInterval == 0 {
+		opts.PollInterval = tr.opts.RefreshInterval
+	}
+
+	var lastKey []byte
+	if opts.StartAfterKey != nil {
+		lastKey = opts.StartAfterKey
+	}
+
+	for {
+
+		if err := tr.Refresh(ctx); err != nil {
+			if tr.opts.OnRefreshError != nil {
+				tr.opts.OnRefreshError(err)
+			}
+
+		}
+
+		minKey := opts.MinKey
+		if lastKey != nil {
+
+			minKey = incrementKey(lastKey)
+		}
+
+		iter, err := tr.reader.NewIterator(ctx, IteratorOptions{
+			MinKey: minKey,
+			MaxKey: opts.MaxKey,
+		})
+		if err != nil {
+			return err
+		}
+
+		for iter.Next() {
+			kv := KV{
+				Key:   iter.Key(),
+				Value: iter.Value(),
+			}
+
+			if err := handler(kv); err != nil {
+				iter.Close()
+				return err
+			}
+
+			lastKey = append(lastKey[:0], kv.Key...)
+		}
+
+		if err := iter.Err(); err != nil {
+			iter.Close()
+			return err
+		}
+		iter.Close()
+
+		select {
+		case <-time.After(opts.PollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func incrementKey(key []byte) []byte {
+	if len(key) == 0 {
+		return nil
+	}
+
+	result := make([]byte, len(key))
+	copy(result, key)
+
+	for i := len(result) - 1; i >= 0; i-- {
+		if result[i] < 0xFF {
+			result[i]++
+			return result
+		}
+		result[i] = 0
+	}
+
+	return append(result, 0)
+}
+
+func (tr *TailingReader) TailChannel(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error) {
+	ch := make(chan KV, 100)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		err := tr.Tail(ctx, opts, func(kv KV) error {
+			select {
+			case ch <- kv:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	return ch, errCh
+}

@@ -3,22 +3,20 @@ package manifest
 import (
 	"testing"
 	"time"
-
-	"github.com/segmentio/ksuid"
 )
 
 func TestSnapshotRoundTrip(t *testing.T) {
 	m := &Manifest{
-		Version:   2,
-		NextEpoch: 7,
-		LevelConfig: LevelConfig{
-			MaxLevels:             4,
-			L0CompactionThreshold: 4,
-			L1TargetSize:          64 << 20,
-			LevelSizeMultiplier:   10,
-			VLogGarbageThreshold:  0.5,
+		Version:         2,
+		NextEpoch:       7,
+		NextSortedRunID: 3,
+		TieredConfig: TieredConfig{
+			L0CompactionThreshold:   8,
+			TierCompactionThreshold: 8,
+			MaxTiers:                4,
+			LazyLeveling:            true,
 		},
-		SSTables: []SSTMeta{
+		L0SSTs: []SSTMeta{
 			{
 				ID:        "1-1-2-deadbeef.sst",
 				Epoch:     1,
@@ -30,15 +28,19 @@ func TestSnapshotRoundTrip(t *testing.T) {
 				Checksum:  "sha256:abc",
 				CreatedAt: time.Unix(1700000000, 0).UTC(),
 				Level:     0,
-				VLogID:    ksuid.New(),
-				VLogSize:  456,
-				VLogRefs: []VLogRef{
-					{VLogID: ksuid.New(), LiveBytes: 100},
-				},
 			},
 		},
-		VLogs: []VLogMeta{
-			{ID: ksuid.New(), Size: 999, ReferencedBy: []string{"1-1-2-deadbeef.sst"}},
+		SortedRuns: []SortedRun{
+			{
+				ID: 1,
+				SSTs: []SSTMeta{
+					{
+						ID:     "2-1-5-abcdef.sst",
+						MinKey: []byte("c"),
+						MaxKey: []byte("z"),
+					},
+				},
+			},
 		},
 	}
 
@@ -53,14 +55,23 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if got.Version != m.Version || got.NextEpoch != m.NextEpoch {
 		t.Fatalf("manifest mismatch: version=%d nextEpoch=%d", got.Version, got.NextEpoch)
 	}
-	if len(got.SSTables) != 1 || len(got.VLogs) != 1 {
-		t.Fatalf("manifest slices mismatch: sst=%d vlogs=%d", len(got.SSTables), len(got.VLogs))
+	if got.NextSortedRunID != m.NextSortedRunID {
+		t.Fatalf("NextSortedRunID mismatch: got %d want %d", got.NextSortedRunID, m.NextSortedRunID)
 	}
-	if got.SSTables[0].ID != m.SSTables[0].ID {
-		t.Fatalf("sst id mismatch: got %s want %s", got.SSTables[0].ID, m.SSTables[0].ID)
+	if len(got.L0SSTs) != 1 {
+		t.Fatalf("manifest L0SSTs mismatch: got %d want 1", len(got.L0SSTs))
 	}
-	if got.SSTables[0].CreatedAt.IsZero() {
+	if got.L0SSTs[0].ID != m.L0SSTs[0].ID {
+		t.Fatalf("L0 sst id mismatch: got %s want %s", got.L0SSTs[0].ID, m.L0SSTs[0].ID)
+	}
+	if got.L0SSTs[0].CreatedAt.IsZero() {
 		t.Fatalf("createdAt should be preserved")
+	}
+	if len(got.SortedRuns) != 1 || got.SortedRuns[0].ID != 1 {
+		t.Fatalf("SortedRuns mismatch")
+	}
+	if got.TieredConfig.L0CompactionThreshold != 8 {
+		t.Fatalf("TieredConfig mismatch")
 	}
 }
 

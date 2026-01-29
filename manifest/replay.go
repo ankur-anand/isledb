@@ -1,6 +1,5 @@
 package manifest
 
-// Replay rebuilds a manifest from a snapshot blob and a list of log entry blobs.
 func Replay(snapshot []byte, logEntries [][]byte) (*Manifest, error) {
 	var m *Manifest
 	var err error

@@ -11,7 +11,6 @@ import (
 
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/segmentio/ksuid"
 )
 
 type sliceSSTIter struct {
@@ -78,25 +77,12 @@ func (m *memReadable) NewReadHandle(_ objstorage.ReadBeforeSize) objstorage.Read
 	return &m.rh
 }
 
-func findVLogRef(refs []VLogRef, id ksuid.KSUID) (VLogRef, bool) {
-	for _, ref := range refs {
-		if ref.VLogID == id {
-			return ref, true
-		}
-	}
-	return VLogRef{}, false
-}
-
-func TestWriteSST_InlineAndPending(t *testing.T) {
+func TestWriteSST_Inline(t *testing.T) {
 	inline := []byte("x")
-	pending := make([]byte, DefaultInlineThreshold+10)
-	for i := range pending {
-		pending[i] = byte(i % 251)
-	}
 
 	entries := []MemEntry{
 		{Key: []byte("a"), Seq: 2, Kind: OpPut, Inline: true, Value: inline},
-		{Key: []byte("b"), Seq: 1, Kind: OpPut, PendingValue: pending},
+		{Key: []byte("b"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -107,17 +93,11 @@ func TestWriteSST_InlineAndPending(t *testing.T) {
 	if len(res.SSTData) == 0 {
 		t.Fatalf("expected SST data")
 	}
-	if len(res.VLogData) == 0 {
-		t.Fatalf("expected VLog data")
-	}
 	if res.Meta.SeqLo != 1 || res.Meta.SeqHi != 2 {
 		t.Errorf("seq range mismatch: got %d-%d", res.Meta.SeqLo, res.Meta.SeqHi)
 	}
 	if !bytes.Equal(res.Meta.MinKey, []byte("a")) || !bytes.Equal(res.Meta.MaxKey, []byte("b")) {
 		t.Errorf("key range mismatch: %s-%s", res.Meta.MinKey, res.Meta.MaxKey)
-	}
-	if res.Meta.VLogID.IsNil() || res.Meta.VLogID != res.VLogID {
-		t.Errorf("vlog id mismatch: meta=%s result=%s", res.Meta.VLogID, res.VLogID)
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
@@ -141,7 +121,6 @@ func TestWriteSST_InlineAndPending(t *testing.T) {
 
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
 		v, _, err := kv.V.Value(nil)
-
 		if err != nil {
 			t.Fatalf("value error: %v", err)
 		}
@@ -172,25 +151,59 @@ func TestWriteSST_InlineAndPending(t *testing.T) {
 	if !bytes.Equal(seen[1].key, []byte("b")) || seen[1].seq != 1 {
 		t.Fatalf("second entry mismatch: key=%s seq=%d", seen[1].key, seen[1].seq)
 	}
-	if seen[1].value.Inline {
-		t.Fatalf("expected pointer entry")
+	if !seen[1].value.Inline || !bytes.Equal(seen[1].value.Value, []byte("y")) {
+		t.Fatalf("expected inline entry")
 	}
-	if seen[1].value.VLogID != res.VLogID {
-		t.Fatalf("vlog id mismatch: %s %s", seen[1].value.VLogID, res.VLogID)
+}
+
+func TestWriteSST_BlobReference(t *testing.T) {
+	blobID := ComputeBlobID([]byte("large-value-content"))
+
+	entries := []MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: false, BlobID: blobID},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	if err != nil {
+		t.Fatalf("WriteSST error: %v", err)
+	}
+	if len(res.SSTData) == 0 {
+		t.Fatalf("expected SST data")
 	}
 
-	ptr := VLogPointer{
-		VLogID:   seen[1].value.VLogID,
-		Offset:   seen[1].value.VOffset,
-		Length:   seen[1].value.VLength,
-		Checksum: seen[1].value.VChecksum,
-	}
-	value, err := NewVLogReader(res.VLogData).ReadValue(ptr)
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
-		t.Fatalf("vlog read error: %v", err)
+		t.Fatalf("reader error: %v", err)
 	}
-	if !bytes.Equal(value, pending) {
-		t.Fatalf("vlog value mismatch")
+	defer reader.Close()
+
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	if err != nil {
+		t.Fatalf("iter error: %v", err)
+	}
+	defer iter.Close()
+
+	kv := iter.First()
+	if kv == nil {
+		t.Fatalf("expected entry")
+	}
+	v, _, err := kv.V.Value(nil)
+	if err != nil {
+		t.Fatalf("value error: %v", err)
+	}
+	decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
+	if err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if decoded.Inline {
+		t.Fatalf("expected blob reference, got inline")
+	}
+	if !decoded.HasBlobID() {
+		t.Fatalf("expected blob ID")
+	}
+	if decoded.BlobID != blobID {
+		t.Fatalf("blob id mismatch: got %x, want %x", decoded.BlobID, blobID)
 	}
 }
 
@@ -268,64 +281,6 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 	}
 	if decoded.Kind != OpDelete {
 		t.Fatalf("expected delete, got %v", decoded.Kind)
-	}
-}
-
-func TestWriteSST_VLogRefs_Pending(t *testing.T) {
-	pending := make([]byte, DefaultInlineThreshold+10)
-	for i := range pending {
-		pending[i] = byte(i % 251)
-	}
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, PendingValue: pending},
-	}
-	it := &sliceSSTIter{entries: entries}
-
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
-	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
-	}
-	if len(res.Meta.VLogRefs) != 1 {
-		t.Fatalf("expected 1 vlog ref, got %d", len(res.Meta.VLogRefs))
-	}
-	ref, ok := findVLogRef(res.Meta.VLogRefs, res.VLogID)
-	if !ok {
-		t.Fatalf("missing vlog ref for %s", res.VLogID)
-	}
-	if ref.LiveBytes != int64(len(res.VLogData)) {
-		t.Fatalf("live bytes mismatch: got %d, want %d", ref.LiveBytes, len(res.VLogData))
-	}
-}
-
-func TestWriteSST_VLogRefs_Pointer(t *testing.T) {
-	ptrID := ksuid.New()
-	entries := []MemEntry{
-		{
-			Key:     []byte("a"),
-			Seq:     1,
-			Kind:    OpPut,
-			VLogPtr: &VLogPointer{VLogID: ptrID, Offset: 0, Length: 100, Checksum: 1},
-		},
-	}
-	it := &sliceSSTIter{entries: entries}
-
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
-	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
-	}
-	if len(res.VLogData) != 0 {
-		t.Fatalf("expected no vlog data")
-	}
-	if len(res.Meta.VLogRefs) != 1 {
-		t.Fatalf("expected 1 vlog ref, got %d", len(res.Meta.VLogRefs))
-	}
-	ref, ok := findVLogRef(res.Meta.VLogRefs, ptrID)
-	if !ok {
-		t.Fatalf("missing vlog ref for %s", ptrID)
-	}
-	expected := int64(VLogEntryHeaderSize + 100)
-	if ref.LiveBytes != expected {
-		t.Fatalf("live bytes mismatch: got %d, want %d", ref.LiveBytes, expected)
 	}
 }
 
