@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 func buildTestIter(t *testing.T, entries []MemEntry) (*sstable.Reader, sstable.Iterator) {
@@ -17,11 +17,11 @@ func buildTestIter(t *testing.T, entries []MemEntry) (*sstable.Reader, sstable.I
 		t.Fatalf("WriteSST: %v", err)
 	}
 
-	reader, err := sstable.NewReader(newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	iter, err := reader.NewIter(nil, nil)
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
 		_ = reader.Close()
 		t.Fatalf("NewIter: %v", err)
@@ -34,13 +34,11 @@ func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 		{Key: []byte("k"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("old")},
 	})
 	defer readerOld.Close()
-	defer iterOld.Close()
 
 	readerNew, iterNew := buildTestIter(t, []MemEntry{
 		{Key: []byte("k"), Seq: 5, Kind: OpPut, Inline: true, Value: []byte("new")},
 	})
 	defer readerNew.Close()
-	defer iterNew.Close()
 
 	merge := NewMergeIterator([]sstable.Iterator{iterOld, iterNew})
 	defer merge.Close()
@@ -72,21 +70,20 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 		{Key: []byte("k"), Seq: seq, Kind: OpPut, Inline: true, Value: []byte("set")},
 	})
 	defer readerSet.Close()
-	defer iterSet.Close()
 
 	readerDel, iterDel := buildTestIter(t, []MemEntry{
 		{Key: []byte("k"), Seq: seq, Kind: OpDelete},
 	})
 	defer readerDel.Close()
-	defer iterDel.Close()
 
-	ikeySet, _ := iterSet.First()
-	ikeyDel, _ := iterDel.First()
-	if ikeySet == nil || ikeyDel == nil {
+	kvSet := iterSet.First()
+	kvDel := iterDel.First()
+
+	if kvSet == nil || kvDel == nil {
 		t.Fatalf("expected keys from iterators")
 	}
-	trailerSet := ikeySet.Trailer
-	trailerDel := ikeyDel.Trailer
+	trailerSet := kvSet.K.Trailer
+	trailerDel := kvDel.K.Trailer
 
 	iterSet.First()
 	iterDel.First()

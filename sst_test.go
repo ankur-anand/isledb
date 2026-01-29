@@ -9,8 +9,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/cockroachdb/pebble/objstorage"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/objstorage"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/segmentio/ksuid"
 )
 
@@ -74,7 +74,7 @@ func (m *memReadable) Size() int64 {
 	return int64(len(m.data))
 }
 
-func (m *memReadable) NewReadHandle(_ context.Context) objstorage.ReadHandle {
+func (m *memReadable) NewReadHandle(_ objstorage.ReadBeforeSize) objstorage.ReadHandle {
 	return &m.rh
 }
 
@@ -120,13 +120,13 @@ func TestWriteSST_InlineAndPending(t *testing.T) {
 		t.Errorf("vlog id mismatch: meta=%s result=%s", res.Meta.VLogID, res.VLogID)
 	}
 
-	reader, err := sstable.NewReader(newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
 	defer reader.Close()
 
-	iter, err := reader.NewIter(nil, nil)
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
 		t.Fatalf("iter error: %v", err)
 	}
@@ -139,22 +139,21 @@ func TestWriteSST_InlineAndPending(t *testing.T) {
 	}
 	var seen []seenEntry
 
-	key, val := iter.First()
-	for key != nil {
-		v, _, err := val.Value(nil)
+	for kv := iter.First(); kv != nil; kv = iter.Next() {
+		v, _, err := kv.V.Value(nil)
+
 		if err != nil {
 			t.Fatalf("value error: %v", err)
 		}
-		decoded, err := DecodeKeyEntry(key.UserKey, v)
+		decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
 		if err != nil {
 			t.Fatalf("decode error: %v", err)
 		}
 		seen = append(seen, seenEntry{
-			key:   append([]byte(nil), key.UserKey...),
+			key:   append([]byte(nil), kv.K.UserKey...),
 			value: decoded,
-			seq:   key.Trailer >> 8,
+			seq:   uint64(kv.K.Trailer >> 8),
 		})
-		key, val = iter.Next()
 	}
 	if err := iter.Error(); err != nil {
 		t.Fatalf("iter error: %v", err)
@@ -243,27 +242,27 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 		t.Fatalf("WriteSST error: %v", err)
 	}
 
-	reader, err := sstable.NewReader(newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
 	defer reader.Close()
 
-	iter, err := reader.NewIter(nil, nil)
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
 		t.Fatalf("iter error: %v", err)
 	}
 	defer iter.Close()
 
-	key, val := iter.First()
-	if key == nil {
+	kv := iter.First()
+	if kv == nil {
 		t.Fatalf("expected entry")
 	}
-	v, _, err := val.Value(nil)
+	v, _, err := kv.V.Value(nil)
 	if err != nil {
 		t.Fatalf("value error: %v", err)
 	}
-	decoded, err := DecodeKeyEntry(key.UserKey, v)
+	decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
 	}

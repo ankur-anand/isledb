@@ -12,8 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/segmentio/ksuid"
 )
 
@@ -88,17 +89,14 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 			return abort(err)
 		}
 
-		kind := sstable.InternalKeyKindSet
+		kind := pebble.InternalKeyKindSet
 		if e.Kind == OpDelete {
-			kind = sstable.InternalKeyKindDelete
+			kind = pebble.InternalKeyKindDelete
 		}
 
-		ikey := sstable.InternalKey{
-			UserKey: k,
-			Trailer: (e.Seq << 8) | uint64(kind),
-		}
+		iKey := pebble.MakeInternalKey(k, pebble.SeqNum(e.Seq), kind)
 
-		if err := sst.Add(ikey, encodedValue); err != nil {
+		if err := sst.Raw().Add(iKey, encodedValue, false); err != nil {
 			return abort(err)
 		}
 
@@ -281,7 +279,7 @@ func buildSSTID(epoch, seqLo, seqHi uint64, hashHex string) string {
 	return fmt.Sprintf("%d-%d-%d-%s.sst", epoch, seqLo, seqHi, shortHash)
 }
 
-func compressionFromString(name string) sstable.Compression {
+func compressionFromString(name string) *sstable.CompressionProfile {
 	switch strings.ToLower(name) {
 	case "none", "no":
 		return sstable.NoCompression

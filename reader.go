@@ -9,8 +9,8 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
-	"github.com/cockroachdb/pebble/objstorage"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/objstorage"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 type ReaderOptions struct {
@@ -114,14 +114,17 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 		readers = append(readers, reader)
 		iters = append(iters, iter)
 	}
+	// imp: merge iterator closes the iterator
+	// pebble doc: iterator should be closed only once.
 	defer func() {
-		for _, it := range iters {
-			_ = it.Close()
-		}
 		for _, rd := range readers {
 			_ = rd.Close()
 		}
 	}()
+
+	if len(iters) == 0 {
+		return nil, nil
+	}
 
 	mergeIter := NewMergeIterator(iters)
 	defer mergeIter.Close()
@@ -216,8 +219,8 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 	defer iter.Close()
 	defer reader.Close()
 
-	for ikey, val := iter.First(); ikey != nil; ikey, val = iter.Next() {
-		cmp := bytes.Compare(ikey.UserKey, key)
+	for kv := iter.Next(); kv != nil; kv = iter.Next() {
+		cmp := bytes.Compare(kv.K.UserKey, key)
 		if cmp < 0 {
 			continue
 		}
@@ -225,11 +228,11 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 			break
 		}
 
-		raw, _, err := val.Value(nil)
+		raw, _, err := kv.V.Value(nil)
 		if err != nil {
 			return nil, false, false, err
 		}
-		decoded, err := DecodeKeyEntry(ikey.UserKey, raw)
+		decoded, err := DecodeKeyEntry(kv.K.UserKey, raw)
 		if err != nil {
 			return nil, false, false, err
 		}
@@ -279,11 +282,11 @@ func (r *Reader) openSSTIter(ctx context.Context, sstMeta SSTMeta) (*sstable.Rea
 		return nil, nil, fmt.Errorf("read sst %s: %w", sstMeta.ID, err)
 	}
 
-	reader, err := sstable.NewReader(newSSTReadable(data), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
 	if err != nil {
 		return nil, nil, err
 	}
-	iter, err := reader.NewIter(nil, nil)
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
 		_ = reader.Close()
 		return nil, nil, err
@@ -325,6 +328,6 @@ func (m *sstReadable) Size() int64 {
 	return int64(len(m.data))
 }
 
-func (m *sstReadable) NewReadHandle(_ context.Context) objstorage.ReadHandle {
+func (m *sstReadable) NewReadHandle(_ objstorage.ReadBeforeSize) objstorage.ReadHandle {
 	return &m.rh
 }

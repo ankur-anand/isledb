@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"container/heap"
 
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 // KMergeIterator merges multiple SSTable iterators, yielding entries in sorted order.
@@ -21,7 +22,7 @@ type mergeEntry struct {
 	key     []byte
 	seq     uint64
 	trailer uint64
-	kind    sstable.InternalKeyKind
+	kind    pebble.InternalKeyKind
 	value   []byte
 	source  int
 }
@@ -81,42 +82,36 @@ func NewMergeIterator(iters []sstable.Iterator) *KMergeIterator {
 // advanceIter moves iterator i to the first entry and pushes to heap.
 func (mi *KMergeIterator) advanceIter(i int) {
 	wrapper := mi.iters[i]
-	ikey, val := wrapper.iter.First()
-	if ikey != nil {
-		mi.pushEntry(ikey, &val, i)
+	kv := wrapper.iter.First()
+	if kv != nil {
+		mi.pushEntry(&kv.K, kv.InPlaceValue(), i)
 	}
 }
 
 // advanceIterNext calls Next() and pushes if valid.
 func (mi *KMergeIterator) advanceIterNext(i int) {
 	wrapper := mi.iters[i]
-	ikey, val := wrapper.iter.Next()
-	if ikey != nil {
-		mi.pushEntry(ikey, &val, i)
+	kv := wrapper.iter.Next()
+	if kv != nil {
+		mi.pushEntry(&kv.K, kv.InPlaceValue(), i)
 	}
 }
 
-// lazyValueGetter is a minimal interface for getting the in-place value.
-type lazyValueGetter interface {
-	InPlaceValue() []byte
-}
-
-func (mi *KMergeIterator) pushEntry(ikey *sstable.InternalKey, val lazyValueGetter, source int) {
+func (mi *KMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, source int) {
 	trailer := ikey.Trailer
-	seq := trailer >> 8
+	seq := uint64(trailer >> 8)
 	kind := ikey.Kind()
 
 	keyCopy := make([]byte, len(ikey.UserKey))
 	copy(keyCopy, ikey.UserKey)
 
-	valBytes := val.InPlaceValue()
-	valCopy := make([]byte, len(valBytes))
-	copy(valCopy, valBytes)
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
 
 	entry := &mergeEntry{
 		key:     keyCopy,
 		seq:     seq,
-		trailer: trailer,
+		trailer: uint64(trailer),
 		kind:    kind,
 		value:   valCopy,
 		source:  source,
@@ -157,9 +152,9 @@ func (mi *KMergeIterator) Seq() uint64 {
 	return mi.current.seq
 }
 
-func (mi *KMergeIterator) Kind() sstable.InternalKeyKind {
+func (mi *KMergeIterator) Kind() pebble.InternalKeyKind {
 	if mi.current == nil {
-		return sstable.InternalKeyKindInvalid
+		return pebble.InternalKeyKindInvalid
 	}
 	return mi.current.kind
 }
