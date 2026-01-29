@@ -12,7 +12,7 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	store := blobstore.NewMemory("writer-test")
 	defer store.Close()
 
-	w, err := NewWriter(ctx, store, WriterOptions{
+	w, err := newWriter(ctx, store, WriterOptions{
 		MemtableSize:    1 << 20,
 		FlushInterval:   0,
 		BloomBitsPerKey: 0,
@@ -20,18 +20,18 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 		Compression:     "none",
 	})
 	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
+		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := w.Put([]byte("a"), []byte("value-1")); err != nil {
-		t.Fatalf("Put: %v", err)
+	if err := w.put([]byte("a"), []byte("value-1")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := w.close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 
 	manifestKey := store.ManifestPath()
@@ -61,40 +61,40 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	store := blobstore.NewMemory("writer-replay")
 	defer store.Close()
 
-	w, err := NewWriter(ctx, store, WriterOptions{
+	w, err := newWriter(ctx, store, WriterOptions{
 		MemtableSize:  1 << 20,
 		FlushInterval: 0,
 		BlockSize:     4096,
 		Compression:   "none",
 	})
 	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
+		t.Fatalf("newWriter: %v", err)
 	}
-	if err := w.Put([]byte("a"), []byte("v1")); err != nil {
-		t.Fatalf("Put: %v", err)
+	if err := w.put([]byte("a"), []byte("v1")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := w.close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 
-	w2, err := NewWriter(ctx, store, WriterOptions{
+	w2, err := newWriter(ctx, store, WriterOptions{
 		MemtableSize:  1 << 20,
 		FlushInterval: 0,
 		BlockSize:     4096,
 		Compression:   "none",
 	})
 	if err != nil {
-		t.Fatalf("NewWriter(2): %v", err)
+		t.Fatalf("newWriter(2): %v", err)
 	}
-	defer w2.Close()
+	defer w2.close()
 
-	if err := w2.Put([]byte("b"), []byte("v2")); err != nil {
+	if err := w2.put([]byte("b"), []byte("v2")); err != nil {
 		t.Fatalf("Put2: %v", err)
 	}
-	if err := w2.Flush(ctx); err != nil {
+	if err := w2.flush(ctx); err != nil {
 		t.Fatalf("Flush2: %v", err)
 	}
 

@@ -6,23 +6,24 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
 )
 
 func TestTTL_EntryEncodeDecode(t *testing.T) {
 
 	expireAt := time.Now().Add(time.Hour).UnixMilli()
 
-	entry := KeyEntry{
+	entry := internal.KeyEntry{
 		Key:      []byte("key1"),
 		Seq:      1,
-		Kind:     OpPut,
+		Kind:     internal.OpPut,
 		Inline:   true,
 		Value:    []byte("value1"),
 		ExpireAt: expireAt,
 	}
 
-	encoded := EncodeKeyEntry(entry)
-	decoded, err := DecodeKeyEntry(entry.Key, encoded)
+	encoded := internal.EncodeKeyEntry(entry)
+	decoded, err := internal.DecodeKeyEntry(entry.Key, encoded)
 	if err != nil {
 		t.Fatalf("DecodeKeyEntry failed: %v", err)
 	}
@@ -30,8 +31,8 @@ func TestTTL_EntryEncodeDecode(t *testing.T) {
 	if decoded.ExpireAt != expireAt {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", decoded.ExpireAt, expireAt)
 	}
-	if decoded.Kind != OpPut {
-		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, OpPut)
+	if decoded.Kind != internal.OpPut {
+		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, internal.OpPut)
 	}
 	if !decoded.Inline {
 		t.Error("Expected Inline to be true")
@@ -43,17 +44,17 @@ func TestTTL_EntryEncodeDecode(t *testing.T) {
 
 func TestTTL_EntryEncodeDecodeNoTTL(t *testing.T) {
 
-	entry := KeyEntry{
+	entry := internal.KeyEntry{
 		Key:      []byte("key1"),
 		Seq:      1,
-		Kind:     OpPut,
+		Kind:     internal.OpPut,
 		Inline:   true,
 		Value:    []byte("value1"),
 		ExpireAt: 0,
 	}
 
-	encoded := EncodeKeyEntry(entry)
-	decoded, err := DecodeKeyEntry(entry.Key, encoded)
+	encoded := internal.EncodeKeyEntry(entry)
+	decoded, err := internal.DecodeKeyEntry(entry.Key, encoded)
 	if err != nil {
 		t.Fatalf("DecodeKeyEntry failed: %v", err)
 	}
@@ -70,21 +71,21 @@ func TestTTL_DeleteWithTTL(t *testing.T) {
 
 	expireAt := time.Now().Add(time.Hour).UnixMilli()
 
-	entry := KeyEntry{
+	entry := internal.KeyEntry{
 		Key:      []byte("key1"),
 		Seq:      1,
-		Kind:     OpDelete,
+		Kind:     internal.OpDelete,
 		ExpireAt: expireAt,
 	}
 
-	encoded := EncodeKeyEntry(entry)
-	decoded, err := DecodeKeyEntry(entry.Key, encoded)
+	encoded := internal.EncodeKeyEntry(entry)
+	decoded, err := internal.DecodeKeyEntry(entry.Key, encoded)
 	if err != nil {
 		t.Fatalf("DecodeKeyEntry failed: %v", err)
 	}
 
-	if decoded.Kind != OpDelete {
-		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, OpDelete)
+	if decoded.Kind != internal.OpDelete {
+		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, internal.OpDelete)
 	}
 	if decoded.ExpireAt != expireAt {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", decoded.ExpireAt, expireAt)
@@ -97,17 +98,17 @@ func TestTTL_BlobWithTTL(t *testing.T) {
 	var blobID [32]byte
 	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
 
-	entry := KeyEntry{
+	entry := internal.KeyEntry{
 		Key:      []byte("key1"),
 		Seq:      1,
-		Kind:     OpPut,
+		Kind:     internal.OpPut,
 		Inline:   false,
 		BlobID:   blobID,
 		ExpireAt: expireAt,
 	}
 
-	encoded := EncodeKeyEntry(entry)
-	decoded, err := DecodeKeyEntry(entry.Key, encoded)
+	encoded := internal.EncodeKeyEntry(entry)
+	decoded, err := internal.DecodeKeyEntry(entry.Key, encoded)
 	if err != nil {
 		t.Fatalf("DecodeKeyEntry failed: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestTTL_IsExpired(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entry := KeyEntry{ExpireAt: tt.expireAt}
+			entry := internal.KeyEntry{ExpireAt: tt.expireAt}
 			if got := entry.IsExpired(now); got != tt.want {
 				t.Errorf("IsExpired() = %v, want %v", got, tt.want)
 			}
@@ -148,7 +149,7 @@ func TestTTL_IsExpired(t *testing.T) {
 }
 
 func TestTTL_MemtablePutWithTTL(t *testing.T) {
-	m := NewMemtable(1024*1024, 4096)
+	m := internal.NewMemtable(1024*1024, 4096)
 	expireAt := time.Now().Add(time.Hour).UnixMilli()
 
 	m.PutWithTTL([]byte("key1"), []byte("value1"), 1, expireAt)
@@ -177,19 +178,19 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := NewWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, opts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.Close()
+	defer w.close()
 
-	err = w.PutWithTTL([]byte("key1"), []byte("value1"), time.Hour)
+	err = w.putWithTTL([]byte("key1"), []byte("value1"), time.Hour)
 	if err != nil {
-		t.Fatalf("PutWithTTL failed: %v", err)
+		t.Fatalf("putWithTTL failed: %v", err)
 	}
 
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
 	r, err := NewReader(ctx, store, DefaultReaderOptions())
@@ -218,11 +219,11 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := NewWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, opts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.Close()
+	defer w.close()
 
 	w.mu.Lock()
 	w.seq++
@@ -231,13 +232,13 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("expired_key"), []byte("expired_value"), seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.PutWithTTL([]byte("valid_key"), []byte("valid_value"), time.Hour)
+	err = w.putWithTTL([]byte("valid_key"), []byte("valid_value"), time.Hour)
 	if err != nil {
-		t.Fatalf("PutWithTTL failed: %v", err)
+		t.Fatalf("putWithTTL failed: %v", err)
 	}
 
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
 	r, err := NewReader(ctx, store, DefaultReaderOptions())
@@ -274,11 +275,11 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := NewWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, opts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.Close()
+	defer w.close()
 
 	w.mu.Lock()
 	w.seq++
@@ -288,17 +289,17 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("ccc"), []byte("expired2"), w.seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.PutWithTTL([]byte("bbb"), []byte("valid1"), time.Hour)
+	err = w.putWithTTL([]byte("bbb"), []byte("valid1"), time.Hour)
 	if err != nil {
-		t.Fatalf("PutWithTTL failed: %v", err)
+		t.Fatalf("putWithTTL failed: %v", err)
 	}
-	err = w.PutWithTTL([]byte("ddd"), []byte("valid2"), time.Hour)
+	err = w.putWithTTL([]byte("ddd"), []byte("valid2"), time.Hour)
 	if err != nil {
-		t.Fatalf("PutWithTTL failed: %v", err)
+		t.Fatalf("putWithTTL failed: %v", err)
 	}
 
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
 	r, err := NewReader(ctx, store, DefaultReaderOptions())
@@ -333,18 +334,18 @@ func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := NewWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, opts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.Close()
+	defer w.close()
 
-	if err := w.Put([]byte("key1"), []byte("old_value")); err != nil {
-		t.Fatalf("Put failed: %v", err)
+	if err := w.put([]byte("key1"), []byte("old_value")); err != nil {
+		t.Fatalf("put failed: %v", err)
 	}
 
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
 	w.mu.Lock()
@@ -354,8 +355,8 @@ func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("key1"), []byte("new_value"), seq, expireAt)
 	w.mu.Unlock()
 
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
 	r, err := NewReader(ctx, store, DefaultReaderOptions())

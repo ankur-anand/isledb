@@ -1,6 +1,11 @@
 package isledb
 
-import "time"
+import (
+	"time"
+
+	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/internal"
+)
 
 type WriterOptions struct {
 	MemtableSize    int64
@@ -10,7 +15,7 @@ type WriterOptions struct {
 	Compression     string
 
 	OnFlushError func(error)
-	ValueStorage ValueStorageConfig
+	ValueStorage config.ValueStorageConfig
 
 	EnableFencing bool
 	OwnerID       string
@@ -32,10 +37,10 @@ type ReaderOptions struct {
 	SSTReaderCache     SSTReaderCache
 	SSTReaderCacheSize int
 
-	BlobCache          BlobCache
+	BlobCache          internal.BlobCache
 	BlobCacheSize      int64
 	BlobCacheItemSize  int64
-	ValueStorageConfig ValueStorageConfig
+	ValueStorageConfig config.ValueStorageConfig
 }
 
 func DefaultReaderOptions() ReaderOptions {

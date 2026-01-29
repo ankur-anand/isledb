@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -26,7 +28,7 @@ type DBOptions struct {
 	BlockSize       int
 	Compression     string
 
-	ValueStorage ValueStorageConfig
+	ValueStorage config.ValueStorageConfig
 
 	AppendOnlyMode bool
 
@@ -70,7 +72,7 @@ func DefaultDBOptions() DBOptions {
 		BloomBitsPerKey: 10,
 		BlockSize:       4096,
 		Compression:     "snappy",
-		ValueStorage:    DefaultValueStorageConfig(),
+		ValueStorage:    config.DefaultValueStorageConfig(),
 
 		AppendOnlyMode:             false,
 		RetentionCompactorMode:     CompactByAge,
@@ -88,8 +90,8 @@ func DefaultDBOptions() DBOptions {
 
 		SSTCacheSize:       DefaultSSTCacheSize,
 		SSTReaderCacheSize: DefaultSSTReaderCacheSize,
-		BlobCacheSize:      DefaultBlobCacheSize,
-		BlobCacheItemSize:  DefaultBlobCacheMaxItemSize,
+		BlobCacheSize:      internal.DefaultBlobCacheSize,
+		BlobCacheItemSize:  internal.DefaultBlobCacheMaxItemSize,
 
 		WarmCacheOnOpen:     false,
 		WarmCacheTimeout:    DefaultWarmCacheTimeout,
@@ -130,7 +132,7 @@ type DB struct {
 	store *blobstore.Store
 	opts  DBOptions
 
-	writer             *Writer
+	writer             *writer
 	compactor          *Compactor
 	retentionCompactor *RetentionCompactor
 
@@ -208,7 +210,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		OnFlushError:    opts.OnFlushError,
 	}
 
-	writer, err := NewWriter(ctx, store, writerOpts)
+	writer, err := newWriter(ctx, store, writerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +225,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 
 	reader, err := NewReader(ctx, store, readerOpts)
 	if err != nil {
-		writer.Close()
+		writer.close()
 		return nil, err
 	}
 
@@ -261,7 +263,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		appendOnlyCleaner, err := NewRetentionCompactor(ctx, store, appendOnlyCleanerOpts)
 		if err != nil {
 			_ = reader.Close()
-			_ = writer.Close()
+			_ = writer.close()
 			return nil, err
 		}
 		db.retentionCompactor = appendOnlyCleaner
@@ -285,7 +287,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		compactor, err := NewCompactor(ctx, store, compactorOpts)
 		if err != nil {
 			_ = reader.Close()
-			_ = writer.Close()
+			_ = writer.close()
 			return nil, err
 		}
 		db.compactor = compactor
@@ -315,7 +317,7 @@ func (db *DB) Put(key, value []byte) error {
 	if db.closed.Load() {
 		return errors.New("db closed")
 	}
-	return db.writer.Put(key, value)
+	return db.writer.put(key, value)
 }
 
 func (db *DB) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
@@ -332,7 +334,7 @@ func (db *DB) Delete(key []byte) error {
 	if db.closed.Load() {
 		return errors.New("db closed")
 	}
-	return db.writer.Delete(key)
+	return db.writer.delete(key)
 }
 
 func (db *DB) Scan(ctx context.Context, start, end []byte) ([]KV, error) {
@@ -349,7 +351,7 @@ func (db *DB) Flush(ctx context.Context) error {
 	if db.closed.Load() {
 		return errors.New("db closed")
 	}
-	return db.writer.Flush(ctx)
+	return db.writer.flush(ctx)
 }
 
 func (db *DB) Compact(ctx context.Context) error {
@@ -549,7 +551,7 @@ func (db *DB) Close() error {
 		}
 	}
 
-	if err := db.writer.Close(); err != nil && firstErr == nil {
+	if err := db.writer.close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 

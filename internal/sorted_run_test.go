@@ -1,11 +1,13 @@
-package isledb
+package internal
 
 import (
 	"testing"
+
+	"github.com/ankur-anand/isledb/manifest"
 )
 
 func TestSortedRun_FindSST(t *testing.T) {
-	sr := NewSortedRun(1, []SSTMeta{
+	sr := NewSortedRun(1, []manifest.SSTMeta{
 		{ID: "sst1", MinKey: []byte("a"), MaxKey: []byte("d")},
 		{ID: "sst2", MinKey: []byte("e"), MaxKey: []byte("h")},
 		{ID: "sst3", MinKey: []byte("i"), MaxKey: []byte("m")},
@@ -47,7 +49,7 @@ func TestSortedRun_FindSST(t *testing.T) {
 }
 
 func TestSortedRun_OverlappingSSTs(t *testing.T) {
-	sr := NewSortedRun(1, []SSTMeta{
+	sr := NewSortedRun(1, []manifest.SSTMeta{
 		{ID: "sst1", MinKey: []byte("a"), MaxKey: []byte("d")},
 		{ID: "sst2", MinKey: []byte("e"), MaxKey: []byte("h")},
 		{ID: "sst3", MinKey: []byte("i"), MaxKey: []byte("m")},
@@ -86,7 +88,7 @@ func TestSortedRun_OverlappingSSTs(t *testing.T) {
 }
 
 func TestSortedRun_MinMaxKey(t *testing.T) {
-	sr := NewSortedRun(1, []SSTMeta{
+	sr := NewSortedRun(1, []manifest.SSTMeta{
 		{ID: "sst1", MinKey: []byte("c"), MaxKey: []byte("f")},
 		{ID: "sst2", MinKey: []byte("a"), MaxKey: []byte("b")},
 		{ID: "sst3", MinKey: []byte("g"), MaxKey: []byte("z")},
@@ -101,7 +103,7 @@ func TestSortedRun_MinMaxKey(t *testing.T) {
 }
 
 func TestSortedRun_TotalSize(t *testing.T) {
-	sr := NewSortedRun(1, []SSTMeta{
+	sr := NewSortedRun(1, []manifest.SSTMeta{
 		{ID: "sst1", Size: 100},
 		{ID: "sst2", Size: 200},
 		{ID: "sst3", Size: 300},
@@ -113,7 +115,7 @@ func TestSortedRun_TotalSize(t *testing.T) {
 }
 
 func TestSortedRun_InRange(t *testing.T) {
-	sr := NewSortedRun(1, []SSTMeta{
+	sr := NewSortedRun(1, []manifest.SSTMeta{
 		{ID: "sst1", MinKey: []byte("b"), MaxKey: []byte("d")},
 		{ID: "sst2", MinKey: []byte("e"), MaxKey: []byte("h")},
 	})
@@ -158,7 +160,7 @@ func TestSortedRun_Empty(t *testing.T) {
 }
 
 func TestDefaultTieredConfig(t *testing.T) {
-	cfg := DefaultTieredConfig()
+	cfg := manifest.DefaultTieredConfig()
 
 	if cfg.L0CompactionThreshold != 8 {
 		t.Errorf("expected L0CompactionThreshold 8, got %d", cfg.L0CompactionThreshold)

@@ -1,4 +1,4 @@
-package isledb
+package internal
 
 import (
 	"sync"

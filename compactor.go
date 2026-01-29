@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
@@ -535,7 +536,7 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator
 
 type mergeIteratorAdapter struct {
 	iter    *KMergeIterator
-	current *MemEntry
+	current *internal.MemEntry
 	done    bool
 	err     error
 	nowMs   int64
@@ -557,7 +558,7 @@ func (a *mergeIteratorAdapter) Next() bool {
 		return false
 	}
 
-	a.current = &MemEntry{
+	a.current = &internal.MemEntry{
 		Key:      entry.Key,
 		Seq:      entry.Seq,
 		Kind:     entry.Kind,
@@ -568,7 +569,7 @@ func (a *mergeIteratorAdapter) Next() bool {
 	}
 
 	if entry.ExpireAt > 0 && entry.ExpireAt <= a.nowMs {
-		a.current.Kind = OpDelete
+		a.current.Kind = internal.OpDelete
 		a.current.Inline = false
 		a.current.Value = nil
 		a.current.BlobID = [32]byte{}
@@ -579,9 +580,9 @@ func (a *mergeIteratorAdapter) Next() bool {
 	return true
 }
 
-func (a *mergeIteratorAdapter) Entry() MemEntry {
+func (a *mergeIteratorAdapter) Entry() internal.MemEntry {
 	if a.current == nil {
-		return MemEntry{}
+		return internal.MemEntry{}
 	}
 	return *a.current
 }

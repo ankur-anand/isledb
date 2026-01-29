@@ -1,17 +1,18 @@
-package isledb
+package internal
 
 import (
 	"bytes"
 	"context"
 	"sort"
-
+	
+	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-func NewSortedRun(id uint32, ssts []SSTMeta) *SortedRun {
-	sr := &SortedRun{
+func NewSortedRun(id uint32, ssts []manifest.SSTMeta) *manifest.SortedRun {
+	sr := &manifest.SortedRun{
 		ID:   id,
-		SSTs: make([]SSTMeta, len(ssts)),
+		SSTs: make([]manifest.SSTMeta, len(ssts)),
 	}
 	copy(sr.SSTs, ssts)
 
@@ -22,13 +23,13 @@ func NewSortedRun(id uint32, ssts []SSTMeta) *SortedRun {
 	return sr
 }
 
-type SSTOpener func(ctx context.Context, sst SSTMeta) (*sstable.Reader, sstable.Iterator, error)
+type SSTOpener func(ctx context.Context, sst manifest.SSTMeta) (*sstable.Reader, sstable.Iterator, error)
 
-type SSTBoundedOpener func(ctx context.Context, sst SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error)
+type SSTBoundedOpener func(ctx context.Context, sst manifest.SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error)
 
 type SortedRunIterator struct {
 	ctx           context.Context
-	run           *SortedRun
+	run           *manifest.SortedRun
 	opener        SSTOpener
 	boundedOpener SSTBoundedOpener
 
@@ -42,7 +43,7 @@ type SortedRunIterator struct {
 	readers []*sstable.Reader
 }
 
-func NewSortedRunIterator(ctx context.Context, run *SortedRun, opener SSTOpener) *SortedRunIterator {
+func NewSortedRunIterator(ctx context.Context, run *manifest.SortedRun, opener SSTOpener) *SortedRunIterator {
 	return &SortedRunIterator{
 		ctx:     ctx,
 		run:     run,
@@ -52,7 +53,7 @@ func NewSortedRunIterator(ctx context.Context, run *SortedRun, opener SSTOpener)
 	}
 }
 
-func NewSortedRunIteratorWithBounds(ctx context.Context, run *SortedRun, opener SSTOpener, boundedOpener SSTBoundedOpener) *SortedRunIterator {
+func NewSortedRunIteratorWithBounds(ctx context.Context, run *manifest.SortedRun, opener SSTOpener, boundedOpener SSTBoundedOpener) *SortedRunIterator {
 	return &SortedRunIterator{
 		ctx:           ctx,
 		run:           run,

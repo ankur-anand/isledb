@@ -9,12 +9,13 @@ import (
 	"io"
 	"testing"
 
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 type sliceSSTIter struct {
-	entries []MemEntry
+	entries []internal.MemEntry
 	idx     int
 	err     error
 }
@@ -27,7 +28,7 @@ func (it *sliceSSTIter) Next() bool {
 	return true
 }
 
-func (it *sliceSSTIter) Entry() MemEntry {
+func (it *sliceSSTIter) Entry() internal.MemEntry {
 	return it.entries[it.idx-1]
 }
 
@@ -80,9 +81,9 @@ func (m *memReadable) NewReadHandle(_ objstorage.ReadBeforeSize) objstorage.Read
 func TestWriteSST_Inline(t *testing.T) {
 	inline := []byte("x")
 
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 2, Kind: OpPut, Inline: true, Value: inline},
-		{Key: []byte("b"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("y")},
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: inline},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -114,7 +115,7 @@ func TestWriteSST_Inline(t *testing.T) {
 
 	type seenEntry struct {
 		key   []byte
-		value KeyEntry
+		value internal.KeyEntry
 		seq   uint64
 	}
 	var seen []seenEntry
@@ -124,7 +125,7 @@ func TestWriteSST_Inline(t *testing.T) {
 		if err != nil {
 			t.Fatalf("value error: %v", err)
 		}
-		decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
+		decoded, err := internal.DecodeKeyEntry(kv.K.UserKey, v)
 		if err != nil {
 			t.Fatalf("decode error: %v", err)
 		}
@@ -157,10 +158,10 @@ func TestWriteSST_Inline(t *testing.T) {
 }
 
 func TestWriteSST_BlobReference(t *testing.T) {
-	blobID := ComputeBlobID([]byte("large-value-content"))
+	blobID := internal.ComputeBlobID([]byte("large-value-content"))
 
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: false, BlobID: blobID},
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: false, BlobID: blobID},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -192,7 +193,7 @@ func TestWriteSST_BlobReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("value error: %v", err)
 	}
-	decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
+	decoded, err := internal.DecodeKeyEntry(kv.K.UserKey, v)
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
@@ -216,9 +217,9 @@ func TestWriteSST_EmptyIterator(t *testing.T) {
 }
 
 func TestWriteSST_OutOfOrder(t *testing.T) {
-	entries := []MemEntry{
-		{Key: []byte("b"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("x")},
-		{Key: []byte("a"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("y")},
+	entries := []internal.MemEntry{
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -232,9 +233,9 @@ func TestWriteSST_OutOfOrder(t *testing.T) {
 }
 
 func TestWriteSST_DuplicateKeySeqOrder(t *testing.T) {
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("v1")},
-		{Key: []byte("a"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("v2")},
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v1")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("v2")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -245,8 +246,8 @@ func TestWriteSST_DuplicateKeySeqOrder(t *testing.T) {
 }
 
 func TestWriteSST_DeleteEntry(t *testing.T) {
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpDelete},
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpDelete},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -275,11 +276,11 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("value error: %v", err)
 	}
-	decoded, err := DecodeKeyEntry(kv.K.UserKey, v)
+	decoded, err := internal.DecodeKeyEntry(kv.K.UserKey, v)
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
-	if decoded.Kind != OpDelete {
+	if decoded.Kind != internal.OpDelete {
 		t.Fatalf("expected delete, got %v", decoded.Kind)
 	}
 }
@@ -296,8 +297,8 @@ func (s *ed25519Signer) SignHash(hash []byte) ([]byte, error) {
 }
 
 func TestWriteSST_Signature(t *testing.T) {
-	entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("v")},
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
 	}
 	it := &sliceSSTIter{entries: entries}
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)

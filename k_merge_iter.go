@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
@@ -158,21 +159,21 @@ func (mi *KMergeIterator) Value() []byte {
 	return mi.current.value
 }
 
-func (mi *KMergeIterator) Entry() (CompactionEntry, error) {
+func (mi *KMergeIterator) Entry() (internal.CompactionEntry, error) {
 	if mi.current == nil {
-		return CompactionEntry{}, nil
+		return internal.CompactionEntry{}, nil
 	}
 
-	entry := CompactionEntry{
+	entry := internal.CompactionEntry{
 		Key: mi.current.key,
 		Seq: mi.current.seq,
 	}
 
 	if mi.current.kind == sstable.InternalKeyKindDelete {
-		entry.Kind = OpDelete
+		entry.Kind = internal.OpDelete
 
 		if len(mi.current.value) > 0 {
-			keyEntry, err := DecodeKeyEntry(mi.current.key, mi.current.value)
+			keyEntry, err := internal.DecodeKeyEntry(mi.current.key, mi.current.value)
 			if err == nil {
 				entry.ExpireAt = keyEntry.ExpireAt
 			}
@@ -180,9 +181,9 @@ func (mi *KMergeIterator) Entry() (CompactionEntry, error) {
 		return entry, nil
 	}
 
-	keyEntry, err := DecodeKeyEntry(mi.current.key, mi.current.value)
+	keyEntry, err := internal.DecodeKeyEntry(mi.current.key, mi.current.value)
 	if err != nil {
-		return CompactionEntry{}, err
+		return internal.CompactionEntry{}, err
 	}
 
 	entry.Kind = keyEntry.Kind

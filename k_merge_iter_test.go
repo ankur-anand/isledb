@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-func buildTestIter(t *testing.T, entries []MemEntry) (*sstable.Reader, sstable.Iterator) {
+func buildTestIter(t *testing.T, entries []internal.MemEntry) (*sstable.Reader, sstable.Iterator) {
 	t.Helper()
 
 	it := &sliceSSTIter{entries: entries}
@@ -31,13 +32,13 @@ func buildTestIter(t *testing.T, entries []MemEntry) (*sstable.Reader, sstable.I
 }
 
 func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
-	readerOld, iterOld := buildTestIter(t, []MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("old")},
+	readerOld, iterOld := buildTestIter(t, []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
 	})
 	defer readerOld.Close()
 
-	readerNew, iterNew := buildTestIter(t, []MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: OpPut, Inline: true, Value: []byte("new")},
+	readerNew, iterNew := buildTestIter(t, []internal.MemEntry{
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
 	})
 	defer readerNew.Close()
 
@@ -67,13 +68,13 @@ func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 
 func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 	seq := uint64(7)
-	readerSet, iterSet := buildTestIter(t, []MemEntry{
-		{Key: []byte("k"), Seq: seq, Kind: OpPut, Inline: true, Value: []byte("set")},
+	readerSet, iterSet := buildTestIter(t, []internal.MemEntry{
+		{Key: []byte("k"), Seq: seq, Kind: internal.OpPut, Inline: true, Value: []byte("set")},
 	})
 	defer readerSet.Close()
 
-	readerDel, iterDel := buildTestIter(t, []MemEntry{
-		{Key: []byte("k"), Seq: seq, Kind: OpDelete},
+	readerDel, iterDel := buildTestIter(t, []internal.MemEntry{
+		{Key: []byte("k"), Seq: seq, Kind: internal.OpDelete},
 	})
 	defer readerDel.Close()
 
@@ -100,11 +101,11 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 	}
 
 	if trailerSet > trailerDel {
-		if entry.Kind != OpPut || !bytes.Equal(entry.Value, []byte("set")) {
+		if entry.Kind != internal.OpPut || !bytes.Equal(entry.Value, []byte("set")) {
 			t.Fatalf("expected set to win, got kind=%v value=%q", entry.Kind, entry.Value)
 		}
 	} else {
-		if entry.Kind != OpDelete {
+		if entry.Kind != internal.OpDelete {
 			t.Fatalf("expected delete to win, got kind=%v", entry.Kind)
 		}
 	}
@@ -113,7 +114,7 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable.Reader, sstable.Iterator) {
 	b.Helper()
 
-	entries := make([]MemEntry, n)
+	entries := make([]internal.MemEntry, n)
 	value := make([]byte, valueSize)
 	for i := range value {
 		value[i] = byte(i % 256)
@@ -121,10 +122,10 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key%010d", keyOffset+i)
-		entries[i] = MemEntry{
+		entries[i] = internal.MemEntry{
 			Key:    []byte(key),
 			Seq:    uint64(keyOffset + i),
-			Kind:   OpPut,
+			Kind:   internal.OpPut,
 			Inline: true,
 			Value:  value,
 		}
@@ -250,7 +251,7 @@ func BenchmarkKMergeIterator_OverlappingKeys(b *testing.B) {
 func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize int, seqOffset uint64) (*sstable.Reader, sstable.Iterator) {
 	b.Helper()
 
-	entries := make([]MemEntry, n)
+	entries := make([]internal.MemEntry, n)
 	value := make([]byte, valueSize)
 	for i := range value {
 		value[i] = byte(i % 256)
@@ -258,10 +259,10 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key%010d", keyOffset+i)
-		entries[i] = MemEntry{
+		entries[i] = internal.MemEntry{
 			Key:    []byte(key),
 			Seq:    seqOffset + uint64(i),
-			Kind:   OpPut,
+			Kind:   internal.OpPut,
 			Inline: true,
 			Value:  value,
 		}

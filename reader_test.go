@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []MemEntry, level int, epoch uint64) WriteSSTResult {
+func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) WriteSSTResult {
 	t.Helper()
 
 	it := &sliceSSTIter{entries: entries}
@@ -37,17 +38,17 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	store := blobstore.NewMemory("reader-test")
 	ms := manifest.NewStore(store)
 
-	l1Entries := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-a")},
-		{Key: []byte("c"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-c")},
-		{Key: []byte("d"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("l1-d")},
+	l1Entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-a")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-c")},
+		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-d")},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 1)
 
-	l0Entries := []MemEntry{
-		{Key: []byte("a"), Seq: 3, Kind: OpDelete},
-		{Key: []byte("b"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("l0-b")},
-		{Key: []byte("e"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("l0-e")},
+	l0Entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 3, Kind: internal.OpDelete},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-b")},
+		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-e")},
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
@@ -133,13 +134,13 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 
-	oldEntries := []MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("old")},
+	oldEntries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, oldEntries, 0, 1)
 
-	newEntries := []MemEntry{
-		{Key: []byte("k"), Seq: 3, Kind: OpPut, Inline: true, Value: []byte("new")},
+	newEntries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
 	}
 	writeTestSST(t, ctx, store, ms, newEntries, 0, 2)
 
@@ -180,8 +181,8 @@ func TestReader_Refresh_PicksUpNewSSTs(t *testing.T) {
 		t.Fatalf("expected key to be missing before refresh")
 	}
 
-	entries := []MemEntry{
-		{Key: []byte("x"), Seq: 5, Kind: OpPut, Inline: true, Value: []byte("value")},
+	entries := []internal.MemEntry{
+		{Key: []byte("x"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("value")},
 	}
 	writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
@@ -203,13 +204,13 @@ func TestReader_Get_L0PrefersNewerSeq(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 
-	older := []MemEntry{
-		{Key: []byte("k"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("old")},
+	older := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, older, 0, 1)
 
-	newer := []MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: OpPut, Inline: true, Value: []byte("new")},
+	newer := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
 	}
 	writeTestSST(t, ctx, store, ms, newer, 0, 2)
 
@@ -234,15 +235,15 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 
-	first := []MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("va")},
-		{Key: []byte("b"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("vb")},
+	first := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
 	}
 	writeTestSST(t, ctx, store, ms, first, 1, 1)
 
-	second := []MemEntry{
-		{Key: []byte("d"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("vd")},
-		{Key: []byte("e"), Seq: 2, Kind: OpPut, Inline: true, Value: []byte("ve")},
+	second := []internal.MemEntry{
+		{Key: []byte("d"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vd")},
+		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("ve")},
 	}
 	writeTestSST(t, ctx, store, ms, second, 1, 2)
 
@@ -279,13 +280,13 @@ func TestReader_Get_TombstoneShadowsLowerLevel(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 
-	l2Entries := []MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("old")},
+	l2Entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, l2Entries, 2, 1)
 
-	l1Entries := []MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: OpDelete},
+	l1Entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpDelete},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
@@ -308,14 +309,14 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 
-	l2Entries := []MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("old")},
-		{Key: []byte("m"), Seq: 1, Kind: OpPut, Inline: true, Value: []byte("keep")},
+	l2Entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
+		{Key: []byte("m"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("keep")},
 	}
 	writeTestSST(t, ctx, store, ms, l2Entries, 2, 1)
 
-	l1Entries := []MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: OpDelete},
+	l1Entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpDelete},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 

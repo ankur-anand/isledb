@@ -16,24 +16,24 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := NewWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, wOpts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 5; batch++ {
 		for i := 0; i < 10; i++ {
 			key := fmt.Sprintf("wal:%d:%03d", batch, i)
 			value := fmt.Sprintf("entry:%d:%03d", batch, i)
-			if err := w.Put([]byte(key), []byte(value)); err != nil {
-				t.Fatalf("Put failed: %v", err)
+			if err := w.put([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("put failed: %v", err)
 			}
 		}
-		if err := w.Flush(ctx); err != nil {
-			t.Fatalf("Flush failed: %v", err)
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.Close()
+	w.close()
 
 	reader, _ := NewReader(ctx, store, DefaultReaderOptions())
 	m := reader.Manifest()
@@ -78,24 +78,24 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := NewWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, wOpts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 3; batch++ {
 		for i := 0; i < 5; i++ {
 			key := fmt.Sprintf("log:%d:%03d", batch, i)
 			value := fmt.Sprintf("data:%d:%03d", batch, i)
-			if err := w.Put([]byte(key), []byte(value)); err != nil {
-				t.Fatalf("Put failed: %v", err)
+			if err := w.put([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("put failed: %v", err)
 			}
 		}
-		if err := w.Flush(ctx); err != nil {
-			t.Fatalf("Flush failed: %v", err)
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.Close()
+	w.close()
 
 	cleanerOpts := RetentionCompactorOptions{
 		Mode:            CompactByTimeWindow,
@@ -133,21 +133,21 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := NewWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, wOpts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.Put([]byte(key), []byte("value")); err != nil {
-			t.Fatalf("Put failed: %v", err)
+		if err := w.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
 		}
 	}
-	if err := w.Flush(ctx); err != nil {
-		t.Fatalf("Flush failed: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
-	w.Close()
+	w.close()
 
 	cleanerOpts := RetentionCompactorOptions{
 		Mode:            CompactByAge,
@@ -182,20 +182,20 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := NewWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, wOpts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 5; batch++ {
-		if err := w.Put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
-			t.Fatalf("Put failed: %v", err)
+		if err := w.put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
 		}
-		if err := w.Flush(ctx); err != nil {
-			t.Fatalf("Flush failed: %v", err)
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.Close()
+	w.close()
 
 	var callbackCalled atomic.Bool
 	var deletedCount int
@@ -237,20 +237,20 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := NewWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, wOpts)
 	if err != nil {
-		t.Fatalf("NewWriter failed: %v", err)
+		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 5; batch++ {
-		if err := w.Put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
-			t.Fatalf("Put failed: %v", err)
+		if err := w.put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
 		}
-		if err := w.Flush(ctx); err != nil {
-			t.Fatalf("Flush failed: %v", err)
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.Close()
+	w.close()
 
 	var cleanupCount atomic.Int32
 

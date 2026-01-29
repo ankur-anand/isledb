@@ -24,14 +24,14 @@ func TestDB_BasicOperations(t *testing.T) {
 	defer db.Close()
 
 	if err := db.Put([]byte("key1"), []byte("value1")); err != nil {
-		t.Fatalf("Put: %v", err)
+		t.Fatalf("put: %v", err)
 	}
 	if err := db.Put([]byte("key2"), []byte("value2")); err != nil {
-		t.Fatalf("Put: %v", err)
+		t.Fatalf("put: %v", err)
 	}
 
 	if err := db.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+		t.Fatalf("flush: %v", err)
 	}
 
 	if err := db.Refresh(ctx); err != nil {
@@ -50,10 +50,10 @@ func TestDB_BasicOperations(t *testing.T) {
 	}
 
 	if err := db.Delete([]byte("key1")); err != nil {
-		t.Fatalf("Delete: %v", err)
+		t.Fatalf("delete: %v", err)
 	}
 	if err := db.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+		t.Fatalf("flush: %v", err)
 	}
 	if err := db.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -97,11 +97,11 @@ func TestDB_Scan(t *testing.T) {
 		key := []byte(fmt.Sprintf("key%02d", i))
 		value := []byte(fmt.Sprintf("value%02d", i))
 		if err := db.Put(key, value); err != nil {
-			t.Fatalf("Put: %v", err)
+			t.Fatalf("put: %v", err)
 		}
 	}
 	if err := db.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+		t.Fatalf("flush: %v", err)
 	}
 	if err := db.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -151,11 +151,11 @@ func TestDB_WithCompaction(t *testing.T) {
 			key := []byte{byte('a' + batch), byte('0' + i)}
 			value := []byte("value")
 			if err := db.Put(key, value); err != nil {
-				t.Fatalf("Put: %v", err)
+				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := db.Flush(ctx); err != nil {
-			t.Fatalf("Flush: %v", err)
+			t.Fatalf("flush: %v", err)
 		}
 	}
 
@@ -215,11 +215,11 @@ func TestDB_Stats(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		for j := 0; j < 5; j++ {
 			if err := db.Put([]byte{byte(i), byte(j)}, []byte("val")); err != nil {
-				t.Fatalf("Put: %v", err)
+				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := db.Flush(ctx); err != nil {
-			t.Fatalf("Flush: %v", err)
+			t.Fatalf("flush: %v", err)
 		}
 	}
 
@@ -253,15 +253,15 @@ func TestDB_Close(t *testing.T) {
 	}
 
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
-		t.Fatalf("Put: %v", err)
+		t.Fatalf("put: %v", err)
 	}
 
 	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+		t.Fatalf("close: %v", err)
 	}
 
 	if err := db.Put([]byte("key2"), []byte("value2")); err == nil {
-		t.Error("Put after Close should fail")
+		t.Error("put after close should fail")
 	}
 
 	db2, err := Open(ctx, store, opts)
@@ -300,11 +300,11 @@ func TestDB_WarmCacheOnOpen(t *testing.T) {
 			key := []byte(fmt.Sprintf("key-%d-%d", i, j))
 			value := []byte(fmt.Sprintf("value-%d-%d", i, j))
 			if err := db.Put(key, value); err != nil {
-				t.Fatalf("Put: %v", err)
+				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := db.Flush(ctx); err != nil {
-			t.Fatalf("Flush: %v", err)
+			t.Fatalf("flush: %v", err)
 		}
 	}
 
@@ -381,11 +381,11 @@ func TestDB_BackgroundSync(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		if err := db.Put([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
-			t.Fatalf("Put: %v", err)
+			t.Fatalf("put: %v", err)
 		}
 	}
 	if err := db.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
+		t.Fatalf("flush: %v", err)
 	}
 
 	time.Sleep(100 * time.Millisecond)

@@ -1,4 +1,4 @@
-package isledb
+package internal
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/config"
 )
 
 func TestBlobStorage_WriteAndRead(t *testing.T) {
@@ -14,7 +15,7 @@ func TestBlobStorage_WriteAndRead(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	bs := NewBlobStorage(store, DefaultValueStorageConfig())
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
 
 	value := []byte("hello world this is a test value")
 	blobID, err := bs.Write(ctx, value)
@@ -42,7 +43,7 @@ func TestBlobStorage_Deduplication(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	bs := NewBlobStorage(store, DefaultValueStorageConfig())
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
 
 	value := []byte("duplicate value")
 
@@ -75,7 +76,7 @@ func TestBlobStorage_LargeBlob(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	bs := NewBlobStorage(store, DefaultValueStorageConfig())
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
 
 	value := make([]byte, 1024*1024)
 	if _, err := rand.Read(value); err != nil {
@@ -108,7 +109,7 @@ func TestBlobStorage_VerifyOnRead(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	config := DefaultValueStorageConfig()
+	config := config.DefaultValueStorageConfig()
 	config.VerifyBlobsOnRead = true
 	bs := NewBlobStorage(store, config)
 
@@ -133,7 +134,7 @@ func TestBlobStorage_Exists(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	bs := NewBlobStorage(store, DefaultValueStorageConfig())
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
 
 	value := []byte("check if exists")
 	blobID, err := bs.Write(ctx, value)
@@ -164,7 +165,7 @@ func TestBlobStorage_Delete(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
-	bs := NewBlobStorage(store, DefaultValueStorageConfig())
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
 
 	value := []byte("delete this blob")
 	blobID, err := bs.Write(ctx, value)
@@ -178,7 +179,7 @@ func TestBlobStorage_Delete(t *testing.T) {
 	}
 
 	if err := bs.Delete(ctx, blobID); err != nil {
-		t.Fatalf("Delete failed: %v", err)
+		t.Fatalf("delete failed: %v", err)
 	}
 
 	exists, _ = bs.Exists(ctx, blobID)

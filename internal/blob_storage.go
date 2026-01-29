@@ -1,4 +1,4 @@
-package isledb
+package internal
 
 import (
 	"context"
@@ -7,14 +7,15 @@ import (
 	"fmt"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/config"
 )
 
 type BlobStorage struct {
 	store  *blobstore.Store
-	config ValueStorageConfig
+	config config.ValueStorageConfig
 }
 
-func NewBlobStorage(store *blobstore.Store, config ValueStorageConfig) *BlobStorage {
+func NewBlobStorage(store *blobstore.Store, config config.ValueStorageConfig) *BlobStorage {
 	return &BlobStorage{
 		store:  store,
 		config: config,

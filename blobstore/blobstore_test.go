@@ -268,7 +268,7 @@ func TestBasicOperations(t *testing.T) {
 		}
 
 		if err := store.Delete(ctx, key); err != nil {
-			t.Fatalf("Delete failed: %v", err)
+			t.Fatalf("delete failed: %v", err)
 		}
 
 		exists, err = store.Exists(ctx, key)
@@ -280,7 +280,7 @@ func TestBasicOperations(t *testing.T) {
 		}
 
 		if err := store.Delete(ctx, key); err != nil {
-			t.Errorf("Delete non-existent failed: %v", err)
+			t.Errorf("delete non-existent failed: %v", err)
 		}
 	})
 }

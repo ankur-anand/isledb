@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -21,9 +23,9 @@ type Reader struct {
 	sstCache       SSTCache
 	sstReaderCache SSTReaderCache
 
-	blobStorage *BlobStorage
-	blobCache   BlobCache
-	valueConfig ValueStorageConfig
+	blobStorage *internal.BlobStorage
+	blobCache   internal.BlobCache
+	valueConfig config.ValueStorageConfig
 
 	mu       sync.RWMutex
 	manifest *Manifest
@@ -59,24 +61,24 @@ func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		sstReaderCache = NewLRUSSTReaderCache(DefaultSSTReaderCacheSize)
 	}
 
-	var blobCache BlobCache
+	var blobCache internal.BlobCache
 	if opts.BlobCache != nil {
 		blobCache = opts.BlobCache
 	} else {
 		cacheSize := opts.BlobCacheSize
 		if cacheSize == 0 {
-			cacheSize = DefaultBlobCacheSize
+			cacheSize = internal.DefaultBlobCacheSize
 		}
 		itemSize := opts.BlobCacheItemSize
 		if itemSize == 0 {
-			itemSize = DefaultBlobCacheMaxItemSize
+			itemSize = internal.DefaultBlobCacheMaxItemSize
 		}
-		blobCache = NewLRUBlobCache(cacheSize, itemSize)
+		blobCache = internal.NewLRUBlobCache(cacheSize, itemSize)
 	}
 
 	valueConfig := opts.ValueStorageConfig
 	if valueConfig.BlobThreshold == 0 {
-		valueConfig = DefaultValueStorageConfig()
+		valueConfig = config.DefaultValueStorageConfig()
 	}
 
 	return &Reader{
@@ -85,7 +87,7 @@ func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		manifest:       m,
 		sstCache:       sstCache,
 		sstReaderCache: sstReaderCache,
-		blobStorage:    NewBlobStorage(store, valueConfig),
+		blobStorage:    internal.NewBlobStorage(store, valueConfig),
 		blobCache:      blobCache,
 		valueConfig:    valueConfig,
 	}, nil
@@ -281,7 +283,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 			continue
 		}
 
-		if entry.Kind == OpDelete {
+		if entry.Kind == internal.OpDelete {
 			continue
 		}
 
@@ -379,7 +381,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 			continue
 		}
 
-		if entry.Kind == OpDelete {
+		if entry.Kind == internal.OpDelete {
 			continue
 		}
 
@@ -451,7 +453,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 	if err != nil {
 		return nil, false, false, err
 	}
-	decoded, err := DecodeKeyEntry(kv.K.UserKey, raw)
+	decoded, err := internal.DecodeKeyEntry(kv.K.UserKey, raw)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -462,7 +464,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 		return nil, true, true, nil
 	}
 
-	if decoded.Kind == OpDelete {
+	if decoded.Kind == internal.OpDelete {
 		return nil, true, true, nil
 	}
 	if decoded.Inline {
@@ -480,7 +482,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 	return nil, false, false, errors.New("corrupt entry: non-inline, non-blob")
 }
 
-func (r *Reader) entryValue(ctx context.Context, entry CompactionEntry) ([]byte, error) {
+func (r *Reader) entryValue(ctx context.Context, entry internal.CompactionEntry) ([]byte, error) {
 	if entry.Inline {
 		return append([]byte(nil), entry.Value...), nil
 	}
@@ -493,7 +495,7 @@ func (r *Reader) entryValue(ctx context.Context, entry CompactionEntry) ([]byte,
 }
 
 func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error) {
-	blobIDHex := BlobIDToHex(blobID)
+	blobIDHex := internal.BlobIDToHex(blobID)
 
 	if r.blobCache != nil {
 		if data, ok := r.blobCache.Get(blobIDHex); ok {
@@ -513,11 +515,11 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error)
 	return data, nil
 }
 
-func (r *Reader) BlobCacheStats() BlobCacheStats {
+func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
 	if r.blobCache != nil {
 		return r.blobCache.Stats()
 	}
-	return BlobCacheStats{}
+	return internal.BlobCacheStats{}
 }
 
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
@@ -727,7 +729,7 @@ func (it *Iterator) Next() bool {
 			continue
 		}
 
-		if entry.Kind == OpDelete {
+		if entry.Kind == internal.OpDelete {
 			continue
 		}
 

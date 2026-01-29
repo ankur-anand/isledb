@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -23,7 +24,7 @@ var ErrOutOfOrder = errors.New("iterator out of order")
 
 type SSTIterator interface {
 	Next() bool
-	Entry() MemEntry
+	Entry() internal.MemEntry
 	Err() error
 	Close() error
 }
@@ -71,14 +72,14 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 			return abort(err)
 		}
 
-		encodedValue := EncodeKeyEntry(keyEntry)
+		encodedValue := internal.EncodeKeyEntry(keyEntry)
 
 		if err := state.updateOrder(k, e.Seq); err != nil {
 			return abort(err)
 		}
 
 		kind := pebble.InternalKeyKindSet
-		if e.Kind == OpDelete {
+		if e.Kind == internal.OpDelete {
 			kind = pebble.InternalKeyKindDelete
 		}
 
@@ -180,15 +181,15 @@ func (s *sstBuildState) updateBounds(key []byte, seq uint64) {
 	}
 }
 
-func buildKeyEntry(e MemEntry, key []byte) (KeyEntry, error) {
-	keyEntry := KeyEntry{
+func buildKeyEntry(e internal.MemEntry, key []byte) (internal.KeyEntry, error) {
+	keyEntry := internal.KeyEntry{
 		Key:      key,
 		Seq:      e.Seq,
 		Kind:     e.Kind,
 		ExpireAt: e.ExpireAt,
 	}
 
-	if e.Kind == OpDelete {
+	if e.Kind == internal.OpDelete {
 		return keyEntry, nil
 	}
 
@@ -205,7 +206,7 @@ func buildKeyEntry(e MemEntry, key []byte) (KeyEntry, error) {
 		return keyEntry, nil
 	}
 
-	return KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-blob for key %q", key)
+	return internal.KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-blob for key %q", key)
 }
 
 func buildSSTID(epoch, seqLo, seqHi uint64, hashHex string) string {
