@@ -219,12 +219,12 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 	}
 
 	logName := formatLogSeq(entry.Seq)
-	path, err := s.storage.WriteLog(ctx, logName, data)
+	_, err = s.storage.WriteLog(ctx, logName, data)
 	if err != nil {
 		return fmt.Errorf("write log entry: %w", err)
 	}
 
-	return s.appendCurrent(ctx, path, entry)
+	return s.appendCurrent(ctx, entry)
 }
 
 func (s *Store) AppendAddSSTable(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
@@ -317,8 +317,8 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 		m = &Manifest{Version: 2, NextEpoch: 1}
 	}
 
-	logs := currentLogs(current)
-	if len(logs) == 0 {
+	logs := currentLogs(current, s.logPath)
+	if logs == nil {
 		logs, err = s.List(ctx)
 		if err != nil {
 			return nil, err
@@ -396,7 +396,7 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
 	current.Snapshot = path
-	current.Logs = nil
+	current.LogSeqStart = s.nextSeq
 	current.NextEpoch = m.NextEpoch
 	current.NextSeq = s.nextSeq
 
@@ -406,13 +406,14 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	return path, nil
 }
 
-func currentLogs(current *Current) []string {
-	if current == nil || len(current.Logs) == 0 {
+func currentLogs(current *Current, pathFn func(seq uint64) string) []string {
+	if current == nil {
 		return nil
 	}
-	out := make([]string, len(current.Logs))
-	copy(out, current.Logs)
-	return out
+	if current.NextSeq <= current.LogSeqStart {
+		return []string{}
+	}
+	return current.LogPaths(pathFn)
 }
 
 func formatLogSeq(seq uint64) string {
@@ -455,7 +456,11 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expec
 	return s.storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
-func (s *Store) appendCurrent(ctx context.Context, logPath string, entry *ManifestLogEntry) error {
+func (s *Store) logPath(seq uint64) string {
+	return s.storage.LogPath(formatLogSeq(seq))
+}
+
+func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) error {
 	current, err := s.readCurrent(ctx)
 	if err != nil {
 		return err
@@ -464,7 +469,9 @@ func (s *Store) appendCurrent(ctx context.Context, logPath string, entry *Manife
 		current = &Current{NextEpoch: 1}
 	}
 
-	current.Logs = append(current.Logs, logPath)
+	if current.LogSeqStart == current.NextSeq {
+		current.LogSeqStart = entry.Seq
+	}
 	current.NextSeq = s.nextSeq
 	current.NextEpoch = nextEpochFromEntry(current.NextEpoch, entry)
 

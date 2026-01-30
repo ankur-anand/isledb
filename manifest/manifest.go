@@ -65,13 +65,25 @@ type SSTMeta struct {
 }
 
 type Current struct {
-	Snapshot  string   `json:"snapshot"`
-	Logs      []string `json:"logs,omitempty"`
-	NextSeq   uint64   `json:"next_seq"`
-	NextEpoch uint64   `json:"next_epoch"`
+	Snapshot    string `json:"snapshot"`
+	LogSeqStart uint64 `json:"log_seq_start,omitempty"`
+	NextSeq     uint64 `json:"next_seq"`
+	NextEpoch   uint64 `json:"next_epoch"`
 
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
+}
+
+func (c *Current) LogPaths(pathFn func(seq uint64) string) []string {
+	if c == nil || pathFn == nil || c.NextSeq <= c.LogSeqStart {
+		return nil
+	}
+
+	paths := make([]string, 0, c.NextSeq-c.LogSeqStart)
+	for seq := c.LogSeqStart; seq < c.NextSeq; seq++ {
+		paths = append(paths, pathFn(seq))
+	}
+	return paths
 }
 
 func EncodeSnapshot(m *Manifest) ([]byte, error) {

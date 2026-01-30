@@ -21,4 +21,6 @@ type Storage interface {
 	ReadLog(ctx context.Context, path string) ([]byte, error)
 	WriteLog(ctx context.Context, name string, data []byte) (string, error)
 	ListLogs(ctx context.Context) ([]string, error)
+
+	LogPath(name string) string
 }

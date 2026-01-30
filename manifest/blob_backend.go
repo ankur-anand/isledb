@@ -68,6 +68,10 @@ func (b *BlobStoreBackend) ListLogs(ctx context.Context) ([]string, error) {
 	return entries, nil
 }
 
+func (b *BlobStoreBackend) LogPath(name string) string {
+	return b.store.ManifestLogPath(name)
+}
+
 func (b *BlobStoreBackend) mapError(err error) error {
 	if err == nil {
 		return nil

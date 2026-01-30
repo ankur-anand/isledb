@@ -77,10 +77,10 @@ func TestSnapshotRoundTrip(t *testing.T) {
 
 func TestCurrentRoundTrip(t *testing.T) {
 	c := &Current{
-		Snapshot:  "snapshots/000000001.manifest",
-		Logs:      []string{"log/000000002.log"},
-		NextSeq:   12,
-		NextEpoch: 5,
+		Snapshot:    "snapshots/000000001.manifest",
+		LogSeqStart: 7,
+		NextSeq:     12,
+		NextEpoch:   5,
 	}
 
 	data, err := EncodeCurrent(c)
@@ -91,10 +91,7 @@ func TestCurrentRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode current: %v", err)
 	}
-	if got.Snapshot != c.Snapshot || got.NextSeq != c.NextSeq || got.NextEpoch != c.NextEpoch {
+	if got.Snapshot != c.Snapshot || got.LogSeqStart != c.LogSeqStart || got.NextSeq != c.NextSeq || got.NextEpoch != c.NextEpoch {
 		t.Fatalf("current mismatch")
-	}
-	if len(got.Logs) != 1 || got.Logs[0] != c.Logs[0] {
-		t.Fatalf("logs mismatch: %v", got.Logs)
 	}
 }
