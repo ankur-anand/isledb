@@ -15,10 +15,8 @@ import (
 )
 
 const (
-	DefaultWarmCacheTimeout = 30 * time.Second
-
-	DefaultSyncInterval = 5 * time.Second
-
+	DefaultWarmCacheTimeout    = 30 * time.Second
+	DefaultSyncInterval        = 5 * time.Second
 	DefaultPrefetchConcurrency = 10
 )
 
@@ -32,13 +30,13 @@ type DBOptions struct {
 	ValueStorage    config.ValueStorageConfig
 	ManifestStorage manifest.Storage
 
-	AppendOnlyMode bool
+	LogMode bool
 
 	RetentionCompactorMode     RetentionCompactorMode
-	AppendOnlyRetentionPeriod  time.Duration
-	AppendOnlyRetentionCount   int
+	LogRetentionPeriod         time.Duration
+	LogRetentionCount          int
 	RetentionCompactorInterval time.Duration
-	AppendOnlySegmentDuration  time.Duration
+	LogSegmentDuration         time.Duration
 
 	EnableCompaction        bool
 	L0CompactionThreshold   int
@@ -59,11 +57,11 @@ type DBOptions struct {
 	BackgroundSync bool
 	SyncInterval   time.Duration
 
-	OnFlushError        func(error)
-	OnCompactionStart   func(CompactionJob)
-	OnCompactionEnd     func(CompactionJob, error)
-	OnCacheWarmDone     func(warmed int, duration time.Duration)
-	OnAppendOnlyCleanup func(CleanupStats)
+	OnFlushError      func(error)
+	OnCompactionStart func(CompactionJob)
+	OnCompactionEnd   func(CompactionJob, error)
+	OnCacheWarmDone   func(warmed int, duration time.Duration)
+	OnLogCleanup      func(CleanupStats)
 }
 
 func DefaultDBOptions() DBOptions {
@@ -76,12 +74,12 @@ func DefaultDBOptions() DBOptions {
 		Compression:     "snappy",
 		ValueStorage:    config.DefaultValueStorageConfig(),
 
-		AppendOnlyMode:             false,
+		LogMode:                    false,
 		RetentionCompactorMode:     CompactByAge,
-		AppendOnlyRetentionPeriod:  7 * 24 * time.Hour,
-		AppendOnlyRetentionCount:   10,
+		LogRetentionPeriod:         7 * 24 * time.Hour,
+		LogRetentionCount:          10,
 		RetentionCompactorInterval: time.Minute,
-		AppendOnlySegmentDuration:  time.Hour,
+		LogSegmentDuration:         time.Hour,
 
 		EnableCompaction:        true,
 		L0CompactionThreshold:   8,
@@ -104,15 +102,15 @@ func DefaultDBOptions() DBOptions {
 	}
 }
 
-func DefaultAppendOnlyOptions() DBOptions {
+func DefaultLogModeOptions() DBOptions {
 	opts := DefaultDBOptions()
 
-	opts.AppendOnlyMode = true
+	opts.LogMode = true
 	opts.EnableCompaction = false
 
 	opts.RetentionCompactorMode = CompactByAge
-	opts.AppendOnlyRetentionPeriod = 7 * 24 * time.Hour
-	opts.AppendOnlyRetentionCount = 10
+	opts.LogRetentionPeriod = 7 * 24 * time.Hour
+	opts.LogRetentionCount = 10
 	opts.RetentionCompactorInterval = time.Minute
 
 	opts.BackgroundSync = true
@@ -130,6 +128,173 @@ func InProcessDBOptions() DBOptions {
 	return opts
 }
 
+// WithDefaults returns a copy of opts with zero values replaced by defaults.
+func (o DBOptions) WithDefaults() DBOptions {
+	defaults := DefaultDBOptions()
+
+	if o.MemtableSize == 0 {
+		o.MemtableSize = defaults.MemtableSize
+	}
+	if o.FlushInterval == 0 {
+		o.FlushInterval = defaults.FlushInterval
+	}
+	if o.ValueStorage.BlobThreshold == 0 {
+		o.ValueStorage = defaults.ValueStorage
+	}
+	if o.BloomBitsPerKey == 0 {
+		o.BloomBitsPerKey = defaults.BloomBitsPerKey
+	}
+	if o.BlockSize == 0 {
+		o.BlockSize = defaults.BlockSize
+	}
+	if o.Compression == "" {
+		o.Compression = defaults.Compression
+	}
+
+	if o.RetentionCompactorInterval == 0 {
+		o.RetentionCompactorInterval = defaults.RetentionCompactorInterval
+	}
+	if o.LogRetentionPeriod == 0 {
+		o.LogRetentionPeriod = defaults.LogRetentionPeriod
+	}
+	if o.LogRetentionCount == 0 {
+		o.LogRetentionCount = defaults.LogRetentionCount
+	}
+	if o.LogSegmentDuration == 0 {
+		o.LogSegmentDuration = defaults.LogSegmentDuration
+	}
+
+	if o.L0CompactionThreshold == 0 {
+		o.L0CompactionThreshold = defaults.L0CompactionThreshold
+	}
+	if o.MinSources == 0 {
+		o.MinSources = defaults.MinSources
+	}
+	if o.MaxSources == 0 {
+		o.MaxSources = defaults.MaxSources
+	}
+	if o.SizeThreshold == 0 {
+		o.SizeThreshold = defaults.SizeThreshold
+	}
+	if o.CompactionCheckInterval == 0 {
+		o.CompactionCheckInterval = defaults.CompactionCheckInterval
+	}
+
+	if o.SSTCacheSize == 0 {
+		o.SSTCacheSize = defaults.SSTCacheSize
+	}
+	if o.SSTReaderCacheSize == 0 {
+		o.SSTReaderCacheSize = defaults.SSTReaderCacheSize
+	}
+	if o.BlobCacheSize == 0 {
+		o.BlobCacheSize = defaults.BlobCacheSize
+	}
+	if o.BlobCacheItemSize == 0 {
+		o.BlobCacheItemSize = defaults.BlobCacheItemSize
+	}
+
+	if o.WarmCacheTimeout == 0 {
+		o.WarmCacheTimeout = defaults.WarmCacheTimeout
+	}
+	if o.PrefetchConcurrency == 0 {
+		o.PrefetchConcurrency = defaults.PrefetchConcurrency
+	}
+	if o.SyncInterval == 0 {
+		o.SyncInterval = defaults.SyncInterval
+	}
+
+	return o
+}
+
+// Validate checks the configuration for invalid combinations.
+func (o DBOptions) Validate() error {
+	if o.LogMode && o.EnableCompaction {
+		return errors.New("log mode and compaction are mutually exclusive")
+	}
+	if o.BackgroundSync && o.SyncInterval <= 0 {
+		return errors.New("background sync requires positive sync interval")
+	}
+	return nil
+}
+
+// ToWriterOptions converts DBOptions to WriterOptions.
+func (o DBOptions) ToWriterOptions() WriterOptions {
+	return WriterOptions{
+		MemtableSize:    o.MemtableSize,
+		FlushInterval:   o.FlushInterval,
+		BloomBitsPerKey: o.BloomBitsPerKey,
+		BlockSize:       o.BlockSize,
+		Compression:     o.Compression,
+		ValueStorage:    o.ValueStorage,
+		OnFlushError:    o.OnFlushError,
+		ManifestStorage: o.ManifestStorage,
+	}
+}
+
+// ToReaderOptions converts DBOptions to ReaderOptions.
+func (o DBOptions) ToReaderOptions() ReaderOptions {
+	return ReaderOptions{
+		SSTCacheSize:       o.SSTCacheSize,
+		SSTReaderCacheSize: o.SSTReaderCacheSize,
+		BlobCacheSize:      o.BlobCacheSize,
+		BlobCacheItemSize:  o.BlobCacheItemSize,
+		ValueStorageConfig: o.ValueStorage,
+		ManifestStorage:    o.ManifestStorage,
+	}
+}
+
+// ToCompactorOptions converts DBOptions to CompactorOptions.
+func (o DBOptions) ToCompactorOptions() CompactorOptions {
+	return CompactorOptions{
+		L0CompactionThreshold: o.L0CompactionThreshold,
+		MinSources:            o.MinSources,
+		MaxSources:            o.MaxSources,
+		SizeThreshold:         o.SizeThreshold,
+		BloomBitsPerKey:       o.BloomBitsPerKey,
+		BlockSize:             o.BlockSize,
+		Compression:           o.Compression,
+		CheckInterval:         o.CompactionCheckInterval,
+		OnCompactionStart:     o.OnCompactionStart,
+		OnCompactionEnd:       o.OnCompactionEnd,
+		ManifestStorage:       o.ManifestStorage,
+	}
+}
+
+// ToRetentionCompactorOptions converts DBOptions to RetentionCompactorOptions.
+func (o DBOptions) ToRetentionCompactorOptions() RetentionCompactorOptions {
+	return RetentionCompactorOptions{
+		Mode:            o.RetentionCompactorMode,
+		RetentionPeriod: o.LogRetentionPeriod,
+		RetentionCount:  o.LogRetentionCount,
+		CheckInterval:   o.RetentionCompactorInterval,
+		SegmentDuration: o.LogSegmentDuration,
+		OnCleanup:       o.OnLogCleanup,
+		ManifestStorage: o.ManifestStorage,
+	}
+}
+
+type resourceGuard struct {
+	closers []func() error
+}
+
+func (g *resourceGuard) add(closer func() error) {
+	g.closers = append(g.closers, closer)
+}
+
+func (g *resourceGuard) abort() error {
+	var firstErr error
+	for i := len(g.closers) - 1; i >= 0; i-- {
+		if err := g.closers[i](); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (g *resourceGuard) disarm() {
+	g.closers = nil
+}
+
 type DB struct {
 	store *blobstore.Store
 	opts  DBOptions
@@ -144,97 +309,35 @@ type DB struct {
 	syncCancel context.CancelFunc
 	syncWg     sync.WaitGroup
 
-	closed atomic.Bool
+	started atomic.Bool
+	closed  atomic.Bool
 }
 
-func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
-
-	defaults := DefaultDBOptions()
-	if opts.MemtableSize == 0 {
-		opts.MemtableSize = defaults.MemtableSize
-	}
-	if opts.FlushInterval == 0 {
-		opts.FlushInterval = defaults.FlushInterval
-	}
-	if opts.ValueStorage.BlobThreshold == 0 {
-		opts.ValueStorage = defaults.ValueStorage
-	}
-	if opts.BloomBitsPerKey == 0 {
-		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
-	}
-	if opts.BlockSize == 0 {
-		opts.BlockSize = defaults.BlockSize
-	}
-	if opts.Compression == "" {
-		opts.Compression = defaults.Compression
-	}
-	if opts.L0CompactionThreshold == 0 {
-		opts.L0CompactionThreshold = defaults.L0CompactionThreshold
-	}
-	if opts.MinSources == 0 {
-		opts.MinSources = defaults.MinSources
-	}
-	if opts.MaxSources == 0 {
-		opts.MaxSources = defaults.MaxSources
-	}
-	if opts.SizeThreshold == 0 {
-		opts.SizeThreshold = defaults.SizeThreshold
-	}
-	if opts.CompactionCheckInterval == 0 {
-		opts.CompactionCheckInterval = defaults.CompactionCheckInterval
-	}
-	if opts.SSTCacheSize == 0 {
-		opts.SSTCacheSize = defaults.SSTCacheSize
-	}
-	if opts.SSTReaderCacheSize == 0 {
-		opts.SSTReaderCacheSize = defaults.SSTReaderCacheSize
-	}
-	if opts.BlobCacheSize == 0 {
-		opts.BlobCacheSize = defaults.BlobCacheSize
-	}
-	if opts.BlobCacheItemSize == 0 {
-		opts.BlobCacheItemSize = defaults.BlobCacheItemSize
-	}
-	if opts.WarmCacheTimeout == 0 {
-		opts.WarmCacheTimeout = defaults.WarmCacheTimeout
-	}
-	if opts.PrefetchConcurrency == 0 {
-		opts.PrefetchConcurrency = defaults.PrefetchConcurrency
-	}
-	if opts.SyncInterval == 0 {
-		opts.SyncInterval = defaults.SyncInterval
-	}
-
-	writerOpts := WriterOptions{
-		MemtableSize:    opts.MemtableSize,
-		FlushInterval:   opts.FlushInterval,
-		BloomBitsPerKey: opts.BloomBitsPerKey,
-		BlockSize:       opts.BlockSize,
-		Compression:     opts.Compression,
-		ValueStorage:    opts.ValueStorage,
-		OnFlushError:    opts.OnFlushError,
-		ManifestStorage: opts.ManifestStorage,
-	}
-
-	writer, err := newWriter(ctx, store, writerOpts)
-	if err != nil {
+// New creates a DB instance with writer and reader initialized.
+// Unlike Open, it does not start background goroutines (compaction, sync, cache warming).
+// Call Start() to begin background operations, or use Open() for the combined behavior.
+func New(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
+	opts = opts.WithDefaults()
+	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
 
-	readerOpts := ReaderOptions{
-		SSTCacheSize:       opts.SSTCacheSize,
-		SSTReaderCacheSize: opts.SSTReaderCacheSize,
-		BlobCacheSize:      opts.BlobCacheSize,
-		BlobCacheItemSize:  opts.BlobCacheItemSize,
-		ValueStorageConfig: opts.ValueStorage,
-		ManifestStorage:    opts.ManifestStorage,
-	}
+	var guard resourceGuard
+	defer func() {
+		guard.abort()
+	}()
 
-	reader, err := NewReader(ctx, store, readerOpts)
+	writer, err := newWriter(ctx, store, opts.ToWriterOptions())
 	if err != nil {
-		writer.close()
 		return nil, err
 	}
+	guard.add(writer.close)
+
+	reader, err := NewReader(ctx, store, opts.ToReaderOptions())
+	if err != nil {
+		return nil, err
+	}
+	guard.add(reader.Close)
 
 	db := &DB{
 		store:  store,
@@ -243,80 +346,69 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		reader: reader,
 	}
 
-	if opts.AppendOnlyMode {
-
-		appendOnlyCleanerOpts := RetentionCompactorOptions{
-			Mode:            opts.RetentionCompactorMode,
-			RetentionPeriod: opts.AppendOnlyRetentionPeriod,
-			RetentionCount:  opts.AppendOnlyRetentionCount,
-			CheckInterval:   opts.RetentionCompactorInterval,
-			SegmentDuration: opts.AppendOnlySegmentDuration,
-			OnCleanup:       opts.OnAppendOnlyCleanup,
-			ManifestStorage: opts.ManifestStorage,
-		}
-
-		if appendOnlyCleanerOpts.RetentionPeriod == 0 {
-			appendOnlyCleanerOpts.RetentionPeriod = 7 * 24 * time.Hour
-		}
-		if appendOnlyCleanerOpts.RetentionCount == 0 {
-			appendOnlyCleanerOpts.RetentionCount = 10
-		}
-		if appendOnlyCleanerOpts.CheckInterval == 0 {
-			appendOnlyCleanerOpts.CheckInterval = time.Minute
-		}
-		if appendOnlyCleanerOpts.SegmentDuration == 0 {
-			appendOnlyCleanerOpts.SegmentDuration = time.Hour
-		}
-
-		appendOnlyCleaner, err := NewRetentionCompactor(ctx, store, appendOnlyCleanerOpts)
+	if opts.LogMode {
+		retentionCompactor, err := NewRetentionCompactor(ctx, store, opts.ToRetentionCompactorOptions())
 		if err != nil {
-			_ = reader.Close()
-			_ = writer.close()
 			return nil, err
 		}
-		db.retentionCompactor = appendOnlyCleaner
-		appendOnlyCleaner.Start()
+
+		guard.add(retentionCompactor.Close)
+		db.retentionCompactor = retentionCompactor
 
 	} else if opts.EnableCompaction {
-
-		compactorOpts := CompactorOptions{
-			L0CompactionThreshold: opts.L0CompactionThreshold,
-			MinSources:            opts.MinSources,
-			MaxSources:            opts.MaxSources,
-			SizeThreshold:         opts.SizeThreshold,
-			BloomBitsPerKey:       opts.BloomBitsPerKey,
-			BlockSize:             opts.BlockSize,
-			Compression:           opts.Compression,
-			CheckInterval:         opts.CompactionCheckInterval,
-			OnCompactionStart:     opts.OnCompactionStart,
-			OnCompactionEnd:       opts.OnCompactionEnd,
-			ManifestStorage:       opts.ManifestStorage,
-		}
-
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := NewCompactor(ctx, store, opts.ToCompactorOptions())
 		if err != nil {
-			_ = reader.Close()
-			_ = writer.close()
 			return nil, err
 		}
+
+		guard.add(compactor.Close)
 		db.compactor = compactor
-		compactor.Start()
 	}
 
-	if opts.WarmCacheOnOpen {
+	guard.disarm()
+	return db, nil
+}
+
+// Start begins background processes (compaction, cache warming, background sync).
+func (db *DB) Start(ctx context.Context) error {
+	if !db.started.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	if db.retentionCompactor != nil {
+		db.retentionCompactor.Start()
+	} else if db.compactor != nil {
+		db.compactor.Start()
+	}
+
+	if db.opts.WarmCacheOnOpen {
 		start := time.Now()
 		warmed, _ := db.warmCache(ctx)
-
-		if opts.OnCacheWarmDone != nil {
-			opts.OnCacheWarmDone(warmed, time.Since(start))
+		if db.opts.OnCacheWarmDone != nil {
+			db.opts.OnCacheWarmDone(warmed, time.Since(start))
 		}
 	}
 
-	if opts.BackgroundSync {
-		syncCtx, cancel := context.WithCancel(context.Background())
+	if db.opts.BackgroundSync {
+		syncCtx, cancel := context.WithCancel(ctx)
 		db.syncCancel = cancel
 		db.syncWg.Add(1)
 		go db.backgroundSyncLoop(syncCtx)
+	}
+
+	return nil
+}
+
+// Open creates and starts a DB.
+func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
+	db, err := New(ctx, store, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Start(ctx); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	return db, nil

@@ -419,3 +419,185 @@ func TestDB_InProcessOptions(t *testing.T) {
 		t.Errorf("SSTReaderCacheSize = %d, want 100", opts.SSTReaderCacheSize)
 	}
 }
+
+func TestDBOptions_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    DBOptions
+		wantErr string
+	}{
+		{
+			name:    "valid default options",
+			opts:    DefaultDBOptions(),
+			wantErr: "",
+		},
+		{
+			name: "log mode with compaction enabled",
+			opts: DBOptions{
+				LogMode:          true,
+				EnableCompaction: true,
+			},
+			wantErr: "log mode and compaction are mutually exclusive",
+		},
+		{
+			name: "background sync without interval",
+			opts: DBOptions{
+				BackgroundSync: true,
+				SyncInterval:   0,
+			},
+			wantErr: "background sync requires positive sync interval",
+		},
+		{
+			name: "background sync with valid interval",
+			opts: DBOptions{
+				BackgroundSync: true,
+				SyncInterval:   time.Second,
+			},
+			wantErr: "",
+		},
+		{
+			name: "log mode without compaction is valid",
+			opts: DBOptions{
+				LogMode:          true,
+				EnableCompaction: false,
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.opts.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Errorf("Validate() expected error containing %q, got nil", tt.wantErr)
+				} else if err.Error() != tt.wantErr {
+					t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+				}
+			}
+		})
+	}
+}
+
+func TestDBOptions_WithDefaults(t *testing.T) {
+	empty := DBOptions{}
+	withDefaults := empty.WithDefaults()
+
+	defaults := DefaultDBOptions()
+
+	if withDefaults.MemtableSize != defaults.MemtableSize {
+		t.Errorf("MemtableSize = %d, want %d", withDefaults.MemtableSize, defaults.MemtableSize)
+	}
+	if withDefaults.FlushInterval != defaults.FlushInterval {
+		t.Errorf("FlushInterval = %v, want %v", withDefaults.FlushInterval, defaults.FlushInterval)
+	}
+	if withDefaults.BloomBitsPerKey != defaults.BloomBitsPerKey {
+		t.Errorf("BloomBitsPerKey = %d, want %d", withDefaults.BloomBitsPerKey, defaults.BloomBitsPerKey)
+	}
+	if withDefaults.BlockSize != defaults.BlockSize {
+		t.Errorf("BlockSize = %d, want %d", withDefaults.BlockSize, defaults.BlockSize)
+	}
+	if withDefaults.Compression != defaults.Compression {
+		t.Errorf("Compression = %q, want %q", withDefaults.Compression, defaults.Compression)
+	}
+	if withDefaults.SSTCacheSize != defaults.SSTCacheSize {
+		t.Errorf("SSTCacheSize = %d, want %d", withDefaults.SSTCacheSize, defaults.SSTCacheSize)
+	}
+	if withDefaults.SyncInterval != defaults.SyncInterval {
+		t.Errorf("SyncInterval = %v, want %v", withDefaults.SyncInterval, defaults.SyncInterval)
+	}
+
+	custom := DBOptions{
+		MemtableSize:  8 * 1024 * 1024,
+		FlushInterval: 5 * time.Second,
+	}
+	customWithDefaults := custom.WithDefaults()
+	if customWithDefaults.MemtableSize != custom.MemtableSize {
+		t.Errorf("custom MemtableSize = %d, want %d", customWithDefaults.MemtableSize, custom.MemtableSize)
+	}
+	if customWithDefaults.FlushInterval != custom.FlushInterval {
+		t.Errorf("custom FlushInterval = %v, want %v", customWithDefaults.FlushInterval, custom.FlushInterval)
+	}
+}
+
+func TestDB_NewWithoutStart(t *testing.T) {
+	store := blobstore.NewMemory("test")
+	ctx := context.Background()
+
+	opts := DefaultDBOptions()
+	opts.EnableCompaction = true
+	opts.BackgroundSync = true
+	opts.WarmCacheOnOpen = true
+
+	db, err := New(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if db.compactor == nil {
+		t.Error("compactor should be created")
+	}
+
+	if db.started.Load() {
+		t.Error("started should be false before Start() is called")
+	}
+}
+
+func TestDB_DoubleStart(t *testing.T) {
+	store := blobstore.NewMemory("test")
+	ctx := context.Background()
+
+	opts := DefaultDBOptions()
+	opts.EnableCompaction = false
+	opts.BackgroundSync = true
+	opts.SyncInterval = time.Second
+
+	db, err := New(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if !db.started.Load() {
+		t.Error("started should be true after Start()")
+	}
+
+	if err := db.Start(ctx); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+
+	if !db.started.Load() {
+		t.Error("started should still be true after second Start()")
+	}
+}
+
+func TestDB_OpenValidationError(t *testing.T) {
+	store := blobstore.NewMemory("test")
+	ctx := context.Background()
+
+	opts := DBOptions{
+		LogMode:          true,
+		EnableCompaction: true,
+	}
+
+	_, err := Open(ctx, store, opts)
+	if err == nil {
+		t.Fatal("Open should fail with invalid options")
+	}
+	if err.Error() != "log mode and compaction are mutually exclusive" {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
