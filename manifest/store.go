@@ -14,8 +14,7 @@ import (
 )
 
 var (
-	ErrFenced = errors.New("fenced: epoch superseded by newer owner")
-
+	ErrFenced        = errors.New("fenced: epoch superseded by newer owner")
 	ErrFenceConflict = errors.New("fence conflict: concurrent claim detected")
 )
 
