@@ -5,13 +5,12 @@ import (
 	"sort"
 )
 
-func DefaultTieredConfig() TieredConfig {
-	return TieredConfig{
-		L0CompactionThreshold:   8,
-		TierCompactionThreshold: 8,
-		TierMaxRuns:             16,
-		MaxTiers:                4,
-		LazyLeveling:            true,
+func DefaultCompactionConfig() CompactionConfig {
+	return CompactionConfig{
+		L0CompactionThreshold: 8,
+		MinSources:            4,
+		MaxSources:            8,
+		SizeThreshold:         4,
 	}
 }
 
@@ -20,10 +19,10 @@ func (m *Manifest) Clone() *Manifest {
 		return nil
 	}
 	clone := &Manifest{
-		Version:         m.Version,
-		NextEpoch:       m.NextEpoch,
-		NextSortedRunID: m.NextSortedRunID,
-		TieredConfig:    m.TieredConfig,
+		Version:          m.Version,
+		NextEpoch:        m.NextEpoch,
+		NextSortedRunID:  m.NextSortedRunID,
+		CompactionConfig: m.CompactionConfig,
 	}
 
 	if len(m.L0SSTs) > 0 {
@@ -104,47 +103,41 @@ func (m *Manifest) SortedRunCount() int {
 	return len(m.SortedRuns)
 }
 
-func (m *Manifest) SortedRunsByTier(config TieredConfig) [][]SortedRun {
-	if len(m.SortedRuns) == 0 {
+// FindConsecutiveSimilarRuns finds consecutive runs with similar sizes.
+func (m *Manifest) FindConsecutiveSimilarRuns(minSources, maxSources, sizeThreshold int) []SortedRun {
+	if minSources < 2 {
+		minSources = 2
+	}
+	if maxSources < minSources {
+		maxSources = minSources
+	}
+	if sizeThreshold < 1 {
+		sizeThreshold = 1
+	}
+	if len(m.SortedRuns) < minSources {
 		return nil
 	}
 
-	tiers := make([][]SortedRun, config.MaxTiers)
-	for i := range tiers {
-		tiers[i] = make([]SortedRun, 0)
-	}
+	for start := 0; start <= len(m.SortedRuns)-minSources; start++ {
+		baseSize := m.SortedRuns[start].TotalSize()
+		group := []SortedRun{m.SortedRuns[start]}
 
-	for _, sr := range m.SortedRuns {
-		tier := m.determineTier(sr, config)
-		if tier >= config.MaxTiers {
-			tier = config.MaxTiers - 1
+		for i := start + 1; i < len(m.SortedRuns) && len(group) < maxSources; i++ {
+			size := m.SortedRuns[i].TotalSize()
+
+			ratio := float64(size) / float64(baseSize)
+			if ratio > float64(sizeThreshold) || ratio < 1.0/float64(sizeThreshold) {
+				break
+			}
+			group = append(group, m.SortedRuns[i])
 		}
-		tiers[tier] = append(tiers[tier], sr)
-	}
 
-	return tiers
-}
-
-func (m *Manifest) determineTier(sr SortedRun, config TieredConfig) int {
-	if len(m.SortedRuns) == 0 {
-		return 0
-	}
-
-	position := 0
-	for i, run := range m.SortedRuns {
-		if run.ID == sr.ID {
-			position = i
-			break
+		if len(group) >= minSources {
+			return group
 		}
 	}
 
-	runsPerTier := config.TierCompactionThreshold
-	tier := position / runsPerTier
-	if tier >= config.MaxTiers {
-		tier = config.MaxTiers - 1
-	}
-
-	return tier
+	return nil
 }
 
 func (m *Manifest) GetSortedRun(id uint32) *SortedRun {

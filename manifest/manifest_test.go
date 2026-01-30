@@ -10,11 +10,11 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		Version:         2,
 		NextEpoch:       7,
 		NextSortedRunID: 3,
-		TieredConfig: TieredConfig{
-			L0CompactionThreshold:   8,
-			TierCompactionThreshold: 8,
-			MaxTiers:                4,
-			LazyLeveling:            true,
+		CompactionConfig: CompactionConfig{
+			L0CompactionThreshold: 8,
+			MinSources:            4,
+			MaxSources:            8,
+			SizeThreshold:         4,
 		},
 		L0SSTs: []SSTMeta{
 			{
@@ -70,8 +70,8 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if len(got.SortedRuns) != 1 || got.SortedRuns[0].ID != 1 {
 		t.Fatalf("SortedRuns mismatch")
 	}
-	if got.TieredConfig.L0CompactionThreshold != 8 {
-		t.Fatalf("TieredConfig mismatch")
+	if got.CompactionConfig.L0CompactionThreshold != 8 {
+		t.Fatalf("CompactionConfig mismatch")
 	}
 }
 

@@ -40,9 +40,9 @@ type DBOptions struct {
 
 	EnableCompaction        bool
 	L0CompactionThreshold   int
-	TierCompactionThreshold int
-	MaxTiers                int
-	LazyLeveling            bool
+	MinSources              int
+	MaxSources              int
+	SizeThreshold           int
 	CompactionCheckInterval time.Duration
 
 	SSTCacheSize       int64
@@ -83,9 +83,9 @@ func DefaultDBOptions() DBOptions {
 
 		EnableCompaction:        true,
 		L0CompactionThreshold:   8,
-		TierCompactionThreshold: 4,
-		MaxTiers:                4,
-		LazyLeveling:            true,
+		MinSources:              4,
+		MaxSources:              8,
+		SizeThreshold:           4,
 		CompactionCheckInterval: 5 * time.Second,
 
 		SSTCacheSize:       DefaultSSTCacheSize,
@@ -169,11 +169,14 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 	if opts.L0CompactionThreshold == 0 {
 		opts.L0CompactionThreshold = defaults.L0CompactionThreshold
 	}
-	if opts.TierCompactionThreshold == 0 {
-		opts.TierCompactionThreshold = defaults.TierCompactionThreshold
+	if opts.MinSources == 0 {
+		opts.MinSources = defaults.MinSources
 	}
-	if opts.MaxTiers == 0 {
-		opts.MaxTiers = defaults.MaxTiers
+	if opts.MaxSources == 0 {
+		opts.MaxSources = defaults.MaxSources
+	}
+	if opts.SizeThreshold == 0 {
+		opts.SizeThreshold = defaults.SizeThreshold
 	}
 	if opts.CompactionCheckInterval == 0 {
 		opts.CompactionCheckInterval = defaults.CompactionCheckInterval
@@ -272,16 +275,16 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 	} else if opts.EnableCompaction {
 
 		compactorOpts := CompactorOptions{
-			L0CompactionThreshold:   opts.L0CompactionThreshold,
-			TierCompactionThreshold: opts.TierCompactionThreshold,
-			MaxTiers:                opts.MaxTiers,
-			LazyLeveling:            opts.LazyLeveling,
-			BloomBitsPerKey:         opts.BloomBitsPerKey,
-			BlockSize:               opts.BlockSize,
-			Compression:             opts.Compression,
-			CheckInterval:           opts.CompactionCheckInterval,
-			OnCompactionStart:       opts.OnCompactionStart,
-			OnCompactionEnd:         opts.OnCompactionEnd,
+			L0CompactionThreshold: opts.L0CompactionThreshold,
+			MinSources:            opts.MinSources,
+			MaxSources:            opts.MaxSources,
+			SizeThreshold:         opts.SizeThreshold,
+			BloomBitsPerKey:       opts.BloomBitsPerKey,
+			BlockSize:             opts.BlockSize,
+			Compression:           opts.Compression,
+			CheckInterval:         opts.CompactionCheckInterval,
+			OnCompactionStart:     opts.OnCompactionStart,
+			OnCompactionEnd:       opts.OnCompactionEnd,
 		}
 
 		compactor, err := NewCompactor(ctx, store, compactorOpts)

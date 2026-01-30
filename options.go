@@ -67,10 +67,11 @@ func DefaultTailingReaderOptions() TailingReaderOptions {
 }
 
 type CompactorOptions struct {
-	L0CompactionThreshold   int
-	TierCompactionThreshold int
-	MaxTiers                int
-	LazyLeveling            bool
+	L0CompactionThreshold int
+
+	MinSources    int
+	MaxSources    int
+	SizeThreshold int
 
 	BloomBitsPerKey int
 	BlockSize       int
@@ -87,15 +88,15 @@ type CompactorOptions struct {
 
 func DefaultCompactorOptions() CompactorOptions {
 	return CompactorOptions{
-		L0CompactionThreshold:   8,
-		TierCompactionThreshold: 4,
-		MaxTiers:                4,
-		LazyLeveling:            true,
-		BloomBitsPerKey:         10,
-		BlockSize:               4096,
-		Compression:             "snappy",
-		TargetSSTSize:           64 * 1024 * 1024,
-		CheckInterval:           time.Second * 5,
+		L0CompactionThreshold: 8,
+		MinSources:            4,
+		MaxSources:            8,
+		SizeThreshold:         4,
+		BloomBitsPerKey:       10,
+		BlockSize:             4096,
+		Compression:           "snappy",
+		TargetSSTSize:         64 * 1024 * 1024,
+		CheckInterval:         time.Second * 5,
 	}
 }
 

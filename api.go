@@ -3,7 +3,7 @@ package isledb
 import "github.com/ankur-anand/isledb/manifest"
 
 type Manifest = manifest.Manifest
-type TieredConfig = manifest.TieredConfig
+type CompactionConfig = manifest.CompactionConfig
 type SSTMeta = manifest.SSTMeta
 type BloomMeta = manifest.BloomMeta
 type SSTSignature = manifest.SSTSignature

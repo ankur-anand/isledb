@@ -20,13 +20,12 @@ import (
 type CompactionJobType int
 
 const (
-	CompactionL0ToTier1 CompactionJobType = iota
-	CompactionTierMerge
+	CompactionL0Flush CompactionJobType = iota
+	CompactionConsecutiveMerge
 )
 
 type CompactionJob struct {
 	Type      CompactionJobType
-	Tier      int
 	InputSSTs []string
 	InputRuns []uint32
 	OutputRun *SortedRun
@@ -57,11 +56,14 @@ func NewCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOpt
 	if opts.L0CompactionThreshold == 0 {
 		opts.L0CompactionThreshold = defaults.L0CompactionThreshold
 	}
-	if opts.TierCompactionThreshold == 0 {
-		opts.TierCompactionThreshold = defaults.TierCompactionThreshold
+	if opts.MinSources == 0 {
+		opts.MinSources = defaults.MinSources
 	}
-	if opts.MaxTiers == 0 {
-		opts.MaxTiers = defaults.MaxTiers
+	if opts.MaxSources == 0 {
+		opts.MaxSources = defaults.MaxSources
+	}
+	if opts.SizeThreshold == 0 {
+		opts.SizeThreshold = defaults.SizeThreshold
 	}
 	if opts.BloomBitsPerKey == 0 {
 		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
@@ -202,14 +204,14 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 			continue
 		}
 
-		if job := c.findTierCompaction(m); job != nil {
-			if err := c.compactTier(ctx, m, job); err != nil {
+		if job := c.findConsecutiveCompaction(m); job != nil {
+			if err := c.compactRuns(ctx, m, job); err != nil {
 
 				if errors.Is(err, manifest.ErrFenced) {
 					c.fenced.Store(true)
 					return err
 				}
-				return fmt.Errorf("tier compaction: %w", err)
+				return fmt.Errorf("consecutive compaction: %w", err)
 			}
 			continue
 		}
@@ -226,8 +228,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 	}
 
 	job := CompactionJob{
-		Type:      CompactionL0ToTier1,
-		Tier:      0,
+		Type:      CompactionL0Flush,
 		InputSSTs: make([]string, len(m.L0SSTs)),
 	}
 	for i, sst := range m.L0SSTs {
@@ -301,67 +302,34 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 	return nil
 }
 
-func (c *Compactor) findTierCompaction(m *Manifest) *CompactionJob {
-	if len(m.SortedRuns) < c.opts.TierCompactionThreshold {
+func (c *Compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
+	runs := m.FindConsecutiveSimilarRuns(
+		c.opts.MinSources,
+		c.opts.MaxSources,
+		c.opts.SizeThreshold,
+	)
+
+	if len(runs) == 0 {
 		return nil
 	}
 
-	tiers := m.SortedRunsByTier(manifest.TieredConfig{
-		L0CompactionThreshold:   c.opts.L0CompactionThreshold,
-		TierCompactionThreshold: c.opts.TierCompactionThreshold,
-		MaxTiers:                c.opts.MaxTiers,
-		LazyLeveling:            c.opts.LazyLeveling,
-	})
+	job := &CompactionJob{
+		Type:      CompactionConsecutiveMerge,
+		InputRuns: make([]uint32, len(runs)),
+		InputSSTs: make([]string, 0),
+	}
 
-	for tierIdx := 0; tierIdx < len(tiers)-1; tierIdx++ {
-		tier := tiers[tierIdx]
-		if len(tier) >= c.opts.TierCompactionThreshold {
-
-			runsToMerge := tier
-			if len(runsToMerge) > c.opts.TierCompactionThreshold {
-
-				runsToMerge = tier[:c.opts.TierCompactionThreshold]
-			}
-
-			job := &CompactionJob{
-				Type:      CompactionTierMerge,
-				Tier:      tierIdx,
-				InputRuns: make([]uint32, len(runsToMerge)),
-				InputSSTs: make([]string, 0),
-			}
-			for i, run := range runsToMerge {
-				job.InputRuns[i] = run.ID
-				for _, sst := range run.SSTs {
-					job.InputSSTs = append(job.InputSSTs, sst.ID)
-				}
-			}
-			return job
+	for i, run := range runs {
+		job.InputRuns[i] = run.ID
+		for _, sst := range run.SSTs {
+			job.InputSSTs = append(job.InputSSTs, sst.ID)
 		}
 	}
 
-	if c.opts.LazyLeveling && len(tiers) > 0 {
-		finalTier := tiers[len(tiers)-1]
-		if len(finalTier) > 1 {
-			job := &CompactionJob{
-				Type:      CompactionTierMerge,
-				Tier:      len(tiers) - 1,
-				InputRuns: make([]uint32, len(finalTier)),
-				InputSSTs: make([]string, 0),
-			}
-			for i, run := range finalTier {
-				job.InputRuns[i] = run.ID
-				for _, sst := range run.SSTs {
-					job.InputSSTs = append(job.InputSSTs, sst.ID)
-				}
-			}
-			return job
-		}
-	}
-
-	return nil
+	return job
 }
 
-func (c *Compactor) compactTier(ctx context.Context, m *Manifest, job *CompactionJob) error {
+func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *CompactionJob) error {
 	if c.opts.OnCompactionStart != nil {
 		c.opts.OnCompactionStart(*job)
 	}

@@ -4,19 +4,19 @@ import (
 	"testing"
 )
 
-func TestDefaultTieredCompactionConfig(t *testing.T) {
-	cfg := DefaultTieredConfig()
+func TestDefaultCompactionConfig(t *testing.T) {
+	cfg := DefaultCompactionConfig()
 	if cfg.L0CompactionThreshold != 8 {
 		t.Fatalf("expected L0CompactionThreshold 8, got %d", cfg.L0CompactionThreshold)
 	}
-	if cfg.TierCompactionThreshold != 8 {
-		t.Fatalf("expected TierCompactionThreshold 8, got %d", cfg.TierCompactionThreshold)
+	if cfg.MinSources != 4 {
+		t.Fatalf("expected MinSources 4, got %d", cfg.MinSources)
 	}
-	if cfg.MaxTiers != 4 {
-		t.Fatalf("expected MaxTiers 4, got %d", cfg.MaxTiers)
+	if cfg.MaxSources != 8 {
+		t.Fatalf("expected MaxSources 8, got %d", cfg.MaxSources)
 	}
-	if !cfg.LazyLeveling {
-		t.Fatalf("expected LazyLeveling true")
+	if cfg.SizeThreshold != 4 {
+		t.Fatalf("expected SizeThreshold 4, got %d", cfg.SizeThreshold)
 	}
 }
 
@@ -290,5 +290,224 @@ func TestManifest_Clone(t *testing.T) {
 	}
 	if clone.SortedRuns[0].SSTs[0].ID != "b.sst" {
 		t.Fatalf("clone SortedRun SST was modified")
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_Basic(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 8, SSTs: []SSTMeta{{ID: "8.sst", Size: 16 * MB}}},
+			{ID: 7, SSTs: []SSTMeta{{ID: "7.sst", Size: 16 * MB}}},
+			{ID: 6, SSTs: []SSTMeta{{ID: "6.sst", Size: 16 * MB}}},
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 16 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 16 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 16 * MB}}},
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 16 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if len(runs) != 8 {
+		t.Fatalf("expected 8 consecutive similar runs, got %d", len(runs))
+	}
+
+	if runs[0].ID != 8 {
+		t.Errorf("expected first run ID 8, got %d", runs[0].ID)
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_LargeRunBlocks(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 8, SSTs: []SSTMeta{{ID: "8.sst", Size: 16 * MB}}},
+			{ID: 7, SSTs: []SSTMeta{{ID: "7.sst", Size: 16 * MB}}},
+			{ID: 6, SSTs: []SSTMeta{{ID: "6.sst", Size: 16 * MB}}},
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 16 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 16 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 16 * MB}}},
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 16 * MB}}},
+			{ID: 0, SSTs: []SSTMeta{{ID: "0.sst", Size: 512 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if len(runs) != 8 {
+		t.Fatalf("expected 8 consecutive similar runs (excluding the large one), got %d", len(runs))
+	}
+
+	for _, run := range runs {
+		if run.ID == 0 {
+			t.Errorf("large run (ID 0) should not be included")
+		}
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_NotEnoughRuns(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 16 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 16 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 16 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if runs != nil {
+		t.Fatalf("expected nil when not enough runs, got %d runs", len(runs))
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_SizeThresholdRespected(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 20 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 25 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 100 * MB}}},
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 15 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(3, 8, 4)
+
+	if len(runs) != 3 {
+		t.Fatalf("expected 3 consecutive similar runs, got %d", len(runs))
+	}
+
+	expectedIDs := []uint32{5, 4, 3}
+	for i, expected := range expectedIDs {
+		if runs[i].ID != expected {
+			t.Errorf("position %d: expected run ID %d, got %d", i, expected, runs[i].ID)
+		}
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_MaxSourcesRespected(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 10, SSTs: []SSTMeta{{ID: "10.sst", Size: 16 * MB}}},
+			{ID: 9, SSTs: []SSTMeta{{ID: "9.sst", Size: 16 * MB}}},
+			{ID: 8, SSTs: []SSTMeta{{ID: "8.sst", Size: 16 * MB}}},
+			{ID: 7, SSTs: []SSTMeta{{ID: "7.sst", Size: 16 * MB}}},
+			{ID: 6, SSTs: []SSTMeta{{ID: "6.sst", Size: 16 * MB}}},
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 16 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 16 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 16 * MB}}},
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 16 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 5, 4)
+
+	if len(runs) != 5 {
+		t.Fatalf("expected 5 runs (maxSources), got %d", len(runs))
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_EmptyManifest(t *testing.T) {
+	m := &Manifest{}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if runs != nil {
+		t.Fatalf("expected nil for empty manifest, got %d runs", len(runs))
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_StartsAtFirstValidGroup(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 8, SSTs: []SSTMeta{{ID: "8.sst", Size: 100 * MB}}},
+			{ID: 7, SSTs: []SSTMeta{{ID: "7.sst", Size: 16 * MB}}},
+			{ID: 6, SSTs: []SSTMeta{{ID: "6.sst", Size: 16 * MB}}},
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 16 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if len(runs) != 4 {
+		t.Fatalf("expected 4 runs, got %d", len(runs))
+	}
+	if runs[0].ID != 7 {
+		t.Errorf("expected first run ID 7, got %d", runs[0].ID)
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_SmallToLargeRatio(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 60 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 20 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 18 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if len(runs) != 4 {
+		t.Fatalf("expected 4 runs, got %d", len(runs))
+	}
+}
+
+func TestFindConsecutiveSimilarRuns_ExampleScenario(t *testing.T) {
+	const MB = 1024 * 1024
+
+	m := &Manifest{
+		SortedRuns: []SortedRun{
+			{ID: 8, SSTs: []SSTMeta{{ID: "8.sst", Size: 16 * MB}}},
+			{ID: 7, SSTs: []SSTMeta{{ID: "7.sst", Size: 16 * MB}}},
+			{ID: 6, SSTs: []SSTMeta{{ID: "6.sst", Size: 16 * MB}}},
+			{ID: 5, SSTs: []SSTMeta{{ID: "5.sst", Size: 16 * MB}}},
+			{ID: 4, SSTs: []SSTMeta{{ID: "4.sst", Size: 16 * MB}}},
+			{ID: 3, SSTs: []SSTMeta{{ID: "3.sst", Size: 16 * MB}}},
+			{ID: 2, SSTs: []SSTMeta{{ID: "2.sst", Size: 16 * MB}}},
+			{ID: 1, SSTs: []SSTMeta{{ID: "1.sst", Size: 16 * MB}}},
+			{ID: 0, SSTs: []SSTMeta{{ID: "0.sst", Size: 512 * MB}}},
+		},
+	}
+
+	runs := m.FindConsecutiveSimilarRuns(4, 8, 4)
+
+	if len(runs) != 8 {
+		t.Fatalf("expected 8 runs, got %d", len(runs))
+	}
+
+	var totalSize int64
+	for _, run := range runs {
+		totalSize += run.TotalSize()
+	}
+
+	expectedSize := int64(8 * 16 * MB)
+	if totalSize != expectedSize {
+		t.Errorf("expected total size %d, got %d", expectedSize, totalSize)
+	}
+
+	for _, run := range runs {
+		if run.ID == 0 {
+			t.Error("512MB run should not be included")
+		}
 	}
 }

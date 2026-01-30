@@ -112,14 +112,11 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 	defer cleaner.Close()
 
 	statsBefore := cleaner.Stats()
-	t.Logf("Before cleanup: L0=%d, SortedRuns=%d", statsBefore.L0SSTCount, statsBefore.SortedRunCount)
-
 	if err := cleaner.RunCleanup(ctx); err != nil {
 		t.Fatalf("RunCleanup failed: %v", err)
 	}
 
 	statsAfter := cleaner.Stats()
-	t.Logf("After cleanup: L0=%d, SortedRuns=%d", statsAfter.L0SSTCount, statsAfter.SortedRunCount)
 
 	totalAfter := statsAfter.L0SSTCount + statsAfter.SortedRunCount
 	if totalAfter > statsBefore.L0SSTCount+statsBefore.SortedRunCount {
@@ -208,8 +205,6 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 		OnCleanup: func(stats CleanupStats) {
 			callbackCalled.Store(true)
 			deletedCount = stats.SSTsDeleted
-			t.Logf("Cleanup: deleted %d SSTs, reclaimed %d bytes in %v",
-				stats.SSTsDeleted, stats.BytesReclaimed, stats.Duration)
 		},
 	}
 

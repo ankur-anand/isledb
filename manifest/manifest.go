@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+type CompactionConfig struct {
+	L0CompactionThreshold int `json:"l0_compaction_threshold,omitempty"`
+	MinSources            int `json:"min_sources,omitempty"`
+	MaxSources            int `json:"max_sources,omitempty"`
+	SizeThreshold         int `json:"size_threshold,omitempty"`
+}
+
 type Manifest struct {
 	Version   int    `json:"version"`
 	NextEpoch uint64 `json:"next_epoch"`
@@ -12,10 +19,10 @@ type Manifest struct {
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
 
-	L0SSTs          []SSTMeta    `json:"l0_ssts,omitempty"`
-	SortedRuns      []SortedRun  `json:"sorted_runs,omitempty"`
-	NextSortedRunID uint32       `json:"next_sorted_run_id,omitempty"`
-	TieredConfig    TieredConfig `json:"tiered_config,omitempty"`
+	L0SSTs           []SSTMeta        `json:"l0_ssts,omitempty"`
+	SortedRuns       []SortedRun      `json:"sorted_runs,omitempty"`
+	NextSortedRunID  uint32           `json:"next_sorted_run_id,omitempty"`
+	CompactionConfig CompactionConfig `json:"compaction_config,omitempty"`
 }
 
 type FenceToken struct {
@@ -27,14 +34,6 @@ type FenceToken struct {
 type SortedRun struct {
 	ID   uint32    `json:"id"`
 	SSTs []SSTMeta `json:"ssts"`
-}
-
-type TieredConfig struct {
-	L0CompactionThreshold   int  `json:"l0_compaction_threshold,omitempty"`
-	TierCompactionThreshold int  `json:"tier_compaction_threshold,omitempty"`
-	TierMaxRuns             int  `json:"tier_max_runs,omitempty"`
-	MaxTiers                int  `json:"max_tiers,omitempty"`
-	LazyLeveling            bool `json:"lazy_leveling,omitempty"`
 }
 
 type SSTSignature struct {
