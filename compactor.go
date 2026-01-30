@@ -81,7 +81,7 @@ func NewCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOpt
 		opts.TargetSSTSize = defaults.TargetSSTSize
 	}
 
-	manifestLog := manifest.NewStore(store)
+	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)

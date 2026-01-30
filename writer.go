@@ -69,7 +69,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) 
 		valueConfig.MaxValueSize = 256 * 1024 * 1024
 	}
 
-	manifestLog := manifest.NewStore(store)
+	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)

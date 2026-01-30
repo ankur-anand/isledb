@@ -27,7 +27,7 @@ const (
 )
 
 type Store struct {
-	store   *blobstore.Store
+	storage Storage
 	mu      sync.Mutex
 	nextSeq uint64
 
@@ -36,7 +36,11 @@ type Store struct {
 }
 
 func NewStore(store *blobstore.Store) *Store {
-	return &Store{store: store}
+	return NewStoreWithStorage(NewBlobStoreBackend(store))
+}
+
+func NewStoreWithStorage(storage Storage) *Store {
+	return &Store{storage: storage}
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
@@ -53,7 +57,7 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 
 		current, etag, err := s.readCurrentWithETag(ctx)
-		if err != nil && !errors.Is(err, blobstore.ErrNotFound) {
+		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
 		}
 		if current == nil {
@@ -87,7 +91,7 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 		}
 
 		if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
-			if errors.Is(err, blobstore.ErrPreconditionFailed) {
+			if errors.Is(err, ErrPreconditionFailed) {
 
 				time.Sleep(time.Millisecond * 10 * time.Duration(attempt+1))
 				continue
@@ -215,8 +219,8 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 	}
 
 	logName := formatLogSeq(entry.Seq)
-	path := s.store.ManifestLogPath(logName)
-	if _, err := s.store.Write(ctx, path, data); err != nil {
+	path, err := s.storage.WriteLog(ctx, logName, data)
+	if err != nil {
 		return fmt.Errorf("write log entry: %w", err)
 	}
 
@@ -297,8 +301,8 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 
 	var m *Manifest
 	if current != nil && current.Snapshot != "" {
-		data, _, err := s.store.Read(ctx, current.Snapshot)
-		if err != nil && !errors.Is(err, blobstore.ErrNotFound) {
+		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot)
+		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
 		}
 		if len(data) > 0 {
@@ -349,26 +353,19 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 }
 
 func (s *Store) List(ctx context.Context) ([]string, error) {
-	objects, err := s.store.ListManifestLogs(ctx)
+	objects, err := s.storage.ListLogs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list manifest logs: %w", err)
 	}
 
-	var entries []string
-	for _, obj := range objects {
-		if obj.IsDir {
-			continue
-		}
-		entries = append(entries, obj.Key)
-	}
-	sort.Strings(entries)
-	return entries, nil
+	sort.Strings(objects)
+	return objects, nil
 }
 
 func (s *Store) Read(ctx context.Context, path string) (*ManifestLogEntry, error) {
-	data, _, err := s.store.Read(ctx, path)
+	data, err := s.storage.ReadLog(ctx, path)
 	if err != nil {
-		if errors.Is(err, blobstore.ErrNotFound) {
+		if errors.Is(err, ErrNotFound) {
 			return nil, fmt.Errorf("log entry %s not found", path)
 		}
 		return nil, fmt.Errorf("read log entry: %w", err)
@@ -386,8 +383,8 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	}
 
 	id := ksuid.New().String()
-	path := s.store.ManifestSnapshotPath(id)
-	if _, err := s.store.Write(ctx, path, data); err != nil {
+	path, err := s.storage.WriteSnapshot(ctx, id, data)
+	if err != nil {
 		return "", err
 	}
 
@@ -428,9 +425,9 @@ func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
 }
 
 func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, error) {
-	data, attr, err := s.store.Read(ctx, s.store.ManifestPath())
+	data, etag, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
-		if errors.Is(err, blobstore.ErrNotFound) {
+		if errors.Is(err, ErrNotFound) {
 			return nil, "", nil
 		}
 		return nil, "", err
@@ -439,7 +436,7 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	if err := json.Unmarshal(data, &current); err != nil {
 		return nil, "", err
 	}
-	return &current, attr.ETag, nil
+	return &current, etag, nil
 }
 
 func (s *Store) writeCurrent(ctx context.Context, current *Current) error {
@@ -447,10 +444,7 @@ func (s *Store) writeCurrent(ctx context.Context, current *Current) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.store.Write(ctx, s.store.ManifestPath(), data); err != nil {
-		return err
-	}
-	return nil
+	return s.storage.WriteCurrent(ctx, data)
 }
 
 func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expectedETag string) error {
@@ -458,8 +452,7 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expec
 	if err != nil {
 		return err
 	}
-	_, err = s.store.WriteIfMatch(ctx, s.store.ManifestPath(), data, expectedETag)
-	return err
+	return s.storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
 func (s *Store) appendCurrent(ctx context.Context, logPath string, entry *ManifestLogEntry) error {

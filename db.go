@@ -10,6 +10,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -28,7 +29,8 @@ type DBOptions struct {
 	BlockSize       int
 	Compression     string
 
-	ValueStorage config.ValueStorageConfig
+	ValueStorage    config.ValueStorageConfig
+	ManifestStorage manifest.Storage
 
 	AppendOnlyMode bool
 
@@ -211,6 +213,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		Compression:     opts.Compression,
 		ValueStorage:    opts.ValueStorage,
 		OnFlushError:    opts.OnFlushError,
+		ManifestStorage: opts.ManifestStorage,
 	}
 
 	writer, err := newWriter(ctx, store, writerOpts)
@@ -224,6 +227,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 		BlobCacheSize:      opts.BlobCacheSize,
 		BlobCacheItemSize:  opts.BlobCacheItemSize,
 		ValueStorageConfig: opts.ValueStorage,
+		ManifestStorage:    opts.ManifestStorage,
 	}
 
 	reader, err := NewReader(ctx, store, readerOpts)
@@ -248,6 +252,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 			CheckInterval:   opts.RetentionCompactorInterval,
 			SegmentDuration: opts.AppendOnlySegmentDuration,
 			OnCleanup:       opts.OnAppendOnlyCleanup,
+			ManifestStorage: opts.ManifestStorage,
 		}
 
 		if appendOnlyCleanerOpts.RetentionPeriod == 0 {
@@ -285,6 +290,7 @@ func Open(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, err
 			CheckInterval:         opts.CompactionCheckInterval,
 			OnCompactionStart:     opts.OnCompactionStart,
 			OnCompactionEnd:       opts.OnCompactionEnd,
+			ManifestStorage:       opts.ManifestStorage,
 		}
 
 		compactor, err := NewCompactor(ctx, store, compactorOpts)

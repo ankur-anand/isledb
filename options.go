@@ -5,6 +5,7 @@ import (
 
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/manifest"
 )
 
 type WriterOptions struct {
@@ -14,8 +15,9 @@ type WriterOptions struct {
 	BlockSize       int
 	Compression     string
 
-	OnFlushError func(error)
-	ValueStorage config.ValueStorageConfig
+	OnFlushError    func(error)
+	ValueStorage    config.ValueStorageConfig
+	ManifestStorage manifest.Storage
 
 	EnableFencing bool
 	OwnerID       string
@@ -41,6 +43,7 @@ type ReaderOptions struct {
 	BlobCacheSize      int64
 	BlobCacheItemSize  int64
 	ValueStorageConfig config.ValueStorageConfig
+	ManifestStorage    manifest.Storage
 }
 
 func DefaultReaderOptions() ReaderOptions {
@@ -81,6 +84,7 @@ type CompactorOptions struct {
 	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
+	ManifestStorage   manifest.Storage
 
 	EnableFencing bool
 	OwnerID       string

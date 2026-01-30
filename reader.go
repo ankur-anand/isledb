@@ -37,7 +37,7 @@ type KV struct {
 }
 
 func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) (*Reader, error) {
-	ms := manifest.NewStore(store)
+	ms := newManifestStore(store, opts.ManifestStorage)
 	m, err := ms.Replay(ctx)
 	if err != nil {
 		return nil, err
