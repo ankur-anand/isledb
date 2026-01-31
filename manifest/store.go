@@ -42,6 +42,10 @@ func NewStoreWithStorage(storage Storage) *Store {
 	return &Store{storage: storage}
 }
 
+func (s *Store) Storage() Storage {
+	return s.storage
+}
+
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
 	return s.claimFence(ctx, FenceRoleWriter, ownerID)
 }

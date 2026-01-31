@@ -3,6 +3,7 @@ package isledb
 import (
 	"time"
 
+	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
@@ -44,6 +45,10 @@ type ReaderOptions struct {
 	BlobCacheItemSize  int64
 	ValueStorageConfig config.ValueStorageConfig
 	ManifestStorage    manifest.Storage
+
+	ManifestLogCache     cachestore.ManifestLogCache
+	ManifestLogCacheSize int
+	DisableManifestCache bool
 }
 
 func DefaultReaderOptions() ReaderOptions {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
@@ -37,7 +38,7 @@ type KV struct {
 }
 
 func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) (*Reader, error) {
-	ms := newManifestStore(store, opts.ManifestStorage)
+	ms := newManifestStoreWithCache(store, &opts)
 	m, err := ms.Replay(ctx)
 	if err != nil {
 		return nil, err
@@ -569,6 +570,13 @@ func (r *Reader) SSTCacheStats() SSTCacheStats {
 
 func (r *Reader) SSTReaderCacheStats() SSTReaderCacheStats {
 	return r.sstReaderCache.Stats()
+}
+
+func (r *Reader) ManifestLogCacheStats() cachestore.ManifestLogCacheStats {
+	if cs, ok := r.manifestStore.Storage().(*cachestore.CachingStorage); ok {
+		return cs.CacheStats()
+	}
+	return cachestore.ManifestLogCacheStats{}
 }
 
 type sstReadable struct {

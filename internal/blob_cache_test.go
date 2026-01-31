@@ -224,14 +224,14 @@ func TestLRUBlobCache_ImmutableData(t *testing.T) {
 
 	got, _ := cache.Get(id)
 	if string(got) != "original" {
-		t.Error("Cache data was mutated when original was changed")
+		t.Error("ManifestCache data was mutated when original was changed")
 	}
 
 	got[0] = 'Y'
 
 	got2, _ := cache.Get(id)
 	if string(got2) != "original" {
-		t.Error("Cache data was mutated when retrieved copy was changed")
+		t.Error("ManifestCache data was mutated when retrieved copy was changed")
 	}
 }
 
