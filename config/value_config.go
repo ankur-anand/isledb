@@ -2,41 +2,54 @@ package config
 
 import "time"
 
-type ValueStorageConfig struct {
-	MaxKeySize int
-
+type ValueOptions struct {
+	MaxKeySize    int
 	BlobThreshold int
+	MaxValueSize  int64
+}
 
-	MaxValueSize int64
-
-	TargetSSTSize int64
-
-	BlockSize int
-
+type BlobReadOptions struct {
 	VerifyBlobsOnRead bool
+}
 
-	BlobGCEnabled bool
+type BlobGCOptions struct {
+	Enabled  bool
+	Interval time.Duration
+	MinAge   time.Duration
+}
 
-	BlobGCInterval time.Duration
+type ValueStorageConfig struct {
+	ValueOptions
+	BlobReadOptions
+	BlobGCOptions
+}
 
-	BlobGCMinAge time.Duration
+func DefaultValueOptions() ValueOptions {
+	return ValueOptions{
+		MaxKeySize:    64 * 1024,
+		BlobThreshold: 256 * 1024,
+		MaxValueSize:  256 * 1024 * 1024,
+	}
+}
+
+func DefaultBlobReadOptions() BlobReadOptions {
+	return BlobReadOptions{
+		VerifyBlobsOnRead: false,
+	}
+}
+
+func DefaultBlobGCOptions() BlobGCOptions {
+	return BlobGCOptions{
+		Enabled:  true,
+		Interval: time.Hour,
+		MinAge:   10 * time.Minute,
+	}
 }
 
 func DefaultValueStorageConfig() ValueStorageConfig {
 	return ValueStorageConfig{
-
-		MaxKeySize: 64 * 1024,
-
-		BlobThreshold: 256 * 1024,
-		MaxValueSize:  256 * 1024 * 1024,
-
-		TargetSSTSize: 64 * 1024 * 1024,
-		BlockSize:     64 * 1024,
-
-		VerifyBlobsOnRead: false,
-
-		BlobGCEnabled:  true,
-		BlobGCInterval: time.Hour,
-		BlobGCMinAge:   10 * time.Minute,
+		ValueOptions:    DefaultValueOptions(),
+		BlobReadOptions: DefaultBlobReadOptions(),
+		BlobGCOptions:   DefaultBlobGCOptions(),
 	}
 }

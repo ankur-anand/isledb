@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -41,33 +42,18 @@ type writer struct {
 
 func newWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) (*writer, error) {
 
-	defaults := DefaultWriterOptions()
-	if opts.MemtableSize == 0 {
-		opts.MemtableSize = defaults.MemtableSize
-	}
-	if opts.FlushInterval == 0 {
-		opts.FlushInterval = defaults.FlushInterval
-	}
-	if opts.BloomBitsPerKey == 0 {
-		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
-	}
-	if opts.BlockSize == 0 {
-		opts.BlockSize = defaults.BlockSize
-	}
-	if opts.Compression == "" {
-		opts.Compression = defaults.Compression
-	}
+	d := DefaultWriterOptions()
+	opts.MemtableSize = cmp.Or(opts.MemtableSize, d.MemtableSize)
+	opts.FlushInterval = cmp.Or(opts.FlushInterval, d.FlushInterval)
+	opts.BloomBitsPerKey = cmp.Or(opts.BloomBitsPerKey, d.BloomBitsPerKey)
+	opts.BlockSize = cmp.Or(opts.BlockSize, d.BlockSize)
+	opts.Compression = cmp.Or(opts.Compression, d.Compression)
 
+	vd := config.DefaultValueStorageConfig()
 	valueConfig := opts.ValueStorage
-	if valueConfig.BlobThreshold == 0 {
-		valueConfig = config.DefaultValueStorageConfig()
-	}
-	if valueConfig.MaxKeySize == 0 {
-		valueConfig.MaxKeySize = 64 * 1024
-	}
-	if valueConfig.MaxValueSize == 0 {
-		valueConfig.MaxValueSize = 256 * 1024 * 1024
-	}
+	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
+	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
+	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
 
 	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
