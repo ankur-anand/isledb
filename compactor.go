@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,8 @@ const (
 	CompactionConsecutiveMerge
 )
 
+const CompactionMaxIterations = 100
+
 type CompactionJob struct {
 	Type      CompactionJobType
 	InputSSTs []string
@@ -31,6 +34,7 @@ type CompactionJob struct {
 	OutputRun *SortedRun
 }
 
+// Compactor merges SSTs into sorted runs in the background.
 type Compactor struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
@@ -50,36 +54,17 @@ type Compactor struct {
 	closed  atomic.Bool
 }
 
-func NewCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOptions) (*Compactor, error) {
-
-	defaults := DefaultCompactorOptions()
-	if opts.L0CompactionThreshold == 0 {
-		opts.L0CompactionThreshold = defaults.L0CompactionThreshold
-	}
-	if opts.MinSources == 0 {
-		opts.MinSources = defaults.MinSources
-	}
-	if opts.MaxSources == 0 {
-		opts.MaxSources = defaults.MaxSources
-	}
-	if opts.SizeThreshold == 0 {
-		opts.SizeThreshold = defaults.SizeThreshold
-	}
-	if opts.BloomBitsPerKey == 0 {
-		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
-	}
-	if opts.BlockSize == 0 {
-		opts.BlockSize = defaults.BlockSize
-	}
-	if opts.Compression == "" {
-		opts.Compression = defaults.Compression
-	}
-	if opts.CheckInterval == 0 {
-		opts.CheckInterval = defaults.CheckInterval
-	}
-	if opts.TargetSSTSize == 0 {
-		opts.TargetSSTSize = defaults.TargetSSTSize
-	}
+func newCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOptions) (*Compactor, error) {
+	d := DefaultCompactorOptions()
+	opts.L0CompactionThreshold = cmp.Or(opts.L0CompactionThreshold, d.L0CompactionThreshold)
+	opts.MinSources = cmp.Or(opts.MinSources, d.MinSources)
+	opts.MaxSources = cmp.Or(opts.MaxSources, d.MaxSources)
+	opts.SizeThreshold = cmp.Or(opts.SizeThreshold, d.SizeThreshold)
+	opts.BloomBitsPerKey = cmp.Or(opts.BloomBitsPerKey, d.BloomBitsPerKey)
+	opts.BlockSize = cmp.Or(opts.BlockSize, d.BlockSize)
+	opts.Compression = cmp.Or(opts.Compression, d.Compression)
+	opts.CheckInterval = cmp.Or(opts.CheckInterval, d.CheckInterval)
+	opts.TargetSSTSize = cmp.Or(opts.TargetSSTSize, d.TargetSSTSize)
 
 	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
@@ -121,7 +106,6 @@ func (c *Compactor) Start() {
 }
 
 func (c *Compactor) Stop() {
-
 	if !c.running.CompareAndSwap(true, false) {
 		return
 	}
@@ -133,7 +117,6 @@ func (c *Compactor) Stop() {
 }
 
 func (c *Compactor) Close() error {
-
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -171,15 +154,13 @@ func (c *Compactor) compactionLoop() {
 	}
 }
 
+// RunCompaction performs a compaction cycle and returns when no work remains.
 func (c *Compactor) RunCompaction(ctx context.Context) error {
-	const maxIterations = 100
 
-	for i := 0; i < maxIterations; i++ {
-
+	for i := 0; i < CompactionMaxIterations; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-
 		if c.fenced.Load() {
 			return manifest.ErrFenced
 		}
@@ -219,6 +200,8 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 		return nil
 	}
 
+	slog.Warn("isledb: compaction hit max iterations, possible infinite loop or excessive L0 accumulation",
+		"CompactionMaxIterations", CompactionMaxIterations)
 	return nil
 }
 

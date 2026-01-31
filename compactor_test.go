@@ -52,9 +52,9 @@ func TestCompactor_L0Compaction(t *testing.T) {
 		}
 	}
 
-	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 	defer compactor.Close()
 
@@ -116,9 +116,9 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
 
-	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 
 	if err := compactor.RunCompaction(ctx); err != nil {
@@ -188,9 +188,9 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
 
-	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 
 	if err := compactor.RunCompaction(ctx); err != nil {
@@ -242,9 +242,9 @@ func TestCompactor_BackgroundLoop(t *testing.T) {
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.CheckInterval = 10 * time.Millisecond
 
-	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 
 	compactor.Start()
@@ -262,9 +262,9 @@ func TestCompactor_Refresh(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
-	compactor, err := NewCompactor(ctx, store, DefaultCompactorOptions())
+	compactor, err := newCompactor(ctx, store, DefaultCompactorOptions())
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 	defer compactor.Close()
 
@@ -331,9 +331,9 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	compactorOpts.TargetSSTSize = 4 * 1024
 	compactorOpts.CheckInterval = time.Hour
 
-	compactor, err := NewCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 	defer compactor.Close()
 
@@ -416,9 +416,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, compactorOpts)
 		if err != nil {
-			t.Fatalf("NewCompactor: %v", err)
+			t.Fatalf("newCompactor: %v", err)
 		}
 
 		if err := compactor.RunCompaction(ctx); err != nil {
@@ -497,9 +497,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, compactorOpts)
 		if err != nil {
-			t.Fatalf("NewCompactor: %v", err)
+			t.Fatalf("newCompactor: %v", err)
 		}
 
 		if err := compactor.RunCompaction(ctx); err != nil {
@@ -566,9 +566,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			}
 			writer.close()
 
-			compactor, err := NewCompactor(ctx, store, compactorOpts)
+			compactor, err := newCompactor(ctx, store, compactorOpts)
 			if err != nil {
-				t.Fatalf("NewCompactor: %v", err)
+				t.Fatalf("newCompactor: %v", err)
 			}
 
 			if err := compactor.RunCompaction(ctx); err != nil {
@@ -577,9 +577,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			compactor.Close()
 		}
 
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, compactorOpts)
 		if err != nil {
-			t.Fatalf("NewCompactor: %v", err)
+			t.Fatalf("newCompactor: %v", err)
 		}
 
 		compactor.Close()
@@ -651,9 +651,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, compactorOpts)
 		if err != nil {
-			t.Fatalf("NewCompactor: %v", err)
+			t.Fatalf("newCompactor: %v", err)
 		}
 
 		if err := compactor.RunCompaction(ctx); err != nil {
@@ -774,9 +774,9 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 	writer1.close()
 
-	compactor1, err := NewCompactor(ctx, store, compactorOpts)
+	compactor1, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 	if err := compactor1.RunCompaction(ctx); err != nil {
 		t.Fatalf("RunCompaction: %v", err)
@@ -812,9 +812,9 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 	writer2.close()
 
-	compactor2, err := NewCompactor(ctx, store, compactorOpts)
+	compactor2, err := newCompactor(ctx, store, compactorOpts)
 	if err != nil {
-		t.Fatalf("NewCompactor: %v", err)
+		t.Fatalf("newCompactor: %v", err)
 	}
 	if err := compactor2.RunCompaction(ctx); err != nil {
 		t.Fatalf("RunCompaction: %v", err)
@@ -881,9 +881,9 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := NewCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, compactorOpts)
 		if err != nil {
-			t.Fatalf("NewCompactor: %v", err)
+			t.Fatalf("newCompactor: %v", err)
 		}
 		if err := compactor.RunCompaction(ctx); err != nil {
 			t.Fatalf("RunCompaction: %v", err)

@@ -356,7 +356,7 @@ func New(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, erro
 		db.retentionCompactor = retentionCompactor
 
 	} else if opts.EnableCompaction {
-		compactor, err := NewCompactor(ctx, store, opts.ToCompactorOptions())
+		compactor, err := newCompactor(ctx, store, opts.ToCompactorOptions())
 		if err != nil {
 			return nil, err
 		}
