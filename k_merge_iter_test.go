@@ -42,15 +42,15 @@ func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 	})
 	defer readerNew.Close()
 
-	merge := NewMergeIterator([]sstable.Iterator{iterOld, iterNew})
-	defer merge.Close()
+	merge := newMergeIterator([]sstable.Iterator{iterOld, iterNew})
+	defer merge.close()
 
 	if !merge.Next() {
 		t.Fatalf("expected entry")
 	}
-	entry, err := merge.Entry()
+	entry, err := merge.entry()
 	if err != nil {
-		t.Fatalf("Entry: %v", err)
+		t.Fatalf("entry: %v", err)
 	}
 	if !bytes.Equal(entry.Key, []byte("k")) {
 		t.Fatalf("key: got %q want %q", entry.Key, []byte("k"))
@@ -89,15 +89,15 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 	iterSet.First()
 	iterDel.First()
 
-	merge := NewMergeIterator([]sstable.Iterator{iterSet, iterDel})
-	defer merge.Close()
+	merge := newMergeIterator([]sstable.Iterator{iterSet, iterDel})
+	defer merge.close()
 
 	if !merge.Next() {
 		t.Fatalf("expected entry")
 	}
-	entry, err := merge.Entry()
+	entry, err := merge.entry()
 	if err != nil {
-		t.Fatalf("Entry: %v", err)
+		t.Fatalf("entry: %v", err)
 	}
 
 	if trailerSet > trailerDel {
@@ -179,14 +179,14 @@ func BenchmarkKMergeIterator_DisjointKeys(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				count := 0
 				for merge.Next() {
-					_ = merge.Key()
-					_ = merge.Value()
+					_ = merge.key()
+					_ = merge.value()
 					count++
 				}
-				merge.Close()
+				merge.close()
 
 				if count != numIters*entriesPerIter {
 					b.Fatalf("expected %d entries, got %d", numIters*entriesPerIter, count)
@@ -229,13 +229,13 @@ func BenchmarkKMergeIterator_OverlappingKeys(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				count := 0
 				for merge.Next() {
-					_ = merge.Key()
+					_ = merge.key()
 					count++
 				}
-				merge.Close()
+				merge.close()
 
 				if count != entriesPerIter {
 					b.Fatalf("expected %d unique entries, got %d", entriesPerIter, count)
@@ -314,12 +314,12 @@ func BenchmarkKMergeIterator_EntryCounts(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				count := 0
 				for merge.Next() {
 					count++
 				}
-				merge.Close()
+				merge.close()
 
 				if count != numIters*entryCount {
 					b.Fatalf("expected %d entries, got %d", numIters*entryCount, count)
@@ -359,13 +359,13 @@ func BenchmarkKMergeIterator_ValueSizes(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				count := 0
 				for merge.Next() {
-					_ = merge.Value()
+					_ = merge.value()
 					count++
 				}
-				merge.Close()
+				merge.close()
 			}
 
 			b.ReportMetric(float64(valueSize), "bytes/value")
@@ -400,12 +400,12 @@ func BenchmarkKMergeIterator_WithEntryDecode(b *testing.B) {
 				iters[j] = iter
 			}
 
-			merge := NewMergeIterator(iters)
+			merge := newMergeIterator(iters)
 			for merge.Next() {
-				_ = merge.Key()
-				_ = merge.Value()
+				_ = merge.key()
+				_ = merge.value()
 			}
-			merge.Close()
+			merge.close()
 		}
 	})
 
@@ -420,11 +420,11 @@ func BenchmarkKMergeIterator_WithEntryDecode(b *testing.B) {
 				iters[j] = iter
 			}
 
-			merge := NewMergeIterator(iters)
+			merge := newMergeIterator(iters)
 			for merge.Next() {
-				_, _ = merge.Entry()
+				_, _ = merge.entry()
 			}
-			merge.Close()
+			merge.close()
 		}
 	})
 }
@@ -588,13 +588,13 @@ func BenchmarkMergeIterator_Comparison(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				count := 0
 				for merge.Next() {
-					_ = merge.Key()
+					_ = merge.key()
 					count++
 				}
-				merge.Close()
+				merge.close()
 			}
 		})
 
@@ -653,10 +653,10 @@ func BenchmarkKMergeIterator_HeapOperations(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := NewMergeIterator(iters)
+				merge := newMergeIterator(iters)
 				for merge.Next() {
 				}
-				merge.Close()
+				merge.close()
 			}
 
 			b.ReportMetric(float64(numIters), "heap_size")

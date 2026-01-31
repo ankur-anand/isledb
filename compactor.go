@@ -235,7 +235,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 		}
 	}()
 
-	mergeIter := NewMergeIterator(iters)
+	mergeIter := newMergeIterator(iters)
 
 	newEpoch := m.NextEpoch
 	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
@@ -342,7 +342,7 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 		}
 	}()
 
-	mergeIter := NewMergeIterator(iters)
+	mergeIter := newMergeIterator(iters)
 
 	newEpoch := m.NextEpoch
 	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
@@ -454,8 +454,8 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 	return iters, readers, nil
 }
 
-func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
-	defer iter.Close()
+func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
+	defer iter.close()
 
 	sstOpts := SSTWriterOptions{
 		BloomBitsPerKey: c.opts.BloomBitsPerKey,
@@ -487,7 +487,7 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *KMergeIterator
 }
 
 type mergeIteratorAdapter struct {
-	iter    *KMergeIterator
+	iter    *kMergeIterator
 	current *internal.MemEntry
 	done    bool
 	err     error
@@ -503,7 +503,7 @@ func (a *mergeIteratorAdapter) Next() bool {
 		return false
 	}
 
-	entry, err := a.iter.Entry()
+	entry, err := a.iter.entry()
 	if err != nil {
 		a.err = err
 		a.done = true

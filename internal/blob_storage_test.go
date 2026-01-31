@@ -34,7 +34,7 @@ func TestBlobStorage_WriteAndRead(t *testing.T) {
 	}
 
 	if string(readValue) != string(value) {
-		t.Errorf("Value mismatch: got %q, want %q", readValue, value)
+		t.Errorf("value mismatch: got %q, want %q", readValue, value)
 	}
 }
 
@@ -125,7 +125,7 @@ func TestBlobStorage_VerifyOnRead(t *testing.T) {
 	}
 
 	if string(readValue) != string(value) {
-		t.Errorf("Value mismatch")
+		t.Errorf("value mismatch")
 	}
 }
 

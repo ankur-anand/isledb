@@ -262,7 +262,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 		return nil, nil
 	}
 
-	mergeIter := NewMergeIterator(allIters)
+	mergeIter := newMergeIterator(allIters)
 
 	nowMs := time.Now().UnixMilli()
 	var out []KV
@@ -271,7 +271,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 			return nil, err
 		}
 
-		entry, err := mergeIter.Entry()
+		entry, err := mergeIter.entry()
 		if err != nil {
 			return nil, err
 		}
@@ -356,7 +356,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		return nil, nil
 	}
 
-	mergeIter := NewMergeIterator(allIters)
+	mergeIter := newMergeIterator(allIters)
 
 	nowMs := time.Now().UnixMilli()
 	var out []KV
@@ -369,7 +369,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 			break
 		}
 
-		entry, err := mergeIter.Entry()
+		entry, err := mergeIter.entry()
 		if err != nil {
 			return nil, err
 		}
@@ -626,7 +626,7 @@ type Iterator struct {
 	minKey    []byte
 	maxKey    []byte
 	nowMs     int64
-	mergeIter *KMergeIterator
+	mergeIter *kMergeIterator
 	sstIters  []sstable.Iterator
 	current   *iterEntry
 	started   bool
@@ -698,7 +698,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		minKey:    opts.MinKey,
 		maxKey:    opts.MaxKey,
 		nowMs:     time.Now().UnixMilli(),
-		mergeIter: NewMergeIterator(allIters),
+		mergeIter: newMergeIterator(allIters),
 		sstIters:  allIters,
 		closed:    false,
 	}, nil
@@ -723,7 +723,7 @@ func (it *Iterator) Next() bool {
 			return false
 		}
 
-		entry, err := it.mergeIter.Entry()
+		entry, err := it.mergeIter.entry()
 		if err != nil {
 			it.err = err
 			return false

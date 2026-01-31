@@ -32,13 +32,13 @@ func TestTTL_EntryEncodeDecode(t *testing.T) {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", decoded.ExpireAt, expireAt)
 	}
 	if decoded.Kind != internal.OpPut {
-		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, internal.OpPut)
+		t.Errorf("kind mismatch: got %d, want %d", decoded.Kind, internal.OpPut)
 	}
 	if !decoded.Inline {
 		t.Error("Expected Inline to be true")
 	}
 	if string(decoded.Value) != "value1" {
-		t.Errorf("Value mismatch: got %q, want %q", decoded.Value, "value1")
+		t.Errorf("value mismatch: got %q, want %q", decoded.Value, "value1")
 	}
 }
 
@@ -63,7 +63,7 @@ func TestTTL_EntryEncodeDecodeNoTTL(t *testing.T) {
 		t.Errorf("ExpireAt should be 0, got %d", decoded.ExpireAt)
 	}
 	if string(decoded.Value) != "value1" {
-		t.Errorf("Value mismatch: got %q, want %q", decoded.Value, "value1")
+		t.Errorf("value mismatch: got %q, want %q", decoded.Value, "value1")
 	}
 }
 
@@ -85,7 +85,7 @@ func TestTTL_DeleteWithTTL(t *testing.T) {
 	}
 
 	if decoded.Kind != internal.OpDelete {
-		t.Errorf("Kind mismatch: got %d, want %d", decoded.Kind, internal.OpDelete)
+		t.Errorf("kind mismatch: got %d, want %d", decoded.Kind, internal.OpDelete)
 	}
 	if decoded.ExpireAt != expireAt {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", decoded.ExpireAt, expireAt)
@@ -166,7 +166,7 @@ func TestTTL_MemtablePutWithTTL(t *testing.T) {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", entry.ExpireAt, expireAt)
 	}
 	if string(entry.Value) != "value1" {
-		t.Errorf("Value mismatch: got %q, want %q", entry.Value, "value1")
+		t.Errorf("value mismatch: got %q, want %q", entry.Value, "value1")
 	}
 }
 
@@ -207,7 +207,7 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 		t.Error("Expected to find key1")
 	}
 	if string(val) != "value1" {
-		t.Errorf("Value mismatch: got %q, want %q", val, "value1")
+		t.Errorf("value mismatch: got %q, want %q", val, "value1")
 	}
 }
 
@@ -263,7 +263,7 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 		t.Error("Expected valid_key to be found")
 	}
 	if string(val) != "valid_value" {
-		t.Errorf("Value mismatch: got %q, want %q", val, "valid_value")
+		t.Errorf("value mismatch: got %q, want %q", val, "valid_value")
 	}
 }
 

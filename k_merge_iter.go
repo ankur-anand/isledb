@@ -9,7 +9,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-type KMergeIterator struct {
+type kMergeIterator struct {
 	iters   []*sstIterWrapper
 	heap    mergeHeap
 	current *mergeEntry
@@ -60,8 +60,8 @@ func (h *mergeHeap) Pop() interface{} {
 	return x
 }
 
-func NewMergeIterator(iters []sstable.Iterator) *KMergeIterator {
-	mi := &KMergeIterator{
+func newMergeIterator(iters []sstable.Iterator) *kMergeIterator {
+	mi := &kMergeIterator{
 		iters: make([]*sstIterWrapper, len(iters)),
 		heap:  make(mergeHeap, 0, len(iters)),
 	}
@@ -75,7 +75,7 @@ func NewMergeIterator(iters []sstable.Iterator) *KMergeIterator {
 	return mi
 }
 
-func (mi *KMergeIterator) advanceIter(i int) {
+func (mi *kMergeIterator) advanceIter(i int) {
 	wrapper := mi.iters[i]
 	kv := wrapper.iter.First()
 	if kv != nil {
@@ -83,7 +83,7 @@ func (mi *KMergeIterator) advanceIter(i int) {
 	}
 }
 
-func (mi *KMergeIterator) advanceIterNext(i int) {
+func (mi *kMergeIterator) advanceIterNext(i int) {
 	wrapper := mi.iters[i]
 	kv := wrapper.iter.Next()
 	if kv != nil {
@@ -91,7 +91,7 @@ func (mi *KMergeIterator) advanceIterNext(i int) {
 	}
 }
 
-func (mi *KMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, source int) {
+func (mi *kMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, source int) {
 	trailer := ikey.Trailer
 	seq := uint64(trailer >> 8)
 	kind := ikey.Kind()
@@ -114,7 +114,7 @@ func (mi *KMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, sourc
 	heap.Push(&mi.heap, entry)
 }
 
-func (mi *KMergeIterator) Next() bool {
+func (mi *kMergeIterator) Next() bool {
 	for mi.heap.Len() > 0 {
 		entry := heap.Pop(&mi.heap).(*mergeEntry)
 
@@ -131,35 +131,35 @@ func (mi *KMergeIterator) Next() bool {
 	return false
 }
 
-func (mi *KMergeIterator) Key() []byte {
+func (mi *kMergeIterator) key() []byte {
 	if mi.current == nil {
 		return nil
 	}
 	return mi.current.key
 }
 
-func (mi *KMergeIterator) Seq() uint64 {
+func (mi *kMergeIterator) seq() uint64 {
 	if mi.current == nil {
 		return 0
 	}
 	return mi.current.seq
 }
 
-func (mi *KMergeIterator) Kind() pebble.InternalKeyKind {
+func (mi *kMergeIterator) kind() pebble.InternalKeyKind {
 	if mi.current == nil {
 		return pebble.InternalKeyKindInvalid
 	}
 	return mi.current.kind
 }
 
-func (mi *KMergeIterator) Value() []byte {
+func (mi *kMergeIterator) value() []byte {
 	if mi.current == nil {
 		return nil
 	}
 	return mi.current.value
 }
 
-func (mi *KMergeIterator) Entry() (internal.CompactionEntry, error) {
+func (mi *kMergeIterator) entry() (internal.CompactionEntry, error) {
 	if mi.current == nil {
 		return internal.CompactionEntry{}, nil
 	}
@@ -195,7 +195,7 @@ func (mi *KMergeIterator) Entry() (internal.CompactionEntry, error) {
 	return entry, nil
 }
 
-func (mi *KMergeIterator) Err() error {
+func (mi *kMergeIterator) Err() error {
 	if mi.err != nil {
 		return mi.err
 	}
@@ -207,7 +207,7 @@ func (mi *KMergeIterator) Err() error {
 	return nil
 }
 
-func (mi *KMergeIterator) Close() error {
+func (mi *kMergeIterator) close() error {
 	var firstErr error
 	for _, w := range mi.iters {
 		if err := w.iter.Close(); err != nil && firstErr == nil {
