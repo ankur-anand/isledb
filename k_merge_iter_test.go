@@ -21,7 +21,7 @@ func buildTestIter(t *testing.T, entries []internal.MemEntry) (*sstable.Reader, 
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
@@ -139,7 +139,7 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
-		b.Fatalf("NewReader: %v", err)
+		b.Fatalf("newReader: %v", err)
 	}
 	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
@@ -276,7 +276,7 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
 	if err != nil {
-		b.Fatalf("NewReader: %v", err)
+		b.Fatalf("newReader: %v", err)
 	}
 	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {

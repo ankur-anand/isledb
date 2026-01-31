@@ -131,5 +131,5 @@ type TailOptions struct {
 	// If set, it overrides MinKey as the lower bound.
 	StartAfterKey []byte
 	// PollInterval controls how often to check for new keys.
-	PollInterval  time.Duration
+	PollInterval time.Duration
 }

@@ -31,7 +31,7 @@ func newTailingReader(ctx context.Context, store *blobstore.Store, opts TailingR
 		opts.RefreshInterval = 100 * time.Millisecond
 	}
 
-	reader, err := NewReader(ctx, store, opts.ReaderOptions)
+	reader, err := newReader(ctx, store, opts.ReaderOptions)
 	if err != nil {
 		return nil, err
 	}

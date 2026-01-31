@@ -193,9 +193,9 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -241,9 +241,9 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -302,9 +302,9 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -359,9 +359,9 @@ func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 

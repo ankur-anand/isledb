@@ -37,7 +37,7 @@ type KV struct {
 	Value []byte
 }
 
-func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) (*Reader, error) {
+func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) (*Reader, error) {
 	ms := newManifestStoreWithCache(store, &opts)
 	m, err := ms.Replay(ctx)
 	if err != nil {
@@ -94,6 +94,7 @@ func NewReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 	}, nil
 }
 
+// Refresh reloads the manifest and invalidates caches for removed SSTs.
 func (r *Reader) Refresh(ctx context.Context) error {
 	m, err := r.manifestStore.Replay(ctx)
 	if err != nil {
@@ -160,6 +161,7 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 	return r.manifest
 }
 
+// Get returns the value for key if present and not deleted/expired.
 func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	if len(key) == 0 {
 		return nil, false, errors.New("empty key")
@@ -211,6 +213,7 @@ func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
+// Scan returns all key-value pairs in the given key range.
 func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
 	r.mu.RLock()
 	m := r.manifest

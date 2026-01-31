@@ -333,7 +333,7 @@ func New(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, erro
 	}
 	guard.add(writer.close)
 
-	reader, err := NewReader(ctx, store, opts.ToReaderOptions())
+	reader, err := newReader(ctx, store, opts.ToReaderOptions())
 	if err != nil {
 		return nil, err
 	}

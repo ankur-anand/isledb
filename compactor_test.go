@@ -126,9 +126,9 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	}
 	compactor.Close()
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	for key, expectedValue := range testData {
@@ -198,9 +198,9 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	}
 	compactor.Close()
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	for batch := 0; batch < 4; batch++ {
@@ -444,9 +444,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 
 	t.Run("Phase2_ReadCorrectnessAfterCompaction", func(t *testing.T) {
-		reader, err := NewReader(ctx, store, ReaderOptions{})
+		reader, err := newReader(ctx, store, ReaderOptions{})
 		if err != nil {
-			t.Fatalf("NewReader: %v", err)
+			t.Fatalf("newReader: %v", err)
 		}
 		defer reader.Close()
 
@@ -512,9 +512,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 
 		compactor.Close()
 
-		reader, err := NewReader(ctx, store, ReaderOptions{})
+		reader, err := newReader(ctx, store, ReaderOptions{})
 		if err != nil {
-			t.Fatalf("NewReader: %v", err)
+			t.Fatalf("newReader: %v", err)
 		}
 		defer reader.Close()
 
@@ -584,9 +584,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 
 		compactor.Close()
 
-		reader, err := NewReader(ctx, store, ReaderOptions{})
+		reader, err := newReader(ctx, store, ReaderOptions{})
 		if err != nil {
-			t.Fatalf("NewReader: %v", err)
+			t.Fatalf("newReader: %v", err)
 		}
 		defer reader.Close()
 
@@ -661,9 +661,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		compactor.Close()
 
-		reader, err := NewReader(ctx, store, ReaderOptions{})
+		reader, err := newReader(ctx, store, ReaderOptions{})
 		if err != nil {
-			t.Fatalf("NewReader: %v", err)
+			t.Fatalf("newReader: %v", err)
 		}
 		defer reader.Close()
 
@@ -695,9 +695,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 
 	t.Run("Phase6_ScanWorksAfterCompaction", func(t *testing.T) {
-		reader, err := NewReader(ctx, store, ReaderOptions{})
+		reader, err := newReader(ctx, store, ReaderOptions{})
 		if err != nil {
-			t.Fatalf("NewReader: %v", err)
+			t.Fatalf("newReader: %v", err)
 		}
 		defer reader.Close()
 
@@ -822,9 +822,9 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 
 	compactor2.Close()
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	defer reader.Close()
 
@@ -892,9 +892,9 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 		compactor.Close()
 	}
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 	defer reader.Close()
 

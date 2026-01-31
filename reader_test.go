@@ -52,10 +52,10 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
 		store.Close()
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	cleanup := func() {
@@ -144,9 +144,9 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, newEntries, 0, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	results, err := reader.Scan(ctx, []byte("k"), []byte("k"))
@@ -170,9 +170,9 @@ func TestReader_Refresh_PicksUpNewSSTs(t *testing.T) {
 	defer store.Close()
 
 	ms := manifest.NewStore(store)
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	if _, found, err := reader.Get(ctx, []byte("x")); err != nil {
@@ -214,9 +214,9 @@ func TestReader_Get_L0PrefersNewerSeq(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, newer, 0, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	value, found, err := reader.Get(ctx, []byte("k"))
@@ -247,9 +247,9 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, second, 1, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	results, err := reader.Scan(ctx, []byte("a"), []byte("e"))
@@ -290,9 +290,9 @@ func TestReader_Get_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	if _, found, err := reader.Get(ctx, []byte("k")); err != nil {
@@ -320,9 +320,9 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
-	reader, err := NewReader(ctx, store, ReaderOptions{})
+	reader, err := newReader(ctx, store, ReaderOptions{})
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("newReader: %v", err)
 	}
 
 	results, err := reader.Scan(ctx, []byte("k"), []byte("m"))

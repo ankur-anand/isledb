@@ -34,9 +34,9 @@ func TestReader_ScanLimit(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -108,9 +108,9 @@ func TestReader_Iterator(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -178,9 +178,9 @@ func TestReader_Iterator_Empty(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -227,9 +227,9 @@ func TestReader_Iterator_SeekGE(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -313,9 +313,9 @@ func TestReader_Iterator_WithDeletes(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
@@ -370,9 +370,9 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	r, err := NewReader(ctx, store, DefaultReaderOptions())
+	r, err := newReader(ctx, store, DefaultReaderOptions())
 	if err != nil {
-		t.Fatalf("NewReader failed: %v", err)
+		t.Fatalf("newReader failed: %v", err)
 	}
 	defer r.Close()
 
