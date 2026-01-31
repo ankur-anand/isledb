@@ -121,10 +121,15 @@ type IteratorOptions struct {
 	MaxKey []byte
 }
 
+// TailOptions controls tailing behavior for a TailingReader.
 type TailOptions struct {
+	// MinKey and MaxKey constrain the tailing range (inclusive bounds).
 	MinKey []byte
 	MaxKey []byte
 
+	// StartAfterKey resumes tailing from the next key after this value.
+	// If set, it overrides MinKey as the lower bound.
 	StartAfterKey []byte
+	// PollInterval controls how often to check for new keys.
 	PollInterval  time.Duration
 }

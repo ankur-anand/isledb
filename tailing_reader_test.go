@@ -38,9 +38,9 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 			refreshCount.Add(1)
 		},
 	}
-	tr, err := NewTailingReader(ctx, store, trOpts)
+	tr, err := newTailingReader(ctx, store, trOpts)
 	if err != nil {
-		t.Fatalf("NewTailingReader failed: %v", err)
+		t.Fatalf("newTailingReader failed: %v", err)
 	}
 	defer tr.Close()
 
@@ -93,9 +93,9 @@ func TestTailingReader_Tail(t *testing.T) {
 	trOpts := TailingReaderOptions{
 		RefreshInterval: 20 * time.Millisecond,
 	}
-	tr, err := NewTailingReader(ctx, store, trOpts)
+	tr, err := newTailingReader(ctx, store, trOpts)
 	if err != nil {
-		t.Fatalf("NewTailingReader failed: %v", err)
+		t.Fatalf("newTailingReader failed: %v", err)
 	}
 	defer tr.Close()
 
@@ -182,11 +182,11 @@ func TestTailingReader_TailChannel(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	tr, err := NewTailingReader(ctx, store, TailingReaderOptions{
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 20 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("NewTailingReader failed: %v", err)
+		t.Fatalf("newTailingReader failed: %v", err)
 	}
 	defer tr.Close()
 
@@ -253,11 +253,11 @@ func TestTailingReader_StartAfterKey(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	tr, err := NewTailingReader(ctx, store, TailingReaderOptions{
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("NewTailingReader failed: %v", err)
+		t.Fatalf("newTailingReader failed: %v", err)
 	}
 	defer tr.Close()
 

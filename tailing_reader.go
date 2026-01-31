@@ -9,6 +9,8 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 )
 
+// TailingReader is a read-only handle that refreshes manifests periodically
+// and can tail new keys as they appear in object storage.
 type TailingReader struct {
 	reader *Reader
 	opts   TailingReaderOptions
@@ -24,8 +26,7 @@ type TailingReader struct {
 	closed  atomic.Bool
 }
 
-func NewTailingReader(ctx context.Context, store *blobstore.Store, opts TailingReaderOptions) (*TailingReader, error) {
-
+func newTailingReader(ctx context.Context, store *blobstore.Store, opts TailingReaderOptions) (*TailingReader, error) {
 	if opts.RefreshInterval == 0 {
 		opts.RefreshInterval = 100 * time.Millisecond
 	}
@@ -53,6 +54,7 @@ func (tr *TailingReader) Start() {
 	go tr.refreshLoop()
 }
 
+// Stop terminates the background refresh loop.
 func (tr *TailingReader) Stop() {
 	if !tr.running.Swap(false) {
 		return
@@ -62,6 +64,7 @@ func (tr *TailingReader) Stop() {
 	tr.wg.Wait()
 }
 
+// Close stops background refresh and closes the underlying reader.
 func (tr *TailingReader) Close() error {
 	if !tr.closed.CompareAndSwap(false, true) {
 		return nil
@@ -125,26 +128,32 @@ func (tr *TailingReader) Get(ctx context.Context, key []byte) ([]byte, bool, err
 	return tr.reader.Get(ctx, key)
 }
 
+// Scan returns all key-value pairs in the given range.
 func (tr *TailingReader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
 	return tr.reader.Scan(ctx, minKey, maxKey)
 }
 
+// ScanLimit returns up to limit key-value pairs in the given range.
 func (tr *TailingReader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error) {
 	return tr.reader.ScanLimit(ctx, minKey, maxKey, limit)
 }
 
+// NewIterator returns an iterator over the requested key range.
 func (tr *TailingReader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
 	return tr.reader.NewIterator(ctx, opts)
 }
 
+// Manifest returns a snapshot of the current manifest.
 func (tr *TailingReader) Manifest() *Manifest {
 	return tr.reader.Manifest()
 }
 
+// Reader exposes the underlying Reader.
 func (tr *TailingReader) Reader() *Reader {
 	return tr.reader
 }
 
+// Tail continuously scans for new keys and calls handler for each result.
 func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler func(KV) error) error {
 	if opts.PollInterval == 0 {
 		opts.PollInterval = tr.opts.RefreshInterval
@@ -225,6 +234,7 @@ func incrementKey(key []byte) []byte {
 	return append(result, 0)
 }
 
+// TailChannel returns a channel of KV updates and an error channel.
 func (tr *TailingReader) TailChannel(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error) {
 	ch := make(chan KV, 100)
 	errCh := make(chan error, 1)
