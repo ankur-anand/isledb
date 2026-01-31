@@ -224,7 +224,7 @@ func (w *writer) flush(ctx context.Context) error {
 		Compression:     w.opts.Compression,
 	}
 
-	result, err := WriteSST(ctx, oldMemtable.Iterator(), sstOpts, epoch)
+	result, err := writeSST(ctx, oldMemtable.Iterator(), sstOpts, epoch)
 	if err != nil {
 		if errors.Is(err, ErrEmptyIterator) {
 			return nil

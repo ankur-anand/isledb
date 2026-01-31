@@ -454,7 +454,7 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 	return iters, readers, nil
 }
 
-func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]WriteSSTResult, error) {
+func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]writeSSTResult, error) {
 	defer iter.close()
 
 	sstOpts := SSTWriterOptions{
@@ -465,7 +465,7 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 
 	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
 
-	uploadFn := func(result *WriteSSTResult) error {
+	uploadFn := func(result *writeSSTResult) error {
 		sstPath := c.store.SSTPath(result.Meta.ID)
 		if _, err := c.store.Write(ctx, sstPath, result.SSTData); err != nil {
 			return fmt.Errorf("upload sst: %w", err)

@@ -87,9 +87,9 @@ func TestWriteSST_Inline(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
+		t.Fatalf("writeSST error: %v", err)
 	}
 	if len(res.SSTData) == 0 {
 		t.Fatalf("expected SST data")
@@ -165,9 +165,9 @@ func TestWriteSST_BlobReference(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
+		t.Fatalf("writeSST error: %v", err)
 	}
 	if len(res.SSTData) == 0 {
 		t.Fatalf("expected SST data")
@@ -210,7 +210,7 @@ func TestWriteSST_BlobReference(t *testing.T) {
 
 func TestWriteSST_EmptyIterator(t *testing.T) {
 	it := &sliceSSTIter{}
-	_, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	_, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if !errors.Is(err, ErrEmptyIterator) {
 		t.Fatalf("expected ErrEmptyIterator, got %v", err)
 	}
@@ -223,7 +223,7 @@ func TestWriteSST_OutOfOrder(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	_, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	_, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -239,7 +239,7 @@ func TestWriteSST_DuplicateKeySeqOrder(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	_, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	_, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if !errors.Is(err, ErrOutOfOrder) {
 		t.Fatalf("expected ErrOutOfOrder, got %v", err)
 	}
@@ -251,9 +251,9 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
+		t.Fatalf("writeSST error: %v", err)
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
@@ -309,9 +309,9 @@ func TestWriteSST_Signature(t *testing.T) {
 		keyID: hex.EncodeToString(pub),
 	}
 
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none", Signer: signer}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none", Signer: signer}, 1)
 	if err != nil {
-		t.Fatalf("WriteSST error: %v", err)
+		t.Fatalf("writeSST error: %v", err)
 	}
 	if res.Meta.Signature == nil {
 		t.Fatalf("expected signature")

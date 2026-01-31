@@ -14,9 +14,9 @@ func buildTestIter(t *testing.T, entries []internal.MemEntry) (*sstable.Reader, 
 	t.Helper()
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
-		t.Fatalf("WriteSST: %v", err)
+		t.Fatalf("writeSST: %v", err)
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
@@ -132,9 +132,9 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
 	if err != nil {
-		b.Fatalf("WriteSST: %v", err)
+		b.Fatalf("writeSST: %v", err)
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
@@ -269,9 +269,9 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := WriteSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
+	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
 	if err != nil {
-		b.Fatalf("WriteSST: %v", err)
+		b.Fatalf("writeSST: %v", err)
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})

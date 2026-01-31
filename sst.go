@@ -29,15 +29,15 @@ type SSTIterator interface {
 	Close() error
 }
 
-type WriteSSTResult struct {
+type writeSSTResult struct {
 	Meta    SSTMeta
 	SSTData []byte
 }
 
-func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (WriteSSTResult, error) {
+func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (writeSSTResult, error) {
 	defer it.Close()
 
-	var result WriteSSTResult
+	var result writeSSTResult
 
 	sstBuf := new(bytes.Buffer)
 	writable := newHashingWritable(sstBuf)
@@ -53,7 +53,7 @@ func WriteSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 	sst := sstable.NewWriter(writable, wo)
 
 	state := newSSTBuildState()
-	abort := func(err error) (WriteSSTResult, error) {
+	abort := func(err error) (writeSSTResult, error) {
 		writable.Abort()
 		_ = sst.Close()
 		return result, err
@@ -279,10 +279,10 @@ func (h *hashingWritable) sumBytes() []byte {
 	return h.hash.Sum(nil)
 }
 
-func writeMultipleSSTs(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64, targetSize int64, onSSTComplete func(*WriteSSTResult) error) ([]WriteSSTResult, error) {
+func writeMultipleSSTs(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64, targetSize int64, onSSTComplete func(*writeSSTResult) error) ([]writeSSTResult, error) {
 	defer it.Close()
 
-	var results []WriteSSTResult
+	var results []writeSSTResult
 	var currentSize int64
 	var sstBuf *bytes.Buffer
 	var writable *hashingWritable
@@ -317,7 +317,7 @@ func writeMultipleSSTs(ctx context.Context, it SSTIterator, opts SSTWriterOption
 		hashBytes := writable.sumBytes()
 		hashStr := hex.EncodeToString(hashBytes)
 
-		result := WriteSSTResult{
+		result := writeSSTResult{
 			SSTData: sstBuf.Bytes(),
 			Meta: SSTMeta{
 				ID:        buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),

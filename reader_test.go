@@ -10,13 +10,13 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) WriteSSTResult {
+func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) writeSSTResult {
 	t.Helper()
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := WriteSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, epoch)
+	res, err := writeSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, epoch)
 	if err != nil {
-		t.Fatalf("WriteSST: %v", err)
+		t.Fatalf("writeSST: %v", err)
 	}
 
 	res.Meta.Level = level
