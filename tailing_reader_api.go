@@ -37,7 +37,6 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 		SSTCacheSize:         opts.ReaderOptions.SSTCacheSize,
 		BlobCacheSize:        opts.ReaderOptions.BlobCacheSize,
 		BlobCacheMaxItemSize: opts.ReaderOptions.BlobCacheMaxItemSize,
-		SSTReaderCacheSize:   opts.ReaderOptions.SSTReaderCacheSize,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

@@ -21,10 +21,9 @@ import (
 )
 
 type Reader struct {
-	store          *blobstore.Store
-	manifestStore  *manifest.Store
-	sstCache       SSTCache
-	sstReaderCache SSTReaderCache
+	store         *blobstore.Store
+	manifestStore *manifest.Store
+	sstCache      SSTCache
 
 	blobStorage *internal.BlobStorage
 	blobCache   internal.BlobCache
@@ -71,31 +70,21 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		}
 	}()
 
-	var sstReaderCache SSTReaderCache
-	if opts.SSTReaderCache != nil {
-		sstReaderCache = opts.SSTReaderCache
-	} else if opts.SSTReaderCacheSize > 0 {
-		sstReaderCache = NewLRUSSTReaderCache(opts.SSTReaderCacheSize)
-	} else {
-		sstReaderCache = NewLRUSSTReaderCache(DefaultSSTReaderCacheSize)
-	}
-
 	valueConfig := opts.ValueStorageConfig
 	if valueConfig.BlobThreshold == 0 {
 		valueConfig = config.DefaultValueStorageConfig()
 	}
 
 	reader := &Reader{
-		store:          store,
-		manifestStore:  ms,
-		manifest:       m,
-		sstCache:       sstCache,
-		sstReaderCache: sstReaderCache,
-		blobStorage:    internal.NewBlobStorage(store, valueConfig),
-		blobCache:      blobCache,
-		valueConfig:    valueConfig,
-		ownsSSTCache:   ownsSSTCache,
-		ownsBlobCache:  ownsBlobCache,
+		store:         store,
+		manifestStore: ms,
+		manifest:      m,
+		sstCache:      sstCache,
+		blobStorage:   internal.NewBlobStorage(store, valueConfig),
+		blobCache:     blobCache,
+		valueConfig:   valueConfig,
+		ownsSSTCache:  ownsSSTCache,
+		ownsBlobCache: ownsBlobCache,
 	}
 	cleanupSSTCache = false
 	cleanupBlobCache = false
@@ -181,9 +170,6 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
 	for id := range oldIDs {
 		if _, exists := newIDs[id]; !exists {
 			path := r.store.SSTPath(id)
-
-			r.sstReaderCache.Remove(path)
-
 			r.sstCache.Remove(path)
 		}
 	}
@@ -191,10 +177,6 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
 
 func (r *Reader) Close() error {
 	var firstErr error
-
-	if r.sstReaderCache != nil {
-		r.sstReaderCache.Clear()
-	}
 
 	if r.sstCache != nil && r.ownsSSTCache {
 		if err := r.sstCache.Close(); err != nil {
@@ -594,25 +576,15 @@ func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	path := r.store.SSTPath(sstMeta.ID)
 
-	if reader, ok := r.sstReaderCache.Get(path); ok {
-		iter, err := reader.NewIter(sstable.NoTransforms, lower, upper, sstable.AssertNoBlobHandles)
-		if err != nil {
-			return nil, nil, err
-		}
-		return reader, iter, nil
-	}
-
 	var data []byte
 	var err error
 	if cached, ok := r.sstCache.Get(path); ok {
 		data = cached
 	} else {
-
 		data, _, err = r.store.Read(ctx, path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("read sst %s: %w", sstMeta.ID, err)
 		}
-
 		r.sstCache.Set(path, data)
 	}
 
@@ -627,17 +599,11 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 		return nil, nil, err
 	}
 
-	r.sstReaderCache.Set(path, reader, data)
-
 	return reader, iter, nil
 }
 
 func (r *Reader) SSTCacheStats() SSTCacheStats {
 	return r.sstCache.Stats()
-}
-
-func (r *Reader) SSTReaderCacheStats() SSTReaderCacheStats {
-	return r.sstReaderCache.Stats()
 }
 
 func (r *Reader) ManifestLogCacheStats() cachestore.ManifestLogCacheStats {

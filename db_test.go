@@ -355,11 +355,6 @@ func TestDB_WarmCacheOnOpen(t *testing.T) {
 		t.Errorf("SSTCache.EntryCount = %d, want 5", stats.EntryCount)
 	}
 
-	readerStats := db2.reader.SSTReaderCacheStats()
-	if readerStats.EntryCount != 5 {
-		t.Errorf("SSTReaderCache.EntryCount = %d, want 5", readerStats.EntryCount)
-	}
-
 	value, found, err := db2.Get(ctx, []byte("key-0-0"))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -369,11 +364,6 @@ func TestDB_WarmCacheOnOpen(t *testing.T) {
 	}
 	if string(value) != "value-0-0" {
 		t.Errorf("Get = %q, want %q", value, "value-0-0")
-	}
-
-	readerStatsAfter := db2.reader.SSTReaderCacheStats()
-	if readerStatsAfter.Hits == 0 {
-		t.Error("expected reader cache hits after Get")
 	}
 }
 
@@ -429,9 +419,6 @@ func TestDB_InProcessOptions(t *testing.T) {
 	}
 	if opts.SSTCacheSize != 256*1024*1024 {
 		t.Errorf("SSTCacheSize = %d, want 256MB", opts.SSTCacheSize)
-	}
-	if opts.SSTReaderCacheSize != 100 {
-		t.Errorf("SSTReaderCacheSize = %d, want 100", opts.SSTReaderCacheSize)
 	}
 }
 

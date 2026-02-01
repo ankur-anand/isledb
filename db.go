@@ -50,7 +50,6 @@ type DBOptions struct {
 	SSTCacheSize         int64
 	BlobCacheSize        int64
 	BlobCacheMaxItemSize int64
-	SSTReaderCacheSize   int
 
 	WarmCacheOnOpen     bool
 	WarmCacheTimeout    time.Duration
@@ -90,9 +89,8 @@ func DefaultDBOptions() DBOptions {
 		SizeThreshold:           4,
 		CompactionCheckInterval: 5 * time.Second,
 
-		SSTCacheSize:       defaultSSTCacheSize,
-		SSTReaderCacheSize: DefaultSSTReaderCacheSize,
-		BlobCacheSize:      defaultBlobCacheSize,
+		SSTCacheSize:  defaultSSTCacheSize,
+		BlobCacheSize: defaultBlobCacheSize,
 
 		WarmCacheOnOpen:     false,
 		WarmCacheTimeout:    DefaultWarmCacheTimeout,
@@ -125,7 +123,6 @@ func InProcessDBOptions() DBOptions {
 	opts.WarmCacheOnOpen = true
 	opts.BackgroundSync = true
 	opts.SSTCacheSize = 256 * 1024 * 1024
-	opts.SSTReaderCacheSize = 100
 	return opts
 }
 
@@ -184,9 +181,6 @@ func (o DBOptions) WithDefaults() DBOptions {
 	if o.SSTCacheSize == 0 {
 		o.SSTCacheSize = defaults.SSTCacheSize
 	}
-	if o.SSTReaderCacheSize == 0 {
-		o.SSTReaderCacheSize = defaults.SSTReaderCacheSize
-	}
 	if o.BlobCacheSize == 0 {
 		o.BlobCacheSize = defaults.BlobCacheSize
 	}
@@ -239,7 +233,6 @@ func (o DBOptions) ToReaderOptions() ReaderOptions {
 		SSTCacheSize:         o.SSTCacheSize,
 		BlobCacheSize:        o.BlobCacheSize,
 		BlobCacheMaxItemSize: o.BlobCacheMaxItemSize,
-		SSTReaderCacheSize:   o.SSTReaderCacheSize,
 		ValueStorageConfig:   o.ValueStorage,
 		ManifestStorage:      o.ManifestStorage,
 	}
@@ -545,7 +538,7 @@ func (db *DB) prefetchSST(ctx context.Context, path string) error {
 	reader := db.reader
 	db.mu.RUnlock()
 
-	if _, ok := reader.sstReaderCache.Get(path); ok {
+	if _, ok := reader.sstCache.Get(path); ok {
 		return nil
 	}
 
@@ -555,13 +548,6 @@ func (db *DB) prefetchSST(ctx context.Context, path string) error {
 	}
 
 	reader.sstCache.Set(path, data)
-
-	sstReader, err := newSSTReader(ctx, data)
-	if err != nil {
-		return err
-	}
-	reader.sstReaderCache.Set(path, sstReader, data)
-
 	return nil
 }
 

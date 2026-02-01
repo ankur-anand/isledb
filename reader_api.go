@@ -22,9 +22,6 @@ type ReaderOpenOptions struct {
 	// BlobCacheMaxItemSize is the maximum size per item in the blob cache.
 	BlobCacheMaxItemSize int64
 
-	// SSTReaderCacheSize is the maximum number of SST readers to cache in memory.
-	SSTReaderCacheSize int
-
 	BlobReadOptions config.BlobReadOptions
 	ManifestStorage manifest.Storage
 }
@@ -33,10 +30,9 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions() ReaderOpenOptions {
 	defaults := DefaultReaderOptions()
 	return ReaderOpenOptions{
-		SSTCacheSize:       defaults.SSTCacheSize,
-		BlobCacheSize:      defaults.BlobCacheSize,
-		SSTReaderCacheSize: defaults.SSTReaderCacheSize,
-		BlobReadOptions:    config.DefaultBlobReadOptions(),
+		SSTCacheSize:    defaults.SSTCacheSize,
+		BlobCacheSize:   defaults.BlobCacheSize,
+		BlobReadOptions: config.DefaultBlobReadOptions(),
 	}
 }
 
@@ -52,7 +48,6 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		SSTCacheSize:         opts.SSTCacheSize,
 		BlobCacheSize:        opts.BlobCacheSize,
 		BlobCacheMaxItemSize: opts.BlobCacheMaxItemSize,
-		SSTReaderCacheSize:   opts.SSTReaderCacheSize,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

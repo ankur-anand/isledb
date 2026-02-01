@@ -60,10 +60,6 @@ type ReaderOptions struct {
 	// Items larger than this will not be cached. Default 0 means no limit.
 	BlobCacheMaxItemSize int64
 
-	// SSTReaderCache caches parsed SST readers (stays in-memory, small footprint).
-	SSTReaderCache     SSTReaderCache
-	SSTReaderCacheSize int
-
 	ValueStorageConfig config.ValueStorageConfig
 	ManifestStorage    manifest.Storage
 
@@ -74,9 +70,8 @@ type ReaderOptions struct {
 
 func DefaultReaderOptions() ReaderOptions {
 	return ReaderOptions{
-		SSTCacheSize:       defaultSSTCacheSize,
-		BlobCacheSize:      defaultBlobCacheSize,
-		SSTReaderCacheSize: DefaultSSTReaderCacheSize,
+		SSTCacheSize:  defaultSSTCacheSize,
+		BlobCacheSize: defaultBlobCacheSize,
 	}
 }
 
