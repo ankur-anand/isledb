@@ -52,13 +52,15 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		store.Close()
 		t.Fatalf("newReader: %v", err)
 	}
 
 	cleanup := func() {
+		_ = reader.Close()
 		_ = store.Close()
 	}
 
@@ -144,10 +146,12 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, newEntries, 0, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	results, err := reader.Scan(ctx, []byte("k"), []byte("k"))
 	if err != nil {
@@ -170,10 +174,12 @@ func TestReader_Refresh_PicksUpNewSSTs(t *testing.T) {
 	defer store.Close()
 
 	ms := manifest.NewStore(store)
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	if _, found, err := reader.Get(ctx, []byte("x")); err != nil {
 		t.Fatalf("Get before refresh: %v", err)
@@ -214,10 +220,12 @@ func TestReader_Get_L0PrefersNewerSeq(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, newer, 0, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	value, found, err := reader.Get(ctx, []byte("k"))
 	if err != nil {
@@ -247,10 +255,12 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, second, 1, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	results, err := reader.Scan(ctx, []byte("a"), []byte("e"))
 	if err != nil {
@@ -290,10 +300,12 @@ func TestReader_Get_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	if _, found, err := reader.Get(ctx, []byte("k")); err != nil {
 		t.Fatalf("Get: %v", err)
@@ -320,10 +332,12 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
-	reader, err := newReader(ctx, store, ReaderOptions{})
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	results, err := reader.Scan(ctx, []byte("k"), []byte("m"))
 	if err != nil {

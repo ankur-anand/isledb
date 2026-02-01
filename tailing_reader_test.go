@@ -37,6 +37,9 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 		OnRefresh: func() {
 			refreshCount.Add(1)
 		},
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
 	}
 	tr, err := newTailingReader(ctx, store, trOpts)
 	if err != nil {
@@ -92,6 +95,9 @@ func TestTailingReader_Tail(t *testing.T) {
 
 	trOpts := TailingReaderOptions{
 		RefreshInterval: 20 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
 	}
 	tr, err := newTailingReader(ctx, store, trOpts)
 	if err != nil {
@@ -184,6 +190,9 @@ func TestTailingReader_TailChannel(t *testing.T) {
 
 	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 20 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
 	})
 	if err != nil {
 		t.Fatalf("newTailingReader failed: %v", err)
@@ -255,6 +264,9 @@ func TestTailingReader_StartAfterKey(t *testing.T) {
 
 	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
 	})
 	if err != nil {
 		t.Fatalf("newTailingReader failed: %v", err)

@@ -14,6 +14,7 @@ func TestDB_BasicOperations(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 
@@ -84,6 +85,7 @@ func TestDB_Scan(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 
@@ -130,6 +132,7 @@ func TestDB_WithCompaction(t *testing.T) {
 
 	compactionCount := 0
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = true
 	opts.L0CompactionThreshold = 4
@@ -195,6 +198,7 @@ func TestDB_Stats(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 
@@ -243,7 +247,10 @@ func TestDB_Close(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	cacheDir := t.TempDir()
+
 	opts := DefaultDBOptions()
+	opts.CacheDir = cacheDir
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 
@@ -264,7 +271,12 @@ func TestDB_Close(t *testing.T) {
 		t.Error("put after close should fail")
 	}
 
-	db2, err := Open(ctx, store, opts)
+	opts2 := DefaultDBOptions()
+	opts2.CacheDir = t.TempDir()
+	opts2.FlushInterval = 0
+	opts2.EnableCompaction = false
+
+	db2, err := Open(ctx, store, opts2)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
@@ -287,6 +299,7 @@ func TestDB_WarmCacheOnOpen(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 
@@ -314,6 +327,7 @@ func TestDB_WarmCacheOnOpen(t *testing.T) {
 	var warmDuration time.Duration
 
 	opts2 := DefaultDBOptions()
+	opts2.CacheDir = t.TempDir()
 	opts2.FlushInterval = 0
 	opts2.EnableCompaction = false
 	opts2.WarmCacheOnOpen = true
@@ -368,6 +382,7 @@ func TestDB_BackgroundSync(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.FlushInterval = 0
 	opts.EnableCompaction = false
 	opts.BackgroundSync = true
@@ -427,13 +442,27 @@ func TestDBOptions_Validate(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "valid default options",
-			opts:    DefaultDBOptions(),
+			name: "valid default options with CacheDir",
+			opts: func() DBOptions {
+				o := DefaultDBOptions()
+				o.CacheDir = "/tmp/test"
+				return o
+			}(),
 			wantErr: "",
+		},
+		{
+			name: "missing CacheDir",
+			opts: func() DBOptions {
+				o := DefaultDBOptions()
+				o.CacheDir = ""
+				return o
+			}(),
+			wantErr: "CacheDir is required",
 		},
 		{
 			name: "log mode with compaction enabled",
 			opts: DBOptions{
+				CacheDir:         "/tmp/test",
 				LogMode:          true,
 				EnableCompaction: true,
 			},
@@ -442,6 +471,7 @@ func TestDBOptions_Validate(t *testing.T) {
 		{
 			name: "background sync without interval",
 			opts: DBOptions{
+				CacheDir:       "/tmp/test",
 				BackgroundSync: true,
 				SyncInterval:   0,
 			},
@@ -450,6 +480,7 @@ func TestDBOptions_Validate(t *testing.T) {
 		{
 			name: "background sync with valid interval",
 			opts: DBOptions{
+				CacheDir:       "/tmp/test",
 				BackgroundSync: true,
 				SyncInterval:   time.Second,
 			},
@@ -458,6 +489,7 @@ func TestDBOptions_Validate(t *testing.T) {
 		{
 			name: "log mode without compaction is valid",
 			opts: DBOptions{
+				CacheDir:         "/tmp/test",
 				LogMode:          true,
 				EnableCompaction: false,
 			},
@@ -484,7 +516,7 @@ func TestDBOptions_Validate(t *testing.T) {
 }
 
 func TestDBOptions_WithDefaults(t *testing.T) {
-	empty := DBOptions{}
+	empty := DBOptions{CacheDir: "/tmp/test"}
 	withDefaults := empty.WithDefaults()
 
 	defaults := DefaultDBOptions()
@@ -512,6 +544,7 @@ func TestDBOptions_WithDefaults(t *testing.T) {
 	}
 
 	custom := DBOptions{
+		CacheDir:      "/tmp/test",
 		MemtableSize:  8 * 1024 * 1024,
 		FlushInterval: 5 * time.Second,
 	}
@@ -529,9 +562,9 @@ func TestDB_NewWithoutStart(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.EnableCompaction = true
 	opts.BackgroundSync = true
-	opts.WarmCacheOnOpen = true
 
 	db, err := New(ctx, store, opts)
 	if err != nil {
@@ -557,6 +590,7 @@ func TestDB_DoubleStart(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultDBOptions()
+	opts.CacheDir = t.TempDir()
 	opts.EnableCompaction = false
 	opts.BackgroundSync = true
 	opts.SyncInterval = time.Second
@@ -589,6 +623,7 @@ func TestDB_OpenValidationError(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DBOptions{
+		CacheDir:         t.TempDir(),
 		LogMode:          true,
 		EnableCompaction: true,
 	}

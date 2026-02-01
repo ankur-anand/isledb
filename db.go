@@ -9,7 +9,6 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/config"
-	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
@@ -45,10 +44,13 @@ type DBOptions struct {
 	SizeThreshold           int
 	CompactionCheckInterval time.Duration
 
-	SSTCacheSize       int64
-	SSTReaderCacheSize int
-	BlobCacheSize      int64
-	BlobCacheItemSize  int64
+	// CacheDir is the directory for disk caches (required).
+	CacheDir string
+
+	SSTCacheSize         int64
+	BlobCacheSize        int64
+	BlobCacheMaxItemSize int64
+	SSTReaderCacheSize   int
 
 	WarmCacheOnOpen     bool
 	WarmCacheTimeout    time.Duration
@@ -88,10 +90,9 @@ func DefaultDBOptions() DBOptions {
 		SizeThreshold:           4,
 		CompactionCheckInterval: 5 * time.Second,
 
-		SSTCacheSize:       DefaultSSTCacheSize,
+		SSTCacheSize:       defaultSSTCacheSize,
 		SSTReaderCacheSize: DefaultSSTReaderCacheSize,
-		BlobCacheSize:      internal.DefaultBlobCacheSize,
-		BlobCacheItemSize:  internal.DefaultBlobCacheMaxItemSize,
+		BlobCacheSize:      defaultBlobCacheSize,
 
 		WarmCacheOnOpen:     false,
 		WarmCacheTimeout:    DefaultWarmCacheTimeout,
@@ -189,9 +190,6 @@ func (o DBOptions) WithDefaults() DBOptions {
 	if o.BlobCacheSize == 0 {
 		o.BlobCacheSize = defaults.BlobCacheSize
 	}
-	if o.BlobCacheItemSize == 0 {
-		o.BlobCacheItemSize = defaults.BlobCacheItemSize
-	}
 
 	if o.WarmCacheTimeout == 0 {
 		o.WarmCacheTimeout = defaults.WarmCacheTimeout
@@ -214,6 +212,9 @@ func (o DBOptions) Validate() error {
 	if o.BackgroundSync && o.SyncInterval <= 0 {
 		return errors.New("background sync requires positive sync interval")
 	}
+	if o.CacheDir == "" {
+		return errors.New("CacheDir is required")
+	}
 	return nil
 }
 
@@ -234,12 +235,13 @@ func (o DBOptions) ToWriterOptions() WriterOptions {
 // ToReaderOptions converts DBOptions to ReaderOptions.
 func (o DBOptions) ToReaderOptions() ReaderOptions {
 	return ReaderOptions{
-		SSTCacheSize:       o.SSTCacheSize,
-		SSTReaderCacheSize: o.SSTReaderCacheSize,
-		BlobCacheSize:      o.BlobCacheSize,
-		BlobCacheItemSize:  o.BlobCacheItemSize,
-		ValueStorageConfig: o.ValueStorage,
-		ManifestStorage:    o.ManifestStorage,
+		CacheDir:             o.CacheDir,
+		SSTCacheSize:         o.SSTCacheSize,
+		BlobCacheSize:        o.BlobCacheSize,
+		BlobCacheMaxItemSize: o.BlobCacheMaxItemSize,
+		SSTReaderCacheSize:   o.SSTReaderCacheSize,
+		ValueStorageConfig:   o.ValueStorage,
+		ManifestStorage:      o.ManifestStorage,
 	}
 }
 

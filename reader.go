@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
@@ -27,6 +29,9 @@ type Reader struct {
 	blobStorage *internal.BlobStorage
 	blobCache   internal.BlobCache
 	valueConfig config.ValueStorageConfig
+
+	ownsSSTCache  bool
+	ownsBlobCache bool
 
 	mu       sync.RWMutex
 	manifest *Manifest
@@ -44,14 +49,27 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		return nil, err
 	}
 
-	var sstCache SSTCache
-	if opts.SSTCache != nil {
-		sstCache = opts.SSTCache
-	} else if opts.SSTCacheSize > 0 {
-		sstCache = NewLRUSSTCache(opts.SSTCacheSize)
-	} else {
-		sstCache = NewLRUSSTCache(DefaultSSTCacheSize)
+	sstCache, ownsSSTCache, err := initSSTCache(opts)
+	if err != nil {
+		return nil, err
 	}
+	cleanupSSTCache := ownsSSTCache
+	defer func() {
+		if cleanupSSTCache {
+			_ = sstCache.Close()
+		}
+	}()
+
+	blobCache, ownsBlobCache, err := initBlobCache(opts)
+	if err != nil {
+		return nil, err
+	}
+	cleanupBlobCache := ownsBlobCache
+	defer func() {
+		if cleanupBlobCache {
+			_ = blobCache.Close()
+		}
+	}()
 
 	var sstReaderCache SSTReaderCache
 	if opts.SSTReaderCache != nil {
@@ -62,27 +80,12 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		sstReaderCache = NewLRUSSTReaderCache(DefaultSSTReaderCacheSize)
 	}
 
-	var blobCache internal.BlobCache
-	if opts.BlobCache != nil {
-		blobCache = opts.BlobCache
-	} else {
-		cacheSize := opts.BlobCacheSize
-		if cacheSize == 0 {
-			cacheSize = internal.DefaultBlobCacheSize
-		}
-		itemSize := opts.BlobCacheItemSize
-		if itemSize == 0 {
-			itemSize = internal.DefaultBlobCacheMaxItemSize
-		}
-		blobCache = internal.NewLRUBlobCache(cacheSize, itemSize)
-	}
-
 	valueConfig := opts.ValueStorageConfig
 	if valueConfig.BlobThreshold == 0 {
 		valueConfig = config.DefaultValueStorageConfig()
 	}
 
-	return &Reader{
+	reader := &Reader{
 		store:          store,
 		manifestStore:  ms,
 		manifest:       m,
@@ -91,7 +94,59 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		blobStorage:    internal.NewBlobStorage(store, valueConfig),
 		blobCache:      blobCache,
 		valueConfig:    valueConfig,
-	}, nil
+		ownsSSTCache:   ownsSSTCache,
+		ownsBlobCache:  ownsBlobCache,
+	}
+	cleanupSSTCache = false
+	cleanupBlobCache = false
+	return reader, nil
+}
+
+func initSSTCache(opts ReaderOptions) (diskcache.RefCountedCache, bool, error) {
+	if opts.SSTCache != nil {
+		return opts.SSTCache, false, nil
+	}
+
+	if opts.CacheDir == "" {
+		return nil, false, errors.New("CacheDir is required")
+	}
+
+	maxSize := opts.SSTCacheSize
+	if maxSize == 0 {
+		maxSize = defaultSSTCacheSize
+	}
+
+	cache, err := diskcache.NewSSTCache(diskcache.SSTCacheOptions{
+		Dir:     filepath.Join(opts.CacheDir, "sst"),
+		MaxSize: maxSize,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("create sst cache: %w", err)
+	}
+
+	return cache, true, nil
+}
+
+func initBlobCache(opts ReaderOptions) (diskcache.Cache, bool, error) {
+	if opts.BlobCache != nil {
+		return opts.BlobCache, false, nil
+	}
+
+	maxSize := opts.BlobCacheSize
+	if maxSize == 0 {
+		maxSize = defaultBlobCacheSize
+	}
+
+	cache, err := diskcache.NewBlobCache(diskcache.BlobCacheOptions{
+		Dir:         filepath.Join(opts.CacheDir, "blob"),
+		MaxSize:     maxSize,
+		MaxItemSize: opts.BlobCacheMaxItemSize,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("create blob cache: %w", err)
+	}
+
+	return cache, true, nil
 }
 
 // Refresh reloads the manifest and invalidates caches for removed SSTs.
@@ -135,15 +190,25 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
 }
 
 func (r *Reader) Close() error {
+	var firstErr error
 
 	if r.sstReaderCache != nil {
 		r.sstReaderCache.Clear()
 	}
 
-	if r.sstCache != nil {
-		r.sstCache.Clear()
+	if r.sstCache != nil && r.ownsSSTCache {
+		if err := r.sstCache.Close(); err != nil {
+			firstErr = err
+		}
 	}
-	return nil
+
+	if r.blobCache != nil && r.ownsBlobCache {
+		if err := r.blobCache.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
 }
 
 func (r *Reader) Manifest() *Manifest {

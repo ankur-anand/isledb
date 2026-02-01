@@ -35,7 +35,9 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	}
 	w.close()
 
-	reader, _ := newReader(ctx, store, DefaultReaderOptions())
+	rOpts := DefaultReaderOptions()
+	rOpts.CacheDir = t.TempDir()
+	reader, _ := newReader(ctx, store, rOpts)
 	m := reader.Manifest()
 	if m.L0SSTCount() != 5 {
 		t.Fatalf("Expected 5 L0 SSTs, got %d", m.L0SSTCount())
@@ -59,7 +61,9 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 		t.Fatalf("RunCleanup failed: %v", err)
 	}
 
-	reader2, _ := newReader(ctx, store, DefaultReaderOptions())
+	rOpts2 := DefaultReaderOptions()
+	rOpts2.CacheDir = t.TempDir()
+	reader2, _ := newReader(ctx, store, rOpts2)
 	m2 := reader2.Manifest()
 	reader2.Close()
 

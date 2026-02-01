@@ -5,8 +5,14 @@ import (
 
 	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
+)
+
+const (
+	defaultSSTCacheSize  = 1 << 30
+	defaultBlobCacheSize = 1 << 30
 )
 
 type WriterOptions struct {
@@ -35,14 +41,29 @@ func DefaultWriterOptions() WriterOptions {
 }
 
 type ReaderOptions struct {
-	SSTCache           SSTCache
-	SSTCacheSize       int64
+	// CacheDir is the directory for disk caches.
+	CacheDir string
+
+	// SSTCache is an optional pre-created SST cache.
+	SSTCache diskcache.RefCountedCache
+
+	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
+	SSTCacheSize int64
+
+	// BlobCache is an optional pre-created blob cache.
+	BlobCache internal.BlobCache
+
+	// BlobCacheSize is the maximum bytes for blob cache (default 1GB).
+	BlobCacheSize int64
+
+	// BlobCacheMaxItemSize is the maximum size per item in the blob cache.
+	// Items larger than this will not be cached. Default 0 means no limit.
+	BlobCacheMaxItemSize int64
+
+	// SSTReaderCache caches parsed SST readers (stays in-memory, small footprint).
 	SSTReaderCache     SSTReaderCache
 	SSTReaderCacheSize int
 
-	BlobCache          internal.BlobCache
-	BlobCacheSize      int64
-	BlobCacheItemSize  int64
 	ValueStorageConfig config.ValueStorageConfig
 	ManifestStorage    manifest.Storage
 
@@ -53,7 +74,8 @@ type ReaderOptions struct {
 
 func DefaultReaderOptions() ReaderOptions {
 	return ReaderOptions{
-		SSTCacheSize:       DefaultSSTCacheSize,
+		SSTCacheSize:       defaultSSTCacheSize,
+		BlobCacheSize:      defaultBlobCacheSize,
 		SSTReaderCacheSize: DefaultSSTReaderCacheSize,
 	}
 }
