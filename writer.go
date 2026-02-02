@@ -17,6 +17,8 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
+var ErrBackpressure = errors.New("writer backpressure")
+
 type writer struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
@@ -25,6 +27,7 @@ type writer struct {
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
+	immQueue                []*internal.Memtable
 	memtableInlineThreshold int
 	seq                     uint64
 	epoch                   uint64
@@ -42,7 +45,6 @@ type writer struct {
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
-
 	d := DefaultWriterOptions()
 	opts.MemtableSize = cmp.Or(opts.MemtableSize, d.MemtableSize)
 	opts.FlushInterval = cmp.Or(opts.FlushInterval, d.FlushInterval)
@@ -132,20 +134,26 @@ func (w *writer) putWithTTL(key, value []byte, ttl time.Duration) error {
 
 func (w *writer) putInline(key, value []byte, expireAt int64) error {
 	w.mu.Lock()
+	if err := w.ensureCapacityLocked(); err != nil {
+		w.mu.Unlock()
+		return err
+	}
 	w.seq++
 	seq := w.seq
 	w.memtable.PutWithTTL(key, value, seq, expireAt)
-	size := w.memtable.TotalSize()
 	w.mu.Unlock()
-
-	if size >= w.opts.MemtableSize {
-		return w.flush(context.Background())
-	}
 	return nil
 }
 
 func (w *writer) putBlob(key, value []byte, expireAt int64) error {
 	ctx := context.Background()
+
+	w.mu.Lock()
+	if err := w.ensureCapacityLocked(); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	w.mu.Unlock()
 
 	blobID, err := w.blobStorage.Write(ctx, value)
 	if err != nil {
@@ -153,15 +161,15 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) error {
 	}
 
 	w.mu.Lock()
+	if err := w.ensureCapacityLocked(); err != nil {
+		w.mu.Unlock()
+		_ = w.blobStorage.Delete(ctx, blobID)
+		return err
+	}
 	w.seq++
 	seq := w.seq
 	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
-	size := w.memtable.TotalSize()
 	w.mu.Unlock()
-
-	if size >= w.opts.MemtableSize {
-		return w.flush(ctx)
-	}
 	return nil
 }
 
@@ -190,11 +198,29 @@ func (w *writer) deleteWithTTL(key []byte, ttl time.Duration) error {
 	}
 
 	w.mu.Lock()
+	if err := w.ensureCapacityLocked(); err != nil {
+		w.mu.Unlock()
+		return err
+	}
 	w.seq++
 	seq := w.seq
 	w.memtable.DeleteWithTTL(key, seq, expireAt)
 	w.mu.Unlock()
 
+	return nil
+}
+
+func (w *writer) ensureCapacityLocked() error {
+	if w.memtable.ApproxSize() < w.opts.MemtableSize {
+		return nil
+	}
+	if w.opts.MaxImmutableMemtables > 0 && len(w.immQueue) >= w.opts.MaxImmutableMemtables {
+		return ErrBackpressure
+	}
+	if w.memtable.ApproxSize() > 0 {
+		w.immQueue = append(w.immQueue, w.memtable)
+		w.memtable = internal.NewMemtable(w.opts.MemtableSize*2, w.memtableInlineThreshold)
+	}
 	return nil
 }
 
@@ -207,13 +233,34 @@ func (w *writer) flush(ctx context.Context) error {
 	}
 
 	w.mu.Lock()
-	if w.memtable.ApproxSize() == 0 {
-		w.mu.Unlock()
-		return nil
+	toFlush := append([]*internal.Memtable(nil), w.immQueue...)
+	w.immQueue = nil
+	if w.memtable.ApproxSize() > 0 {
+		toFlush = append(toFlush, w.memtable)
+		w.memtable = internal.NewMemtable(w.opts.MemtableSize*2, w.memtableInlineThreshold)
+	}
+	w.mu.Unlock()
+
+	for i, mt := range toFlush {
+		if err := w.flushMemtable(ctx, mt); err != nil {
+			if errors.Is(err, ErrEmptyIterator) {
+				continue
+			}
+			w.mu.Lock()
+			remaining := toFlush[i:]
+			if len(remaining) > 0 {
+				w.immQueue = append(remaining, w.immQueue...)
+			}
+			w.mu.Unlock()
+			return err
+		}
 	}
 
-	oldMemtable := w.memtable
-	w.memtable = internal.NewMemtable(w.opts.MemtableSize*2, w.memtableInlineThreshold)
+	return nil
+}
+
+func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error {
+	w.mu.Lock()
 	epoch := w.epoch
 	w.epoch++
 	w.mu.Unlock()
@@ -230,12 +277,9 @@ func (w *writer) flush(ctx context.Context) error {
 		return err
 	}
 
-	seqLo, seqHi := oldMemtable.SeqLo(), oldMemtable.SeqHi()
-	result, err := writeSSTStreaming(ctx, oldMemtable.Iterator(), sstOpts, epoch, seqLo, seqHi, uploadFn)
+	seqLo, seqHi := mt.SeqLo(), mt.SeqHi()
+	result, err := writeSSTStreaming(ctx, mt.Iterator(), sstOpts, epoch, seqLo, seqHi, uploadFn)
 	if err != nil {
-		if errors.Is(err, ErrEmptyIterator) {
-			return nil
-		}
 		return fmt.Errorf("stream sst: %w", err)
 	}
 

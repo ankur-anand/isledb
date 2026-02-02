@@ -21,6 +21,9 @@ type WriterOptions struct {
 	BloomBitsPerKey int
 	BlockSize       int
 	Compression     string
+	// MaxImmutableMemtables limits pending memtables waiting to be flushed.
+	// When the limit is reached, writers return ErrBackpressure.
+	MaxImmutableMemtables int
 
 	OnFlushError func(error)
 	ValueStorage config.ValueStorageConfig
