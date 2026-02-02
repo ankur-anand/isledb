@@ -2,12 +2,15 @@ package isledb
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
+
+var ErrTailingReaderStopped = errors.New("tailing reader stopped")
 
 // TailingReader is a read-only handle that refreshes manifests periodically
 // and can tail new keys as they appear in object storage.
@@ -23,6 +26,7 @@ type TailingReader struct {
 	wg     sync.WaitGroup
 
 	running atomic.Bool
+	stopped atomic.Bool
 	closed  atomic.Bool
 }
 
@@ -45,23 +49,32 @@ func newTailingReader(ctx context.Context, store *blobstore.Store, opts TailingR
 	return tr, nil
 }
 
-func (tr *TailingReader) Start() {
+func (tr *TailingReader) Start() error {
+	if tr.closed.Load() || tr.stopped.Load() {
+		return ErrTailingReaderStopped
+	}
 	if tr.running.Swap(true) {
-		return
+		return nil
 	}
 
 	tr.wg.Add(1)
 	go tr.refreshLoop()
+	return nil
 }
 
 // Stop terminates the background refresh loop.
 func (tr *TailingReader) Stop() {
-	if !tr.running.Swap(false) {
+	if tr.stopped.Swap(true) {
+		return
+	}
+
+	if tr.running.Swap(false) {
+		close(tr.stopCh)
+		tr.wg.Wait()
 		return
 	}
 
 	close(tr.stopCh)
-	tr.wg.Wait()
 }
 
 // Close stops background refresh and closes the underlying reader.

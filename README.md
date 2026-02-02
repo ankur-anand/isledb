@@ -116,7 +116,9 @@ if err != nil {
 }
 defer tr.Close()
 
-tr.Start()
+if err := tr.Start(); err != nil {
+	log.Fatal(err)
+}
 err = tr.Tail(ctx, isledb.TailOptions{
 	PollInterval: time.Second,
 }, func(kv isledb.KV) error {

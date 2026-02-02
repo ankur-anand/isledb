@@ -153,7 +153,9 @@ func main() {
 	}
 	defer tr.Close()
 
-	tr.Start()
+	if err := tr.Start(); err != nil {
+		log.Fatal(err)
+	}
 	tailCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 

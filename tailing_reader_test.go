@@ -49,7 +49,9 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 	}
 	defer tr.Close()
 
-	tr.Start()
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	val, found, err := tr.Get(ctx, []byte("key:001"))
 	if err != nil {
