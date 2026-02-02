@@ -3,8 +3,10 @@ package isledb
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
@@ -60,13 +62,22 @@ func writeSSTStreaming(
 	}
 	producerDone := make(chan producerResult, 1)
 
+	var uploadErr atomic.Value
+	getUploadErr := func() error {
+		if v := uploadErr.Load(); v != nil {
+			return v.(error)
+		}
+		return nil
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	// read from the pipe and upload to the blob
 	g.Go(func() error {
 		err := uploadFn(gctx, sstID, pr)
 		if err != nil {
-			pr.Close()
+			uploadErr.Store(err)
+			_ = pr.CloseWithError(err)
 			return fmt.Errorf("sst upload: %w", err)
 		}
 		return nil
@@ -79,9 +90,13 @@ func writeSSTStreaming(
 
 		for it.Next() {
 			if err := gctx.Err(); err != nil {
+				if ue := getUploadErr(); ue != nil {
+					err = fmt.Errorf("sst upload: %w", ue)
+				}
 				writable.Abort()
 				_ = sst.Close()
 				producerDone <- producerResult{err: err}
+				pw.CloseWithError(err)
 				return err
 			}
 
@@ -115,6 +130,9 @@ func writeSSTStreaming(
 			ikey := pebble.MakeInternalKey(k, pebble.SeqNum(e.Seq), kind)
 
 			if err := sst.Raw().Add(ikey, encodedValue, false); err != nil {
+				if ue := getUploadErr(); ue != nil && errors.Is(err, io.ErrClosedPipe) {
+					err = fmt.Errorf("sst upload: %w", ue)
+				}
 				writable.Abort()
 				_ = sst.Close()
 				producerDone <- producerResult{err: err}
@@ -142,6 +160,9 @@ func writeSSTStreaming(
 		}
 
 		if err := sst.Close(); err != nil {
+			if ue := getUploadErr(); ue != nil && errors.Is(err, io.ErrClosedPipe) {
+				err = fmt.Errorf("sst upload: %w", ue)
+			}
 			producerDone <- producerResult{err: err}
 			pw.CloseWithError(err)
 			return fmt.Errorf("sst producer: %w", err)
