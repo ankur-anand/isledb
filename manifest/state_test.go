@@ -161,6 +161,36 @@ func TestManifest_AllSSTIDs(t *testing.T) {
 	}
 }
 
+func TestManifest_LookupSST(t *testing.T) {
+	m := &Manifest{
+		L0SSTs: []SSTMeta{
+			{ID: "l0-1.sst"},
+			{ID: "l0-2.sst"},
+		},
+		SortedRuns: []SortedRun{
+			{
+				ID: 1,
+				SSTs: []SSTMeta{
+					{ID: "sr-1-a.sst"},
+					{ID: "sr-1-b.sst"},
+				},
+			},
+		},
+	}
+
+	if got := m.LookupSST("l0-2.sst"); got == nil || got.ID != "l0-2.sst" {
+		t.Fatalf("expected to find l0-2.sst, got %+v", got)
+	}
+
+	if got := m.LookupSST("sr-1-b.sst"); got == nil || got.ID != "sr-1-b.sst" {
+		t.Fatalf("expected to find sr-1-b.sst, got %+v", got)
+	}
+
+	if got := m.LookupSST("missing.sst"); got != nil {
+		t.Fatalf("expected missing.sst to be nil, got %+v", got)
+	}
+}
+
 func TestSortedRun_FindSST(t *testing.T) {
 	sr := SortedRun{
 		ID: 1,

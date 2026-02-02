@@ -103,6 +103,29 @@ func (m *Manifest) SortedRunCount() int {
 	return len(m.SortedRuns)
 }
 
+// LookupSST returns the SST meta by ID if present in L0 or sorted runs.
+func (m *Manifest) LookupSST(id string) *SSTMeta {
+	if m == nil {
+		return nil
+	}
+
+	for i := range m.L0SSTs {
+		if m.L0SSTs[i].ID == id {
+			return &m.L0SSTs[i]
+		}
+	}
+
+	for i := range m.SortedRuns {
+		for j := range m.SortedRuns[i].SSTs {
+			if m.SortedRuns[i].SSTs[j].ID == id {
+				return &m.SortedRuns[i].SSTs[j]
+			}
+		}
+	}
+
+	return nil
+}
+
 // FindConsecutiveSimilarRuns finds consecutive runs with similar sizes.
 func (m *Manifest) FindConsecutiveSimilarRuns(minSources, maxSources, sizeThreshold int) []SortedRun {
 	if minSources < 2 {

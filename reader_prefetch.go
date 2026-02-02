@@ -1,6 +1,9 @@
 package isledb
 
-import "context"
+import (
+	"context"
+	"path/filepath"
+)
 
 // RefreshAndPrefetchSSTs refreshes the manifest and prefetches any new SSTs
 // that were added since the last refresh. This is useful for keeping the
@@ -57,6 +60,21 @@ func (r *Reader) prefetchSST(ctx context.Context, path string) {
 	data, _, err := r.store.Read(ctx, path)
 	if err != nil {
 		return
+	}
+
+	if r.verifySST || r.verifier != nil {
+		r.mu.RLock()
+		m := r.manifest
+		r.mu.RUnlock()
+		if m != nil {
+			id := filepath.Base(path)
+			meta := m.LookupSST(id)
+			if meta != nil {
+				if err := r.validateSSTData(*meta, data); err != nil {
+					return
+				}
+			}
+		}
 	}
 
 	r.sstCache.Set(path, data)

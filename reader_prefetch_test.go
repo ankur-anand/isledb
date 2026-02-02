@@ -201,3 +201,88 @@ func TestReader_RefreshAndPrefetch_MultipleFlushes(t *testing.T) {
 		}
 	}
 }
+
+func TestReader_RefreshAndPrefetch_ValidatesChecksum(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("key:%03d", i)
+		value := fmt.Sprintf("value:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	rOpts := DefaultReaderOptions()
+	rOpts.CacheDir = t.TempDir()
+	rOpts.ValidateSSTChecksum = true
+	r, err := newReader(ctx, store, rOpts)
+	if err != nil {
+		t.Fatalf("newReader failed: %v", err)
+	}
+	defer r.Close()
+
+	if err := r.RefreshAndPrefetchSSTs(ctx); err != nil {
+		t.Fatalf("RefreshAndPrefetchSSTs failed: %v", err)
+	}
+	statsBefore := r.SSTCacheStats()
+
+	for i := 3; i < 6; i++ {
+		key := fmt.Sprintf("key:%03d", i)
+		value := fmt.Sprintf("value:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	m, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay manifest: %v", err)
+	}
+	if len(m.L0SSTs) == 0 {
+		t.Fatalf("expected L0 SSTs in manifest")
+	}
+
+	newest := m.L0SSTs[0]
+	path := store.SSTPath(newest.ID)
+	data, _, err := store.Read(ctx, path)
+	if err != nil {
+		t.Fatalf("read sst: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("unexpected empty sst data")
+	}
+	data[0] ^= 0xFF
+	if _, err := store.Write(ctx, path, data); err != nil {
+		t.Fatalf("write corrupt sst: %v", err)
+	}
+
+	if err := r.RefreshAndPrefetchSSTs(ctx); err != nil {
+		t.Fatalf("RefreshAndPrefetchSSTs failed: %v", err)
+	}
+
+	statsAfter := r.SSTCacheStats()
+	if statsAfter.EntryCount != statsBefore.EntryCount {
+		t.Fatalf("expected cache entry count unchanged, got %d (was %d)", statsAfter.EntryCount, statsBefore.EntryCount)
+	}
+	if _, ok := r.sstCache.Get(path); ok {
+		t.Fatalf("expected corrupted sst to be skipped during prefetch")
+	}
+}
