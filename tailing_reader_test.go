@@ -313,7 +313,7 @@ func TestIncrementKey(t *testing.T) {
 	}{
 		{[]byte("a"), []byte("b")},
 		{[]byte("abc"), []byte("abd")},
-		{[]byte{0xFF}, []byte{0x00, 0x00}},
+		{[]byte{0xFF}, []byte{0xFF, 0x00}},
 		{[]byte{0x01, 0xFF}, []byte{0x02, 0x00}},
 		{[]byte("key:000"), []byte("key:001")},
 	}

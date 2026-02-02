@@ -278,6 +278,10 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 	}
 
 	var allIters []sstable.Iterator
+	upper := maxKey
+	if len(maxKey) > 0 {
+		upper = incrementKey(maxKey)
+	}
 
 	cleanup := func() {
 		for _, it := range allIters {
@@ -290,7 +294,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, nil)
+		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
 		if err != nil {
 			cleanup()
 			return nil, err
@@ -301,7 +305,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 	for _, sr := range m.SortedRuns {
 		overlapping := sr.OverlappingSSTs(minKey, maxKey)
 		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, nil)
+			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
 			if err != nil {
 				cleanup()
 				return nil, err
@@ -373,6 +377,10 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	}
 
 	var allIters []sstable.Iterator
+	upper := maxKey
+	if len(maxKey) > 0 {
+		upper = incrementKey(maxKey)
+	}
 
 	cleanup := func() {
 		for _, it := range allIters {
@@ -384,7 +392,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, nil)
+		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
 		if err != nil {
 			cleanup()
 			return nil, err
@@ -395,7 +403,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	for _, sr := range m.SortedRuns {
 		overlapping := sr.OverlappingSSTs(minKey, maxKey)
 		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, nil)
+			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
 			if err != nil {
 				cleanup()
 				return nil, err
@@ -775,6 +783,10 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 	}
 
 	var allIters []sstable.Iterator
+	upper := opts.MaxKey
+	if len(opts.MaxKey) > 0 {
+		upper = incrementKey(opts.MaxKey)
+	}
 
 	cleanup := func() {
 		for _, it := range allIters {
@@ -786,7 +798,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		if !overlapsRange(sst.MinKey, sst.MaxKey, opts.MinKey, opts.MaxKey) {
 			continue
 		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, nil)
+		_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
 		if err != nil {
 			cleanup()
 			return nil, err
@@ -797,7 +809,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 	for _, sr := range m.SortedRuns {
 		overlapping := sr.OverlappingSSTs(opts.MinKey, opts.MaxKey)
 		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, nil)
+			_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
 			if err != nil {
 				cleanup()
 				return nil, err

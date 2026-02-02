@@ -215,25 +215,6 @@ func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler fun
 	}
 }
 
-func incrementKey(key []byte) []byte {
-	if len(key) == 0 {
-		return nil
-	}
-
-	result := make([]byte, len(key))
-	copy(result, key)
-
-	for i := len(result) - 1; i >= 0; i-- {
-		if result[i] < 0xFF {
-			result[i]++
-			return result
-		}
-		result[i] = 0
-	}
-
-	return append(result, 0)
-}
-
 // TailChannel returns a channel of KV updates and an error channel.
 func (tr *TailingReader) TailChannel(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error) {
 	ch := make(chan KV, 100)
