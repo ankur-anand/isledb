@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 )
 
@@ -46,20 +47,22 @@ func (r *Reader) RefreshAndPrefetchSSTs(ctx context.Context) error {
 			}
 		}
 		path := r.store.SSTPath(id)
-		r.prefetchSST(ctx, path)
+		if err := r.prefetchSST(ctx, path); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (r *Reader) prefetchSST(ctx context.Context, path string) {
+func (r *Reader) prefetchSST(ctx context.Context, path string) error {
 	if _, ok := r.sstCache.Get(path); ok {
-		return
+		return nil
 	}
 
 	data, _, err := r.store.Read(ctx, path)
 	if err != nil {
-		return
+		return fmt.Errorf("read sst %s: %w", path, err)
 	}
 
 	if r.verifySST || r.verifier != nil {
@@ -71,11 +74,14 @@ func (r *Reader) prefetchSST(ctx context.Context, path string) {
 			meta := m.LookupSST(id)
 			if meta != nil {
 				if err := r.validateSSTData(*meta, data); err != nil {
-					return
+					return fmt.Errorf("validate sst %s: %w", path, err)
 				}
 			}
 		}
 	}
 
-	r.sstCache.Set(path, data)
+	if err := r.sstCache.Set(path, data); err != nil {
+		return fmt.Errorf("cache sst %s: %w", path, err)
+	}
+	return nil
 }

@@ -274,8 +274,8 @@ func TestReader_RefreshAndPrefetch_ValidatesChecksum(t *testing.T) {
 		t.Fatalf("write corrupt sst: %v", err)
 	}
 
-	if err := r.RefreshAndPrefetchSSTs(ctx); err != nil {
-		t.Fatalf("RefreshAndPrefetchSSTs failed: %v", err)
+	if err := r.RefreshAndPrefetchSSTs(ctx); err == nil {
+		t.Fatalf("expected RefreshAndPrefetchSSTs to fail on checksum mismatch")
 	}
 
 	statsAfter := r.SSTCacheStats()

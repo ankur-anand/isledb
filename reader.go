@@ -607,7 +607,9 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 		if err := r.validateSSTData(sstMeta, data); err != nil {
 			return nil, nil, err
 		}
-		_ = r.sstCache.Set(path, data)
+		if err := r.sstCache.Set(path, data); err != nil {
+			return nil, nil, fmt.Errorf("cache sst %s: %w", sstMeta.ID, err)
+		}
 		if cached, ok := r.sstCache.Acquire(path); ok {
 			data = cached
 			release = func() {
