@@ -174,11 +174,13 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -217,11 +219,13 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -275,11 +279,13 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -336,11 +342,13 @@ func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}

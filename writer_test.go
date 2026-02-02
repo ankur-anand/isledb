@@ -83,7 +83,7 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	if err := w.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	
+
 	w2, err := newWriter(ctx, store, manifestStore, WriterOptions{
 		MemtableSize:  1 << 20,
 		FlushInterval: 0,

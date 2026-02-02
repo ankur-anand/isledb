@@ -35,8 +35,6 @@ type RetentionCompactorOptions struct {
 	OnCleanup func(CleanupStats)
 
 	OnCleanupError func(error)
-
-	ManifestStorage manifest.Storage
 }
 
 type CleanupStats struct {
@@ -71,7 +69,7 @@ type RetentionCompactor struct {
 	closed  atomic.Bool
 }
 
-func NewRetentionCompactor(ctx context.Context, store *blobstore.Store, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
+func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
 
 	defaults := DefaultRetentionCompactorOptions()
 	if opts.RetentionPeriod == 0 {
@@ -87,7 +85,6 @@ func NewRetentionCompactor(ctx context.Context, store *blobstore.Store, opts Ret
 		opts.SegmentDuration = defaults.SegmentDuration
 	}
 
-	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)

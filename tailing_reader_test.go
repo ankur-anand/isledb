@@ -16,9 +16,11 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -85,9 +87,11 @@ func TestTailingReader_Tail(t *testing.T) {
 
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -169,9 +173,11 @@ func TestTailingReader_TailChannel(t *testing.T) {
 
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -243,9 +249,11 @@ func TestTailingReader_StartAfterKey(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}

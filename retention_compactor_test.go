@@ -14,9 +14,11 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -51,9 +53,9 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 		CheckInterval:   time.Hour,
 	}
 
-	cleaner, err := NewRetentionCompactor(ctx, store, cleanerOpts)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
 	if err != nil {
-		t.Fatalf("NewRetentionCompactor failed: %v", err)
+		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 	defer cleaner.Close()
 
@@ -80,9 +82,11 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -109,9 +113,9 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 		CheckInterval:   time.Hour,
 	}
 
-	cleaner, err := NewRetentionCompactor(ctx, store, cleanerOpts)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
 	if err != nil {
-		t.Fatalf("NewRetentionCompactor failed: %v", err)
+		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 	defer cleaner.Close()
 
@@ -132,9 +136,11 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -157,9 +163,9 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 		CheckInterval:   time.Hour,
 	}
 
-	cleaner, err := NewRetentionCompactor(ctx, store, cleanerOpts)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
 	if err != nil {
-		t.Fatalf("NewRetentionCompactor failed: %v", err)
+		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 	defer cleaner.Close()
 
@@ -181,9 +187,11 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -212,9 +220,9 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 		},
 	}
 
-	cleaner, err := NewRetentionCompactor(ctx, store, cleanerOpts)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
 	if err != nil {
-		t.Fatalf("NewRetentionCompactor failed: %v", err)
+		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 	defer cleaner.Close()
 
@@ -234,9 +242,11 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -263,9 +273,9 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 		},
 	}
 
-	cleaner, err := NewRetentionCompactor(ctx, store, cleanerOpts)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
 	if err != nil {
-		t.Fatalf("NewRetentionCompactor failed: %v", err)
+		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 
 	cleaner.Start()

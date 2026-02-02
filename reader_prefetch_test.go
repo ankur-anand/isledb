@@ -12,9 +12,11 @@ func TestReader_RefreshAndPrefetch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -78,9 +80,11 @@ func TestReader_RefreshAndPrefetch_NoNewSSTs(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -142,9 +146,11 @@ func TestReader_RefreshAndPrefetch_MultipleFlushes(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	wOpts := DefaultWriterOptions()
 	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, wOpts)
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}

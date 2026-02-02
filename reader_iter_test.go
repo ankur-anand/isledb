@@ -12,11 +12,13 @@ func TestReader_ScanLimit(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -88,11 +90,13 @@ func TestReader_Iterator(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -166,10 +170,12 @@ func TestReader_Iterator_Empty(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -211,11 +217,13 @@ func TestReader_Iterator_SeekGE(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -292,11 +300,13 @@ func TestReader_Iterator_WithDeletes(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
@@ -351,11 +361,13 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
+	manifestStore := newManifestStore(store, nil)
+
 	opts := DefaultWriterOptions()
 	opts.MemtableSize = 1024 * 1024
 	opts.FlushInterval = 0
 
-	w, err := newWriter(ctx, store, opts)
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
