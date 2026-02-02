@@ -164,6 +164,12 @@ func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler fun
 		lastKey = opts.StartAfterKey
 	}
 
+	timer := time.NewTimer(opts.PollInterval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
 	for {
 
 		if err := tr.Refresh(ctx); err != nil {
@@ -207,8 +213,11 @@ func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler fun
 		}
 		iter.Close()
 
+		timer.Stop()
+		timer.Reset(opts.PollInterval)
+
 		select {
-		case <-time.After(opts.PollInterval):
+		case <-timer.C:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
