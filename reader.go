@@ -3,10 +3,13 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +31,8 @@ type Reader struct {
 	blobStorage *internal.BlobStorage
 	blobCache   internal.BlobCache
 	valueConfig config.ValueStorageConfig
+	verifySST   bool
+	verifier    SSTHashVerifier
 
 	ownsSSTCache  bool
 	ownsBlobCache bool
@@ -83,6 +88,8 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		blobStorage:   internal.NewBlobStorage(store, valueConfig),
 		blobCache:     blobCache,
 		valueConfig:   valueConfig,
+		verifySST:     opts.ValidateSSTChecksum,
+		verifier:      opts.SSTHashVerifier,
 		ownsSSTCache:  ownsSSTCache,
 		ownsBlobCache: ownsBlobCache,
 	}
@@ -585,6 +592,9 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 		if err != nil {
 			return nil, nil, fmt.Errorf("read sst %s: %w", sstMeta.ID, err)
 		}
+		if err := r.validateSSTData(sstMeta, data); err != nil {
+			return nil, nil, err
+		}
 		r.sstCache.Set(path, data)
 	}
 
@@ -600,6 +610,44 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 	}
 
 	return reader, iter, nil
+}
+
+func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
+	if r.verifier != nil && meta.Signature == nil {
+		return fmt.Errorf("sst %s: missing signature", meta.ID)
+	}
+
+	needHash := r.verifySST || r.verifier != nil
+	if !needHash {
+		return nil
+	}
+
+	sum := sha256.Sum256(data)
+	hashHex := hex.EncodeToString(sum[:])
+
+	if r.verifySST {
+		if meta.Checksum == "" {
+			return fmt.Errorf("sst %s: missing checksum", meta.ID)
+		}
+		algo, expected, ok := strings.Cut(meta.Checksum, ":")
+		if !ok || algo != "sha256" {
+			return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
+		}
+		if expected != hashHex {
+			return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
+		}
+	}
+
+	if r.verifier != nil {
+		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
+			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
+		}
+		if err := r.verifier.VerifyHash(sum[:], *meta.Signature); err != nil {
+			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
+		}
+	}
+
+	return nil
 }
 
 func (r *Reader) SSTCacheStats() SSTCacheStats {

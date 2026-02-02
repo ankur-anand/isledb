@@ -22,6 +22,14 @@ type ReaderOpenOptions struct {
 	// BlobCacheMaxItemSize is the maximum size per item in the blob cache.
 	BlobCacheMaxItemSize int64
 
+	// ValidateSSTChecksum verifies SST checksums on first download.
+	// If enabled and checksum is missing or mismatched, reads fail.
+	ValidateSSTChecksum bool
+
+	// SSTHashVerifier verifies SST signatures when present.
+	// If provided and the SST has a signature, verification is enforced.
+	SSTHashVerifier SSTHashVerifier
+
 	BlobReadOptions config.BlobReadOptions
 	ManifestStorage manifest.Storage
 }
@@ -48,6 +56,8 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		SSTCacheSize:         opts.SSTCacheSize,
 		BlobCacheSize:        opts.BlobCacheSize,
 		BlobCacheMaxItemSize: opts.BlobCacheMaxItemSize,
+		ValidateSSTChecksum:  opts.ValidateSSTChecksum,
+		SSTHashVerifier:      opts.SSTHashVerifier,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

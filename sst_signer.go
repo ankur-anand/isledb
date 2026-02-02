@@ -6,3 +6,8 @@ type SSTHashSigner interface {
 	KeyID() string
 	SignHash(hash []byte) ([]byte, error)
 }
+
+// SSTHashVerifier verifies SST hash signatures for integrity checks.
+type SSTHashVerifier interface {
+	VerifyHash(hash []byte, sig SSTSignature) error
+}

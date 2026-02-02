@@ -65,6 +65,14 @@ type ReaderOptions struct {
 	ManifestLogCache     cachestore.ManifestLogCache
 	ManifestLogCacheSize int
 	DisableManifestCache bool
+
+	// ValidateSSTChecksum verifies SST checksums on first download.
+	// If enabled and checksum is missing or mismatched, reads fail.
+	ValidateSSTChecksum bool
+
+	// SSTHashVerifier verifies SST signatures when present.
+	// If provided and the SST has a signature, verification is enforced.
+	SSTHashVerifier SSTHashVerifier
 }
 
 func DefaultReaderOptions() ReaderOptions {

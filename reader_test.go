@@ -3,6 +3,7 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -348,5 +349,96 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	if !bytes.Equal(results[0].Key, []byte("m")) || !bytes.Equal(results[0].Value, []byte("keep")) {
 		t.Fatalf("scan result: %q=%q", results[0].Key, results[0].Value)
+	}
+}
+
+type noopSSTVerifier struct{}
+
+func (noopSSTVerifier) VerifyHash(_ []byte, _ SSTSignature) error {
+	return nil
+}
+
+func TestReader_VerifierRequiresSignature(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-verify")
+	ms := manifest.NewStore(store)
+
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+	}
+	writeTestSST(t, ctx, store, ms, entries, 0, 1)
+
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir:        cacheDir,
+		SSTHashVerifier: noopSSTVerifier{},
+	})
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("newReader: %v", err)
+	}
+	defer func() {
+		_ = reader.Close()
+		_ = store.Close()
+	}()
+
+	if _, _, err := reader.Get(ctx, []byte("a")); err == nil {
+		t.Fatalf("expected missing signature error")
+	} else if !strings.Contains(err.Error(), "missing signature") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReader_ChecksumMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-checksum")
+	ms := manifest.NewStore(store)
+
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+	}
+
+	it := &sliceSSTIter{entries: entries}
+	res, err := writeSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	if err != nil {
+		t.Fatalf("writeSST: %v", err)
+	}
+	res.Meta.Level = 0
+
+	sstPath := store.SSTPath(res.Meta.ID)
+	if _, err := store.Write(ctx, sstPath, res.SSTData); err != nil {
+		t.Fatalf("write sst: %v", err)
+	}
+	if _, err := ms.AppendAddSSTable(ctx, res.Meta); err != nil {
+		t.Fatalf("append manifest log: %v", err)
+	}
+
+	corrupt := append([]byte(nil), res.SSTData...)
+	if len(corrupt) == 0 {
+		t.Fatalf("unexpected empty sst data")
+	}
+	corrupt[0] ^= 0xff
+	if _, err := store.Write(ctx, sstPath, corrupt); err != nil {
+		t.Fatalf("write corrupt sst: %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir:            cacheDir,
+		ValidateSSTChecksum: true,
+	})
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("newReader: %v", err)
+	}
+	defer func() {
+		_ = reader.Close()
+		_ = store.Close()
+	}()
+
+	if _, _, err := reader.Get(ctx, []byte("a")); err == nil {
+		t.Fatalf("expected checksum mismatch error")
+	} else if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

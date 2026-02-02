@@ -497,7 +497,7 @@ func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
-	
+
 	h := sha256.Sum256(uploadedData)
 	computedHash := hex.EncodeToString(h[:])
 	metaHash := strings.TrimPrefix(results[0].Meta.Checksum, "sha256:")
