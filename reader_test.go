@@ -442,3 +442,48 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-cache-release")
+	ms := manifest.NewStore(store)
+
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value")},
+	}
+	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
+
+	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		store.Close()
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+	defer store.Close()
+
+	path := store.SSTPath(res.Meta.ID)
+
+	_, iter, err := reader.openSSTIterBounded(ctx, res.Meta, nil, nil)
+	if err != nil {
+		t.Fatalf("openSSTIterBounded: %v", err)
+	}
+
+	if _, ok := reader.sstCache.Get(path); !ok {
+		iter.Close()
+		t.Fatalf("expected sst cache entry after iterator open")
+	}
+
+	reader.sstCache.Remove(path)
+	if _, ok := reader.sstCache.Get(path); !ok {
+		iter.Close()
+		t.Fatalf("expected sst cache entry to remain while iterator open")
+	}
+
+	if err := iter.Close(); err != nil {
+		t.Fatalf("iter close: %v", err)
+	}
+
+	if _, ok := reader.sstCache.Get(path); ok {
+		t.Fatalf("expected sst cache entry removed after iterator close")
+	}
+}

@@ -585,8 +585,12 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 
 	var data []byte
 	var err error
-	if cached, ok := r.sstCache.Get(path); ok {
+	var release func()
+	if cached, ok := r.sstCache.Acquire(path); ok {
 		data = cached
+		release = func() {
+			r.sstCache.Release(path)
+		}
 	} else {
 		data, _, err = r.store.Read(ctx, path)
 		if err != nil {
@@ -595,21 +599,64 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 		if err := r.validateSSTData(sstMeta, data); err != nil {
 			return nil, nil, err
 		}
-		r.sstCache.Set(path, data)
+		_ = r.sstCache.Set(path, data)
+		if cached, ok := r.sstCache.Acquire(path); ok {
+			data = cached
+			release = func() {
+				r.sstCache.Release(path)
+			}
+		}
 	}
 
 	reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
 	if err != nil {
+		if release != nil {
+			release()
+		}
 		return nil, nil, err
 	}
 
 	iter, err := reader.NewIter(sstable.NoTransforms, lower, upper, sstable.AssertNoBlobHandles)
 	if err != nil {
 		_ = reader.Close()
+		if release != nil {
+			release()
+		}
 		return nil, nil, err
 	}
 
-	return reader, iter, nil
+	wrapped := &sstIterWithClose{
+		Iterator: iter,
+		reader:   reader,
+		release:  release,
+	}
+
+	return reader, wrapped, nil
+}
+
+type sstIterWithClose struct {
+	sstable.Iterator
+	reader  *sstable.Reader
+	release func()
+	closed  bool
+}
+
+func (it *sstIterWithClose) Close() error {
+	if it.closed {
+		return nil
+	}
+	it.closed = true
+
+	err := it.Iterator.Close()
+	if it.reader != nil {
+		if rerr := it.reader.Close(); err == nil {
+			err = rerr
+		}
+	}
+	if it.release != nil {
+		it.release()
+	}
+	return err
 }
 
 func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {

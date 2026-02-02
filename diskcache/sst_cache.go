@@ -36,6 +36,8 @@ type sstCache struct {
 	index map[string]*sstEntry
 	order []string
 
+	pending map[string]struct{}
+
 	hits   atomic.Int64
 	misses atomic.Int64
 }
@@ -60,6 +62,7 @@ func NewSSTCache(opts SSTCacheOptions) (RefCountedCache, error) {
 		maxSize: maxSize,
 		index:   make(map[string]*sstEntry),
 		order:   make([]string, 0),
+		pending: make(map[string]struct{}),
 	}, nil
 }
 
@@ -85,7 +88,10 @@ func (c *sstCache) Set(key string, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.index[key]; exists {
+	if entry, exists := c.index[key]; exists {
+		if entry.refs.Load() > 0 {
+			return nil
+		}
 		c.removeLocked(key)
 	}
 
@@ -133,6 +139,14 @@ func (c *sstCache) Set(key string, data []byte) error {
 func (c *sstCache) Remove(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	entry, ok := c.index[key]
+	if !ok {
+		return
+	}
+	if entry.refs.Load() > 0 {
+		c.pending[key] = struct{}{}
+		return
+	}
 	c.removeLocked(key)
 }
 
@@ -153,6 +167,7 @@ func (c *sstCache) removeLocked(key string) {
 	os.Remove(entry.localPath)
 	c.currentSize -= entry.size
 	delete(c.index, key)
+	delete(c.pending, key)
 	c.removeFromOrder(key)
 }
 
@@ -219,9 +234,19 @@ func (c *sstCache) Release(key string) {
 	entry, ok := c.index[key]
 	c.mu.RUnlock()
 
-	if ok {
-		entry.refs.Add(-1)
+	if !ok {
+		return
 	}
+
+	if entry.refs.Add(-1) != 0 {
+		return
+	}
+
+	c.mu.Lock()
+	if _, pending := c.pending[key]; pending {
+		c.removeLocked(key)
+	}
+	c.mu.Unlock()
 }
 
 func (c *sstCache) evictOldest() bool {
