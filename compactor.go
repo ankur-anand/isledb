@@ -99,10 +99,9 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 }
 
 func (c *Compactor) Start() {
-	if c.running.Load() {
+	if !c.running.CompareAndSwap(false, true) {
 		return
 	}
-	c.running.Store(true)
 	c.ticker = time.NewTicker(c.opts.CheckInterval)
 	c.wg.Add(1)
 	go c.compactionLoop()
