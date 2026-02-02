@@ -54,7 +54,7 @@ type Compactor struct {
 	closed  atomic.Bool
 }
 
-func newCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOptions) (*Compactor, error) {
+func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts CompactorOptions) (*Compactor, error) {
 	d := DefaultCompactorOptions()
 	opts.L0CompactionThreshold = cmp.Or(opts.L0CompactionThreshold, d.L0CompactionThreshold)
 	opts.MinSources = cmp.Or(opts.MinSources, d.MinSources)
@@ -66,7 +66,6 @@ func newCompactor(ctx context.Context, store *blobstore.Store, opts CompactorOpt
 	opts.CheckInterval = cmp.Or(opts.CheckInterval, d.CheckInterval)
 	opts.TargetSSTSize = cmp.Or(opts.TargetSSTSize, d.TargetSSTSize)
 
-	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)

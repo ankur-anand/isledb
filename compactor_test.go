@@ -14,11 +14,13 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	writerOpts := DefaultWriterOptions()
 	writerOpts.FlushInterval = 0
 	writerOpts.MemtableSize = 1024
 
-	writer, err := newWriter(ctx, store, writerOpts)
+	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -52,7 +54,7 @@ func TestCompactor_L0Compaction(t *testing.T) {
 		}
 	}
 
-	compactor, err := newCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -88,11 +90,13 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	writerOpts := DefaultWriterOptions()
 	writerOpts.FlushInterval = 0
 	writerOpts.MemtableSize = 512
 
-	writer, err := newWriter(ctx, store, writerOpts)
+	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -116,7 +120,7 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
 
-	compactor, err := newCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -151,11 +155,13 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	writerOpts := DefaultWriterOptions()
 	writerOpts.FlushInterval = 0
 	writerOpts.MemtableSize = 512
 
-	writer, err := newWriter(ctx, store, writerOpts)
+	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -188,7 +194,7 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
 
-	compactor, err := newCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -239,10 +245,12 @@ func TestCompactor_BackgroundLoop(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.CheckInterval = 10 * time.Millisecond
 
-	compactor, err := newCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -262,13 +270,15 @@ func TestCompactor_Refresh(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
-	compactor, err := newCompactor(ctx, store, DefaultCompactorOptions())
+	manifestStore := newManifestStore(store, nil)
+
+	compactor, err := newCompactor(ctx, store, manifestStore, DefaultCompactorOptions())
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
 	defer compactor.Close()
 
-	writer, err := newWriter(ctx, store, DefaultWriterOptions())
+	writer, err := newWriter(ctx, store, manifestStore, DefaultWriterOptions())
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -298,11 +308,13 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	writerOpts := DefaultWriterOptions()
 	writerOpts.FlushInterval = 0
 	writerOpts.MemtableSize = 1024
 
-	writer, err := newWriter(ctx, store, writerOpts)
+	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -331,7 +343,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	compactorOpts.TargetSSTSize = 4 * 1024
 	compactorOpts.CheckInterval = time.Hour
 
-	compactor, err := newCompactor(ctx, store, compactorOpts)
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -367,6 +379,8 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	compactorOpts := CompactorOptions{
 		L0CompactionThreshold: 2,
 		MinSources:            2,
@@ -386,7 +400,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	expectedData := make(map[string]string)
 
 	t.Run("Phase1_L0CompactionCreatesSortedRun", func(t *testing.T) {
-		writer, err := newWriter(ctx, store, writerOpts)
+		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 		if err != nil {
 			t.Fatalf("newWriter: %v", err)
 		}
@@ -416,7 +430,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := newCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}
@@ -467,7 +481,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 
 	t.Run("Phase3_NewerValuesOverrideOlder", func(t *testing.T) {
-		writer, err := newWriter(ctx, store, writerOpts)
+		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 		if err != nil {
 			t.Fatalf("newWriter: %v", err)
 		}
@@ -497,7 +511,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := newCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}
@@ -536,7 +550,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 
 	t.Run("Phase4_ConsecutiveCompactionMergesSimilarRuns", func(t *testing.T) {
 		for batch := 0; batch < 4; batch++ {
-			writer, err := newWriter(ctx, store, writerOpts)
+			writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 			if err != nil {
 				t.Fatalf("newWriter: %v", err)
 			}
@@ -566,7 +580,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			}
 			writer.close()
 
-			compactor, err := newCompactor(ctx, store, compactorOpts)
+			compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 			if err != nil {
 				t.Fatalf("newCompactor: %v", err)
 			}
@@ -577,7 +591,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			compactor.Close()
 		}
 
-		compactor, err := newCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}
@@ -620,7 +634,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 
 	t.Run("Phase5_DeletesRespected", func(t *testing.T) {
-		writer, err := newWriter(ctx, store, writerOpts)
+		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 		if err != nil {
 			t.Fatalf("newWriter: %v", err)
 		}
@@ -651,7 +665,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := newCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}
@@ -729,6 +743,8 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	compactorOpts := CompactorOptions{
 		L0CompactionThreshold: 2,
 		MinSources:            2,
@@ -745,7 +761,7 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	writerOpts.FlushInterval = 0
 	writerOpts.MemtableSize = 256
 
-	writer1, err := newWriter(ctx, store, writerOpts)
+	writer1, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -774,7 +790,7 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 	writer1.close()
 
-	compactor1, err := newCompactor(ctx, store, compactorOpts)
+	compactor1, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -783,7 +799,7 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 	compactor1.Close()
 
-	writer2, err := newWriter(ctx, store, writerOpts)
+	writer2, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -812,7 +828,7 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 	writer2.close()
 
-	compactor2, err := newCompactor(ctx, store, compactorOpts)
+	compactor2, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
@@ -844,6 +860,8 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
+	manifestStore := newManifestStore(store, nil)
+
 	compactorOpts := CompactorOptions{
 		L0CompactionThreshold: 1,
 		MinSources:            2,
@@ -863,7 +881,7 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	expectedData := make(map[string]string)
 
 	for batch := 0; batch < 4; batch++ {
-		writer, err := newWriter(ctx, store, writerOpts)
+		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 		if err != nil {
 			t.Fatalf("newWriter: %v", err)
 		}
@@ -881,7 +899,7 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 		}
 		writer.close()
 
-		compactor, err := newCompactor(ctx, store, compactorOpts)
+		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}

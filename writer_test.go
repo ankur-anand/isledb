@@ -12,7 +12,9 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	store := blobstore.NewMemory("writer-test")
 	defer store.Close()
 
-	w, err := newWriter(ctx, store, WriterOptions{
+	manifestStore := newManifestStore(store, nil)
+
+	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
 		MemtableSize:    1 << 20,
 		FlushInterval:   0,
 		BloomBitsPerKey: 0,
@@ -61,7 +63,9 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	store := blobstore.NewMemory("writer-replay")
 	defer store.Close()
 
-	w, err := newWriter(ctx, store, WriterOptions{
+	manifestStore := newManifestStore(store, nil)
+
+	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
 		MemtableSize:  1 << 20,
 		FlushInterval: 0,
 		BlockSize:     4096,
@@ -79,8 +83,8 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	if err := w.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-
-	w2, err := newWriter(ctx, store, WriterOptions{
+	
+	w2, err := newWriter(ctx, store, manifestStore, WriterOptions{
 		MemtableSize:  1 << 20,
 		FlushInterval: 0,
 		BlockSize:     4096,

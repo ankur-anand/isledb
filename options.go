@@ -22,9 +22,8 @@ type WriterOptions struct {
 	BlockSize       int
 	Compression     string
 
-	OnFlushError    func(error)
-	ValueStorage    config.ValueStorageConfig
-	ManifestStorage manifest.Storage
+	OnFlushError func(error)
+	ValueStorage config.ValueStorageConfig
 
 	EnableFencing bool
 	OwnerID       string
@@ -106,7 +105,6 @@ type CompactorOptions struct {
 	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
-	ManifestStorage   manifest.Storage
 
 	EnableFencing bool
 	OwnerID       string

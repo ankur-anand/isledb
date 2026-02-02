@@ -40,7 +40,7 @@ type writer struct {
 	closed atomic.Bool
 }
 
-func newWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) (*writer, error) {
+func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
 
 	d := DefaultWriterOptions()
 	opts.MemtableSize = cmp.Or(opts.MemtableSize, d.MemtableSize)
@@ -55,7 +55,6 @@ func newWriter(ctx context.Context, store *blobstore.Store, opts WriterOptions) 
 	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
 	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
 
-	manifestLog := newManifestStore(store, opts.ManifestStorage)
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)
