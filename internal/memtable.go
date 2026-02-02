@@ -3,6 +3,7 @@ package internal
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 
 	"github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
@@ -20,12 +21,43 @@ const (
 )
 
 type Memtable struct {
-	sl *skl.Skiplist
+	sl    *skl.Skiplist
+	seqMu sync.Mutex
+	seqLo uint64
+	seqHi uint64
 }
 
 func NewMemtable(arenaBytes int64, inlineThreshold int) *Memtable {
 	return &Memtable{
-		sl: skl.NewSkiplist(arenaBytes),
+		sl:    skl.NewSkiplist(arenaBytes),
+		seqLo: ^uint64(0),
+	}
+}
+
+func (m *Memtable) SeqLo() uint64 {
+	m.seqMu.Lock()
+	defer m.seqMu.Unlock()
+	if m.seqLo == ^uint64(0) {
+		return 0
+	}
+	return m.seqLo
+}
+
+func (m *Memtable) SeqHi() uint64 {
+	m.seqMu.Lock()
+	defer m.seqMu.Unlock()
+	return m.seqHi
+}
+
+func (m *Memtable) updateSeqBounds(seq uint64) {
+	m.seqMu.Lock()
+	defer m.seqMu.Unlock()
+
+	if seq < m.seqLo {
+		m.seqLo = seq
+	}
+	if seq > m.seqHi {
+		m.seqHi = seq
 	}
 }
 
@@ -35,6 +67,7 @@ func (m *Memtable) Put(key, value []byte, seq uint64) {
 
 func (m *Memtable) PutWithTTL(key, value []byte, seq uint64, expireAt int64) {
 	ikey := y.KeyWithTs(key, seq)
+	m.updateSeqBounds(seq)
 
 	if expireAt > 0 {
 		encoded := make([]byte, 2+8+len(value))
@@ -58,6 +91,7 @@ func (m *Memtable) PutBlobRef(key []byte, blobID [32]byte, seq uint64) {
 
 func (m *Memtable) PutBlobRefWithTTL(key []byte, blobID [32]byte, seq uint64, expireAt int64) {
 	iKey := y.KeyWithTs(key, seq)
+	m.updateSeqBounds(seq)
 
 	if expireAt > 0 {
 		encoded := make([]byte, blobRefSizeTTL)
@@ -81,6 +115,7 @@ func (m *Memtable) Delete(key []byte, seq uint64) {
 
 func (m *Memtable) DeleteWithTTL(key []byte, seq uint64, expireAt int64) {
 	ikey := y.KeyWithTs(key, seq)
+	m.updateSeqBounds(seq)
 
 	if expireAt > 0 {
 		encoded := make([]byte, 2+8)

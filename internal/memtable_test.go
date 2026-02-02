@@ -328,3 +328,40 @@ func BenchmarkMemtable_Iterator(b *testing.B) {
 		it.Close()
 	}
 }
+
+func TestMemtable_SeqBounds(t *testing.T) {
+	mt := NewMemtable(1<<20, 0)
+
+	if mt.SeqLo() != 0 {
+		t.Errorf("expected SeqLo=0 for empty memtable, got %d", mt.SeqLo())
+	}
+	if mt.SeqHi() != 0 {
+		t.Errorf("expected SeqHi=0 for empty memtable, got %d", mt.SeqHi())
+	}
+
+	mt.Put([]byte("a"), []byte("v1"), 5)
+	if mt.SeqLo() != 5 || mt.SeqHi() != 5 {
+		t.Errorf("after first put: expected 5-5, got %d-%d", mt.SeqLo(), mt.SeqHi())
+	}
+
+	mt.Put([]byte("b"), []byte("v2"), 10)
+	if mt.SeqLo() != 5 || mt.SeqHi() != 10 {
+		t.Errorf("after second put: expected 5-10, got %d-%d", mt.SeqLo(), mt.SeqHi())
+	}
+
+	mt.Put([]byte("c"), []byte("v3"), 3)
+	if mt.SeqLo() != 3 || mt.SeqHi() != 10 {
+		t.Errorf("after third put: expected 3-10, got %d-%d", mt.SeqLo(), mt.SeqHi())
+	}
+
+	mt.Delete([]byte("d"), 15)
+	if mt.SeqLo() != 3 || mt.SeqHi() != 15 {
+		t.Errorf("after delete: expected 3-15, got %d-%d", mt.SeqLo(), mt.SeqHi())
+	}
+
+	var blobID [32]byte
+	mt.PutBlobRef([]byte("e"), blobID, 1)
+	if mt.SeqLo() != 1 || mt.SeqHi() != 15 {
+		t.Errorf("after blob ref: expected 1-15, got %d-%d", mt.SeqLo(), mt.SeqHi())
+	}
+}
