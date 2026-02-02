@@ -856,6 +856,65 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 }
 
+func TestCompactor_ValidateSSTChecksum(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-checksum")
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+
+	if err := w.put([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.put([]byte("k2"), []byte("v2")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	w.close()
+
+	m, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay manifest: %v", err)
+	}
+	if len(m.L0SSTs) == 0 {
+		t.Fatalf("expected L0 SSTs in manifest")
+	}
+
+	newest := m.L0SSTs[0]
+	path := store.SSTPath(newest.ID)
+	data, _, err := store.Read(ctx, path)
+	if err != nil {
+		t.Fatalf("read sst: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("unexpected empty sst data")
+	}
+	data[0] ^= 0xFF
+	if _, err := store.Write(ctx, path, data); err != nil {
+		t.Fatalf("write corrupt sst: %v", err)
+	}
+
+	cOpts := DefaultCompactorOptions()
+	cOpts.ValidateSSTChecksum = true
+	cOpts.L0CompactionThreshold = 1
+	c, err := newCompactor(ctx, store, manifestStore, cOpts)
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.RunCompaction(ctx); err == nil {
+		t.Fatalf("expected compaction to fail on checksum mismatch")
+	}
+}
+
 func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()

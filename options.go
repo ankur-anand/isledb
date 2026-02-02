@@ -113,6 +113,11 @@ type CompactorOptions struct {
 	Compression     string
 	TargetSSTSize   int64
 
+	// ValidateSSTChecksum verifies SST checksums before compaction.
+	ValidateSSTChecksum bool
+	// SSTHashVerifier verifies SST signatures when present.
+	SSTHashVerifier SSTHashVerifier
+
 	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)

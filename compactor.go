@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -435,6 +438,10 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 			cleanup()
 			return nil, nil, fmt.Errorf("read sst %s: %w", sst.ID, err)
 		}
+		if err := validateSSTDataForCompaction(sst, data, c.opts.ValidateSSTChecksum, c.opts.SSTHashVerifier); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
 
 		reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
 		if err != nil {
@@ -452,6 +459,44 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 	}
 
 	return iters, readers, nil
+}
+
+func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifier SSTHashVerifier) error {
+	if verifier != nil && meta.Signature == nil {
+		return fmt.Errorf("sst %s: missing signature", meta.ID)
+	}
+
+	needHash := verify || verifier != nil
+	if !needHash {
+		return nil
+	}
+
+	sum := sha256.Sum256(data)
+	hashHex := hex.EncodeToString(sum[:])
+
+	if verify {
+		if meta.Checksum == "" {
+			return fmt.Errorf("sst %s: missing checksum", meta.ID)
+		}
+		algo, expected, ok := strings.Cut(meta.Checksum, ":")
+		if !ok || algo != "sha256" {
+			return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
+		}
+		if expected != hashHex {
+			return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
+		}
+	}
+
+	if verifier != nil {
+		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
+			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
+		}
+		if err := verifier.VerifyHash(sum[:], *meta.Signature); err != nil {
+			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
+		}
+	}
+
+	return nil
 }
 
 func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
