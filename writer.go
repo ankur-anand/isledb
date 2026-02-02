@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -223,17 +224,19 @@ func (w *writer) flush(ctx context.Context) error {
 		Compression:     w.opts.Compression,
 	}
 
-	result, err := writeSST(ctx, oldMemtable.Iterator(), sstOpts, epoch)
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		sstPath := w.store.SSTPath(sstID)
+		_, err := w.store.WriteReader(ctx, sstPath, r, nil)
+		return err
+	}
+
+	seqLo, seqHi := oldMemtable.SeqLo(), oldMemtable.SeqHi()
+	result, err := writeSSTStreaming(ctx, oldMemtable.Iterator(), sstOpts, epoch, seqLo, seqHi, uploadFn)
 	if err != nil {
 		if errors.Is(err, ErrEmptyIterator) {
 			return nil
 		}
-		return fmt.Errorf("build sst: %w", err)
-	}
-
-	sstPath := w.store.SSTPath(result.Meta.ID)
-	if _, err := w.store.Write(ctx, sstPath, result.SSTData); err != nil {
-		return fmt.Errorf("upload sst: %w", err)
+		return fmt.Errorf("stream sst: %w", err)
 	}
 
 	var appendErr error
