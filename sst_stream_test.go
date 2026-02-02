@@ -302,3 +302,230 @@ func TestBuildSSTIDWithTimestamp(t *testing.T) {
 		t.Errorf("ID mismatch: got %s, want %s", id, expectedID)
 	}
 }
+
+func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("value-a")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("value-b")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value-c")},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	var uploadedSSTs []struct {
+		id   string
+		data []byte
+	}
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		uploadedSSTs = append(uploadedSSTs, struct {
+			id   string
+			data []byte
+		}{id: sstID, data: data})
+		return nil
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, uploadFn)
+	if err != nil {
+		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatalf("expected at least one result")
+	}
+	if len(uploadedSSTs) != len(results) {
+		t.Errorf("upload count mismatch: uploaded=%d, results=%d", len(uploadedSSTs), len(results))
+	}
+
+	for i, result := range results {
+		if result.Meta.ID == "" {
+			t.Errorf("result %d: empty ID", i)
+		}
+		if !strings.HasSuffix(result.Meta.ID, ".sst") {
+			t.Errorf("result %d: expected .sst suffix, got %s", i, result.Meta.ID)
+		}
+		if result.Meta.Checksum == "" {
+			t.Errorf("result %d: empty checksum", i)
+		}
+		if result.Meta.Size == 0 {
+			t.Errorf("result %d: zero size", i)
+		}
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	var uploadedData []byte
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		uploadedData = data
+		return nil
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err != nil {
+		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	h := sha256.Sum256(uploadedData)
+	expectedChecksum := "sha256:" + hex.EncodeToString(h[:])
+	if results[0].Meta.Checksum != expectedChecksum {
+		t.Errorf("checksum mismatch: got %s, want %s", results[0].Meta.Checksum, expectedChecksum)
+	}
+
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(uploadedData), sstable.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("reader error: %v", err)
+	}
+	defer reader.Close()
+
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	if err != nil {
+		t.Fatalf("iter error: %v", err)
+	}
+	defer iter.Close()
+
+	var count int
+	for kv := iter.First(); kv != nil; kv = iter.Next() {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 entries, got %d", count)
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_EmptyIterator(t *testing.T) {
+	it := &sliceSSTIter{}
+
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		io.ReadAll(r)
+		return nil
+	}
+
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if !errors.Is(err, ErrEmptyIterator) {
+		t.Fatalf("expected ErrEmptyIterator, got %v", err)
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_UploadError(t *testing.T) {
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	uploadErr := errors.New("upload failed")
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		buf := make([]byte, 100)
+		r.Read(buf)
+		return uploadErr
+	}
+
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+
+	if !strings.Contains(err.Error(), "upload failed") && !strings.Contains(err.Error(), "closed pipe") {
+		t.Errorf("expected upload or pipe error, got %v", err)
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_ContextCancellation(t *testing.T) {
+	entries := make([]internal.MemEntry, 100)
+	for i := range entries {
+		entries[i] = internal.MemEntry{
+			Key:    []byte{byte(i)},
+			Seq:    uint64(100 - i),
+			Kind:   internal.OpPut,
+			Inline: true,
+			Value:  bytes.Repeat([]byte("x"), 100),
+		}
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		io.ReadAll(r)
+		return nil
+	}
+
+	_, err := writeMultipleSSTsStreaming(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err == nil {
+		t.Fatalf("expected error due to context cancellation")
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
+	entries := []internal.MemEntry{
+		{Key: []byte("key1"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("value1")},
+		{Key: []byte("key2"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value2")},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	var uploadedData []byte
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		uploadedData = data
+		return nil
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	
+	h := sha256.Sum256(uploadedData)
+	computedHash := hex.EncodeToString(h[:])
+	metaHash := strings.TrimPrefix(results[0].Meta.Checksum, "sha256:")
+
+	if metaHash != computedHash {
+		t.Errorf("hash mismatch: meta=%s, computed=%s", metaHash, computedHash)
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
+	iterErr := errors.New("iterator failed")
+	it := &sliceSSTIter{
+		entries: []internal.MemEntry{
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+		},
+		err: iterErr,
+	}
+
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		io.ReadAll(r)
+		return nil
+	}
+
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !strings.Contains(err.Error(), "iterator failed") {
+		t.Errorf("expected iterator error, got %v", err)
+	}
+}

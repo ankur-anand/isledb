@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"sync"
@@ -453,7 +454,7 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 	return iters, readers, nil
 }
 
-func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]writeSSTResult, error) {
+func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
 	defer iter.close()
 
 	sstOpts := SSTWriterOptions{
@@ -464,17 +465,13 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 
 	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
 
-	uploadFn := func(result *writeSSTResult) error {
-		sstPath := c.store.SSTPath(result.Meta.ID)
-		if _, err := c.store.Write(ctx, sstPath, result.SSTData); err != nil {
-			return fmt.Errorf("upload sst: %w", err)
-		}
-		result.Meta.Level = 1
-		result.SSTData = nil
-		return nil
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		sstPath := c.store.SSTPath(sstID)
+		_, err := c.store.WriteReader(ctx, sstPath, r, nil)
+		return err
 	}
 
-	results, err := writeMultipleSSTs(ctx, adapter, sstOpts, epoch, c.opts.TargetSSTSize, uploadFn)
+	results, err := writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.TargetSSTSize, uploadFn)
 	if err != nil {
 		if errors.Is(err, ErrEmptyIterator) {
 			return nil, nil
@@ -482,6 +479,9 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 		return nil, err
 	}
 
+	for i := range results {
+		results[i].Meta.Level = 1
+	}
 	return results, nil
 }
 

@@ -191,3 +191,200 @@ func writeSSTStreaming(
 
 	return result, nil
 }
+
+// writeMultipleSSTsStreaming builds and uploads multiple SSTs using streaming.
+// Each SST is streamed to the upload function as it's built, with new SSTs
+// started when the current one reaches targetSize.
+func writeMultipleSSTsStreaming(
+	ctx context.Context,
+	it SSTIterator,
+	opts SSTWriterOptions,
+	epoch uint64,
+	targetSize int64,
+	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
+) ([]streamSSTResult, error) {
+	defer it.Close()
+
+	var results []streamSSTResult
+
+	wo := sstable.WriterOptions{
+		BlockSize:   opts.BlockSize,
+		Compression: compressionFromString(opts.Compression),
+	}
+	if opts.BloomBitsPerKey > 0 {
+		wo.FilterPolicy = bloom.FilterPolicy(opts.BloomBitsPerKey)
+	}
+
+	var pr *io.PipeReader
+	var pw *io.PipeWriter
+	var writable *hashingWritable
+	var sst *sstable.Writer
+	var state *sstBuildState
+	var sstID string
+	var ts time.Time
+	var uploadErr error
+	var uploadDone chan struct{}
+	var started bool
+	var sstIndex int
+
+	startNewSST := func() {
+		ts = time.Now().UTC()
+		sstIndex++
+		sstID = fmt.Sprintf("%d-0-0-%d-%04d.sst", epoch, ts.UnixNano(), sstIndex)
+
+		pr, pw = io.Pipe()
+		writable = newHashingWritable(pw)
+		sst = sstable.NewWriter(writable, wo)
+		state = newSSTBuildState()
+		uploadErr = nil
+		uploadDone = make(chan struct{})
+		started = true
+
+		go func(id string, reader *io.PipeReader, done chan struct{}) {
+			defer close(done)
+			if err := uploadFn(ctx, id, reader); err != nil {
+				uploadErr = err
+				reader.Close()
+			}
+		}(sstID, pr, uploadDone)
+	}
+
+	finishCurrentSST := func() error {
+		if !started {
+			return nil
+		}
+
+		if err := sst.Close(); err != nil {
+			pw.CloseWithError(err)
+			<-uploadDone
+			return err
+		}
+		pw.Close()
+
+		<-uploadDone
+		if uploadErr != nil {
+			return fmt.Errorf("sst upload: %w", uploadErr)
+		}
+
+		hashBytes := writable.sumBytes()
+		hashStr := hex.EncodeToString(hashBytes)
+
+		result := streamSSTResult{
+			Meta: SSTMeta{
+				ID:        sstID,
+				Epoch:     epoch,
+				SeqLo:     state.seqLo,
+				SeqHi:     state.seqHi,
+				MinKey:    state.minKey,
+				MaxKey:    state.maxKey,
+				Size:      writable.size,
+				Checksum:  "sha256:" + hashStr,
+				Bloom:     BloomMeta{BitsPerKey: opts.BloomBitsPerKey},
+				CreatedAt: ts,
+				Level:     0,
+			},
+		}
+
+		if opts.Signer != nil {
+			sig, err := opts.Signer.SignHash(hashBytes)
+			if err != nil {
+				return err
+			}
+			result.Meta.Signature = &SSTSignature{
+				Algorithm: opts.Signer.Algorithm(),
+				KeyID:     opts.Signer.KeyID(),
+				Hash:      hashStr,
+				Signature: sig,
+			}
+		}
+
+		results = append(results, result)
+		started = false
+		pr, pw, writable, sst, state, uploadDone = nil, nil, nil, nil, nil, nil
+		return nil
+	}
+
+	abortCurrentSST := func() {
+		if !started {
+			return
+		}
+		if writable != nil {
+			writable.Abort()
+		}
+		if sst != nil {
+			_ = sst.Close()
+		}
+		if pw != nil {
+			pw.Close()
+		}
+		if uploadDone != nil {
+			<-uploadDone
+		}
+		started = false
+		pr, pw, writable, sst, state, uploadDone = nil, nil, nil, nil, nil, nil
+	}
+
+	for it.Next() {
+		if err := ctx.Err(); err != nil {
+			abortCurrentSST()
+			return nil, err
+		}
+
+		if !started {
+			startNewSST()
+		}
+
+		e := it.Entry()
+		k := append([]byte(nil), e.Key...)
+
+		keyEntry, err := buildKeyEntry(e, k)
+		if err != nil {
+			abortCurrentSST()
+			return nil, err
+		}
+
+		encodedValue := internal.EncodeKeyEntry(keyEntry)
+
+		if err := state.updateOrder(k, e.Seq); err != nil {
+			abortCurrentSST()
+			return nil, err
+		}
+
+		kind := pebble.InternalKeyKindSet
+		if e.Kind == internal.OpDelete {
+			kind = pebble.InternalKeyKindDelete
+		}
+
+		ikey := pebble.MakeInternalKey(k, pebble.SeqNum(e.Seq), kind)
+
+		if err := sst.Raw().Add(ikey, encodedValue, false); err != nil {
+			abortCurrentSST()
+			return nil, fmt.Errorf("sst producer: %w", err)
+		}
+
+		state.updateBounds(k, e.Seq)
+
+		if writable.size >= targetSize {
+			if err := finishCurrentSST(); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if err := it.Err(); err != nil {
+		abortCurrentSST()
+		return nil, fmt.Errorf("sst producer: %w", err)
+	}
+
+	if started && state.found {
+		if err := finishCurrentSST(); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(results) == 0 {
+		return nil, ErrEmptyIterator
+	}
+
+	return results, nil
+}
