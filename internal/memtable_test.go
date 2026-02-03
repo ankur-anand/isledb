@@ -291,24 +291,32 @@ func TestMemtable_EmptyKeyAndValue(t *testing.T) {
 }
 
 func BenchmarkMemtable_Put_Small(b *testing.B) {
-	mt := NewMemtable(64<<20, 0)
+	const arenaBytes int64 = 64 << 20
+	mt := NewMemtable(arenaBytes, 0)
 	key := []byte("benchmark-key")
 	value := []byte("small value")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mt.Put(key, value, uint64(i))
+		if mt.ApproxSize() >= arenaBytes-(1<<20) {
+			mt = NewMemtable(arenaBytes, 0)
+		}
 	}
 }
 
 func BenchmarkMemtable_Put_Large(b *testing.B) {
-	mt := NewMemtable(64<<20, 0)
+	const arenaBytes int64 = 64 << 20
+	mt := NewMemtable(arenaBytes, 0)
 	key := []byte("benchmark-key")
 	value := make([]byte, 10000)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mt.Put(key, value, uint64(i))
+		if mt.ApproxSize() >= arenaBytes-(1<<20) {
+			mt = NewMemtable(arenaBytes, 0)
+		}
 	}
 }
 
