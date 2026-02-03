@@ -174,9 +174,10 @@ func (mi *kMergeIterator) entry() (internal.CompactionEntry, error) {
 
 		if len(mi.current.value) > 0 {
 			keyEntry, err := internal.DecodeKeyEntry(mi.current.key, mi.current.value)
-			if err == nil {
-				entry.ExpireAt = keyEntry.ExpireAt
+			if err != nil {
+				return internal.CompactionEntry{}, err
 			}
+			entry.ExpireAt = keyEntry.ExpireAt
 		}
 		return entry, nil
 	}

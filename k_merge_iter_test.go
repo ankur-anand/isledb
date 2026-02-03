@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -108,6 +109,45 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 		if entry.Kind != internal.OpDelete {
 			t.Fatalf("expected delete to win, got kind=%v", entry.Kind)
 		}
+	}
+}
+
+func TestKMergeIterator_DeleteCorruptValue(t *testing.T) {
+	buf := new(bytes.Buffer)
+	writable := newHashingWritable(buf)
+	writer := sstable.NewWriter(writable, sstable.WriterOptions{
+		BlockSize:   4096,
+		Compression: sstable.NoCompression,
+	})
+
+	ikey := pebble.MakeInternalKey([]byte("k"), pebble.SeqNum(1), pebble.InternalKeyKindDelete)
+	badValue := []byte{internal.MarkerBlob}
+	if err := writer.Raw().Add(ikey, badValue, false); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(buf.Bytes()), sstable.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	defer reader.Close()
+
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	if err != nil {
+		t.Fatalf("new iter: %v", err)
+	}
+
+	merge := newMergeIterator([]sstable.Iterator{iter})
+	defer merge.close()
+
+	if !merge.Next() {
+		t.Fatalf("expected entry")
+	}
+	if _, err := merge.entry(); err == nil {
+		t.Fatalf("expected decode error for corrupt delete value")
 	}
 }
 
