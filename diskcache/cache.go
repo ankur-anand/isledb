@@ -32,3 +32,12 @@ type RefCountedCache interface {
 	// When the count reaches zero, the entry becomes eligible for eviction.
 	Release(key string)
 }
+
+type FileBackedCache interface {
+	RefCountedCache
+	CacheDir() string
+
+	// SetFromFile promotes a temp file into the cache under key.
+	// tempPath should point to a file on the same filesystem as CacheDir.
+	SetFromFile(key, tempPath string, size int64) error
+}

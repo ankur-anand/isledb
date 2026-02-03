@@ -66,6 +66,10 @@ func NewSSTCache(opts SSTCacheOptions) (RefCountedCache, error) {
 	}, nil
 }
 
+func (c *sstCache) CacheDir() string {
+	return c.dir
+}
+
 func (c *sstCache) Get(key string) ([]byte, bool) {
 	c.mu.RLock()
 	entry, ok := c.index[key]
@@ -132,6 +136,67 @@ func (c *sstCache) Set(key string, data []byte) error {
 	c.index[key] = entry
 	c.order = append(c.order, key)
 	c.currentSize += dataSize
+
+	return nil
+}
+
+func (c *sstCache) SetFromFile(key, tempPath string, size int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, exists := c.index[key]; exists {
+		if entry.refs.Load() > 0 {
+			_ = os.Remove(tempPath)
+			return nil
+		}
+		c.removeLocked(key)
+	}
+
+	if size < 0 {
+		info, err := os.Stat(tempPath)
+		if err != nil {
+			return err
+		}
+		size = info.Size()
+	}
+
+	for c.currentSize+size > c.maxSize && len(c.order) > 0 {
+		if !c.evictOldest() {
+			break
+		}
+	}
+
+	filename := cacheFileName(key)
+	localPath := filepath.Join(c.dir, filename)
+
+	if err := os.Rename(tempPath, localPath); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+
+	f, err := os.Open(localPath)
+	if err != nil {
+		_ = os.Remove(localPath)
+		return err
+	}
+
+	mmap, err := MmapFile(f)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(localPath)
+		return err
+	}
+
+	entry := &sstEntry{
+		localPath: localPath,
+		size:      size,
+		mmap:      mmap,
+		file:      f,
+	}
+
+	c.index[key] = entry
+	c.order = append(c.order, key)
+	c.currentSize += size
 
 	return nil
 }

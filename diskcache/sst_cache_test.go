@@ -2,6 +2,8 @@ package diskcache
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -75,4 +77,41 @@ func TestSSTCache_MemoryUsage(t *testing.T) {
 	heapGrowth := m2.HeapAlloc - m1.HeapAlloc
 	require.Less(t, heapGrowth, uint64(10*1024*1024),
 		"heap grew too much - data may not be off-heap")
+}
+
+func TestSSTCache_SetFromFile(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewSSTCache(SSTCacheOptions{
+		Dir:     dir,
+		MaxSize: 1024,
+	})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	fb, ok := cache.(FileBackedCache)
+	require.True(t, ok, "cache should implement FileBackedCache")
+
+	data := []byte("hello-sst")
+	tmpFile, err := os.CreateTemp(dir, "sst-temp-*")
+	require.NoError(t, err)
+	tmpPath := tmpFile.Name()
+
+	_, err = tmpFile.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	err = fb.SetFromFile("sst-key", tmpPath, int64(len(data)))
+	require.NoError(t, err)
+
+	_, err = os.Stat(tmpPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	got, ok := cache.Get("sst-key")
+	require.True(t, ok)
+	require.Equal(t, data, got)
+
+	localPath := filepath.Join(dir, cacheFileName("sst-key"))
+	_, err = os.Stat(localPath)
+	require.NoError(t, err)
 }

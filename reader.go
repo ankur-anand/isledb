@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -600,21 +602,16 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 			r.sstCache.Release(path)
 		}
 	} else {
-		data, _, err = r.store.Read(ctx, path)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read sst %s: %w", sstMeta.ID, err)
-		}
-		if err := r.validateSSTData(sstMeta, data); err != nil {
+		if err := r.cacheSST(ctx, &sstMeta, path); err != nil {
 			return nil, nil, err
-		}
-		if err := r.sstCache.Set(path, data); err != nil {
-			return nil, nil, fmt.Errorf("cache sst %s: %w", sstMeta.ID, err)
 		}
 		if cached, ok := r.sstCache.Acquire(path); ok {
 			data = cached
 			release = func() {
 				r.sstCache.Release(path)
 			}
+		} else {
+			return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
 		}
 	}
 
@@ -670,6 +667,16 @@ func (it *sstIterWithClose) Close() error {
 }
 
 func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
+	needHash := r.verifySST || r.verifier != nil
+	if !needHash {
+		return nil
+	}
+
+	sum := sha256.Sum256(data)
+	return r.validateSSTHash(meta, sum)
+}
+
+func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
 	if r.verifier != nil && meta.Signature == nil {
 		return fmt.Errorf("sst %s: missing signature", meta.ID)
 	}
@@ -679,7 +686,6 @@ func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
 		return nil
 	}
 
-	sum := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(sum[:])
 
 	if r.verifySST {
@@ -702,6 +708,82 @@ func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
 		if err := r.verifier.VerifyHash(sum[:], *meta.Signature); err != nil {
 			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
 		}
+	}
+
+	return nil
+}
+
+func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error {
+	if cache, ok := r.sstCache.(diskcache.FileBackedCache); ok {
+		return r.cacheSSTStream(ctx, cache, meta, path)
+	}
+
+	data, _, err := r.store.Read(ctx, path)
+	if err != nil {
+		return fmt.Errorf("read sst %s: %w", path, err)
+	}
+
+	if meta != nil {
+		if err := r.validateSSTData(*meta, data); err != nil {
+			return fmt.Errorf("validate sst %s: %w", path, err)
+		}
+	}
+
+	if err := r.sstCache.Set(path, data); err != nil {
+		return fmt.Errorf("cache sst %s: %w", path, err)
+	}
+	return nil
+}
+
+func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *SSTMeta, path string) error {
+	tmpFile, err := os.CreateTemp(cache.CacheDir(), "sst-*")
+	if err != nil {
+		return fmt.Errorf("create temp sst %s: %w", path, err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}
+
+	stream, err := r.store.ReadStream(ctx, path)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("read sst %s: %w", path, err)
+	}
+	defer stream.Close()
+
+	needHash := meta != nil && (r.verifySST || r.verifier != nil)
+	var hasher hash.Hash
+	writer := io.Writer(tmpFile)
+	if needHash {
+		hasher = sha256.New()
+		writer = io.MultiWriter(tmpFile, hasher)
+	}
+
+	written, err := io.Copy(writer, stream)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("download sst %s: %w", path, err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close sst %s: %w", path, err)
+	}
+
+	if needHash {
+		var sum [32]byte
+		copy(sum[:], hasher.Sum(nil))
+		if err := r.validateSSTHash(*meta, sum); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("validate sst %s: %w", path, err)
+		}
+	}
+
+	if err := cache.SetFromFile(path, tmpPath, written); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("cache sst %s: %w", path, err)
 	}
 
 	return nil
