@@ -58,8 +58,9 @@ type RetentionCompactor struct {
 	manifestLog *manifest.Store
 	opts        RetentionCompactorOptions
 
-	mu       sync.Mutex
-	manifest *Manifest
+	startStopMu sync.Mutex
+	mu          sync.Mutex
+	manifest    *Manifest
 
 	ticker *time.Ticker
 	stopCh chan struct{}
@@ -72,16 +73,16 @@ type RetentionCompactor struct {
 func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
 
 	defaults := DefaultRetentionCompactorOptions()
-	if opts.RetentionPeriod == 0 {
+	if opts.RetentionPeriod <= 0 {
 		opts.RetentionPeriod = defaults.RetentionPeriod
 	}
 	if opts.RetentionCount == 0 {
 		opts.RetentionCount = defaults.RetentionCount
 	}
-	if opts.CheckInterval == 0 {
+	if opts.CheckInterval <= 0 {
 		opts.CheckInterval = defaults.CheckInterval
 	}
-	if opts.SegmentDuration == 0 {
+	if opts.SegmentDuration <= 0 {
 		opts.SegmentDuration = defaults.SegmentDuration
 	}
 
@@ -100,23 +101,36 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 }
 
 func (c *RetentionCompactor) Start() {
+	c.startStopMu.Lock()
+	defer c.startStopMu.Unlock()
+
 	if c.running.Swap(true) {
 		return
 	}
 
+	c.stopCh = make(chan struct{})
 	c.ticker = time.NewTicker(c.opts.CheckInterval)
 	c.wg.Add(1)
-	go c.cleanupLoop()
+	stopCh := c.stopCh
+	ticks := c.ticker.C
+	go c.cleanupLoop(stopCh, ticks)
 }
 
 func (c *RetentionCompactor) Stop() {
+	c.startStopMu.Lock()
+	defer c.startStopMu.Unlock()
+
 	if !c.running.Swap(false) {
 		return
 	}
 
-	close(c.stopCh)
+	if c.stopCh != nil {
+		close(c.stopCh)
+		c.stopCh = nil
+	}
 	if c.ticker != nil {
 		c.ticker.Stop()
+		c.ticker = nil
 	}
 	c.wg.Wait()
 }
@@ -140,12 +154,12 @@ func (c *RetentionCompactor) Refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *RetentionCompactor) cleanupLoop() {
+func (c *RetentionCompactor) cleanupLoop(stopCh <-chan struct{}, ticks <-chan time.Time) {
 	defer c.wg.Done()
 
 	for {
 		select {
-		case <-c.ticker.C:
+		case <-ticks:
 			if err := c.RunCleanup(context.Background()); err != nil {
 				if c.opts.OnCleanupError != nil {
 					c.opts.OnCleanupError(err)
@@ -153,7 +167,7 @@ func (c *RetentionCompactor) cleanupLoop() {
 					slog.Error("isledb: retention cleanup error", "error", err)
 				}
 			}
-		case <-c.stopCh:
+		case <-stopCh:
 			return
 		}
 	}
@@ -390,20 +404,25 @@ func (c *RetentionCompactor) Stats() RetentionCompactorStats {
 			}
 		}
 
-		oldest := time.Now()
+		var oldest time.Time
+		foundOldest := false
 		for _, sst := range c.manifest.L0SSTs {
-			if sst.CreatedAt.Before(oldest) {
+			if !foundOldest || sst.CreatedAt.Before(oldest) {
 				oldest = sst.CreatedAt
+				foundOldest = true
 			}
 		}
 		for _, sr := range c.manifest.SortedRuns {
 			for _, sst := range sr.SSTs {
-				if sst.CreatedAt.Before(oldest) {
+				if !foundOldest || sst.CreatedAt.Before(oldest) {
 					oldest = sst.CreatedAt
+					foundOldest = true
 				}
 			}
 		}
-		stats.OldestSST = oldest
+		if foundOldest {
+			stats.OldestSST = oldest
+		}
 	}
 
 	return stats
