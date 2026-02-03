@@ -112,6 +112,100 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 	}
 }
 
+func TestTournamentMergeIterator_MatchesHeap(t *testing.T) {
+	entries := [][]internal.MemEntry{
+		{
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("a1")},
+			{Key: []byte("b"), Seq: 3, Kind: internal.OpDelete, ExpireAt: 12345},
+			{Key: []byte("c"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("c5")},
+		},
+		{
+			{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("a2")},
+			{Key: []byte("b"), Seq: 4, Kind: internal.OpPut, Inline: true, Value: []byte("b4")},
+			{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("d1")},
+		},
+		{
+			{Key: []byte("a"), Seq: 3, Kind: internal.OpDelete},
+			{Key: []byte("c"), Seq: 6, Kind: internal.OpPut, Inline: true, Value: []byte("c6")},
+			{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("e2")},
+		},
+	}
+
+	readers := make([]*sstable.Reader, len(entries))
+	for i := range entries {
+		it := &sliceSSTIter{entries: entries[i]}
+		res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+		if err != nil {
+			t.Fatalf("writeSST: %v", err)
+		}
+		reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+		if err != nil {
+			t.Fatalf("newReader: %v", err)
+		}
+		readers[i] = reader
+	}
+	defer func() {
+		for _, r := range readers {
+			_ = r.Close()
+		}
+	}()
+
+	makeIters := func() []sstable.Iterator {
+		iters := make([]sstable.Iterator, len(readers))
+		for i, r := range readers {
+			iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+			if err != nil {
+				t.Fatalf("NewIter: %v", err)
+			}
+			iters[i] = iter
+		}
+		return iters
+	}
+
+	heapMerge := newMergeIterator(makeIters())
+	tournamentMerge := newTournamentMergeIterator(makeIters())
+
+	collect := func(it interface {
+		Next() bool
+		entry() (internal.CompactionEntry, error)
+		Err() error
+		close() error
+	}) []internal.CompactionEntry {
+		var out []internal.CompactionEntry
+		for it.Next() {
+			entry, err := it.entry()
+			if err != nil {
+				t.Fatalf("entry: %v", err)
+			}
+			entry.Key = append([]byte(nil), entry.Key...)
+			if entry.Value != nil {
+				entry.Value = append([]byte(nil), entry.Value...)
+			}
+			out = append(out, entry)
+		}
+		if err := it.Err(); err != nil {
+			t.Fatalf("iter err: %v", err)
+		}
+		_ = it.close()
+		return out
+	}
+
+	gotHeap := collect(heapMerge)
+	gotTournament := collect(tournamentMerge)
+
+	if len(gotHeap) != len(gotTournament) {
+		t.Fatalf("entry count mismatch: heap=%d tournament=%d", len(gotHeap), len(gotTournament))
+	}
+	for i := range gotHeap {
+		h := gotHeap[i]
+		tm := gotTournament[i]
+		if !bytes.Equal(h.Key, tm.Key) || h.Seq != tm.Seq || h.Kind != tm.Kind || h.Inline != tm.Inline ||
+			!bytes.Equal(h.Value, tm.Value) || h.BlobID != tm.BlobID || h.ExpireAt != tm.ExpireAt {
+			t.Fatalf("entry %d mismatch: heap=%+v tournament=%+v", i, h, tm)
+		}
+	}
+}
+
 func TestKMergeIterator_DeleteCorruptValue(t *testing.T) {
 	buf := new(bytes.Buffer)
 	writable := newHashingWritable(buf)
@@ -469,141 +563,6 @@ func BenchmarkKMergeIterator_WithEntryDecode(b *testing.B) {
 	})
 }
 
-type binaryMergeIter struct {
-	iters   []sstable.Iterator
-	tree    []int
-	current int
-	lastKey []byte
-	keys    [][]byte
-	vals    [][]byte
-	valid   []bool
-}
-
-func newBinaryMergeIter(iters []sstable.Iterator) *binaryMergeIter {
-	n := len(iters)
-	if n == 0 {
-		return &binaryMergeIter{current: -1}
-	}
-
-	size := 1
-	for size < n {
-		size *= 2
-	}
-
-	bmi := &binaryMergeIter{
-		iters:   iters,
-		tree:    make([]int, size*2),
-		keys:    make([][]byte, n),
-		vals:    make([][]byte, n),
-		valid:   make([]bool, n),
-		current: -1,
-	}
-
-	for i := range bmi.tree {
-		bmi.tree[i] = -1
-	}
-
-	for i := 0; i < n; i++ {
-		kv := iters[i].First()
-		if kv != nil {
-			bmi.keys[i] = append([]byte(nil), kv.K.UserKey...)
-			bmi.vals[i] = kv.InPlaceValue()
-			bmi.valid[i] = true
-			bmi.tree[size+i] = i
-		}
-	}
-
-	for i := size - 1; i >= 1; i-- {
-		bmi.tree[i] = bmi.winner(bmi.tree[i*2], bmi.tree[i*2+1])
-	}
-
-	return bmi
-}
-
-func (bmi *binaryMergeIter) winner(a, b int) int {
-	if a == -1 {
-		return b
-	}
-	if b == -1 {
-		return a
-	}
-	cmp := bytes.Compare(bmi.keys[a], bmi.keys[b])
-	if cmp <= 0 {
-		return a
-	}
-	return b
-}
-
-func (bmi *binaryMergeIter) Next() bool {
-	for {
-
-		bmi.current = bmi.tree[1]
-		if bmi.current == -1 {
-			return false
-		}
-
-		currentKey := bmi.keys[bmi.current]
-
-		kv := bmi.iters[bmi.current].Next()
-		if kv != nil {
-			bmi.keys[bmi.current] = append(bmi.keys[bmi.current][:0], kv.K.UserKey...)
-			bmi.vals[bmi.current] = kv.InPlaceValue()
-		} else {
-			bmi.valid[bmi.current] = false
-			bmi.keys[bmi.current] = nil
-		}
-
-		n := len(bmi.iters)
-		size := 1
-		for size < n {
-			size *= 2
-		}
-
-		pos := size + bmi.current
-		if !bmi.valid[bmi.current] {
-			bmi.tree[pos] = -1
-		}
-
-		for pos > 1 {
-			parent := pos / 2
-			sibling := pos ^ 1
-			bmi.tree[parent] = bmi.winner(bmi.tree[pos], bmi.tree[sibling])
-			pos = parent
-		}
-
-		if bmi.lastKey != nil && bytes.Equal(currentKey, bmi.lastKey) {
-			continue
-		}
-
-		bmi.lastKey = append(bmi.lastKey[:0], currentKey...)
-		return true
-	}
-}
-
-func (bmi *binaryMergeIter) Key() []byte {
-	if bmi.current == -1 {
-		return nil
-	}
-	return bmi.lastKey
-}
-
-func (bmi *binaryMergeIter) Value() []byte {
-	if bmi.current == -1 {
-		return nil
-	}
-	return bmi.vals[bmi.current]
-}
-
-func (bmi *binaryMergeIter) Close() error {
-	var firstErr error
-	for _, iter := range bmi.iters {
-		if err := iter.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
 func BenchmarkMergeIterator_Comparison(b *testing.B) {
 	numItersCases := []int{2, 4, 8, 16}
 	entriesPerIter := 1000
@@ -638,7 +597,7 @@ func BenchmarkMergeIterator_Comparison(b *testing.B) {
 			}
 		})
 
-		b.Run(fmt.Sprintf("Binary/iters=%d", numIters), func(b *testing.B) {
+		b.Run(fmt.Sprintf("Tournament/iters=%d", numIters), func(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
@@ -649,13 +608,13 @@ func BenchmarkMergeIterator_Comparison(b *testing.B) {
 					iters[j] = iter
 				}
 
-				merge := newBinaryMergeIter(iters)
+				merge := newTournamentMergeIterator(iters)
 				count := 0
 				for merge.Next() {
-					_ = merge.Key()
+					_ = merge.key()
 					count++
 				}
-				merge.Close()
+				merge.close()
 			}
 		})
 
