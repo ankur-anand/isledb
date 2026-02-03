@@ -119,6 +119,9 @@ func (mi *kMergeIterator) advance(i int) {
 		mi.loadState(i, &kv.K, kv.InPlaceValue())
 		mi.tree[mi.size+i] = i
 	} else {
+		if err := mi.iters[i].Error(); err != nil && mi.err == nil {
+			mi.err = err
+		}
 		mi.states[i].valid = false
 		mi.states[i].key = nil
 		mi.states[i].value = nil
@@ -134,6 +137,9 @@ func (mi *kMergeIterator) advance(i int) {
 }
 
 func (mi *kMergeIterator) Next() bool {
+	if mi.err != nil {
+		return false
+	}
 	for mi.tree != nil && mi.tree[1] != -1 {
 		index := mi.tree[1]
 		state := &mi.states[index]
@@ -149,6 +155,9 @@ func (mi *kMergeIterator) Next() bool {
 		mi.current.source = index
 
 		mi.advance(index)
+		if mi.err != nil {
+			return false
+		}
 
 		if mi.lastKey != nil && bytes.Equal(mi.current.key, mi.lastKey) {
 			continue
