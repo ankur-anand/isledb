@@ -2,7 +2,6 @@ package isledb
 
 import (
 	"bytes"
-	"container/heap"
 
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2"
@@ -10,8 +9,10 @@ import (
 )
 
 type kMergeIterator struct {
-	iters   []*sstIterWrapper
-	heap    mergeHeap
+	iters   []sstable.Iterator
+	states  []mergeState
+	tree    []int
+	size    int
 	current *mergeEntry
 	lastKey []byte
 	err     error
@@ -26,108 +27,137 @@ type mergeEntry struct {
 	source  int
 }
 
-type sstIterWrapper struct {
-	iter   sstable.Iterator
-	source int
-}
-
-type mergeHeap []*mergeEntry
-
-func (h mergeHeap) Len() int { return len(h) }
-
-func (h mergeHeap) Less(i, j int) bool {
-
-	cmp := bytes.Compare(h[i].key, h[j].key)
-	if cmp != 0 {
-		return cmp < 0
-	}
-	return h[i].trailer > h[j].trailer
-}
-
-func (h mergeHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-func (h *mergeHeap) Push(x interface{}) {
-	*h = append(*h, x.(*mergeEntry))
-}
-
-func (h *mergeHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+type mergeState struct {
+	key     []byte
+	value   []byte
+	trailer uint64
+	seq     uint64
+	kind    pebble.InternalKeyKind
+	valid   bool
 }
 
 func newMergeIterator(iters []sstable.Iterator) *kMergeIterator {
 	mi := &kMergeIterator{
-		iters: make([]*sstIterWrapper, len(iters)),
-		heap:  make(mergeHeap, 0, len(iters)),
+		iters:  iters,
+		states: make([]mergeState, len(iters)),
+	}
+
+	n := len(iters)
+	if n == 0 {
+		return mi
+	}
+
+	size := 1
+	for size < n {
+		size *= 2
+	}
+	mi.size = size
+	mi.tree = make([]int, size*2)
+	for i := range mi.tree {
+		mi.tree[i] = -1
 	}
 
 	for i, iter := range iters {
-		mi.iters[i] = &sstIterWrapper{iter: iter, source: i}
-		mi.advanceIter(i)
+		kv := iter.First()
+		if kv != nil {
+			mi.loadState(i, &kv.K, kv.InPlaceValue())
+			mi.tree[size+i] = i
+		}
 	}
 
-	heap.Init(&mi.heap)
+	for i := size - 1; i >= 1; i-- {
+		mi.tree[i] = mi.winner(mi.tree[i*2], mi.tree[i*2+1])
+	}
+
 	return mi
 }
 
-func (mi *kMergeIterator) advanceIter(i int) {
-	wrapper := mi.iters[i]
-	kv := wrapper.iter.First()
-	if kv != nil {
-		mi.pushEntry(&kv.K, kv.InPlaceValue(), i)
-	}
+func (mi *kMergeIterator) loadState(i int, ikey *sstable.InternalKey, val []byte) {
+	state := &mi.states[i]
+	state.key = append(state.key[:0], ikey.UserKey...)
+	state.value = append(state.value[:0], val...)
+
+	trailer := uint64(ikey.Trailer)
+	state.trailer = trailer
+	state.seq = trailer >> 8
+	state.kind = ikey.Kind()
+	state.valid = true
 }
 
-func (mi *kMergeIterator) advanceIterNext(i int) {
-	wrapper := mi.iters[i]
-	kv := wrapper.iter.Next()
-	if kv != nil {
-		mi.pushEntry(&kv.K, kv.InPlaceValue(), i)
+func (mi *kMergeIterator) winner(a, b int) int {
+	if a == -1 {
+		return b
 	}
+	if b == -1 {
+		return a
+	}
+
+	cmp := bytes.Compare(mi.states[a].key, mi.states[b].key)
+	if cmp < 0 {
+		return a
+	}
+	if cmp > 0 {
+		return b
+	}
+
+	if mi.states[a].trailer > mi.states[b].trailer {
+		return a
+	}
+	if mi.states[a].trailer < mi.states[b].trailer {
+		return b
+	}
+
+	if a < b {
+		return a
+	}
+	return b
 }
 
-func (mi *kMergeIterator) pushEntry(ikey *sstable.InternalKey, val []byte, source int) {
-	trailer := ikey.Trailer
-	seq := uint64(trailer >> 8)
-	kind := ikey.Kind()
-
-	keyCopy := make([]byte, len(ikey.UserKey))
-	copy(keyCopy, ikey.UserKey)
-
-	valCopy := make([]byte, len(val))
-	copy(valCopy, val)
-
-	entry := &mergeEntry{
-		key:     keyCopy,
-		seq:     seq,
-		trailer: uint64(trailer),
-		kind:    kind,
-		value:   valCopy,
-		source:  source,
+func (mi *kMergeIterator) advance(i int) {
+	kv := mi.iters[i].Next()
+	if kv != nil {
+		mi.loadState(i, &kv.K, kv.InPlaceValue())
+		mi.tree[mi.size+i] = i
+	} else {
+		mi.states[i].valid = false
+		mi.states[i].key = nil
+		mi.states[i].value = nil
+		mi.tree[mi.size+i] = -1
 	}
 
-	heap.Push(&mi.heap, entry)
+	for pos := mi.size + i; pos > 1; {
+		parent := pos / 2
+		sibling := pos ^ 1
+		mi.tree[parent] = mi.winner(mi.tree[pos], mi.tree[sibling])
+		pos = parent
+	}
 }
 
 func (mi *kMergeIterator) Next() bool {
-	for mi.heap.Len() > 0 {
-		entry := heap.Pop(&mi.heap).(*mergeEntry)
+	for mi.tree != nil && mi.tree[1] != -1 {
+		index := mi.tree[1]
+		state := &mi.states[index]
 
-		mi.advanceIterNext(entry.source)
+		if mi.current == nil {
+			mi.current = &mergeEntry{}
+		}
+		mi.current.key = append(mi.current.key[:0], state.key...)
+		mi.current.value = append(mi.current.value[:0], state.value...)
+		mi.current.trailer = state.trailer
+		mi.current.seq = state.seq
+		mi.current.kind = state.kind
+		mi.current.source = index
 
-		if mi.lastKey != nil && bytes.Equal(entry.key, mi.lastKey) {
+		mi.advance(index)
+
+		if mi.lastKey != nil && bytes.Equal(mi.current.key, mi.lastKey) {
 			continue
 		}
 
-		mi.current = entry
-		mi.lastKey = append(mi.lastKey[:0], entry.key...)
+		mi.lastKey = append(mi.lastKey[:0], mi.current.key...)
 		return true
 	}
+
 	return false
 }
 
@@ -200,8 +230,8 @@ func (mi *kMergeIterator) Err() error {
 	if mi.err != nil {
 		return mi.err
 	}
-	for _, w := range mi.iters {
-		if err := w.iter.Error(); err != nil {
+	for _, iter := range mi.iters {
+		if err := iter.Error(); err != nil {
 			return err
 		}
 	}
@@ -210,8 +240,8 @@ func (mi *kMergeIterator) Err() error {
 
 func (mi *kMergeIterator) close() error {
 	var firstErr error
-	for _, w := range mi.iters {
-		if err := w.iter.Close(); err != nil && firstErr == nil {
+	for _, iter := range mi.iters {
+		if err := iter.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
