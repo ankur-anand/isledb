@@ -1,13 +1,16 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/config"
+	"gocloud.dev/blob"
 )
 
 type BlobStorage struct {
@@ -28,17 +31,13 @@ func (b *BlobStorage) Write(ctx context.Context, value []byte) ([32]byte, error)
 	blobIDHex := hex.EncodeToString(blobID[:])
 
 	blobPath := b.store.BlobPath(blobIDHex)
-	exists, err := b.store.Exists(ctx, blobPath)
-	if err != nil {
-		return [32]byte{}, fmt.Errorf("check blob existence: %w", err)
-	}
-
-	if exists {
-
-		return blobID, nil
-	}
-
-	if _, err := b.store.Write(ctx, blobPath, value); err != nil {
+	if _, err := b.store.WriteReader(ctx, blobPath, bytes.NewReader(value), &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		IfNotExist:  true,
+	}); err != nil {
+		if errors.Is(err, blobstore.ErrPreconditionFailed) {
+			return blobID, nil
+		}
 		return [32]byte{}, fmt.Errorf("upload blob: %w", err)
 	}
 
