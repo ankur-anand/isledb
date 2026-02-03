@@ -24,6 +24,7 @@ type writer struct {
 	manifestLog *manifest.Store
 	opts        WriterOptions
 	valueConfig config.ValueStorageConfig
+	ctx         context.Context
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
@@ -45,6 +46,9 @@ type writer struct {
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	d := DefaultWriterOptions()
 	opts.MemtableSize = cmp.Or(opts.MemtableSize, d.MemtableSize)
 	opts.FlushInterval = cmp.Or(opts.FlushInterval, d.FlushInterval)
@@ -70,6 +74,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		manifestLog:             manifestLog,
 		opts:                    opts,
 		valueConfig:             valueConfig,
+		ctx:                     ctx,
 		memtable:                internal.NewMemtable(opts.MemtableSize*2, memtableInlineThreshold),
 		memtableInlineThreshold: memtableInlineThreshold,
 		seq:                     m.MaxSeqNum(),
@@ -146,7 +151,7 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 }
 
 func (w *writer) putBlob(key, value []byte, expireAt int64) error {
-	ctx := context.Background()
+	ctx := w.ctx
 
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
