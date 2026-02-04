@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/dgraph-io/ristretto/v2/z"
+	"golang.org/x/sync/singleflight"
 )
 
 type Reader struct {
@@ -31,6 +32,9 @@ type Reader struct {
 	manifestStore *manifest.Store
 	sstCache      SSTCache
 	bloomCache    sync.Map
+	bloomLoads    singleflight.Group
+	sstLoads      singleflight.Group
+	blobLoads     singleflight.Group
 
 	blobStorage *internal.BlobStorage
 	blobCache   internal.BlobCache
@@ -572,17 +576,27 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta SSTMeta, key []byt
 		return filter.(*z.Bloom).Has(bloomHashKey(key)), nil
 	}
 
-	path := r.store.SSTPath(sstMeta.ID)
-	data, _, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
+	value, err, _ := r.bloomLoads.Do(sstMeta.ID, func() (interface{}, error) {
+		if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
+			return filter, nil
+		}
+
+		path := r.store.SSTPath(sstMeta.ID)
+		data, _, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
+		if err != nil {
+			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
+		}
+		filter, err := parseBloomFilter(data)
+		if err != nil {
+			return nil, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
+		}
+		r.bloomCache.Store(sstMeta.ID, filter)
+		return filter, nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
+		return false, err
 	}
-	filter, err := parseBloomFilter(data)
-	if err != nil {
-		return false, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
-	}
-	r.bloomCache.Store(sstMeta.ID, filter)
-	return filter.Has(bloomHashKey(key)), nil
+	return value.(*z.Bloom).Has(bloomHashKey(key)), nil
 }
 
 func (r *Reader) sstCached(id string) bool {
@@ -615,16 +629,26 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error)
 		}
 	}
 
-	data, err := r.blobStorage.Read(ctx, blobID)
+	value, err, _ := r.blobLoads.Do(blobIDHex, func() (interface{}, error) {
+		if r.blobCache != nil {
+			if data, ok := r.blobCache.Get(blobIDHex); ok {
+				return data, nil
+			}
+		}
+
+		data, err := r.blobStorage.Read(ctx, blobID)
+		if err != nil {
+			return nil, err
+		}
+		if r.blobCache != nil {
+			r.blobCache.Set(blobIDHex, data)
+		}
+		return data, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	if r.blobCache != nil {
-		r.blobCache.Set(blobIDHex, data)
-	}
-
-	return data, nil
+	return value.([]byte), nil
 }
 
 func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
@@ -646,7 +670,7 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 			r.sstCache.Release(path)
 		}
 	} else {
-		if err := r.cacheSST(ctx, &sstMeta, path); err != nil {
+		if err := r.ensureSSTCached(ctx, &sstMeta, path); err != nil {
 			return nil, nil, err
 		}
 		if cached, ok := r.sstCache.Acquire(path); ok {
@@ -816,6 +840,22 @@ func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error
 		return fmt.Errorf("cache sst %s: %w", path, err)
 	}
 	return nil
+}
+
+func (r *Reader) ensureSSTCached(ctx context.Context, meta *SSTMeta, path string) error {
+	if _, ok := r.sstCache.Acquire(path); ok {
+		r.sstCache.Release(path)
+		return nil
+	}
+
+	_, err, _ := r.sstLoads.Do(path, func() (interface{}, error) {
+		if _, ok := r.sstCache.Acquire(path); ok {
+			r.sstCache.Release(path)
+			return nil, nil
+		}
+		return nil, r.cacheSST(ctx, meta, path)
+	})
+	return err
 }
 
 func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *SSTMeta, path string) error {
