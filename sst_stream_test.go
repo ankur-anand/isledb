@@ -64,17 +64,22 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 	if result.Meta.Epoch != 1 {
 		t.Errorf("epoch mismatch: got %d", result.Meta.Epoch)
 	}
-	if result.Meta.Size != int64(len(uploadedData)) {
-		t.Errorf("size mismatch: meta=%d, actual=%d", result.Meta.Size, len(uploadedData))
+	expectedSize := result.Meta.Size + result.Meta.Bloom.Length
+	if result.Meta.Bloom.Length > 0 {
+		expectedSize += bloomTrailerLen
+	}
+	if expectedSize != int64(len(uploadedData)) {
+		t.Errorf("size mismatch: meta=%d bloom=%d actual=%d", result.Meta.Size, result.Meta.Bloom.Length, len(uploadedData))
 	}
 
-	h := sha256.Sum256(uploadedData)
+	payload := sstPayload(t, result.Meta, uploadedData)
+	h := sha256.Sum256(payload)
 	expectedChecksum := "sha256:" + hex.EncodeToString(h[:])
 	if result.Meta.Checksum != expectedChecksum {
 		t.Errorf("checksum mismatch: got %s, want %s", result.Meta.Checksum, expectedChecksum)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(uploadedData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(payload), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -212,7 +217,8 @@ func TestWriteSSTStreaming_HashVerification(t *testing.T) {
 		t.Fatalf("writeSSTStreaming error: %v", err)
 	}
 
-	h := sha256.Sum256(uploadedData)
+	payload := sstPayload(t, result.Meta, uploadedData)
+	h := sha256.Sum256(payload)
 	computedHash := hex.EncodeToString(h[:])
 
 	if !strings.HasPrefix(result.Meta.Checksum, "sha256:") {
@@ -251,7 +257,7 @@ func TestWriteSSTStreaming_BlobReference(t *testing.T) {
 		t.Fatalf("expected uploaded data")
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(uploadedData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, result.Meta, uploadedData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -381,13 +387,15 @@ func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 
-	h := sha256.Sum256(uploadedData)
+	result := results[0]
+	payload := sstPayload(t, result.Meta, uploadedData)
+	h := sha256.Sum256(payload)
 	expectedChecksum := "sha256:" + hex.EncodeToString(h[:])
-	if results[0].Meta.Checksum != expectedChecksum {
-		t.Errorf("checksum mismatch: got %s, want %s", results[0].Meta.Checksum, expectedChecksum)
+	if result.Meta.Checksum != expectedChecksum {
+		t.Errorf("checksum mismatch: got %s, want %s", result.Meta.Checksum, expectedChecksum)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(uploadedData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, result.Meta, uploadedData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -498,9 +506,11 @@ func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 
-	h := sha256.Sum256(uploadedData)
+	result := results[0]
+	payload := sstPayload(t, result.Meta, uploadedData)
+	h := sha256.Sum256(payload)
 	computedHash := hex.EncodeToString(h[:])
-	metaHash := strings.TrimPrefix(results[0].Meta.Checksum, "sha256:")
+	metaHash := strings.TrimPrefix(result.Meta.Checksum, "sha256:")
 
 	if metaHash != computedHash {
 		t.Errorf("hash mismatch: meta=%s, computed=%s", metaHash, computedHash)

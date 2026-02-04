@@ -41,6 +41,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 
 	sstBuf := new(bytes.Buffer)
 	writable := newHashingWritable(sstBuf)
+	var hashes []uint64
 
 	wo := sstable.WriterOptions{
 		BlockSize:   opts.BlockSize,
@@ -66,6 +67,9 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 
 		e := it.Entry()
 		k := append([]byte(nil), e.Key...)
+		if opts.BloomBitsPerKey > 0 {
+			hashes = append(hashes, bloomHashKey(k))
+		}
 
 		keyEntry, err := buildKeyEntry(e, k)
 		if err != nil {
@@ -102,21 +106,45 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		return result, err
 	}
 
+	sstSize := writable.size
+	var bloomBytes []byte
+	var bloomK int
+	if opts.BloomBitsPerKey > 0 {
+		var err error
+		bloomBytes, bloomK, err = buildBloomBytes(hashes, opts.BloomBitsPerKey)
+		if err != nil {
+			return result, err
+		}
+		if len(bloomBytes) > 0 {
+			if _, err := sstBuf.Write(bloomBytes); err != nil {
+				return result, err
+			}
+			if err := appendBloomTrailer(sstBuf, int64(len(bloomBytes))); err != nil {
+				return result, err
+			}
+		}
+	}
+
 	hashBytes := writable.sumBytes()
 	hashStr := hex.EncodeToString(hashBytes)
 
 	result.SSTData = sstBuf.Bytes()
 
 	result.Meta = SSTMeta{
-		ID:        buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
-		Epoch:     epoch,
-		SeqLo:     state.seqLo,
-		SeqHi:     state.seqHi,
-		MinKey:    state.minKey,
-		MaxKey:    state.maxKey,
-		Size:      writable.size,
-		Checksum:  "sha256:" + hashStr,
-		Bloom:     BloomMeta{BitsPerKey: opts.BloomBitsPerKey},
+		ID:       buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
+		Epoch:    epoch,
+		SeqLo:    state.seqLo,
+		SeqHi:    state.seqHi,
+		MinKey:   state.minKey,
+		MaxKey:   state.maxKey,
+		Size:     sstSize,
+		Checksum: "sha256:" + hashStr,
+		Bloom: BloomMeta{
+			BitsPerKey: opts.BloomBitsPerKey,
+			K:          bloomK,
+			Offset:     sstSize,
+			Length:     int64(len(bloomBytes)),
+		},
 		CreatedAt: time.Now().UTC(),
 		Level:     0,
 	}

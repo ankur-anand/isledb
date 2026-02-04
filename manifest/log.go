@@ -62,6 +62,10 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 		return m
 	}
 
+	if entry.Seq > m.LogSeq {
+		m.LogSeq = entry.Seq
+	}
+
 	switch entry.Op {
 	case LogOpAddSSTable:
 		if entry.SSTable != nil {
@@ -122,6 +126,9 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 
 	case LogOpCheckpoint:
 		if entry.Checkpoint != nil {
+			if entry.Seq > entry.Checkpoint.LogSeq {
+				entry.Checkpoint.LogSeq = entry.Seq
+			}
 			return entry.Checkpoint
 		}
 

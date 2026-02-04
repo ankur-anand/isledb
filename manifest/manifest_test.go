@@ -9,6 +9,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	m := &Manifest{
 		Version:         2,
 		NextEpoch:       7,
+		LogSeq:          42,
 		NextSortedRunID: 3,
 		CompactionConfig: CompactionConfig{
 			L0CompactionThreshold: 8,
@@ -52,7 +53,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
-	if got.Version != m.Version || got.NextEpoch != m.NextEpoch {
+	if got.Version != m.Version || got.NextEpoch != m.NextEpoch || got.LogSeq != m.LogSeq {
 		t.Fatalf("manifest mismatch: version=%d nextEpoch=%d", got.Version, got.NextEpoch)
 	}
 	if got.NextSortedRunID != m.NextSortedRunID {

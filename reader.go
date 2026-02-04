@@ -23,12 +23,14 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 type Reader struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
 	sstCache      SSTCache
+	bloomCache    sync.Map
 
 	blobStorage *internal.BlobStorage
 	blobCache   internal.BlobCache
@@ -498,6 +500,21 @@ func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
 }
 
 func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([]byte, bool, bool, error) {
+	if sstMeta.Bloom.Length > 0 {
+		if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
+			if !filter.(*z.Bloom).Has(bloomHashKey(key)) {
+				return nil, false, false, nil
+			}
+		} else if !r.sstCached(sstMeta.ID) {
+			mayContain, err := r.bloomMayContain(ctx, sstMeta, key)
+			if err != nil {
+				return nil, false, false, err
+			}
+			if !mayContain {
+				return nil, false, false, nil
+			}
+		}
+	}
 
 	_, iter, err := r.openSSTIterBounded(ctx, sstMeta, key, nil)
 	if err != nil {
@@ -548,6 +565,33 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 	}
 
 	return nil, false, false, errors.New("corrupt entry: non-inline, non-blob")
+}
+
+func (r *Reader) bloomMayContain(ctx context.Context, sstMeta SSTMeta, key []byte) (bool, error) {
+	if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
+		return filter.(*z.Bloom).Has(bloomHashKey(key)), nil
+	}
+
+	path := r.store.SSTPath(sstMeta.ID)
+	data, _, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
+	if err != nil {
+		return false, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
+	}
+	filter, err := parseBloomFilter(data)
+	if err != nil {
+		return false, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
+	}
+	r.bloomCache.Store(sstMeta.ID, filter)
+	return filter.Has(bloomHashKey(key)), nil
+}
+
+func (r *Reader) sstCached(id string) bool {
+	path := r.store.SSTPath(id)
+	if _, ok := r.sstCache.Acquire(path); ok {
+		r.sstCache.Release(path)
+		return true
+	}
+	return false
 }
 
 func (r *Reader) entryValue(ctx context.Context, entry internal.CompactionEntry) ([]byte, error) {
@@ -615,7 +659,17 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 		}
 	}
 
-	reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
+	readerOpts := sstable.ReaderOptions{}
+
+	data, err = trimSSTData(sstMeta, data)
+	if err != nil {
+		if release != nil {
+			release()
+		}
+		return nil, nil, err
+	}
+
+	reader, err := sstable.NewReader(ctx, newSSTReadable(data), readerOpts)
 	if err != nil {
 		if release != nil {
 			release()
@@ -672,6 +726,12 @@ func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
 		return nil
 	}
 
+	var err error
+	data, err = trimSSTData(meta, data)
+	if err != nil {
+		return err
+	}
+
 	sum := sha256.Sum256(data)
 	return r.validateSSTHash(meta, sum)
 }
@@ -713,12 +773,35 @@ func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
 	return nil
 }
 
+func trimSSTData(meta SSTMeta, data []byte) ([]byte, error) {
+	if meta.Size <= 0 {
+		if bloomLen, ok := parseBloomTrailer(data); ok {
+			sstSize := int64(len(data)) - bloomLen - bloomTrailerLen
+			if sstSize < 0 {
+				return nil, fmt.Errorf("sst %s: invalid bloom trailer", meta.ID)
+			}
+			return data[:sstSize], nil
+		}
+		return data, nil
+	}
+	if int64(len(data)) < meta.Size {
+		return nil, fmt.Errorf("sst %s: short read: %d < %d", meta.ID, len(data), meta.Size)
+	}
+	return data[:meta.Size], nil
+}
+
 func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error {
 	if cache, ok := r.sstCache.(diskcache.FileBackedCache); ok {
 		return r.cacheSSTStream(ctx, cache, meta, path)
 	}
 
-	data, _, err := r.store.Read(ctx, path)
+	var data []byte
+	var err error
+	if meta != nil && meta.Size > 0 {
+		data, _, err = r.store.ReadRange(ctx, path, 0, meta.Size)
+	} else {
+		data, _, err = r.store.Read(ctx, path)
+	}
 	if err != nil {
 		return fmt.Errorf("read sst %s: %w", path, err)
 	}
@@ -746,7 +829,12 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 		_ = os.Remove(tmpPath)
 	}
 
-	stream, err := r.store.ReadStream(ctx, path)
+	var stream io.ReadCloser
+	if meta != nil && meta.Size > 0 {
+		stream, err = r.store.ReadRangeStream(ctx, path, 0, meta.Size)
+	} else {
+		stream, err = r.store.ReadStream(ctx, path)
+	}
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("read sst %s: %w", path, err)

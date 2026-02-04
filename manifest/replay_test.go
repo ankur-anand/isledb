@@ -42,6 +42,9 @@ func TestReplaySnapshotAndLogs(t *testing.T) {
 	if got.NextEpoch != 3 {
 		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
 	}
+	if got.LogSeq != entry.Seq {
+		t.Fatalf("log seq mismatch: %d", got.LogSeq)
+	}
 }
 
 func TestReplayEmpty(t *testing.T) {

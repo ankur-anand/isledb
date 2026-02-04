@@ -21,7 +21,7 @@ func buildTestIter(t *testing.T, entries []internal.MemEntry) (*sstable.Reader, 
 		t.Fatalf("writeSST: %v", err)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestTournamentMergeIterator_MatchesHeap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("writeSST: %v", err)
 		}
-		reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+		reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 		if err != nil {
 			t.Fatalf("newReader: %v", err)
 		}
@@ -434,7 +434,7 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 		b.Fatalf("writeSST: %v", err)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(b, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		b.Fatalf("newReader: %v", err)
 	}
@@ -571,7 +571,7 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 		b.Fatalf("writeSST: %v", err)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(b, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		b.Fatalf("newReader: %v", err)
 	}

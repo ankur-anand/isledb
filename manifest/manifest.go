@@ -15,6 +15,7 @@ type CompactionConfig struct {
 type Manifest struct {
 	Version   int    `json:"version"`
 	NextEpoch uint64 `json:"next_epoch"`
+	LogSeq    uint64 `json:"log_seq"`
 
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
@@ -46,6 +47,8 @@ type SSTSignature struct {
 type BloomMeta struct {
 	BitsPerKey int
 	K          int
+	Offset     int64
+	Length     int64
 }
 
 type SSTMeta struct {

@@ -432,12 +432,24 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 
 	for _, sst := range ssts {
 		path := c.store.SSTPath(sst.ID)
-		data, _, err := c.store.Read(ctx, path)
+		var data []byte
+		var err error
+		if sst.Size > 0 {
+			data, _, err = c.store.ReadRange(ctx, path, 0, sst.Size)
+		} else {
+			data, _, err = c.store.Read(ctx, path)
+		}
 		if err != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("read sst %s: %w", sst.ID, err)
 		}
 		if err := validateSSTDataForCompaction(sst, data, c.opts.ValidateSSTChecksum, c.opts.SSTHashVerifier); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+
+		data, err = trimSSTData(sst, data)
+		if err != nil {
 			cleanup()
 			return nil, nil, err
 		}
@@ -468,6 +480,12 @@ func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifi
 	needHash := verify || verifier != nil
 	if !needHash {
 		return nil
+	}
+
+	var err error
+	data, err = trimSSTData(meta, data)
+	if err != nil {
+		return err
 	}
 
 	sum := sha256.Sum256(data)

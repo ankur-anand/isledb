@@ -21,6 +21,7 @@ func (m *Manifest) Clone() *Manifest {
 	clone := &Manifest{
 		Version:          m.Version,
 		NextEpoch:        m.NextEpoch,
+		LogSeq:           m.LogSeq,
 		NextSortedRunID:  m.NextSortedRunID,
 		CompactionConfig: m.CompactionConfig,
 	}

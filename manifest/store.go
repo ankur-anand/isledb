@@ -343,6 +343,11 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	if current != nil && current.NextEpoch > m.NextEpoch {
 		m.NextEpoch = current.NextEpoch
 	}
+	if current != nil && current.NextSeq > 0 {
+		m.LogSeq = current.NextSeq - 1
+	} else if maxSeq > m.LogSeq {
+		m.LogSeq = maxSeq
+	}
 
 	s.mu.Lock()
 	if current != nil && current.NextSeq > 0 {
@@ -380,7 +385,16 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if m == nil {
 		return "", errors.New("nil manifest")
 	}
-	data, err := EncodeSnapshot(m)
+	s.mu.Lock()
+	nextSeq := s.nextSeq
+	s.mu.Unlock()
+
+	snap := m.Clone()
+	if nextSeq > 0 {
+		snap.LogSeq = nextSeq - 1
+	}
+
+	data, err := EncodeSnapshot(snap)
 	if err != nil {
 		return "", err
 	}
@@ -399,9 +413,9 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
 	current.Snapshot = path
-	current.LogSeqStart = s.nextSeq
+	current.LogSeqStart = nextSeq
 	current.NextEpoch = m.NextEpoch
-	current.NextSeq = s.nextSeq
+	current.NextSeq = nextSeq
 
 	if err := s.writeCurrent(ctx, current); err != nil {
 		return "", err

@@ -101,7 +101,7 @@ func TestWriteSST_Inline(t *testing.T) {
 		t.Errorf("key range mismatch: %s-%s", res.Meta.MinKey, res.Meta.MaxKey)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestWriteSST_BlobReference(t *testing.T) {
 		t.Fatalf("expected SST data")
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 		t.Fatalf("writeSST error: %v", err)
 	}
 
-	reader, err := sstable.NewReader(context.Background(), newMemReadable(res.SSTData), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
 	}
@@ -332,4 +332,15 @@ func TestWriteSST_Signature(t *testing.T) {
 	if !ed25519.Verify(pub, hashBytes, res.Meta.Signature.Signature) {
 		t.Fatalf("signature verify failed")
 	}
+}
+
+func sstPayload(tb testing.TB, meta SSTMeta, data []byte) []byte {
+	tb.Helper()
+	if meta.Size <= 0 {
+		return data
+	}
+	if int64(len(data)) < meta.Size {
+		tb.Fatalf("sst payload too short: %d < %d", len(data), meta.Size)
+	}
+	return data[:meta.Size]
 }

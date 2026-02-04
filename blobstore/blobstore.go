@@ -131,8 +131,39 @@ func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error
 	}, nil
 }
 
+func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, Attributes, error) {
+	attr, err := s.bucket.Attributes(ctx, key)
+	if err != nil {
+		return nil, Attributes{}, s.mapError(err)
+	}
+
+	r, err := s.bucket.NewRangeReader(ctx, key, offset, length, nil)
+	if err != nil {
+		return nil, Attributes{}, s.mapError(err)
+	}
+	defer r.Close()
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, Attributes{}, err
+	}
+
+	return data, Attributes{
+		Size: attr.Size,
+		ETag: attr.ETag,
+	}, nil
+}
+
 func (s *Store) ReadStream(ctx context.Context, key string) (*blob.Reader, error) {
 	r, err := s.bucket.NewReader(ctx, key, nil)
+	if err != nil {
+		return nil, s.mapError(err)
+	}
+	return r, nil
+}
+
+func (s *Store) ReadRangeStream(ctx context.Context, key string, offset, length int64) (*blob.Reader, error) {
+	r, err := s.bucket.NewRangeReader(ctx, key, offset, length, nil)
 	if err != nil {
 		return nil, s.mapError(err)
 	}
