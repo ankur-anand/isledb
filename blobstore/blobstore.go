@@ -131,27 +131,19 @@ func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error
 	}, nil
 }
 
-func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, Attributes, error) {
-	attr, err := s.bucket.Attributes(ctx, key)
-	if err != nil {
-		return nil, Attributes{}, s.mapError(err)
-	}
-
+func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	r, err := s.bucket.NewRangeReader(ctx, key, offset, length, nil)
 	if err != nil {
-		return nil, Attributes{}, s.mapError(err)
+		return nil, s.mapError(err)
 	}
 	defer r.Close()
 
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return nil, Attributes{}, err
+		return nil, err
 	}
 
-	return data, Attributes{
-		Size: attr.Size,
-		ETag: attr.ETag,
-	}, nil
+	return data, nil
 }
 
 func (s *Store) ReadStream(ctx context.Context, key string) (*blob.Reader, error) {
@@ -247,6 +239,23 @@ func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, ifMat
 	}
 
 	return s.Write(ctx, key, data)
+}
+
+func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) error {
+	w, err := s.bucket.NewWriter(ctx, key, &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		IfNotExist:  true,
+	})
+	if err != nil {
+		return s.mapError(err)
+	}
+
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return err
+	}
+
+	return s.mapError(w.Close())
 }
 
 func (s *Store) Delete(ctx context.Context, key string) error {

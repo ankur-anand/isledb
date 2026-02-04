@@ -529,3 +529,55 @@ func TestListFunctions(t *testing.T) {
 		}
 	})
 }
+
+func TestWriteIfNotExist_Success(t *testing.T) {
+	forEachStore(t, "test", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		store := h.store
+
+		key := store.ManifestLogPath("00000000000000000001")
+		data := []byte(`{"op": "add_sst", "id": "sst-1"}`)
+
+		err := store.WriteIfNotExist(ctx, key, data)
+		if err != nil {
+			t.Fatalf("WriteIfNotExist failed: %v", err)
+		}
+
+		content, _, err := store.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(content) != string(data) {
+			t.Errorf("content mismatch: got %q, want %q", content, data)
+		}
+	})
+}
+
+func TestWriteIfNotExist_AlreadyExists(t *testing.T) {
+	forEachStore(t, "test", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		store := h.store
+
+		key := store.ManifestLogPath("00000000000000000001")
+		data1 := []byte(`{"op": "add_sst", "id": "sst-1"}`)
+		data2 := []byte(`{"op": "add_sst", "id": "sst-2"}`)
+
+		err := store.WriteIfNotExist(ctx, key, data1)
+		if err != nil {
+			t.Fatalf("first WriteIfNotExist failed: %v", err)
+		}
+
+		err = store.WriteIfNotExist(ctx, key, data2)
+		if !errors.Is(err, ErrPreconditionFailed) {
+			t.Errorf("expected ErrPreconditionFailed, got %v", err)
+		}
+
+		content, _, err := store.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(content) != string(data1) {
+			t.Errorf("content should be unchanged: got %q, want %q", content, data1)
+		}
+	})
+}
