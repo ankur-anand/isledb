@@ -22,6 +22,18 @@ type ReaderOpenOptions struct {
 	// BlobCacheMaxItemSize is the maximum size per item in the blob cache.
 	BlobCacheMaxItemSize int64
 
+	// BlockCacheSize is the maximum bytes for the in-memory block cache used
+	// when range-reading SSTs. Default 0 disables the block cache.
+	BlockCacheSize int64
+
+	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
+	// full-file checksums or signatures.
+	AllowUnverifiedRangeRead bool
+
+	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
+	// range-read + block cache. Default 0 means no size threshold.
+	RangeReadMinSSTSize int64
+
 	// ValidateSSTChecksum verifies SST checksums on first download.
 	// If enabled and checksum is missing or mismatched, reads fail.
 	ValidateSSTChecksum bool
@@ -52,12 +64,15 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 	}
 
 	ropts := ReaderOptions{
-		CacheDir:             opts.CacheDir,
-		SSTCacheSize:         opts.SSTCacheSize,
-		BlobCacheSize:        opts.BlobCacheSize,
-		BlobCacheMaxItemSize: opts.BlobCacheMaxItemSize,
-		ValidateSSTChecksum:  opts.ValidateSSTChecksum,
-		SSTHashVerifier:      opts.SSTHashVerifier,
+		CacheDir:                 opts.CacheDir,
+		SSTCacheSize:             opts.SSTCacheSize,
+		BlobCacheSize:            opts.BlobCacheSize,
+		BlobCacheMaxItemSize:     opts.BlobCacheMaxItemSize,
+		BlockCacheSize:           opts.BlockCacheSize,
+		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
+		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
+		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
+		SSTHashVerifier:          opts.SSTHashVerifier,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

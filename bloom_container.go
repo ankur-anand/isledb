@@ -58,16 +58,3 @@ func appendBloomTrailer(w io.Writer, bloomLen int64) error {
 	_, err := w.Write(buf[:])
 	return err
 }
-
-func parseBloomTrailer(data []byte) (int64, bool) {
-	if len(data) < bloomTrailerLen {
-		return 0, false
-	}
-	start := len(data) - bloomTrailerLen
-	tail := data[start:]
-	if string(tail[:8]) != bloomTrailerMagic {
-		return 0, false
-	}
-	length := binary.LittleEndian.Uint64(tail[8:])
-	return int64(length), true
-}

@@ -23,6 +23,7 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/dgraph-io/ristretto/v2"
 	"github.com/dgraph-io/ristretto/v2/z"
 	"golang.org/x/sync/singleflight"
 )
@@ -31,19 +32,23 @@ type Reader struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
 	sstCache      SSTCache
+	blockCache    *ristretto.Cache[string, []byte]
 	bloomCache    sync.Map
 	bloomLoads    singleflight.Group
 	sstLoads      singleflight.Group
 	blobLoads     singleflight.Group
 
-	blobStorage *internal.BlobStorage
-	blobCache   internal.BlobCache
-	valueConfig config.ValueStorageConfig
-	verifySST   bool
-	verifier    SSTHashVerifier
+	blobStorage              *internal.BlobStorage
+	blobCache                internal.BlobCache
+	valueConfig              config.ValueStorageConfig
+	verifySST                bool
+	verifier                 SSTHashVerifier
+	allowUnverifiedRangeRead bool
+	rangeReadMinSSTSize      int64
 
-	ownsSSTCache  bool
-	ownsBlobCache bool
+	ownsSSTCache   bool
+	ownsBlockCache bool
+	ownsBlobCache  bool
 
 	mu       sync.RWMutex
 	manifest *Manifest
@@ -83,25 +88,41 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		}
 	}()
 
+	blockCache, ownsBlockCache, err := initBlockCache(opts)
+	if err != nil {
+		return nil, err
+	}
+	cleanupBlockCache := ownsBlockCache
+	defer func() {
+		if cleanupBlockCache {
+			blockCache.Close()
+		}
+	}()
+
 	valueConfig := opts.ValueStorageConfig
 	if valueConfig.BlobThreshold == 0 {
 		valueConfig = config.DefaultValueStorageConfig()
 	}
 
 	reader := &Reader{
-		store:         store,
-		manifestStore: ms,
-		manifest:      m,
-		sstCache:      sstCache,
-		blobStorage:   internal.NewBlobStorage(store, valueConfig),
-		blobCache:     blobCache,
-		valueConfig:   valueConfig,
-		verifySST:     opts.ValidateSSTChecksum,
-		verifier:      opts.SSTHashVerifier,
-		ownsSSTCache:  ownsSSTCache,
-		ownsBlobCache: ownsBlobCache,
+		store:                    store,
+		manifestStore:            ms,
+		manifest:                 m,
+		sstCache:                 sstCache,
+		blockCache:               blockCache,
+		blobStorage:              internal.NewBlobStorage(store, valueConfig),
+		blobCache:                blobCache,
+		valueConfig:              valueConfig,
+		verifySST:                opts.ValidateSSTChecksum,
+		verifier:                 opts.SSTHashVerifier,
+		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
+		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
+		ownsSSTCache:             ownsSSTCache,
+		ownsBlockCache:           ownsBlockCache,
+		ownsBlobCache:            ownsBlobCache,
 	}
 	cleanupSSTCache = false
+	cleanupBlockCache = false
 	cleanupBlobCache = false
 	return reader, nil
 }
@@ -197,6 +218,10 @@ func (r *Reader) Close() error {
 		if err := r.sstCache.Close(); err != nil {
 			firstErr = err
 		}
+	}
+
+	if r.blockCache != nil && r.ownsBlockCache {
+		r.blockCache.Close()
 	}
 
 	if r.blobCache != nil && r.ownsBlobCache {
@@ -651,6 +676,13 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error)
 	return value.([]byte), nil
 }
 
+func (r *Reader) sstPayloadSize(meta SSTMeta) (int64, error) {
+	if meta.Size > 0 {
+		return meta.Size, nil
+	}
+	return 0, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
+}
+
 func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
 	if r.blobCache != nil {
 		return r.blobCache.Stats()
@@ -661,40 +693,91 @@ func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	path := r.store.SSTPath(sstMeta.ID)
 
-	var data []byte
-	var err error
-	var release func()
 	if cached, ok := r.sstCache.Acquire(path); ok {
-		data = cached
-		release = func() {
+		release := func() {
 			r.sstCache.Release(path)
 		}
-	} else {
-		if err := r.ensureSSTCached(ctx, &sstMeta, path); err != nil {
-			return nil, nil, err
+		return r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+	}
+
+	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
+		return nil, nil, err
+	} else if ok {
+		return r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
+	}
+
+	if err := r.ensureSSTCached(ctx, &sstMeta, path); err != nil {
+		return nil, nil, err
+	}
+	if cached, ok := r.sstCache.Acquire(path); ok {
+		release := func() {
+			r.sstCache.Release(path)
 		}
-		if cached, ok := r.sstCache.Acquire(path); ok {
-			data = cached
-			release = func() {
-				r.sstCache.Release(path)
+		return r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+	}
+	return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
+}
+
+func (r *Reader) shouldRangeRead(sstMeta SSTMeta) (bool, int64, error) {
+	if r.blockCache == nil {
+		return false, 0, nil
+	}
+	if !r.allowUnverifiedRangeRead && (r.verifySST || r.verifier != nil) {
+		return false, 0, nil
+	}
+
+	size := sstMeta.Size
+	if r.rangeReadMinSSTSize > 0 {
+		if size <= 0 {
+			s, err := r.sstPayloadSize(sstMeta)
+			if err != nil {
+				return false, 0, err
 			}
-		} else {
-			return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
+			size = s
+		}
+		if size < r.rangeReadMinSSTSize {
+			return false, 0, nil
 		}
 	}
 
-	readerOpts := sstable.ReaderOptions{}
+	if size <= 0 {
+		size = sstMeta.Size
+		if size <= 0 {
+			size = 0
+		}
+	}
 
-	data, err = trimSSTData(sstMeta, data)
+	return true, size, nil
+}
+
+func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta SSTMeta, path string, lower, upper []byte, size int64) (*sstable.Reader, sstable.Iterator, error) {
+	if size <= 0 {
+		var err error
+		size, err = r.sstPayloadSize(sstMeta)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	readable := newSSTRangeReadable(r.store, path, sstMeta.ID, size, r.blockCache)
+	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil)
+}
+
+func (r *Reader) openSSTIterFromData(ctx context.Context, sstMeta SSTMeta, data []byte, lower, upper []byte, release func()) (*sstable.Reader, sstable.Iterator, error) {
+	trimmed, err := trimSSTData(sstMeta, data)
 	if err != nil {
 		if release != nil {
 			release()
 		}
 		return nil, nil, err
 	}
+	return r.openSSTIterWithReadable(ctx, newSSTReadable(trimmed), lower, upper, release)
+}
 
-	reader, err := sstable.NewReader(ctx, newSSTReadable(data), readerOpts)
+func (r *Reader) openSSTIterWithReadable(ctx context.Context, readable objstorage.Readable, lower, upper []byte, release func()) (*sstable.Reader, sstable.Iterator, error) {
+	readerOpts := sstable.ReaderOptions{}
+	reader, err := sstable.NewReader(ctx, readable, readerOpts)
 	if err != nil {
+		_ = readable.Close()
 		if release != nil {
 			release()
 		}
@@ -799,14 +882,7 @@ func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
 
 func trimSSTData(meta SSTMeta, data []byte) ([]byte, error) {
 	if meta.Size <= 0 {
-		if bloomLen, ok := parseBloomTrailer(data); ok {
-			sstSize := int64(len(data)) - bloomLen - bloomTrailerLen
-			if sstSize < 0 {
-				return nil, fmt.Errorf("sst %s: invalid bloom trailer", meta.ID)
-			}
-			return data[:sstSize], nil
-		}
-		return data, nil
+		return nil, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
 	}
 	if int64(len(data)) < meta.Size {
 		return nil, fmt.Errorf("sst %s: short read: %d < %d", meta.ID, len(data), meta.Size)

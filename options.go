@@ -62,6 +62,18 @@ type ReaderOptions struct {
 	// Items larger than this will not be cached. Default 0 means no limit.
 	BlobCacheMaxItemSize int64
 
+	// BlockCacheSize is the maximum bytes for the in-memory block cache used
+	// when range-reading SSTs. Default 0 disables the block cache.
+	BlockCacheSize int64
+
+	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
+	// full-file checksums or signatures.
+	AllowUnverifiedRangeRead bool
+
+	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
+	// range-read + block cache. Default 0 means no size threshold.
+	RangeReadMinSSTSize int64
+
 	ValueStorageConfig config.ValueStorageConfig
 	ManifestStorage    manifest.Storage
 
