@@ -1,12 +1,10 @@
-//go:build integration && s3
-
 package blobstore
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -14,40 +12,52 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	_ "gocloud.dev/blob/s3blob"
 )
 
-// docker run --rm -it -p 9000:9000 -p 9001:9001 \
-//   -e MINIO_ROOT_USER=minioadmin \
-//   -e MINIO_ROOT_PASSWORD=minioadmin \
-//   quay.io/minio/minio server /data --console-address ":9001"
 // go test ./blobstore/... -tags="integration,s3" -v -run TestS3 2>&1
 
 const (
-	minioEndpoint  = "http://127.0.0.1:9000"
-	minioAccessKey = "minioadmin"
-	minioSecretKey = "minioadmin"
-	minioRegion    = "us-east-1"
-	minioBucket    = "testbucket"
+	fakeS3AccessKey = "fakeaccess"
+	fakeS3SecretKey = "fakesecret"
+	fakeS3Region    = "us-east-1"
+	fakeS3Bucket    = "testbucket"
 )
 
+var fakeS3Server *httptest.Server
+var fakeS3Endpoint string
+
 func s3BucketURL() string {
-	return fmt.Sprintf("s3://%s?endpoint=http://127.0.0.1:9000&region=%s&use_path_style=true",
-		minioBucket, minioRegion)
+	return fmt.Sprintf("s3://%s?endpoint=%s&region=%s&use_path_style=true",
+		fakeS3Bucket, fakeS3Endpoint, fakeS3Region)
 }
 
 func ensureS3Bucket(t *testing.T) {
 	t.Helper()
 
-	os.Setenv("AWS_ACCESS_KEY_ID", minioAccessKey)
-	os.Setenv("AWS_SECRET_ACCESS_KEY", minioSecretKey)
-	os.Setenv("AWS_REGION", minioRegion)
-	os.Setenv("AWS_S3_USE_PATH_STYLE", "true")
+	if fakeS3Server == nil {
+		backend := s3mem.New()
+		fake := gofakes3.New(backend)
+		fakeS3Server = httptest.NewServer(fake.Server())
+		fakeS3Endpoint = fakeS3Server.URL
+		t.Cleanup(func() {
+			fakeS3Server.Close()
+			fakeS3Server = nil
+			fakeS3Endpoint = ""
+		})
+	}
+
+	t.Setenv("AWS_ACCESS_KEY_ID", fakeS3AccessKey)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", fakeS3SecretKey)
+	t.Setenv("AWS_REGION", fakeS3Region)
+	t.Setenv("AWS_S3_USE_PATH_STYLE", "true")
 
 	cfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(minioRegion),
+		config.WithRegion(fakeS3Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			minioAccessKey, minioSecretKey, "",
+			fakeS3AccessKey, fakeS3SecretKey, "",
 		)),
 	)
 	if err != nil {
@@ -55,13 +65,13 @@ func ensureS3Bucket(t *testing.T) {
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(minioEndpoint)
+		o.BaseEndpoint = aws.String(fakeS3Endpoint)
 		o.UsePathStyle = true
 	})
 
 	ctx := context.Background()
 	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(minioBucket),
+		Bucket: aws.String(fakeS3Bucket),
 	})
 	if err != nil {
 		t.Logf("create bucket (may already exist): %v", err)

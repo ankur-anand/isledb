@@ -24,7 +24,7 @@ func setupFakeGCS(t *testing.T) *Store {
 		server, err := fakestorage.NewServerWithOptions(fakestorage.Options{
 			InitialObjects: []fakestorage.Object{},
 			Host:           "127.0.0.1",
-			Port:           0, // Random port
+			Port:           0,
 		})
 		if err != nil {
 			t.Fatalf("failed to create fake gcs server: %v", err)
