@@ -72,11 +72,7 @@ func (s *CachingStorage) ReadCurrent(ctx context.Context) ([]byte, string, error
 	return s.storage.ReadCurrent(ctx)
 }
 
-func (s *CachingStorage) WriteCurrent(ctx context.Context, data []byte) error {
-	return s.storage.WriteCurrent(ctx, data)
-}
-
-func (s *CachingStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) error {
+func (s *CachingStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	return s.storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 

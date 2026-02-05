@@ -23,12 +23,8 @@ func (m *mockStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
 	return nil, "", manifest.ErrNotFound
 }
 
-func (m *mockStorage) WriteCurrent(ctx context.Context, data []byte) error {
-	return nil
-}
-
-func (m *mockStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) error {
-	return nil
+func (m *mockStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	return "etag", nil
 }
 
 func (m *mockStorage) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
@@ -173,12 +169,7 @@ func TestCachingStorage_DelegateMethods(t *testing.T) {
 		t.Errorf("expected ErrNotFound from ReadCurrent")
 	}
 
-	err = cs.WriteCurrent(ctx, []byte("current"))
-	if err != nil {
-		t.Errorf("unexpected error from WriteCurrent: %v", err)
-	}
-
-	err = cs.WriteCurrentCAS(ctx, []byte("current"), "etag")
+	_, err = cs.WriteCurrentCAS(ctx, []byte("current"), "etag")
 	if err != nil {
 		t.Errorf("unexpected error from WriteCurrentCAS: %v", err)
 	}
