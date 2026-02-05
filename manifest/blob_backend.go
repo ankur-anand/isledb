@@ -3,6 +3,7 @@ package manifest
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
@@ -17,17 +18,28 @@ func NewBlobStoreBackend(store *blobstore.Store) *BlobStoreBackend {
 
 func (b *BlobStoreBackend) ReadCurrent(ctx context.Context) ([]byte, string, error) {
 	data, attr, err := b.store.Read(ctx, b.store.ManifestPath())
-	return data, attr.ETag, b.mapError(err)
+	if err != nil {
+		return nil, "", b.mapError(err)
+	}
+	if attr.ETag == "" && attr.Generation == 0 {
+		if refreshed, refreshErr := b.store.Attributes(ctx, b.store.ManifestPath()); refreshErr == nil {
+			attr = refreshed
+		}
+	}
+	return data, b.etagFromAttrs(attr), nil
 }
 
-func (b *BlobStoreBackend) WriteCurrent(ctx context.Context, data []byte) error {
-	_, err := b.store.Write(ctx, b.store.ManifestPath(), data)
-	return b.mapError(err)
+func (b *BlobStoreBackend) ReadCurrentData(ctx context.Context) ([]byte, error) {
+	data, _, err := b.store.Read(ctx, b.store.ManifestPath())
+	if err != nil {
+		return nil, b.mapError(err)
+	}
+	return data, nil
 }
 
-func (b *BlobStoreBackend) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) error {
-	_, err := b.store.WriteIfMatch(ctx, b.store.ManifestPath(), data, expectedETag)
-	return b.mapError(err)
+func (b *BlobStoreBackend) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	attr, err := b.store.WriteIfMatch(ctx, b.store.ManifestPath(), data, expectedETag)
+	return b.etagFromAttrs(attr), b.mapError(err)
 }
 
 func (b *BlobStoreBackend) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
@@ -48,7 +60,7 @@ func (b *BlobStoreBackend) ReadLog(ctx context.Context, path string) ([]byte, er
 
 func (b *BlobStoreBackend) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
 	path := b.store.ManifestLogPath(name)
-	_, err := b.store.Write(ctx, path, data)
+	_, err := b.store.WriteIfNotExist(ctx, path, data)
 	return path, b.mapError(err)
 }
 
@@ -70,6 +82,13 @@ func (b *BlobStoreBackend) ListLogs(ctx context.Context) ([]string, error) {
 
 func (b *BlobStoreBackend) LogPath(name string) string {
 	return b.store.ManifestLogPath(name)
+}
+
+func (b *BlobStoreBackend) etagFromAttrs(attr blobstore.Attributes) string {
+	if attr.Generation > 0 {
+		return fmt.Sprintf("%d", attr.Generation)
+	}
+	return attr.ETag
 }
 
 func (b *BlobStoreBackend) mapError(err error) error {
