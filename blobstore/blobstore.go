@@ -247,7 +247,19 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes, error) {
-	return s.WriteReader(ctx, key, bytes.NewReader(data), nil)
+	if _, err := s.WriteReader(ctx, key, bytes.NewReader(data), nil); err != nil {
+		return Attributes{}, err
+	}
+	attr, err := s.bucket.Attributes(ctx, key)
+	if err != nil {
+		return Attributes{}, err
+	}
+	gen := generationFromAttrs(attr)
+	return Attributes{
+		Size:       attr.Size,
+		ETag:       attr.ETag,
+		Generation: gen,
+	}, nil
 }
 
 func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *blob.WriterOptions) (Attributes, error) {
@@ -262,7 +274,8 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 		return Attributes{}, s.mapError(err)
 	}
 
-	if _, err := io.Copy(w, r); err != nil {
+	written, err := io.Copy(w, r)
+	if err != nil {
 		_ = w.Close()
 		return Attributes{}, err
 	}
@@ -270,17 +283,8 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 	if err := w.Close(); err != nil {
 		return Attributes{}, s.mapError(err)
 	}
-
-	attr, err := s.bucket.Attributes(ctx, key)
-	if err != nil {
-		return Attributes{}, err
-	}
-	gen := generationFromAttrs(attr)
-
 	return Attributes{
-		Size:       attr.Size,
-		ETag:       attr.ETag,
-		Generation: gen,
+		Size: written,
 	}, nil
 }
 

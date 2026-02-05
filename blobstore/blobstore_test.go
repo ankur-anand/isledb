@@ -404,9 +404,6 @@ func TestWriteReaderAndAttributes(t *testing.T) {
 		if attr.Size != int64(len(data)) {
 			t.Errorf("Size: got %d, want %d", attr.Size, len(data))
 		}
-		if attr.ETag == "" {
-			t.Error("expected non-empty ETag after WriteReader")
-		}
 
 		got, err := store.Attributes(ctx, key)
 		if err != nil {
@@ -415,8 +412,8 @@ func TestWriteReaderAndAttributes(t *testing.T) {
 		if got.Size != attr.Size {
 			t.Errorf("Attributes size: got %d, want %d", got.Size, attr.Size)
 		}
-		if got.ETag != attr.ETag {
-			t.Errorf("Attributes ETag: got %q, want %q", got.ETag, attr.ETag)
+		if got.ETag == "" {
+			t.Error("expected non-empty ETag after Attributes")
 		}
 
 		_, err = store.Attributes(ctx, "missing")

@@ -67,7 +67,19 @@ func (s *Store) writeIfNotExistWithETag(ctx context.Context, key string, data []
 			return s.writeIfNotExistAzureNative(ctx, key, data)
 		}
 	default:
-		return s.writeIfNotExist(ctx, key, data)
+		if _, err := s.writeIfNotExist(ctx, key, data); err != nil {
+			return Attributes{}, err
+		}
+		attr, err := s.bucket.Attributes(ctx, key)
+		if err != nil {
+			return Attributes{}, err
+		}
+		gen := generationFromAttrs(attr)
+		return Attributes{
+			Size:       attr.Size,
+			ETag:       attr.ETag,
+			Generation: gen,
+		}, nil
 	}
 
 }
