@@ -14,17 +14,28 @@ const (
 	LogOpRemoveSSTable LogOpType = "remove_sstables"
 	LogOpCheckpoint    LogOpType = "checkpoint"
 	LogOpCompaction    LogOpType = "compaction"
+	LogOpFenceClaim    LogOpType = "fence_claim"
 )
 
 type ManifestLogEntry struct {
 	ID               ksuid.KSUID           `json:"id"`
 	Seq              uint64                `json:"seq"`
+	Role             FenceRole             `json:"role"`
+	Epoch            uint64                `json:"epoch"`
 	Timestamp        time.Time             `json:"ts"`
 	Op               LogOpType             `json:"op"`
 	SSTable          *SSTMeta              `json:"sstable,omitempty"`
 	RemoveSSTableIDs []string              `json:"remove_sstable_ids,omitempty"`
 	Checkpoint       *Manifest             `json:"checkpoint,omitempty"`
 	Compaction       *CompactionLogPayload `json:"compaction,omitempty"`
+	FenceClaim       *FenceClaimPayload    `json:"fence_claim,omitempty"`
+}
+
+type FenceClaimPayload struct {
+	Role      FenceRole `json:"role"`
+	Epoch     uint64    `json:"epoch"`
+	Owner     string    `json:"owner"`
+	ClaimedAt time.Time `json:"claimed_at"`
 }
 
 type CompactionLogPayload struct {
@@ -72,16 +83,13 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 			sst := *entry.SSTable
 
 			if sst.Level == 0 {
-
 				m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
 			} else {
-
 				sr := SortedRun{
 					ID:   m.NextSortedRunID,
 					SSTs: []SSTMeta{sst},
 				}
 				m.NextSortedRunID++
-
 				m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
 			}
 

@@ -30,6 +30,9 @@ type Store struct {
 	mu      sync.Mutex
 	nextSeq uint64
 
+	current     *Current
+	currentETag string
+
 	writerFence    *FenceToken
 	compactorFence *FenceToken
 }
@@ -47,18 +50,35 @@ func (s *Store) Storage() Storage {
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
-	return s.claimFence(ctx, FenceRoleWriter, ownerID)
+	token, err := s.claimFence(ctx, FenceRoleWriter, ownerID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.writeFenceClaimEntry(ctx, FenceRoleWriter, token); err != nil {
+		return nil, fmt.Errorf("write fence claim entry: %w", err)
+	}
+
+	return token, nil
 }
 
 func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken, error) {
-	return s.claimFence(ctx, FenceRoleCompactor, ownerID)
+	token, err := s.claimFence(ctx, FenceRoleCompactor, ownerID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.writeFenceClaimEntry(ctx, FenceRoleCompactor, token); err != nil {
+		return nil, fmt.Errorf("write fence claim entry: %w", err)
+	}
+
+	return token, nil
 }
 
 func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) (*FenceToken, error) {
 	const maxRetries = 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
@@ -95,7 +115,6 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 
 		if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
-
 				time.Sleep(time.Millisecond * 10 * time.Duration(attempt+1))
 				continue
 			}
@@ -115,6 +134,21 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 	}
 
 	return nil, ErrFenceConflict
+}
+
+func (s *Store) writeFenceClaimEntry(ctx context.Context, role FenceRole, token *FenceToken) error {
+	entry := &ManifestLogEntry{
+		Role:  role,
+		Epoch: token.Epoch,
+		Op:    LogOpFenceClaim,
+		FenceClaim: &FenceClaimPayload{
+			Role:      role,
+			Epoch:     token.Epoch,
+			Owner:     token.Owner,
+			ClaimedAt: token.ClaimedAt,
+		},
+	}
+	return s.appendInternal(ctx, entry, role)
 }
 
 func (s *Store) CheckWriterFence(ctx context.Context) error {
@@ -152,7 +186,7 @@ func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
 	switch role {
 	case FenceRoleWriter:
 		remoteFence = current.WriterFence
-	case FenceRoleCompactor:
+	default:
 		remoteFence = current.CompactorFence
 	}
 
@@ -185,60 +219,100 @@ func (s *Store) CompactorEpoch() uint64 {
 	return s.compactorFence.Epoch
 }
 
-func (s *Store) Append(ctx context.Context, entry *ManifestLogEntry) error {
-	return s.appendInternal(ctx, entry, FenceRole(-1))
-}
-
 func (s *Store) AppendWithWriterFence(ctx context.Context, entry *ManifestLogEntry) error {
-	if err := s.CheckWriterFence(ctx); err != nil {
+	if err := s.checkLocalFence(FenceRoleWriter); err != nil {
 		return err
 	}
 	return s.appendInternal(ctx, entry, FenceRoleWriter)
 }
 
 func (s *Store) AppendWithCompactorFence(ctx context.Context, entry *ManifestLogEntry) error {
-	if err := s.CheckCompactorFence(ctx); err != nil {
+	if err := s.checkLocalFence(FenceRoleCompactor); err != nil {
 		return err
 	}
 	return s.appendInternal(ctx, entry, FenceRoleCompactor)
 }
 
-func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, role FenceRole) error {
+func (s *Store) checkLocalFence(role FenceRole) error {
 	s.mu.Lock()
-	entry.Seq = s.nextSeq
-	s.nextSeq++
-	s.mu.Unlock()
-
-	if entry.ID.IsNil() {
-		entry.ID = ksuid.New()
+	defer s.mu.Unlock()
+	switch role {
+	case FenceRoleWriter:
+		if s.writerFence == nil {
+			return ErrFenced
+		}
+	case FenceRoleCompactor:
+		if s.compactorFence == nil {
+			return ErrFenced
+		}
+	default:
+		return ErrFenced
 	}
-	if entry.Timestamp.IsZero() {
-		entry.Timestamp = time.Now().UTC()
-	}
-
-	data, err := EncodeLogEntry(entry)
-	if err != nil {
-		return fmt.Errorf("marshal log entry: %w", err)
-	}
-
-	logName := formatLogSeq(entry.Seq)
-	_, err = s.storage.WriteLog(ctx, logName, data)
-	if err != nil {
-		return fmt.Errorf("write log entry: %w", err)
-	}
-
-	return s.appendCurrent(ctx, entry)
+	return nil
 }
 
-func (s *Store) AppendAddSSTable(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
-	entry := &ManifestLogEntry{
-		Op:      LogOpAddSSTable,
-		SSTable: &sst,
+func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, role FenceRole) error {
+	const maxRetries = 3
+
+	switch role {
+	case FenceRoleWriter:
+		s.mu.Lock()
+		if s.writerFence != nil {
+			entry.Role = FenceRoleWriter
+			entry.Epoch = s.writerFence.Epoch
+		}
+		s.mu.Unlock()
+	case FenceRoleCompactor:
+		s.mu.Lock()
+		if s.compactorFence != nil {
+			entry.Role = FenceRoleCompactor
+			entry.Epoch = s.compactorFence.Epoch
+		}
+		s.mu.Unlock()
 	}
-	if err := s.Append(ctx, entry); err != nil {
-		return nil, err
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		s.mu.Lock()
+		entry.Seq = s.nextSeq
+		s.nextSeq++
+		s.mu.Unlock()
+
+		if entry.ID.IsNil() {
+			entry.ID = ksuid.New()
+		}
+		if entry.Timestamp.IsZero() {
+			entry.Timestamp = time.Now().UTC()
+		}
+
+		data, err := EncodeLogEntry(entry)
+		if err != nil {
+			return fmt.Errorf("marshal log entry: %w", err)
+		}
+
+		logName := formatLogSeq(entry.Seq)
+		_, err = s.storage.WriteLog(ctx, logName, data)
+		if err != nil {
+			if errors.Is(err, ErrPreconditionFailed) {
+				// we have a seq collision,
+				// so 1. either compactor if we refactor later to run on separate process wrote its entry
+				// or some other new process picked up this role.
+				// so we will check if we still have our role with the fence.
+				if role >= 0 {
+					if fenceErr := s.checkFence(ctx, role); fenceErr != nil {
+						return fenceErr // We've been fenced out
+					}
+					// still own fence, retry with next seq (same epoch)
+					continue
+				}
+				return ErrFenceConflict
+			}
+			return fmt.Errorf("write log entry: %w", err)
+		}
+
+		return s.appendCurrent(ctx, entry)
 	}
-	return entry, nil
+
+	return ErrFenceConflict
 }
 
 func (s *Store) AppendAddSSTableWithFence(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
@@ -252,34 +326,12 @@ func (s *Store) AppendAddSSTableWithFence(ctx context.Context, sst SSTMeta) (*Ma
 	return entry, nil
 }
 
-func (s *Store) AppendRemoveSSTables(ctx context.Context, sstableIDs []string) (*ManifestLogEntry, error) {
+func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []string) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
 		Op:               LogOpRemoveSSTable,
 		RemoveSSTableIDs: sstableIDs,
 	}
-	if err := s.Append(ctx, entry); err != nil {
-		return nil, err
-	}
-	return entry, nil
-}
-
-func (s *Store) AppendCheckpoint(ctx context.Context, manifest *Manifest) (*ManifestLogEntry, error) {
-	entry := &ManifestLogEntry{
-		Op:         LogOpCheckpoint,
-		Checkpoint: manifest,
-	}
-	if err := s.Append(ctx, entry); err != nil {
-		return nil, err
-	}
-	return entry, nil
-}
-
-func (s *Store) AppendCompaction(ctx context.Context, payload CompactionLogPayload) (*ManifestLogEntry, error) {
-	entry := &ManifestLogEntry{
-		Op:         LogOpCompaction,
-		Compaction: &payload,
-	}
-	if err := s.Append(ctx, entry); err != nil {
+	if err := s.AppendWithCompactorFence(ctx, entry); err != nil {
 		return nil, err
 	}
 	return entry, nil
@@ -328,7 +380,12 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 		}
 	}
 
+	entries := make([]*ManifestLogEntry, 0, len(logs))
 	var maxSeq uint64
+	var maxWriterFenceClaimEpoch uint64
+	var maxCompactorFenceClaimEpoch uint64
+	var maxWriterEntryEpoch uint64
+	var maxCompactorEntryEpoch uint64
 	for _, path := range logs {
 		entry, err := s.Read(ctx, path)
 		if err != nil {
@@ -337,7 +394,74 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 		if entry.Seq > maxSeq {
 			maxSeq = entry.Seq
 		}
+		if entry.Op == LogOpFenceClaim {
+			if entry.Role == FenceRoleWriter && entry.Epoch > maxWriterFenceClaimEpoch {
+				maxWriterFenceClaimEpoch = entry.Epoch
+			} else if entry.Role == FenceRoleCompactor && entry.Epoch > maxCompactorFenceClaimEpoch {
+				maxCompactorFenceClaimEpoch = entry.Epoch
+			}
+		}
+		if entry.Role == FenceRoleWriter && entry.Epoch > maxWriterEntryEpoch {
+			maxWriterEntryEpoch = entry.Epoch
+		} else if entry.Role == FenceRoleCompactor && entry.Epoch > maxCompactorEntryEpoch {
+			maxCompactorEntryEpoch = entry.Epoch
+		}
+		entries = append(entries, entry)
+	}
+
+	// track the active epochs per role. Seed from CURRENT only if:
+	// 1. No fence-claim exists in the log window (truncated logs), OR
+	// 2. The log contains entries at CURRENT's epoch but NO fence-claim for that epoch
+	// (writer/compactor crashed after updating CURRENT but before writing fence-claim log)
+	// Otherwise, we start from zero and let fence-claim logs advance epochs in order,
+	// preserving entries that appeared before the fence-claim.
+	var activeWriterEpoch uint64
+	var activeCompactorEpoch uint64
+	if current != nil {
+		if current.WriterFence != nil &&
+			(maxWriterFenceClaimEpoch == 0 ||
+				(maxWriterEntryEpoch >= current.WriterFence.Epoch && maxWriterFenceClaimEpoch < current.WriterFence.Epoch)) {
+			activeWriterEpoch = current.WriterFence.Epoch
+		}
+		if current.CompactorFence != nil &&
+			(maxCompactorFenceClaimEpoch == 0 ||
+				(maxCompactorEntryEpoch >= current.CompactorFence.Epoch && maxCompactorFenceClaimEpoch < current.CompactorFence.Epoch)) {
+			activeCompactorEpoch = current.CompactorFence.Epoch
+		}
+	}
+
+	for _, entry := range entries {
+		// we will handle fence claim entries - they update the active epoch (monotonically)
+		// We only increase epochs to prevent downgrades from stale fence-claim logs
+		// that may appear after CURRENT was updated by a newer writer/compactor.
+		if entry.Op == LogOpFenceClaim {
+			if entry.Role == FenceRoleWriter && entry.Epoch > activeWriterEpoch {
+				activeWriterEpoch = entry.Epoch
+			} else if entry.Role == FenceRoleCompactor && entry.Epoch > activeCompactorEpoch {
+				activeCompactorEpoch = entry.Epoch
+			}
+			// this fence claimed so we don't modify manifest state
+			continue
+		}
+
+		// skip all the entries below fence.
+		if entry.Role == FenceRoleWriter && entry.Epoch < activeWriterEpoch {
+			continue
+		}
+		if entry.Role == FenceRoleCompactor && entry.Epoch < activeCompactorEpoch {
+			continue
+		}
+
 		m = ApplyLogEntry(m, entry)
+	}
+
+	// THIS is IMP: never reuse the same epoch so Set NextEpoch
+	maxEpoch := activeWriterEpoch
+	if activeCompactorEpoch > maxEpoch {
+		maxEpoch = activeCompactorEpoch
+	}
+	if maxEpoch >= m.NextEpoch {
+		m.NextEpoch = maxEpoch + 1
 	}
 
 	if current != nil && current.NextEpoch > m.NextEpoch {
@@ -405,7 +529,7 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		return "", err
 	}
 
-	current, err := s.readCurrent(ctx)
+	current, etag, err := s.readCurrentWithETag(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -417,7 +541,7 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	current.NextEpoch = m.NextEpoch
 	current.NextSeq = nextSeq
 
-	if err := s.writeCurrent(ctx, current); err != nil {
+	if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -442,10 +566,38 @@ func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
 	return current, err
 }
 
+func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
+	if reader, ok := s.storage.(interface {
+		ReadCurrentData(ctx context.Context) ([]byte, error)
+	}); ok {
+		data, err := reader.ReadCurrentData(ctx)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, nil
+		}
+		var current Current
+		if err := json.Unmarshal(data, &current); err != nil {
+			return nil, err
+		}
+		return &current, nil
+	}
+
+	return s.readCurrent(ctx)
+}
+
 func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, error) {
 	data, etag, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
+			s.mu.Lock()
+			s.currentETag = ""
+			s.current = nil
+			s.mu.Unlock()
 			return nil, "", nil
 		}
 		return nil, "", err
@@ -454,15 +606,11 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	if err := json.Unmarshal(data, &current); err != nil {
 		return nil, "", err
 	}
+	s.mu.Lock()
+	s.currentETag = etag
+	s.current = &current
+	s.mu.Unlock()
 	return &current, etag, nil
-}
-
-func (s *Store) writeCurrent(ctx context.Context, current *Current) error {
-	data, err := EncodeCurrent(current)
-	if err != nil {
-		return err
-	}
-	return s.storage.WriteCurrent(ctx, data)
 }
 
 func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expectedETag string) error {
@@ -470,7 +618,18 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expec
 	if err != nil {
 		return err
 	}
-	return s.storage.WriteCurrentCAS(ctx, data, expectedETag)
+	etag, err := s.storage.WriteCurrentCAS(ctx, data, expectedETag)
+	if err != nil {
+		return err
+	}
+	if current != nil {
+		clone := *current
+		s.mu.Lock()
+		s.current = &clone
+		s.currentETag = etag
+		s.mu.Unlock()
+	}
+	return nil
 }
 
 func (s *Store) logPath(seq uint64) string {
@@ -478,21 +637,88 @@ func (s *Store) logPath(seq uint64) string {
 }
 
 func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) error {
-	current, err := s.readCurrent(ctx)
-	if err != nil {
-		return err
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		s.mu.Lock()
+		current := s.current
+		etag := s.currentETag
+		nextSeq := s.nextSeq
+		s.mu.Unlock()
+
+		if current == nil {
+			var err error
+			current, etag, err = s.readCurrentWithETag(ctx)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				current = &Current{NextEpoch: 1}
+			}
+		}
+
+		updated := *current
+		if updated.LogSeqStart == updated.NextSeq {
+			updated.LogSeqStart = entry.Seq
+		}
+		if updated.NextSeq > nextSeq {
+			nextSeq = updated.NextSeq
+		}
+		updated.NextSeq = nextSeq
+		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, entry)
+
+		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
+			if errors.Is(err, ErrPreconditionFailed) {
+				current, _, readErr := s.readCurrentWithETag(ctx)
+				if readErr != nil {
+					return readErr
+				}
+				if fenceErr := s.checkFenceWithCurrent(entry.Role, current); fenceErr != nil {
+					return fenceErr
+				}
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+
+	return ErrFenceConflict
+}
+
+func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {
+	s.mu.Lock()
+	var localFence *FenceToken
+	switch role {
+	case FenceRoleWriter:
+		localFence = s.writerFence
+	case FenceRoleCompactor:
+		localFence = s.compactorFence
+	}
+	s.mu.Unlock()
+
+	if localFence == nil {
+		return ErrFenced
 	}
 	if current == nil {
-		current = &Current{NextEpoch: 1}
+		return ErrFenced
 	}
 
-	if current.LogSeqStart == current.NextSeq {
-		current.LogSeqStart = entry.Seq
+	var remoteFence *FenceToken
+	switch role {
+	case FenceRoleWriter:
+		remoteFence = current.WriterFence
+	case FenceRoleCompactor:
+		remoteFence = current.CompactorFence
 	}
-	current.NextSeq = s.nextSeq
-	current.NextEpoch = nextEpochFromEntry(current.NextEpoch, entry)
 
-	return s.writeCurrent(ctx, current)
+	if remoteFence == nil {
+		return ErrFenced
+	}
+	if remoteFence.Epoch > localFence.Epoch {
+		return ErrFenced
+	}
+	return nil
 }
 
 func nextEpochFromEntry(current uint64, entry *ManifestLogEntry) uint64 {
