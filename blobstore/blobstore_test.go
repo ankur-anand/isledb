@@ -54,16 +54,16 @@ func newMemoryHarness(t *testing.T, prefix string) storeHarness {
 		},
 		reopen: func(t *testing.T) *Store {
 			t.Helper()
-			return NewMemoryFromBucket(store.Bucket(), prefix)
+			return newMemoryFromBucket(store.Bucket(), prefix)
 		},
 	}
 }
 
 func newFileHarness(t *testing.T, prefix string) storeHarness {
 	t.Helper()
-	store, dir, err := NewFileTemp(prefix)
+	store, dir, err := newFileTemp(prefix)
 	if err != nil {
-		t.Fatalf("NewFileTemp: %v", err)
+		t.Fatalf("newFileTemp: %v", err)
 	}
 	return storeHarness{
 		store: store,
@@ -73,9 +73,9 @@ func newFileHarness(t *testing.T, prefix string) storeHarness {
 		},
 		reopen: func(t *testing.T) *Store {
 			t.Helper()
-			reopened, err := NewFile(context.Background(), dir, prefix)
+			reopened, err := openFile(context.Background(), dir, prefix)
 			if err != nil {
-				t.Fatalf("NewFile: %v", err)
+				t.Fatalf("openFile: %v", err)
 			}
 			return reopened
 		},
@@ -548,7 +548,7 @@ func TestWriteIfNotExist_Success(t *testing.T) {
 		key := store.ManifestLogPath("00000000000000000001")
 		data := []byte(`{"op": "add_sst", "id": "sst-1"}`)
 
-		err := store.WriteIfNotExist(ctx, key, data)
+		_, err := store.WriteIfNotExist(ctx, key, data)
 		if err != nil {
 			t.Fatalf("WriteIfNotExist failed: %v", err)
 		}
@@ -572,12 +572,12 @@ func TestWriteIfNotExist_AlreadyExists(t *testing.T) {
 		data1 := []byte(`{"op": "add_sst", "id": "sst-1"}`)
 		data2 := []byte(`{"op": "add_sst", "id": "sst-2"}`)
 
-		err := store.WriteIfNotExist(ctx, key, data1)
+		_, err := store.WriteIfNotExist(ctx, key, data1)
 		if err != nil {
 			t.Fatalf("first WriteIfNotExist failed: %v", err)
 		}
 
-		err = store.WriteIfNotExist(ctx, key, data2)
+		_, err = store.WriteIfNotExist(ctx, key, data2)
 		if !errors.Is(err, ErrPreconditionFailed) {
 			t.Errorf("expected ErrPreconditionFailed, got %v", err)
 		}

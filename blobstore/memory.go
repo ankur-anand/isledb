@@ -1,6 +1,8 @@
 package blobstore
 
 import (
+	"strings"
+
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/memblob"
 )
@@ -10,12 +12,11 @@ func NewMemory(prefix string) *Store {
 	bkt := memblob.OpenBucket(nil)
 	return &Store{
 		bucket: bkt,
-		prefix: prefix,
+		prefix: strings.TrimSuffix(prefix, "/"),
 		owns:   true,
 	}
 }
 
-// NewMemoryFromBucket creates an in-memory store from an existing memblob bucket.
-func NewMemoryFromBucket(bkt *blob.Bucket, prefix string) *Store {
-	return New(bkt, prefix)
+func newMemoryFromBucket(bkt *blob.Bucket, prefix string) *Store {
+	return New(bkt, "", prefix)
 }

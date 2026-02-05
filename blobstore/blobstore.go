@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -13,43 +15,65 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	azblobblob "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
 	ErrNotFound           = errors.New("object not found")
 	ErrPreconditionFailed = errors.New("precondition failed")
+	ErrBucketNameRequired = errors.New("bucket name required for cloud providers")
 )
 
 type Store struct {
-	bucket *blob.Bucket
-	prefix string
-	owns   bool
+	bucket     *blob.Bucket
+	bucketName string
+	prefix     string
+	owns       bool
 }
 
 func Open(ctx context.Context, bucketURL, prefix string) (*Store, error) {
+
+	parsed, err := url.Parse(bucketURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse bucket %q: %w", bucketURL, err)
+	}
+	bucketName := parsed.Host
+	switch parsed.Scheme {
+	case "s3", "gs", "azblob":
+		if bucketName == "" {
+			return nil, fmt.Errorf("%w %q ", ErrBucketNameRequired, bucketURL)
+		}
+	}
+
 	bkt, err := blob.OpenBucket(ctx, bucketURL)
 	if err != nil {
 		return nil, fmt.Errorf("open bucket %q: %w", bucketURL, err)
 	}
 	return &Store{
-		bucket: bkt,
-		prefix: strings.TrimSuffix(prefix, "/"),
-		owns:   true,
+		bucket:     bkt,
+		bucketName: bucketName,
+		prefix:     strings.TrimSuffix(prefix, "/"),
+		owns:       true,
 	}, nil
 }
 
-func New(bkt *blob.Bucket, prefix string) *Store {
+// New wraps an existing bucket. For cloud providers, bucketName is required
+// for CAS writes; use Open() when possible.
+func New(bkt *blob.Bucket, bucketName, prefix string) *Store {
 	return &Store{
-		bucket: bkt,
-		prefix: strings.TrimSuffix(prefix, "/"),
-		owns:   false,
+		bucket:     bkt,
+		bucketName: bucketName,
+		prefix:     strings.TrimSuffix(prefix, "/"),
+		owns:       false,
 	}
 }
 
@@ -130,9 +154,43 @@ func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error
 		return nil, Attributes{}, err
 	}
 
-	return data, Attributes{
-		Size: int64(len(data)),
-	}, nil
+	attrs := Attributes{
+		Size:    r.Size(),
+		ModTime: r.ModTime(),
+	}
+
+	s.extractReaderAttrs(r, &attrs)
+
+	return data, attrs, nil
+}
+
+// extractReaderAttrs extracts ETag/generation from the underlying provider-specific reader.
+// https://gocloud.dev/concepts/as/
+// https://gocloud.dev/howto/blob/
+func (s *Store) extractReaderAttrs(r *blob.Reader, attrs *Attributes) {
+
+	// https://pkg.go.dev/github.com/google/go-cloud/blob/s3blob#hdr-As
+	// Reader: s3.GetObjectOutput
+	var s3Output s3.GetObjectOutput
+	if r.As(&s3Output) && s3Output.ETag != nil {
+		attrs.ETag = *s3Output.ETag
+		return
+	}
+
+	// https://pkg.go.dev/gocloud.dev/blob/gcsblob#hdr-As
+	// Reader: *storage.Reader (use Reader.Attrs for Generation)
+	var gcsReader *storage.Reader
+	if r.As(&gcsReader) && gcsReader != nil {
+		attrs.Generation = gcsReader.Attrs.Generation
+		return
+	}
+
+	// https://pkg.go.dev/gocloud.dev/blob/azureblob#hdr-As
+	var azureResp azblobblob.DownloadStreamResponse
+	if r.As(&azureResp) && azureResp.ETag != nil {
+		attrs.ETag = string(*azureResp.ETag)
+		return
+	}
 }
 
 func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
@@ -228,31 +286,13 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 
 func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
 	if ifMatch == "" {
-		return s.writeIfNotExist(ctx, key, data)
+		return s.WriteIfNotExist(ctx, key, data)
 	}
-
-	if attr, ok, err := s.writeIfMatchAtomic(ctx, key, data, ifMatch); ok || err != nil {
-		return attr, err
-	}
-
-	return s.writeIfMatchFallback(ctx, key, data, ifMatch)
+	return s.writeWithCAS(ctx, key, data, ifMatch)
 }
 
-func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) error {
-	w, err := s.bucket.NewWriter(ctx, key, &blob.WriterOptions{
-		ContentType: "application/octet-stream",
-		IfNotExist:  true,
-	})
-	if err != nil {
-		return s.mapError(err)
-	}
-
-	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return err
-	}
-
-	return s.mapError(w.Close())
+func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) (Attributes, error) {
+	return s.writeIfNotExistWithETag(ctx, key, data)
 }
 
 func (s *Store) writeIfNotExist(ctx context.Context, key string, data []byte) (Attributes, error) {
@@ -282,28 +322,11 @@ func generationFromAttrs(attr *blob.Attributes) int64 {
 	if attr == nil {
 		return 0
 	}
-	var gcsAttrs *storage.ObjectAttrs
-	if attr.As(&gcsAttrs) && gcsAttrs != nil {
+	var gcsAttrs storage.ObjectAttrs
+	if attr.As(&gcsAttrs) {
 		return gcsAttrs.Generation
 	}
 	return 0
-}
-
-func (s *Store) writeIfMatchAtomic(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
-	switch s.providerKind() {
-	case providerS3:
-		return s.writeIfMatchS3(ctx, key, data, ifMatch)
-	case providerAzure:
-		return s.writeIfMatchAzure(ctx, key, data, ifMatch)
-	case providerGCS:
-		gen, err := parseGeneration(ifMatch)
-		if err != nil {
-			return Attributes{}, true, fmt.Errorf("gcs requires generation match token: %w", err)
-		}
-		return s.writeIfMatchGCS(ctx, key, data, gen)
-	default:
-		return Attributes{}, false, nil
-	}
 }
 
 type providerKind int
@@ -340,67 +363,6 @@ func parseGeneration(ifMatch string) (int64, error) {
 		return 0, fmt.Errorf("invalid generation %d", gen)
 	}
 	return gen, nil
-}
-
-func (s *Store) writeIfMatchS3(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
-	opts := &blob.WriterOptions{
-		ContentType: "application/octet-stream",
-		BeforeWrite: func(asFunc func(any) bool) error {
-			var input *s3.PutObjectInput
-			if asFunc(&input) && input != nil {
-				input.IfMatch = aws.String(ifMatch)
-			}
-			return nil
-		},
-	}
-	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
-	if err != nil {
-		return Attributes{}, true, err
-	}
-	return attr, true, nil
-}
-
-func (s *Store) writeIfMatchAzure(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
-	opts := &blob.WriterOptions{
-		ContentType: "application/octet-stream",
-		BeforeWrite: func(asFunc func(any) bool) error {
-			var uploadOpts *azblob.UploadStreamOptions
-			if asFunc(&uploadOpts) && uploadOpts != nil {
-				if uploadOpts.AccessConditions == nil {
-					uploadOpts.AccessConditions = &azblob.AccessConditions{}
-				}
-				if uploadOpts.AccessConditions.ModifiedAccessConditions == nil {
-					uploadOpts.AccessConditions.ModifiedAccessConditions = &azblobblob.ModifiedAccessConditions{}
-				}
-				etag := azcore.ETag(ifMatch)
-				uploadOpts.AccessConditions.ModifiedAccessConditions.IfMatch = &etag
-			}
-			return nil
-		},
-	}
-	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
-	if err != nil {
-		return Attributes{}, true, err
-	}
-	return attr, true, nil
-}
-
-func (s *Store) writeIfMatchGCS(ctx context.Context, key string, data []byte, generation int64) (Attributes, bool, error) {
-	opts := &blob.WriterOptions{
-		ContentType: "application/octet-stream",
-		BeforeWrite: func(asFunc func(any) bool) error {
-			var obj **storage.ObjectHandle
-			if asFunc(&obj) && obj != nil && *obj != nil {
-				*obj = (*obj).If(storage.Conditions{GenerationMatch: generation})
-			}
-			return nil
-		},
-	}
-	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
-	if err != nil {
-		return Attributes{}, true, err
-	}
-	return attr, true, nil
 }
 
 func (s *Store) Delete(ctx context.Context, key string) error {
@@ -485,14 +447,73 @@ func (s *Store) mapError(err error) error {
 	if err == nil {
 		return nil
 	}
+
 	switch gcerrors.Code(err) {
 	case gcerrors.NotFound:
 		return ErrNotFound
 	case gcerrors.FailedPrecondition:
 		return ErrPreconditionFailed
-	default:
-		return err
 	}
+
+	// https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/handle-errors.html
+	// From the Above Doc: All service API response errors implement the smithy.APIError interface type.
+	// This interface can be used to handle both modeled or un-modeled service error responses.
+	// https://pkg.go.dev/github.com/aws/smithy-go#APIError
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey":
+			return ErrNotFound
+		case "PreconditionFailed":
+			return ErrPreconditionFailed
+		}
+	}
+
+	// if some proxy doesn't respect the above.
+	var smithyResp *smithyhttp.ResponseError
+	if errors.As(err, &smithyResp) {
+		switch smithyResp.HTTPStatusCode() {
+		case http.StatusNotFound:
+			return ErrNotFound
+		case http.StatusPreconditionFailed:
+			return ErrPreconditionFailed
+		}
+	}
+
+	var azRespErr *azcore.ResponseError
+	if errors.As(err, &azRespErr) {
+		switch azRespErr.StatusCode {
+		case http.StatusNotFound:
+			return ErrNotFound
+		case http.StatusConflict:
+			// Azure returns 409 for BlobAlreadyExists on If-None-Match writes.
+			return ErrPreconditionFailed
+		case http.StatusPreconditionFailed:
+			return ErrPreconditionFailed
+		}
+	}
+
+	var gcsErr *googleapi.Error
+	if errors.As(err, &gcsErr) {
+		switch gcsErr.Code {
+		case http.StatusNotFound:
+			return ErrNotFound
+		case http.StatusPreconditionFailed:
+			return ErrPreconditionFailed
+		}
+	}
+
+	// if grpc transport is used for gcs.
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.NotFound:
+			return ErrNotFound
+		case codes.FailedPrecondition:
+			return ErrPreconditionFailed
+		}
+	}
+
+	return err
 }
 
 func (s *Store) DebugString() string {
