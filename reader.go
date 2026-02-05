@@ -607,7 +607,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta SSTMeta, key []byt
 		}
 
 		path := r.store.SSTPath(sstMeta.ID)
-		data, _, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
+		data, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
 		if err != nil {
 			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
 		}
@@ -898,7 +898,7 @@ func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error
 	var data []byte
 	var err error
 	if meta != nil && meta.Size > 0 {
-		data, _, err = r.store.ReadRange(ctx, path, 0, meta.Size)
+		data, err = r.store.ReadRange(ctx, path, 0, meta.Size)
 	} else {
 		data, _, err = r.store.Read(ctx, path)
 	}

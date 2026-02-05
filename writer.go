@@ -83,17 +83,15 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		stopCh:                  make(chan struct{}),
 	}
 
-	if opts.EnableFencing {
-		ownerID := opts.OwnerID
-		if ownerID == "" {
-			ownerID = fmt.Sprintf("writer-%d-%d", time.Now().UnixNano(), m.NextEpoch)
-		}
-		token, err := manifestLog.ClaimWriter(ctx, ownerID)
-		if err != nil {
-			return nil, fmt.Errorf("claim writer fence: %w", err)
-		}
-		w.fenceToken = token
+	ownerID := opts.OwnerID
+	if ownerID == "" {
+		ownerID = fmt.Sprintf("writer-%d-%d", time.Now().UnixNano(), m.NextEpoch)
 	}
+	token, err := manifestLog.ClaimWriter(ctx, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("claim writer fence: %w", err)
+	}
+	w.fenceToken = token
 
 	if opts.FlushInterval > 0 {
 		w.flushTicker = time.NewTicker(opts.FlushInterval)
@@ -289,14 +287,10 @@ func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error
 	}
 
 	var appendErr error
-	if w.opts.EnableFencing {
-		_, appendErr = w.manifestLog.AppendAddSSTableWithFence(ctx, result.Meta)
-	} else {
-		_, appendErr = w.manifestLog.AppendAddSSTable(ctx, result.Meta)
-	}
+	_, appendErr = w.manifestLog.AppendAddSSTableWithFence(ctx, result.Meta)
 
 	if appendErr != nil {
-		if errors.Is(appendErr, manifest.ErrFenced) {
+		if isFenceError(appendErr) {
 			w.fenced.Store(true)
 		}
 		return fmt.Errorf("update manifest: %w", appendErr)
@@ -312,7 +306,7 @@ func (w *writer) flushLoop() {
 		case <-w.flushTicker.C:
 			if err := w.flush(context.Background()); err != nil {
 
-				if errors.Is(err, manifest.ErrFenced) {
+				if isFenceError(err) {
 					slog.Error("isledb: writer fenced, stopping background flush")
 					return
 				}

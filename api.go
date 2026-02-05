@@ -1,6 +1,8 @@
 package isledb
 
 import (
+	"errors"
+
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/manifest"
@@ -45,4 +47,8 @@ func newManifestStoreWithCache(store *blobstore.Store, opts *ReaderOptions) *man
 		storage = opts.ManifestStorage
 	}
 	return manifest.NewStoreWithStorage(resolveManifestStorageWithCache(store, storage, opts))
+}
+
+func isFenceError(err error) bool {
+	return errors.Is(err, manifest.ErrFenced) || errors.Is(err, manifest.ErrFenceConflict)
 }

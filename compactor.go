@@ -83,17 +83,15 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 		stopCh:      make(chan struct{}),
 	}
 
-	if opts.EnableFencing {
-		ownerID := opts.OwnerID
-		if ownerID == "" {
-			ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
-		}
-		token, err := manifestLog.ClaimCompactor(ctx, ownerID)
-		if err != nil {
-			return nil, fmt.Errorf("claim compactor fence: %w", err)
-		}
-		c.fenceToken = token
+	ownerID := opts.OwnerID
+	if ownerID == "" {
+		ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
 	}
+	token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("claim compactor fence: %w", err)
+	}
+	c.fenceToken = token
 
 	return c, nil
 }
@@ -144,7 +142,7 @@ func (c *Compactor) compactionLoop() {
 		case <-c.ticker.C:
 			if err := c.RunCompaction(context.Background()); err != nil {
 
-				if errors.Is(err, manifest.ErrFenced) {
+				if isFenceError(err) {
 					slog.Error("isledb: compactor fenced, stopping background compaction")
 					return
 				}
@@ -178,7 +176,7 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 		if m.L0SSTCount() >= c.opts.L0CompactionThreshold {
 			if err := c.compactL0(ctx, m); err != nil {
 
-				if errors.Is(err, manifest.ErrFenced) {
+				if isFenceError(err) {
 					c.fenced.Store(true)
 					return err
 				}
@@ -190,7 +188,7 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 		if job := c.findConsecutiveCompaction(m); job != nil {
 			if err := c.compactRuns(ctx, m, job); err != nil {
 
-				if errors.Is(err, manifest.ErrFenced) {
+				if isFenceError(err) {
 					c.fenced.Store(true)
 					return err
 				}
@@ -398,12 +396,8 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 
 func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
 	var err error
-	if c.opts.EnableFencing {
-		_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload)
-	} else {
-		_, err = c.manifestLog.AppendCompaction(ctx, payload)
-	}
-	if err != nil && errors.Is(err, manifest.ErrFenced) {
+	_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload)
+	if err != nil && isFenceError(err) {
 		c.fenced.Store(true)
 	}
 	return err
@@ -435,7 +429,7 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 		var data []byte
 		var err error
 		if sst.Size > 0 {
-			data, _, err = c.store.ReadRange(ctx, path, 0, sst.Size)
+			data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
 		} else {
 			data, _, err = c.store.Read(ctx, path)
 		}

@@ -121,11 +121,13 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 
 type failOnceStorage struct {
 	manifest.Storage
-	failOnce atomic.Bool
+	writeCount  atomic.Int32
+	failOnWrite int32
 }
 
 func (s *failOnceStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	if s.failOnce.CompareAndSwap(false, true) {
+	count := s.writeCount.Add(1)
+	if count == s.failOnWrite {
 		return "", errors.New("inject log write failure")
 	}
 	return s.Storage.WriteLog(ctx, name, data)
@@ -187,7 +189,8 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	defer store.Close()
 
 	baseStorage := manifest.NewBlobStoreBackend(store)
-	failStorage := &failOnceStorage{Storage: baseStorage}
+	// Fail on second write (first write is the fence claim entry)
+	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 2}
 	manifestStore := manifest.NewStoreWithStorage(failStorage)
 
 	w, err := newWriter(ctx, store, manifestStore, WriterOptions{

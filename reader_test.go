@@ -14,6 +14,12 @@ import (
 func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) writeSSTResult {
 	t.Helper()
 
+	if ms.WriterEpoch() == 0 {
+		if _, err := ms.ClaimWriter(ctx, "reader-test-writer"); err != nil {
+			t.Fatalf("claim writer fence: %v", err)
+		}
+	}
+
 	it := &sliceSSTIter{entries: entries}
 	res, err := writeSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, epoch)
 	if err != nil {
@@ -25,7 +31,7 @@ func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms 
 		t.Fatalf("write sst: %v", err)
 	}
 
-	if _, err := ms.AppendAddSSTable(ctx, res.Meta); err != nil {
+	if _, err := ms.AppendAddSSTableWithFence(ctx, res.Meta); err != nil {
 		t.Fatalf("append manifest log: %v", err)
 	}
 
@@ -38,6 +44,9 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-test")
 	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriter(ctx, "reader-test-writer"); err != nil {
+		t.Fatalf("claim writer fence: %v", err)
+	}
 
 	l1Entries := []internal.MemEntry{
 		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-a")},
@@ -393,6 +402,9 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-checksum")
 	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriter(ctx, "reader-checksum-writer"); err != nil {
+		t.Fatalf("claim writer fence: %v", err)
+	}
 
 	entries := []internal.MemEntry{
 		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
@@ -409,7 +421,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	if _, err := store.Write(ctx, sstPath, res.SSTData); err != nil {
 		t.Fatalf("write sst: %v", err)
 	}
-	if _, err := ms.AppendAddSSTable(ctx, res.Meta); err != nil {
+	if _, err := ms.AppendAddSSTableWithFence(ctx, res.Meta); err != nil {
 		t.Fatalf("append manifest log: %v", err)
 	}
 

@@ -91,6 +91,11 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
 
+	ownerID := fmt.Sprintf("retention-compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+	if _, err := manifestLog.ClaimCompactor(ctx, ownerID); err != nil {
+		return nil, fmt.Errorf("claim compactor fence: %w", err)
+	}
+
 	return &RetentionCompactor{
 		store:       store,
 		manifestLog: manifestLog,
@@ -274,7 +279,7 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 		return 0, 0, nil
 	}
 
-	_, err := c.manifestLog.AppendRemoveSSTables(ctx, toDelete)
+	_, err := c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete)
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
@@ -367,7 +372,7 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 		return 0, 0, nil
 	}
 
-	_, err := c.manifestLog.AppendRemoveSSTables(ctx, toDelete)
+	_, err := c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete)
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}

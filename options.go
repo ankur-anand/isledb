@@ -27,9 +27,7 @@ type WriterOptions struct {
 
 	OnFlushError func(error)
 	ValueStorage config.ValueStorageConfig
-
-	EnableFencing bool
-	OwnerID       string
+	OwnerID      string
 }
 
 func DefaultWriterOptions() WriterOptions {
@@ -133,9 +131,7 @@ type CompactorOptions struct {
 	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
-
-	EnableFencing bool
-	OwnerID       string
+	OwnerID           string
 }
 
 func DefaultCompactorOptions() CompactorOptions {
