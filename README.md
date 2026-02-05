@@ -30,7 +30,8 @@ minimize re-downloads—so read capacity scales horizontally without replicas.
 ```go
 ctx := context.Background()
 
-store, err := blobstore.NewFile(ctx, "./data", "db1")
+dir, _ := filepath.Abs("./data")
+store, err := blobstore.Open(ctx, "file://"+dir, "db1")
 if err != nil {
 	log.Fatal(err)
 }

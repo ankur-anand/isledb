@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/ankur-anand/isledb"
 	"github.com/ankur-anand/isledb/blobstore"
+	_ "gocloud.dev/blob/azureblob"
 )
 
 // This example can be run with the local azure emulator

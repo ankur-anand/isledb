@@ -16,7 +16,15 @@ import (
 func main() {
 	ctx := context.Background()
 
-	store, dir, err := blobstore.NewFileTemp("db1")
+	dir, err := os.MkdirTemp("", "isledb-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	store, err := blobstore.Open(ctx, "file://"+absDir, "db1")
 	if err != nil {
 		log.Fatal(err)
 	}
