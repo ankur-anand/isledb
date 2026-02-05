@@ -7,9 +7,17 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	azblobblob "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -106,14 +114,11 @@ type Attributes struct {
 	Size    int64
 	ETag    string
 	ModTime time.Time
+	// Generation is used/set for GCS. GCS Doesn't use Etag.
+	Generation int64
 }
 
 func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error) {
-	attr, err := s.bucket.Attributes(ctx, key)
-	if err != nil {
-		return nil, Attributes{}, s.mapError(err)
-	}
-
 	r, err := s.bucket.NewReader(ctx, key, nil)
 	if err != nil {
 		return nil, Attributes{}, s.mapError(err)
@@ -126,8 +131,7 @@ func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error
 	}
 
 	return data, Attributes{
-		Size: attr.Size,
-		ETag: attr.ETag,
+		Size: int64(len(data)),
 	}, nil
 }
 
@@ -167,10 +171,12 @@ func (s *Store) Attributes(ctx context.Context, key string) (Attributes, error) 
 	if err != nil {
 		return Attributes{}, s.mapError(err)
 	}
+	gen := generationFromAttrs(attr)
 	return Attributes{
-		Size:    attr.Size,
-		ETag:    attr.ETag,
-		ModTime: attr.ModTime,
+		Size:       attr.Size,
+		ETag:       attr.ETag,
+		ModTime:    attr.ModTime,
+		Generation: gen,
 	}, nil
 }
 
@@ -211,34 +217,25 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 	if err != nil {
 		return Attributes{}, err
 	}
+	gen := generationFromAttrs(attr)
 
 	return Attributes{
-		Size: attr.Size,
-		ETag: attr.ETag,
+		Size:       attr.Size,
+		ETag:       attr.ETag,
+		Generation: gen,
 	}, nil
 }
 
 func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
-	currentAttr, err := s.bucket.Attributes(ctx, key)
-	objectExists := err == nil
-	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
-		return Attributes{}, err
-	}
-
 	if ifMatch == "" {
-		if objectExists {
-			return Attributes{}, ErrPreconditionFailed
-		}
-	} else {
-		if !objectExists {
-			return Attributes{}, ErrPreconditionFailed
-		}
-		if currentAttr.ETag != ifMatch {
-			return Attributes{}, ErrPreconditionFailed
-		}
+		return s.writeIfNotExist(ctx, key, data)
 	}
 
-	return s.Write(ctx, key, data)
+	if attr, ok, err := s.writeIfMatchAtomic(ctx, key, data, ifMatch); ok || err != nil {
+		return attr, err
+	}
+
+	return s.writeIfMatchFallback(ctx, key, data, ifMatch)
 }
 
 func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) error {
@@ -256,6 +253,154 @@ func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) er
 	}
 
 	return s.mapError(w.Close())
+}
+
+func (s *Store) writeIfNotExist(ctx context.Context, key string, data []byte) (Attributes, error) {
+	opts := &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		IfNotExist:  true,
+	}
+	return s.WriteReader(ctx, key, bytes.NewReader(data), opts)
+}
+
+func (s *Store) writeIfMatchFallback(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
+	currentAttr, err := s.bucket.Attributes(ctx, key)
+	objectExists := err == nil
+	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
+		return Attributes{}, err
+	}
+	if !objectExists {
+		return Attributes{}, ErrPreconditionFailed
+	}
+	if currentAttr.ETag != ifMatch {
+		return Attributes{}, ErrPreconditionFailed
+	}
+	return s.Write(ctx, key, data)
+}
+
+func generationFromAttrs(attr *blob.Attributes) int64 {
+	if attr == nil {
+		return 0
+	}
+	var gcsAttrs *storage.ObjectAttrs
+	if attr.As(&gcsAttrs) && gcsAttrs != nil {
+		return gcsAttrs.Generation
+	}
+	return 0
+}
+
+func (s *Store) writeIfMatchAtomic(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
+	switch s.providerKind() {
+	case providerS3:
+		return s.writeIfMatchS3(ctx, key, data, ifMatch)
+	case providerAzure:
+		return s.writeIfMatchAzure(ctx, key, data, ifMatch)
+	case providerGCS:
+		gen, err := parseGeneration(ifMatch)
+		if err != nil {
+			return Attributes{}, true, fmt.Errorf("gcs requires generation match token: %w", err)
+		}
+		return s.writeIfMatchGCS(ctx, key, data, gen)
+	default:
+		return Attributes{}, false, nil
+	}
+}
+
+type providerKind int
+
+const (
+	providerUnknown providerKind = iota
+	providerS3
+	providerGCS
+	providerAzure
+)
+
+func (s *Store) providerKind() providerKind {
+	var s3Client *s3.Client
+	if s.bucket.As(&s3Client) {
+		return providerS3
+	}
+	var gcsClient *storage.Client
+	if s.bucket.As(&gcsClient) {
+		return providerGCS
+	}
+	var azureClient *container.Client
+	if s.bucket.As(&azureClient) {
+		return providerAzure
+	}
+	return providerUnknown
+}
+
+func parseGeneration(ifMatch string) (int64, error) {
+	gen, err := strconv.ParseInt(ifMatch, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if gen <= 0 {
+		return 0, fmt.Errorf("invalid generation %d", gen)
+	}
+	return gen, nil
+}
+
+func (s *Store) writeIfMatchS3(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
+	opts := &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		BeforeWrite: func(asFunc func(any) bool) error {
+			var input *s3.PutObjectInput
+			if asFunc(&input) && input != nil {
+				input.IfMatch = aws.String(ifMatch)
+			}
+			return nil
+		},
+	}
+	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
+	if err != nil {
+		return Attributes{}, true, err
+	}
+	return attr, true, nil
+}
+
+func (s *Store) writeIfMatchAzure(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, bool, error) {
+	opts := &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		BeforeWrite: func(asFunc func(any) bool) error {
+			var uploadOpts *azblob.UploadStreamOptions
+			if asFunc(&uploadOpts) && uploadOpts != nil {
+				if uploadOpts.AccessConditions == nil {
+					uploadOpts.AccessConditions = &azblob.AccessConditions{}
+				}
+				if uploadOpts.AccessConditions.ModifiedAccessConditions == nil {
+					uploadOpts.AccessConditions.ModifiedAccessConditions = &azblobblob.ModifiedAccessConditions{}
+				}
+				etag := azcore.ETag(ifMatch)
+				uploadOpts.AccessConditions.ModifiedAccessConditions.IfMatch = &etag
+			}
+			return nil
+		},
+	}
+	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
+	if err != nil {
+		return Attributes{}, true, err
+	}
+	return attr, true, nil
+}
+
+func (s *Store) writeIfMatchGCS(ctx context.Context, key string, data []byte, generation int64) (Attributes, bool, error) {
+	opts := &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		BeforeWrite: func(asFunc func(any) bool) error {
+			var obj **storage.ObjectHandle
+			if asFunc(&obj) && obj != nil && *obj != nil {
+				*obj = (*obj).If(storage.Conditions{GenerationMatch: generation})
+			}
+			return nil
+		},
+	}
+	attr, err := s.WriteReader(ctx, key, bytes.NewReader(data), opts)
+	if err != nil {
+		return Attributes{}, true, err
+	}
+	return attr, true, nil
 }
 
 func (s *Store) Delete(ctx context.Context, key string) error {

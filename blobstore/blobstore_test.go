@@ -263,8 +263,18 @@ func TestBasicOperations(t *testing.T) {
 		if string(content) != string(data) {
 			t.Errorf("Read content: got %q, want %q", content, data)
 		}
-		if readAttr.ETag != attr.ETag {
-			t.Errorf("ETag mismatch: got %q, want %q", readAttr.ETag, attr.ETag)
+		if readAttr.Size != int64(len(data)) {
+			t.Errorf("Read size: got %d, want %d", readAttr.Size, len(data))
+		}
+		if readAttr.ETag != "" {
+			t.Errorf("Read ETag should be empty, got %q", readAttr.ETag)
+		}
+		attrs, err := store.Attributes(ctx, key)
+		if err != nil {
+			t.Fatalf("Attributes failed: %v", err)
+		}
+		if attrs.ETag != attr.ETag {
+			t.Errorf("ETag mismatch: got %q, want %q", attrs.ETag, attr.ETag)
 		}
 
 		if err := store.Delete(ctx, key); err != nil {
