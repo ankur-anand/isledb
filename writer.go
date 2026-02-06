@@ -200,13 +200,13 @@ func (w *writer) deleteWithTTL(key []byte, ttl time.Duration) error {
 		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 
+	w.seq++
+	seq := w.seq
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	w.seq++
-	seq := w.seq
 	w.memtable.DeleteWithTTL(key, seq, expireAt)
 	w.mu.Unlock()
 
