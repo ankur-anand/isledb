@@ -100,6 +100,7 @@ func (c *Compactor) Start() {
 	if !c.running.CompareAndSwap(false, true) {
 		return
 	}
+	c.stopCh = make(chan struct{})
 	c.ticker = time.NewTicker(c.opts.CheckInterval)
 	c.wg.Add(1)
 	go c.compactionLoop()
@@ -109,7 +110,9 @@ func (c *Compactor) Stop() {
 	if !c.running.CompareAndSwap(true, false) {
 		return
 	}
-	close(c.stopCh)
+	if c.stopCh != nil {
+		close(c.stopCh)
+	}
 	if c.ticker != nil {
 		c.ticker.Stop()
 	}

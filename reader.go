@@ -207,6 +207,7 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
 		if _, exists := newIDs[id]; !exists {
 			path := r.store.SSTPath(id)
 			r.sstCache.Remove(path)
+			r.bloomCache.Delete(id)
 		}
 	}
 }
@@ -1233,10 +1234,9 @@ func (it *Iterator) SeekGE(target []byte) bool {
 		return false
 	}
 
-	for it.Next() {
-		if bytes.Compare(it.Key(), target) >= 0 {
-			return true
-		}
+	it.mergeIter.seekGE(target)
+	if it.mergeIter.err != nil {
+		return false
 	}
-	return false
+	return it.Next()
 }

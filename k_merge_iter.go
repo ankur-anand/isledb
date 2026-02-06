@@ -256,3 +256,33 @@ func (mi *kMergeIterator) close() error {
 	}
 	return firstErr
 }
+
+func (mi *kMergeIterator) seekGE(target []byte) {
+	mi.current = nil
+	mi.lastKey = nil
+	mi.err = nil
+
+	if mi.tree == nil {
+		return
+	}
+
+	for i, iter := range mi.iters {
+		// pebble 0 is base.SeekGEFlagNone
+		kv := iter.SeekGE(target, 0)
+		if kv != nil {
+			mi.loadState(i, &kv.K, kv.InPlaceValue())
+		} else {
+			if err := iter.Close(); err != nil && mi.err == nil {
+				mi.err = err
+			}
+			mi.states[i].valid = false
+			mi.states[i].key = nil
+			mi.states[i].value = nil
+			mi.tree[mi.size+i] = -1
+		}
+	}
+
+	for i := mi.size - 1; i >= 1; i-- {
+		mi.tree[i] = mi.winner(mi.tree[i*2], mi.tree[i*2+1])
+	}
+}

@@ -48,22 +48,19 @@ func (r *sstRangeReadable) ReadAt(ctx context.Context, p []byte, off int64) erro
 	if err != nil {
 		return err
 	}
-	data, err := io.ReadAll(reader)
-	closeErr := reader.Close()
-	if err == nil && closeErr != nil {
-		err = closeErr
-	}
+	defer reader.Close()
+
+	_, err = io.ReadFull(reader, p)
+
 	if err != nil {
 		return err
 	}
-	if len(data) != len(p) {
-		return io.ErrUnexpectedEOF
-	}
 
 	if r.cache != nil {
-		r.cache.Set(key, data, int64(len(data)))
+		cached := make([]byte, len(p))
+		copy(cached, p)
+		r.cache.Set(key, cached, int64(len(p)))
 	}
-	copy(p, data)
 	return nil
 }
 

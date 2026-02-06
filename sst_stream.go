@@ -288,10 +288,17 @@ func writeMultipleSSTsStreaming(
 	var hashes []uint64
 	var sstID string
 	var ts time.Time
-	var uploadErr error
+	var uploadErr atomic.Value
 	var uploadDone chan struct{}
 	var started bool
 	var sstIndex int
+
+	getUploadErr := func() error {
+		if v := uploadErr.Load(); v != nil {
+			return v.(error)
+		}
+		return nil
+	}
 
 	startNewSST := func() error {
 		ts = time.Now().UTC()
@@ -303,17 +310,17 @@ func writeMultipleSSTsStreaming(
 		sst = sstable.NewWriter(writable, wo)
 		state = newSSTBuildState()
 		hashes = nil
-		uploadErr = nil
+		uploadErr = atomic.Value{}
 		uploadDone = make(chan struct{})
 		started = true
 
-		go func(id string, reader *io.PipeReader, done chan struct{}) {
+		go func(id string, reader *io.PipeReader, done chan struct{}, errVal *atomic.Value) {
 			defer close(done)
 			if err := uploadFn(ctx, id, reader); err != nil {
-				uploadErr = err
-				reader.Close()
+				errVal.Store(err)
+				reader.CloseWithError(err)
 			}
-		}(sstID, pr, uploadDone)
+		}(sstID, pr, uploadDone, &uploadErr)
 		return nil
 	}
 
@@ -356,8 +363,8 @@ func writeMultipleSSTsStreaming(
 		pw.Close()
 
 		<-uploadDone
-		if uploadErr != nil {
-			return fmt.Errorf("sst upload: %w", uploadErr)
+		if ue := getUploadErr(); ue != nil {
+			return fmt.Errorf("sst upload: %w", ue)
 		}
 
 		hashBytes := writable.sumBytes()
@@ -407,6 +414,9 @@ func writeMultipleSSTsStreaming(
 		if !started {
 			return
 		}
+
+		abortErr := errors.New("sst aborted")
+
 		if writable != nil {
 			writable.Abort()
 		}
@@ -414,8 +424,13 @@ func writeMultipleSSTsStreaming(
 			_ = sst.Close()
 		}
 		if pw != nil {
-			pw.Close()
+			pw.CloseWithError(abortErr)
 		}
+
+		if pr != nil {
+			pr.CloseWithError(abortErr)
+		}
+
 		if uploadDone != nil {
 			<-uploadDone
 		}
@@ -484,6 +499,9 @@ func writeMultipleSSTsStreaming(
 		if err := finishCurrentSST(); err != nil {
 			return nil, err
 		}
+	} else if started {
+		// IMP: Fix goroutine leak for exhausted iterator.
+		abortCurrentSST()
 	}
 
 	if len(results) == 0 {
