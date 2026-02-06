@@ -84,7 +84,7 @@ func TestReplay_Snapshot_FenceClaimInWindow_PreservesEarlierEpochs(t *testing.T)
 	// seq=11: writer epoch=2 fence claim
 	// seq=12: writer epoch=1 add (stale, should skip)
 	// seq=13: writer epoch=2 add (should apply)
-	
+
 	writeLogEntry(t, ctx, backend, &ManifestLogEntry{
 		Seq:     10,
 		Role:    FenceRoleWriter,

@@ -892,7 +892,7 @@ func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T
 	}()
 
 	<-blocking.started
-	
+
 	for i := 0; i < 20; i++ {
 		appendSST(fmt.Sprintf("during-%02d.sst", i), 1)
 	}

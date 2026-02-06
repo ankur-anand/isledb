@@ -334,5 +334,7 @@ func (w *writer) close() error {
 	}
 	w.wg.Wait()
 
-	return w.flush(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return w.flush(ctx)
 }
