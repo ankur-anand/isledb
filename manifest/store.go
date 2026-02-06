@@ -274,7 +274,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		s.mu.Lock()
 		entry.Seq = s.nextSeq
-		s.nextSeq++
 		s.mu.Unlock()
 
 		if entry.ID.IsNil() {
@@ -293,6 +292,14 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		_, err = s.storage.WriteLog(ctx, logName, data)
 		if err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				// IMP: Only advance if Sequence collision has happened this prevent
+				// the GAP.
+				s.mu.Lock()
+				if s.nextSeq <= entry.Seq {
+					s.nextSeq = entry.Seq + 1
+				}
+				s.mu.Unlock()
+
 				// we have a seq collision,
 				// so 1. either compactor if we refactor later to run on separate process wrote its entry
 				// or some other new process picked up this role.
@@ -308,6 +315,13 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			}
 			return fmt.Errorf("write log entry: %w", err)
 		}
+
+		// if written then only we advance.
+		s.mu.Lock()
+		if s.nextSeq <= entry.Seq {
+			s.nextSeq = entry.Seq + 1
+		}
+		s.mu.Unlock()
 
 		return s.appendCurrent(ctx, entry)
 	}
@@ -357,7 +371,10 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	var m *Manifest
 	if current != nil && current.Snapshot != "" {
 		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot)
-		if err != nil && !errors.Is(err, ErrNotFound) {
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, fmt.Errorf("read snapshot %q: %w", current.Snapshot, err)
+			}
 			return nil, err
 		}
 		if len(data) > 0 {
@@ -366,6 +383,8 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 				return nil, err
 			}
 			m = snap
+		} else {
+			return nil, fmt.Errorf("snapshot %q is empty", current.Snapshot)
 		}
 	}
 	if m == nil {
@@ -509,9 +528,36 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if m == nil {
 		return "", errors.New("nil manifest")
 	}
+
+	current, etag, err := s.readCurrentWithETag(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	s.mu.Lock()
-	nextSeq := s.nextSeq
+	localNextSeq := s.nextSeq
 	s.mu.Unlock()
+
+	nextSeq := localNextSeq
+	if current != nil && current.NextSeq > nextSeq {
+		nextSeq = current.NextSeq
+	}
+
+	// m.LogSeq is the highest applied sequence; next sequence should be LogSeq+1.
+	manifestNextSeq := m.LogSeq + 1
+	// we will preserve zero for a truly empty manifest state.
+	if m.LogSeq == 0 &&
+		len(m.L0SSTs) == 0 &&
+		len(m.SortedRuns) == 0 &&
+		m.NextSortedRunID == 0 &&
+		m.WriterFence == nil &&
+		m.CompactorFence == nil &&
+		m.NextEpoch <= 1 {
+		manifestNextSeq = 0
+	}
+	if manifestNextSeq > nextSeq {
+		nextSeq = manifestNextSeq
+	}
 
 	snap := m.Clone()
 	if nextSeq > 0 {
@@ -529,21 +575,24 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		return "", err
 	}
 
-	current, etag, err := s.readCurrentWithETag(ctx)
-	if err != nil {
-		return "", err
-	}
 	if current == nil {
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
-	current.NextEpoch = m.NextEpoch
+	if current.NextEpoch < m.NextEpoch {
+		current.NextEpoch = m.NextEpoch
+	}
 	current.NextSeq = nextSeq
 
 	if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
 		return "", err
 	}
+	s.mu.Lock()
+	if s.nextSeq < nextSeq {
+		s.nextSeq = nextSeq
+	}
+	s.mu.Unlock()
 	return path, nil
 }
 
@@ -643,7 +692,6 @@ func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) erro
 		s.mu.Lock()
 		current := s.current
 		etag := s.currentETag
-		nextSeq := s.nextSeq
 		s.mu.Unlock()
 
 		if current == nil {
@@ -661,6 +709,7 @@ func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) erro
 		if updated.LogSeqStart == updated.NextSeq {
 			updated.LogSeqStart = entry.Seq
 		}
+		nextSeq := entry.Seq + 1
 		if updated.NextSeq > nextSeq {
 			nextSeq = updated.NextSeq
 		}

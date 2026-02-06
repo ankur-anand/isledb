@@ -3,12 +3,41 @@ package manifest
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/segmentio/ksuid"
 )
+
+type failNthWriteLogStorage struct {
+	Storage
+	failAt int
+	writes int
+}
+
+func (s *failNthWriteLogStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
+	s.writes++
+	if s.failAt > 0 && s.writes == s.failAt {
+		return "", fmt.Errorf("inject log write failure")
+	}
+	return s.Storage.WriteLog(ctx, name, data)
+}
+
+type blockingSnapshotStorage struct {
+	Storage
+	block   chan struct{}
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingSnapshotStorage) WriteSnapshot(ctx context.Context, id string, data []byte) (string, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.block
+	return s.Storage.WriteSnapshot(ctx, id, data)
+}
 
 func TestAppendWithWriterFence_FencedOut(t *testing.T) {
 	ctx := context.Background()
@@ -688,5 +717,233 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 	}
 	if manifest.SortedRuns[0].SSTs[0].ID != "valid-compacted.sst" {
 		t.Errorf("expected valid-compacted.sst, got %s", manifest.SortedRuns[0].SSTs[0].ID)
+	}
+}
+
+func TestReplay_SurvivesTransientWriteLogFailureWithoutSequenceGap(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	failStorage := &failNthWriteLogStorage{Storage: base, failAt: 2}
+	ms := NewStoreWithStorage(failStorage)
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "failed.sst", Epoch: 1, Level: 0}); err == nil {
+		t.Fatal("expected injected append error")
+	}
+
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "applied.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append retry: %v", err)
+	}
+
+	replayStore := NewStoreWithStorage(base)
+	m, err := replayStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay after transient write failure: %v", err)
+	}
+	if m.LookupSST("applied.sst") == nil {
+		t.Fatalf("expected applied.sst to be present after replay")
+	}
+}
+
+func TestWriteSnapshot_DoesNotRegressCurrentNextSeqOnFreshStore(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	ms1 := NewStoreWithStorage(backend)
+
+	if _, err := ms1.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms1.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		_, err := ms1.AppendAddSSTableWithFence(ctx, SSTMeta{
+			ID:    fmt.Sprintf("a-%d.sst", i),
+			Epoch: uint64(i + 1),
+			Level: 0,
+		})
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	beforeData, _, err := backend.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current before snapshot: %v", err)
+	}
+	before, err := DecodeCurrent(beforeData)
+	if err != nil {
+		t.Fatalf("decode current before snapshot: %v", err)
+	}
+
+	m, err := ms1.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot: %v", err)
+	}
+
+	ms2 := NewStoreWithStorage(backend)
+	if _, err := ms2.WriteSnapshot(ctx, m); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	afterData, _, err := backend.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current after snapshot: %v", err)
+	}
+	after, err := DecodeCurrent(afterData)
+	if err != nil {
+		t.Fatalf("decode current after snapshot: %v", err)
+	}
+
+	if after.NextSeq < before.NextSeq {
+		t.Fatalf("next_seq regressed after snapshot: before=%d after=%d", before.NextSeq, after.NextSeq)
+	}
+}
+
+func TestReplay_ErrsWhenCurrentSnapshotIsMissing(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	ms := NewStore(store)
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	m, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot: %v", err)
+	}
+	snapPath, err := ms.WriteSnapshot(ctx, m)
+	if err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	if err := store.Delete(ctx, snapPath); err != nil {
+		t.Fatalf("delete snapshot: %v", err)
+	}
+
+	ms2 := NewStore(store)
+	if _, err := ms2.Replay(ctx); err == nil {
+		t.Fatal("expected replay error when CURRENT points to a missing snapshot")
+	}
+}
+
+func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	blocking := &blockingSnapshotStorage{
+		Storage: base,
+		block:   make(chan struct{}),
+		started: make(chan struct{}),
+	}
+	ms := NewStoreWithStorage(blocking)
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	expected := make(map[string]struct{})
+	appendSST := func(id string, epoch uint64) {
+		if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Epoch: epoch, Level: 0}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+		expected[id] = struct{}{}
+	}
+
+	for i := 0; i < 5; i++ {
+		appendSST(fmt.Sprintf("base-%02d.sst", i), 1)
+	}
+
+	manifestBeforeSnapshot, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot: %v", err)
+	}
+
+	snapshotErrCh := make(chan error, 1)
+	go func() {
+		_, err := ms.WriteSnapshot(ctx, manifestBeforeSnapshot)
+		snapshotErrCh <- err
+	}()
+
+	<-blocking.started
+	
+	for i := 0; i < 20; i++ {
+		appendSST(fmt.Sprintf("during-%02d.sst", i), 1)
+	}
+
+	beforeData, _, err := base.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current before unblocking snapshot: %v", err)
+	}
+	beforeCurrent, err := DecodeCurrent(beforeData)
+	if err != nil {
+		t.Fatalf("decode current before unblocking snapshot: %v", err)
+	}
+
+	close(blocking.block)
+	firstSnapshotErr := <-snapshotErrCh
+	if !errors.Is(firstSnapshotErr, ErrPreconditionFailed) {
+		t.Fatalf("expected first snapshot attempt to fail with CAS conflict, got: %v", firstSnapshotErr)
+	}
+
+	latestManifest, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot retry: %v", err)
+	}
+	if _, err := ms.WriteSnapshot(ctx, latestManifest); err != nil {
+		t.Fatalf("snapshot retry: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		appendSST(fmt.Sprintf("after-%02d.sst", i), 1)
+	}
+
+	afterData, _, err := base.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current after snapshot: %v", err)
+	}
+	afterCurrent, err := DecodeCurrent(afterData)
+	if err != nil {
+		t.Fatalf("decode current after snapshot: %v", err)
+	}
+	if afterCurrent.NextSeq < beforeCurrent.NextSeq {
+		t.Fatalf("next_seq regressed: before=%d after=%d", beforeCurrent.NextSeq, afterCurrent.NextSeq)
+	}
+
+	replayStore := NewStoreWithStorage(base)
+	finalManifest, err := replayStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("final replay: %v", err)
+	}
+	for id := range expected {
+		if finalManifest.LookupSST(id) == nil {
+			t.Fatalf("missing sst after replay: %s", id)
+		}
 	}
 }
