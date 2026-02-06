@@ -33,12 +33,15 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 	}
 
 	ropts := ReaderOptions{
-		CacheDir:             opts.ReaderOptions.CacheDir,
-		SSTCacheSize:         opts.ReaderOptions.SSTCacheSize,
-		BlobCacheSize:        opts.ReaderOptions.BlobCacheSize,
-		BlobCacheMaxItemSize: opts.ReaderOptions.BlobCacheMaxItemSize,
-		ValidateSSTChecksum:  opts.ReaderOptions.ValidateSSTChecksum,
-		SSTHashVerifier:      opts.ReaderOptions.SSTHashVerifier,
+		CacheDir:                 opts.ReaderOptions.CacheDir,
+		SSTCacheSize:             opts.ReaderOptions.SSTCacheSize,
+		BlobCacheSize:            opts.ReaderOptions.BlobCacheSize,
+		BlobCacheMaxItemSize:     opts.ReaderOptions.BlobCacheMaxItemSize,
+		AllowUnverifiedRangeRead: opts.ReaderOptions.AllowUnverifiedRangeRead,
+		BlockCacheSize:           opts.ReaderOptions.BlockCacheSize,
+		RangeReadMinSSTSize:      opts.ReaderOptions.RangeReadMinSSTSize,
+		ValidateSSTChecksum:      opts.ReaderOptions.ValidateSSTChecksum,
+		SSTHashVerifier:          opts.ReaderOptions.SSTHashVerifier,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

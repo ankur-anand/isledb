@@ -71,10 +71,7 @@ func (tr *TailingReader) Stop() {
 	if tr.running.Swap(false) {
 		close(tr.stopCh)
 		tr.wg.Wait()
-		return
 	}
-
-	close(tr.stopCh)
 }
 
 // Close stops background refresh and closes the underlying reader.
