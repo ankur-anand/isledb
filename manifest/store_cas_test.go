@@ -18,6 +18,14 @@ type casInjectStorage struct {
 	bumpWriterFence bool
 }
 
+type cancelCASStorage struct {
+	base   Storage
+	cancel context.CancelFunc
+
+	mu    sync.Mutex
+	calls int
+}
+
 func (s *casInjectStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
 	return s.base.ReadCurrent(ctx)
 }
@@ -113,6 +121,53 @@ func (s *casInjectStorage) bumpWriterFenceEpoch(ctx context.Context) error {
 	return err
 }
 
+func (s *cancelCASStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	return s.base.ReadCurrent(ctx)
+}
+
+func (s *cancelCASStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	cancel := s.cancel
+	s.mu.Unlock()
+
+	if first && cancel != nil {
+		cancel()
+	}
+	return "", ErrPreconditionFailed
+}
+
+func (s *cancelCASStorage) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
+	return s.base.ReadSnapshot(ctx, path)
+}
+
+func (s *cancelCASStorage) WriteSnapshot(ctx context.Context, id string, data []byte) (string, error) {
+	return s.base.WriteSnapshot(ctx, id, data)
+}
+
+func (s *cancelCASStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
+	return s.base.ReadLog(ctx, path)
+}
+
+func (s *cancelCASStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
+	return s.base.WriteLog(ctx, name, data)
+}
+
+func (s *cancelCASStorage) ListLogs(ctx context.Context) ([]string, error) {
+	return s.base.ListLogs(ctx)
+}
+
+func (s *cancelCASStorage) LogPath(name string) string {
+	return s.base.LogPath(name)
+}
+
+func (s *cancelCASStorage) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 func TestAppendCurrent_CASRetry_SucceedsWhenFenceValid(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("cas-retry")
@@ -162,5 +217,25 @@ func TestAppendCurrent_CASFencesWhenEpochAdvanced(t *testing.T) {
 	_, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "b.sst", Epoch: 1, Level: 0})
 	if !errors.Is(err, ErrFenced) {
 		t.Fatalf("expected ErrFenced, got %v", err)
+	}
+}
+
+func TestClaimFence_StopsRetryWhenContextCanceledDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := blobstore.NewMemory("cas-claim-cancel")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	inject := &cancelCASStorage{base: base, cancel: cancel}
+	ms := NewStoreWithStorage(inject)
+
+	_, err := ms.ClaimWriter(ctx, "writer-1")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if calls := inject.callCount(); calls != 1 {
+		t.Fatalf("expected a single CAS attempt before cancellation, got %d", calls)
 	}
 }

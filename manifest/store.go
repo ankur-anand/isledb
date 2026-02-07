@@ -79,6 +79,9 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 	const maxRetries = 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
@@ -115,7 +118,10 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 
 		if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
-				time.Sleep(time.Millisecond * 10 * time.Duration(attempt+1))
+				backoff := time.Millisecond * 10 * time.Duration(attempt+1)
+				if err := sleepWithContext(ctx, backoff); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, err
@@ -134,6 +140,26 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 	}
 
 	return nil, ErrFenceConflict
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *Store) writeFenceClaimEntry(ctx context.Context, role FenceRole, token *FenceToken) error {
