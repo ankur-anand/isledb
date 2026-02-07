@@ -17,16 +17,17 @@ func TestLogEntryRoundTrip(t *testing.T) {
 		Timestamp: now,
 		Op:        LogOpAddSSTable,
 		SSTable: &SSTMeta{
-			ID:        "1-1-2-abc.sst",
-			Epoch:     1,
-			SeqLo:     1,
-			SeqHi:     2,
-			MinKey:    []byte("a"),
-			MaxKey:    []byte("b"),
-			Size:      123,
-			Checksum:  "sha256:abc",
-			CreatedAt: created,
-			Level:     0,
+			ID:          "1-1-2-abc.sst",
+			Epoch:       1,
+			SeqLo:       1,
+			SeqHi:       2,
+			MinKey:      []byte("a"),
+			MaxKey:      []byte("b"),
+			Size:        123,
+			Checksum:    "sha256:abc",
+			CreatedAt:   created,
+			Level:       0,
+			HasBlobRefs: true,
 		},
 	}
 
@@ -46,6 +47,9 @@ func TestLogEntryRoundTrip(t *testing.T) {
 	}
 	if !got.SSTable.CreatedAt.Equal(created) {
 		t.Fatalf("createdAt mismatch")
+	}
+	if !got.SSTable.HasBlobRefs {
+		t.Fatalf("hasBlobRefs mismatch")
 	}
 }
 

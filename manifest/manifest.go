@@ -64,7 +64,8 @@ type SSTMeta struct {
 	Bloom     BloomMeta
 	CreatedAt time.Time
 
-	Level int
+	Level       int
+	HasBlobRefs bool
 }
 
 type Current struct {

@@ -54,6 +54,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 	sst := sstable.NewWriter(writable, wo)
 
 	state := newSSTBuildState()
+	hasBlobRefs := false
 	abort := func(err error) (writeSSTResult, error) {
 		writable.Abort()
 		_ = sst.Close()
@@ -74,6 +75,9 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		keyEntry, err := buildKeyEntry(e, k)
 		if err != nil {
 			return abort(err)
+		}
+		if keyEntry.Kind == internal.OpPut && !keyEntry.Inline {
+			hasBlobRefs = true
 		}
 
 		encodedValue := internal.EncodeKeyEntry(keyEntry)
@@ -145,8 +149,9 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 			Offset:     sstSize,
 			Length:     int64(len(bloomBytes)),
 		},
-		CreatedAt: time.Now().UTC(),
-		Level:     0,
+		CreatedAt:   time.Now().UTC(),
+		Level:       0,
+		HasBlobRefs: hasBlobRefs,
 	}
 	if opts.Signer != nil {
 		sig, err := opts.Signer.SignHash(hashBytes)

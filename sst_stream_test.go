@@ -64,6 +64,9 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 	if result.Meta.Epoch != 1 {
 		t.Errorf("epoch mismatch: got %d", result.Meta.Epoch)
 	}
+	if result.Meta.HasBlobRefs {
+		t.Fatalf("expected HasBlobRefs=false for inline-only SST")
+	}
 	expectedSize := result.Meta.Size + result.Meta.Bloom.Length
 	if result.Meta.Bloom.Length > 0 {
 		expectedSize += bloomTrailerLen
@@ -291,6 +294,9 @@ func TestWriteSSTStreaming_BlobReference(t *testing.T) {
 	if result.Meta.SeqLo != 1 || result.Meta.SeqHi != 1 {
 		t.Errorf("seq range mismatch: got %d-%d", result.Meta.SeqLo, result.Meta.SeqHi)
 	}
+	if !result.Meta.HasBlobRefs {
+		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
+	}
 }
 
 func TestBuildSSTIDWithTimestamp(t *testing.T) {
@@ -357,6 +363,9 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 		}
 		if result.Meta.Size == 0 {
 			t.Errorf("result %d: zero size", i)
+		}
+		if result.Meta.HasBlobRefs {
+			t.Errorf("result %d: expected HasBlobRefs=false for inline-only entries", i)
 		}
 	}
 }
@@ -537,5 +546,29 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "iterator failed") {
 		t.Errorf("expected iterator error, got %v", err)
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_BlobReference(t *testing.T) {
+	blobID := internal.ComputeBlobID([]byte("large-value-content"))
+	entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: false, BlobID: blobID},
+	}
+	it := &sliceSSTIter{entries: entries}
+
+	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if err != nil {
+		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Meta.HasBlobRefs {
+		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
 	}
 }

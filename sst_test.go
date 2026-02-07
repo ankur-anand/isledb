@@ -100,6 +100,9 @@ func TestWriteSST_Inline(t *testing.T) {
 	if !bytes.Equal(res.Meta.MinKey, []byte("a")) || !bytes.Equal(res.Meta.MaxKey, []byte("b")) {
 		t.Errorf("key range mismatch: %s-%s", res.Meta.MinKey, res.Meta.MaxKey)
 	}
+	if res.Meta.HasBlobRefs {
+		t.Fatalf("expected HasBlobRefs=false for inline-only SST")
+	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
@@ -171,6 +174,9 @@ func TestWriteSST_BlobReference(t *testing.T) {
 	}
 	if len(res.SSTData) == 0 {
 		t.Fatalf("expected SST data")
+	}
+	if !res.Meta.HasBlobRefs {
+		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
 	}
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
