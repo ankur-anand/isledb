@@ -1,24 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 942.5 325">
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 942.5 325">
   <defs>
     <style>
       .cls-1, .cls-2 {
         fill: #10182b;
       }
 
-      .cls-2, .cls-3 {
-        font-family: Helvetica-Bold, Helvetica;
-        font-size: 167.14px;
-        font-weight: 700;
+      .cls-2, .cls-3, .cls-4, .cls-5 {
         isolation: isolate;
       }
 
-      .cls-4 {
-        fill: #f39e1e;
-      }
-
-      .cls-5 {
-        fill: #00aeef;
+      .cls-2, .cls-4 {
+        font-family: Helvetica-Bold, Helvetica;
+        font-size: 167.14px;
+        font-weight: 700;
       }
 
       .cls-6 {
@@ -30,31 +25,48 @@
       }
 
       .cls-8 {
+        stroke: url(#linear-gradient);
+        stroke-width: 5px;
+      }
+
+      .cls-8, .cls-3, .cls-5 {
         fill: none;
-        stroke: #354255;
-        stroke-width: 2.5px;
+        stroke-linecap: round;
       }
 
       .cls-3 {
+        opacity: .5;
+        stroke: url(#linear-gradient-2);
+        stroke-width: 4px;
+      }
+
+      .cls-4 {
         fill: #517abd;
       }
 
-      .cls-9 {
-        fill: #45b75f;
+      .cls-5 {
+        opacity: .3;
+        stroke: url(#linear-gradient-3);
+        stroke-width: 3px;
       }
     </style>
+    <linearGradient id="linear-gradient" x1="-73.7" y1="545.45" x2="-71.57" y2="545.45" gradientTransform="translate(7723.57 3508.43) scale(104 -6)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#517abd" stop-opacity=".7"/>
+      <stop offset="1" stop-color="#00b6d4" stop-opacity=".9"/>
+    </linearGradient>
+    <linearGradient id="linear-gradient-2" x1="-73.71" y1="543.43" x2="-71.56" y2="543.43" gradientTransform="translate(7723.57 3518.43) scale(104 -6)" xlink:href="#linear-gradient"/>
+    <linearGradient id="linear-gradient-3" x1="-73.7" y1="541.87" x2="-71.52" y2="541.87" gradientTransform="translate(7635.72 3528.43) scale(102.8 -6)" xlink:href="#linear-gradient"/>
   </defs>
   <rect class="cls-7" width="942.5" height="325" rx="13.92" ry="13.92"/>
   <g>
     <rect class="cls-1" width="327.84" height="325" rx="14" ry="14"/>
-    <ellipse class="cls-8" cx="163.92" cy="162.5" rx="121.77" ry="120.71"/>
     <path class="cls-6" d="M93.67,185.71h140.5c7.76,0,14.05,6.24,14.05,13.93h0c0,7.69-6.29,13.93-14.05,13.93H93.67c-7.76,0-14.05-6.24-14.05-13.93h0c0-7.69,6.29-13.93,14.05-13.93Z"/>
     <path class="cls-6" d="M112.4,143.93h103.03c7.76,0,14.05,6.24,14.05,13.93h0c0,7.69-6.29,13.93-14.05,13.93h-103.03c-7.76,0-14.05-6.24-14.05-13.93h0c0-7.69,6.29-13.93,14.05-13.93Z"/>
     <path class="cls-6" d="M131.13,102.14h65.57c7.76,0,14.05,6.24,14.05,13.93h0c0,7.69-6.29,13.93-14.05,13.93h-65.57c-7.76,0-14.05-6.24-14.05-13.93h0c0-7.69,6.29-13.93,14.05-13.93Z"/>
-    <ellipse class="cls-5" cx="163.92" cy="41.79" rx="18.73" ry="18.57"/>
-    <ellipse class="cls-9" cx="276.32" cy="185.71" rx="18.73" ry="18.57"/>
-    <ellipse class="cls-4" cx="51.52" cy="185.71" rx="18.73" ry="18.57"/>
     <text class="cls-2" transform="translate(398.09 218.22)"><tspan x="0" y="0">isle</tspan></text>
-    <text class="cls-3" transform="translate(679.31 218.22)"><tspan x="0" y="0">db</tspan></text>
+    <text class="cls-4" transform="translate(679.31 218.22)"><tspan x="0" y="0">db</tspan></text>
   </g>
+  <path class="cls-8" d="M42.15,235.75c32.66-19.37,65.32-19.37,97.97,0,32.66,19.37,65.32,19.37,97.97,0,32.66-19.37,52.25-19.37,58.78,0"/>
+  <path class="cls-3" d="M42.15,257.83c39.19-11.62,76.75-11.62,112.67,0,35.92,11.62,68.58,11.62,97.97,0,29.39-11.62,44.09-11.62,44.09,0"/>
+  <path class="cls-5" d="M45.09,277.21c42.46-11.62,83.28-11.62,122.47,0,39.19,11.62,71.85,11.62,97.97,0s35.92-11.62,29.39,0"/>
 </svg>
