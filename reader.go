@@ -1233,6 +1233,10 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	if it.closed || it.err != nil {
 		return false
 	}
+	it.current = nil
+	if it.mergeIter == nil {
+		return false
+	}
 
 	it.mergeIter.seekGE(target)
 	if it.mergeIter.err != nil {

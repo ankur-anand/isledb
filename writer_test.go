@@ -224,3 +224,67 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 		t.Fatalf("flush retry: %v", err)
 	}
 }
+
+func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-delete-backpressure")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
+		MemtableSize:          512,
+		FlushInterval:         0,
+		BlockSize:             4096,
+		Compression:           "none",
+		MaxImmutableMemtables: 1,
+	})
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 10000; i++ {
+		seqBefore := w.seq
+		err := w.delete([]byte(fmt.Sprintf("k%06d", i)))
+		if errors.Is(err, ErrBackpressure) {
+			if w.seq != seqBefore {
+				t.Fatalf("delete error should not advance seq: before=%d after=%d", seqBefore, w.seq)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	t.Fatalf("expected ErrBackpressure from deletes")
+}
+
+func TestWriter_PutBlobWriteFailureDoesNotAdvanceSeq(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := blobstore.NewMemory("writer-putblob-seq-rollback")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	opts := DefaultWriterOptions()
+	opts.FlushInterval = 0
+	opts.ValueStorage.BlobThreshold = 1
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	seqBefore := w.seq
+	cancel()
+
+	err = w.put([]byte("k"), []byte("v"))
+	if err == nil {
+		t.Fatalf("expected put blob error with canceled context")
+	}
+	if w.seq != seqBefore {
+		t.Fatalf("blob write error should not advance seq: before=%d after=%d", seqBefore, w.seq)
+	}
+}

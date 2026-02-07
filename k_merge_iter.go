@@ -271,8 +271,9 @@ func (mi *kMergeIterator) seekGE(target []byte) {
 		kv := iter.SeekGE(target, 0)
 		if kv != nil {
 			mi.loadState(i, &kv.K, kv.InPlaceValue())
+			mi.tree[mi.size+i] = i
 		} else {
-			if err := iter.Close(); err != nil && mi.err == nil {
+			if err := iter.Error(); err != nil && mi.err == nil {
 				mi.err = err
 			}
 			mi.states[i].valid = false

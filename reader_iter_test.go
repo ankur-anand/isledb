@@ -208,6 +208,12 @@ func TestReader_Iterator_Empty(t *testing.T) {
 	if iter.Next() {
 		t.Error("Expected no results for empty range")
 	}
+	if iter.SeekGE([]byte("nonexistent:any")) {
+		t.Error("SeekGE should return false for empty iterator")
+	}
+	if iter.Key() != nil {
+		t.Errorf("Expected nil key for invalid iterator state, got %q", string(iter.Key()))
+	}
 	if iter.Err() != nil {
 		t.Errorf("Unexpected error: %v", iter.Err())
 	}
@@ -410,5 +416,124 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 
 	if string(results[0].Key) != "key:010" {
 		t.Errorf("First key should be key:010, got %s", results[0].Key)
+	}
+}
+
+func TestReader_Iterator_SeekGE_RepositionAfterMiss(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	opts := DefaultWriterOptions()
+	opts.MemtableSize = 1024 * 1024
+	opts.FlushInterval = 0
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 1; i <= 10; i++ {
+		key := fmt.Sprintf("key:%03d", i*10)
+		value := fmt.Sprintf("value:%03d", i*10)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	rOpts := DefaultReaderOptions()
+	rOpts.CacheDir = t.TempDir()
+	r, err := newReader(ctx, store, rOpts)
+	if err != nil {
+		t.Fatalf("newReader failed: %v", err)
+	}
+	defer r.Close()
+
+	iter, err := r.NewIterator(ctx, IteratorOptions{
+		MinKey: []byte("key:"),
+		MaxKey: []byte("key:~"),
+	})
+	if err != nil {
+		t.Fatalf("NewIterator failed: %v", err)
+	}
+	defer iter.Close()
+
+	if iter.SeekGE([]byte("key:999")) {
+		t.Fatal("SeekGE should miss for key beyond range")
+	}
+	if iter.Key() != nil {
+		t.Fatalf("Expected nil key after failed seek, got %q", string(iter.Key()))
+	}
+
+	if !iter.SeekGE([]byte("key:050")) {
+		t.Fatal("SeekGE should find key:050 after previous miss")
+	}
+	if string(iter.Key()) != "key:050" {
+		t.Fatalf("Expected key:050, got %s", iter.Key())
+	}
+}
+
+func TestReader_Iterator_SeekGE_AfterExhaustion(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	opts := DefaultWriterOptions()
+	opts.MemtableSize = 1024 * 1024
+	opts.FlushInterval = 0
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 1; i <= 3; i++ {
+		key := fmt.Sprintf("key:%03d", i*10)
+		value := fmt.Sprintf("value:%03d", i*10)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	rOpts := DefaultReaderOptions()
+	rOpts.CacheDir = t.TempDir()
+	r, err := newReader(ctx, store, rOpts)
+	if err != nil {
+		t.Fatalf("newReader failed: %v", err)
+	}
+	defer r.Close()
+
+	iter, err := r.NewIterator(ctx, IteratorOptions{
+		MinKey: []byte("key:"),
+		MaxKey: []byte("key:~"),
+	})
+	if err != nil {
+		t.Fatalf("NewIterator failed: %v", err)
+	}
+	defer iter.Close()
+
+	for iter.Next() {
+	}
+	if err := iter.Err(); err != nil {
+		t.Fatalf("iterator err: %v", err)
+	}
+
+	if !iter.SeekGE([]byte("key:010")) {
+		t.Fatal("SeekGE should reposition after iterator exhaustion")
+	}
+	if string(iter.Key()) != "key:010" {
+		t.Fatalf("Expected key:010, got %s", iter.Key())
 	}
 }

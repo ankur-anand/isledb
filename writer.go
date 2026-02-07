@@ -156,21 +156,30 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) error {
 		w.mu.Unlock()
 		return err
 	}
+	// we reserve sequence before blob I/O so concurrent operations don't invert order.
+	w.seq++
+	seq := w.seq
 	w.mu.Unlock()
 
 	blobID, err := w.blobStorage.Write(ctx, value)
 	if err != nil {
+		w.mu.Lock()
+		if w.seq == seq {
+			w.seq--
+		}
+		w.mu.Unlock()
 		return fmt.Errorf("write blob: %w", err)
 	}
 
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
+		if w.seq == seq {
+			w.seq--
+		}
 		w.mu.Unlock()
 		_ = w.blobStorage.Delete(ctx, blobID)
 		return err
 	}
-	w.seq++
-	seq := w.seq
 	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
 	w.mu.Unlock()
 	return nil
@@ -200,13 +209,13 @@ func (w *writer) deleteWithTTL(key []byte, ttl time.Duration) error {
 		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 
-	w.seq++
-	seq := w.seq
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
 		return err
 	}
+	w.seq++
+	seq := w.seq
 	w.memtable.DeleteWithTTL(key, seq, expireAt)
 	w.mu.Unlock()
 
