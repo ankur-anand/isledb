@@ -66,6 +66,7 @@ type RetentionCompactor struct {
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
+	fenced  atomic.Bool
 	running atomic.Bool
 	closed  atomic.Bool
 }
@@ -166,6 +167,14 @@ func (c *RetentionCompactor) cleanupLoop(stopCh <-chan struct{}, ticks <-chan ti
 		select {
 		case <-ticks:
 			if err := c.RunCleanup(context.Background()); err != nil {
+				if isFenceError(err) {
+					if c.opts.OnCleanupError != nil {
+						c.opts.OnCleanupError(err)
+					} else {
+						slog.Error("isledb: retention compactor fenced, stopping background cleanup", "error", err)
+					}
+					return
+				}
 				if c.opts.OnCleanupError != nil {
 					c.opts.OnCleanupError(err)
 				} else {
@@ -180,6 +189,15 @@ func (c *RetentionCompactor) cleanupLoop(stopCh <-chan struct{}, ticks <-chan ti
 
 func (c *RetentionCompactor) RunCleanup(ctx context.Context) error {
 	start := time.Now()
+	if c.fenced.Load() {
+		return manifest.ErrFenced
+	}
+	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+		if isFenceError(err) {
+			c.fenced.Store(true)
+		}
+		return err
+	}
 
 	if err := c.Refresh(ctx); err != nil {
 		return fmt.Errorf("refresh manifest: %w", err)
@@ -195,6 +213,9 @@ func (c *RetentionCompactor) RunCleanup(ctx context.Context) error {
 	case CompactByAge:
 		deleted, bytes, err := c.cleanupFIFO(ctx, m)
 		if err != nil {
+			if isFenceError(err) {
+				c.fenced.Store(true)
+			}
 			return err
 		}
 		stats.SSTsDeleted = deleted
@@ -203,6 +224,9 @@ func (c *RetentionCompactor) RunCleanup(ctx context.Context) error {
 	case CompactByTimeWindow:
 		deleted, bytes, err := c.cleanupSegmented(ctx, m)
 		if err != nil {
+			if isFenceError(err) {
+				c.fenced.Store(true)
+			}
 			return err
 		}
 		stats.SSTsDeleted = deleted
@@ -431,6 +455,10 @@ func (c *RetentionCompactor) Stats() RetentionCompactorStats {
 	}
 
 	return stats
+}
+
+func (c *RetentionCompactor) IsFenced() bool {
+	return c.fenced.Load()
 }
 
 type RetentionCompactorStats struct {

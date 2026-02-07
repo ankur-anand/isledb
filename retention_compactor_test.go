@@ -308,3 +308,75 @@ func TestDefaultRetentionCompactorOptions(t *testing.T) {
 		t.Errorf("Default segment duration should be 1 hour")
 	}
 }
+
+func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+
+	for batch := 0; batch < 6; batch++ {
+		if err := w.put([]byte(fmt.Sprintf("fence-key:%d", batch)), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+	if err := w.close(); err != nil {
+		t.Fatalf("writer close failed: %v", err)
+	}
+
+	var cleanupErrCount atomic.Int32
+	cleanerOpts := RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: time.Nanosecond,
+		RetentionCount:  1,
+		CheckInterval:   20 * time.Millisecond,
+		OnCleanupError: func(err error) {
+			cleanupErrCount.Add(1)
+		},
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	competingStore := newManifestStore(store, nil)
+	if _, err := competingStore.Replay(ctx); err != nil {
+		t.Fatalf("competing replay failed: %v", err)
+	}
+	if _, err := competingStore.ClaimCompactor(ctx, "compactor-other"); err != nil {
+		t.Fatalf("competing claim compactor failed: %v", err)
+	}
+
+	cleaner.Start()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for cleanupErrCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cleanupErrCount.Load() == 0 {
+		t.Fatalf("expected cleanup loop to hit fence error at least once")
+	}
+
+	first := cleanupErrCount.Load()
+	time.Sleep(120 * time.Millisecond)
+	after := cleanupErrCount.Load()
+	if after != first {
+		t.Fatalf("expected cleanup loop to stop after fence error; errors before=%d after=%d", first, after)
+	}
+	if !cleaner.IsFenced() {
+		t.Fatalf("expected retention compactor to remain fenced after fence error")
+	}
+}
