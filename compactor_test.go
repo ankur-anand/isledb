@@ -1019,3 +1019,61 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	ctx := context.Background()
+
+	manifestStore := newManifestStore(store, nil)
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.FlushInterval = 0
+	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer writer.close()
+
+	for i := 0; i < 6; i++ {
+		key := fmt.Sprintf("mark-key-%03d", i)
+		if err := writer.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		if err := writer.flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	}
+
+	before, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay manifest before compaction: %v", err)
+	}
+	if len(before.L0SSTs) == 0 {
+		t.Fatalf("expected L0 SSTs before compaction")
+	}
+
+	compactorOpts := DefaultCompactorOptions()
+	compactorOpts.L0CompactionThreshold = 2
+	compactorOpts.CheckInterval = time.Hour
+
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+	defer compactor.Close()
+
+	if err := compactor.RunCompaction(ctx); err != nil {
+		t.Fatalf("RunCompaction: %v", err)
+	}
+
+	for _, sst := range before.L0SSTs {
+		found, err := hasPendingSSTDeleteMark(ctx, store, sst.ID)
+		if err != nil {
+			t.Fatalf("lookup pending delete mark for %s: %v", sst.ID, err)
+		}
+		if !found {
+			t.Fatalf("expected pending delete mark for %s", sst.ID)
+		}
+	}
+}

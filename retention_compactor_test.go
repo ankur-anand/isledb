@@ -380,3 +380,444 @@ func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 		t.Fatalf("expected retention compactor to remain fenced after fence error")
 	}
 }
+
+func TestRetentionCompactor_FIFO_EnqueuesDeleteMarks_NoPhysicalDelete(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for batch := 0; batch < 5; batch++ {
+		key := fmt.Sprintf("fifo-mark:%03d", batch)
+		value := fmt.Sprintf("value:%03d", batch)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	sstBefore, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list ssts before cleanup: %v", err)
+	}
+	if len(sstBefore) != 5 {
+		t.Fatalf("expected 5 SST files before cleanup, got %d", len(sstBefore))
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: time.Nanosecond,
+		RetentionCount:  2,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	if err := cleaner.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup failed: %v", err)
+	}
+
+	sstAfter, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list ssts after cleanup: %v", err)
+	}
+	if len(sstAfter) != len(sstBefore) {
+		t.Fatalf("expected no physical SST deletion in phase-1, before=%d after=%d", len(sstBefore), len(sstAfter))
+	}
+
+	marks, err := loadPendingSSTDeleteMarks(ctx, store)
+	if err != nil {
+		t.Fatalf("load pending delete marks: %v", err)
+	}
+	expectedMarks := len(sstBefore) - 2
+	if len(marks) != expectedMarks {
+		t.Fatalf("expected %d pending delete marks, got %d", expectedMarks, len(marks))
+	}
+}
+
+func TestRetentionCompactor_Segmented_EnqueuesDeleteMarks_NoPhysicalDelete(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for batch := 0; batch < 4; batch++ {
+		key := fmt.Sprintf("seg-mark:%03d", batch)
+		value := fmt.Sprintf("value:%03d", batch)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+		time.Sleep(1100 * time.Millisecond)
+	}
+
+	sstBefore, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list ssts before cleanup: %v", err)
+	}
+	if len(sstBefore) != 4 {
+		t.Fatalf("expected 4 SST files before cleanup, got %d", len(sstBefore))
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByTimeWindow,
+		RetentionPeriod: time.Nanosecond,
+		RetentionCount:  1,
+		SegmentDuration: time.Second,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	if err := cleaner.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup failed: %v", err)
+	}
+
+	sstAfter, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list ssts after cleanup: %v", err)
+	}
+	if len(sstAfter) != len(sstBefore) {
+		t.Fatalf("expected no physical SST deletion in phase-1, before=%d after=%d", len(sstBefore), len(sstAfter))
+	}
+
+	marks, err := loadPendingSSTDeleteMarks(ctx, store)
+	if err != nil {
+		t.Fatalf("load pending delete marks: %v", err)
+	}
+	if len(marks) == 0 {
+		t.Fatalf("expected pending delete marks to be enqueued")
+	}
+}
+
+func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 6; i++ {
+		key := fmt.Sprintf("catchup-key:%03d", i)
+		if err := w.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	beforeCompaction, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before compaction: %v", err)
+	}
+	if len(beforeCompaction.L0SSTs) == 0 {
+		t.Fatalf("expected L0 SSTs before compaction")
+	}
+	targetSSTID := beforeCompaction.L0SSTs[0].ID
+
+	compactor, err := newCompactor(ctx, store, manifestStore, CompactorOptions{
+		L0CompactionThreshold: 2,
+		CheckInterval:         time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newCompactor failed: %v", err)
+	}
+	defer compactor.Close()
+
+	if err := compactor.RunCompaction(ctx); err != nil {
+		t.Fatalf("RunCompaction failed: %v", err)
+	}
+
+	found, err := hasPendingSSTDeleteMark(ctx, store, targetSSTID)
+	if err != nil {
+		t.Fatalf("lookup compactor mark for %s: %v", targetSSTID, err)
+	}
+	if !found {
+		t.Fatalf("expected compactor mark for %s", targetSSTID)
+	}
+	if err := clearPendingSSTDeleteMarks(ctx, store, []string{targetSSTID}); err != nil {
+		t.Fatalf("clear target mark: %v", err)
+	}
+
+	if err := store.Delete(ctx, gcCheckpointPath(store)); err != nil {
+		t.Fatalf("delete gc checkpoint: %v", err)
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: 365 * 24 * time.Hour,
+		RetentionCount:  1000,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	if err := cleaner.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup failed: %v", err)
+	}
+
+	found, err = hasPendingSSTDeleteMark(ctx, store, targetSSTID)
+	if err != nil {
+		t.Fatalf("lookup recreated mark for %s: %v", targetSSTID, err)
+	}
+	if !found {
+		t.Fatalf("expected catchup to recreate mark for %s", targetSSTID)
+	}
+
+	checkpoint, err := loadGCMarkCheckpoint(ctx, store)
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if checkpoint.LastAppliedSeq == 0 {
+		t.Fatalf("expected checkpoint to advance")
+	}
+}
+
+func TestRetentionCompactor_LogCatchup_FastForwardsFromSnapshotBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("snap-boundary-key:%03d", i)
+		if err := w.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	m, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot: %v", err)
+	}
+	if _, err := manifestStore.WriteSnapshot(ctx, m); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	if err := storeGCMarkCheckpoint(ctx, store, &gcMarkCheckpoint{
+		LastAppliedSeq: 0,
+	}); err != nil {
+		t.Fatalf("write stale checkpoint: %v", err)
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: 365 * 24 * time.Hour,
+		RetentionCount:  1000,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	if err := cleaner.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup failed: %v", err)
+	}
+
+	current, err := cleaner.readManifestCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read CURRENT: %v", err)
+	}
+	if current == nil {
+		t.Fatalf("expected non-nil CURRENT")
+	}
+
+	checkpoint, err := loadGCMarkCheckpoint(ctx, store)
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if checkpoint.LastAppliedSeq < current.LogSeqStart {
+		t.Fatalf("checkpoint did not fast-forward to snapshot boundary: got=%d log_seq_start=%d", checkpoint.LastAppliedSeq, current.LogSeqStart)
+	}
+	if checkpoint.LastSeenLogSeqStart != current.LogSeqStart {
+		t.Fatalf("checkpoint log_seq_start mismatch: got=%d want=%d", checkpoint.LastSeenLogSeqStart, current.LogSeqStart)
+	}
+}
+
+func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("orphan-scan-key:%03d", i)
+		if err := w.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	m, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before snapshot: %v", err)
+	}
+	if _, err := manifestStore.WriteSnapshot(ctx, m); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	orphanID := "orphan-manual-sst"
+	if _, err := store.Write(ctx, store.SSTPath(orphanID), []byte("orphan-data")); err != nil {
+		t.Fatalf("write orphan sst: %v", err)
+	}
+
+	if err := storeGCMarkCheckpoint(ctx, store, &gcMarkCheckpoint{
+		LastAppliedSeq: 0,
+	}); err != nil {
+		t.Fatalf("write stale checkpoint: %v", err)
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: 365 * 24 * time.Hour,
+		RetentionCount:  1000,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	if err := cleaner.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup failed: %v", err)
+	}
+
+	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)
+	if err != nil {
+		t.Fatalf("lookup orphan mark: %v", err)
+	}
+	if !found {
+		t.Fatalf("expected orphan sst to be marked: %s", orphanID)
+	}
+}
+
+func TestRetentionCompactor_RunCleanup_MissingManifestLogReturnsError(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("missing-log-key:%03d", i)
+		if err := w.put([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush failed: %v", err)
+		}
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: 365 * 24 * time.Hour,
+		RetentionCount:  1000,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor failed: %v", err)
+	}
+	defer cleaner.Close()
+
+	current, err := cleaner.readManifestCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read CURRENT: %v", err)
+	}
+	if current == nil || current.NextSeq == 0 {
+		t.Fatalf("expected non-empty CURRENT")
+	}
+	missingSeq := current.LogSeqStart
+	if missingSeq >= current.NextSeq {
+		t.Fatalf("invalid log window: start=%d next=%d", current.LogSeqStart, current.NextSeq)
+	}
+	missingPath := manifestStore.Storage().LogPath(fmt.Sprintf("%020d", missingSeq))
+	if err := store.Delete(ctx, missingPath); err != nil {
+		t.Fatalf("delete manifest log %s: %v", missingPath, err)
+	}
+
+	orphanID := "orphan-after-missing-log"
+	if _, err := store.Write(ctx, store.SSTPath(orphanID), []byte("orphan-data")); err != nil {
+		t.Fatalf("write orphan sst: %v", err)
+	}
+
+	if err := cleaner.RunCleanup(ctx); err == nil {
+		t.Fatalf("expected RunCleanup to fail when manifest log is missing")
+	}
+
+	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)
+	if err != nil {
+		t.Fatalf("lookup orphan mark: %v", err)
+	}
+	if found {
+		t.Fatalf("orphan sst should not be marked when catchup fails before commit: %s", orphanID)
+	}
+}

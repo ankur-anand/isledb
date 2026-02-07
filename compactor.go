@@ -398,12 +398,36 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 }
 
 func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
-	var err error
-	_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload)
+	entry, err := c.manifestLog.AppendCompactionWithFence(ctx, payload)
 	if err != nil && isFenceError(err) {
 		c.fenced.Store(true)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	if len(payload.RemoveSSTableIDs) > 0 {
+		if err := enqueuePendingSSTDeleteMarks(ctx, c.store, payload.RemoveSSTableIDs, "compaction", entry.Seq); err != nil {
+			slog.Warn("isledb: enqueue pending sst delete marks failed after compaction append", "error", err, "count", len(payload.RemoveSSTableIDs), "seq", entry.Seq)
+		}
+	}
+
+	addedIDs := make([]string, 0, len(payload.AddSSTables))
+	for _, sst := range payload.AddSSTables {
+		addedIDs = append(addedIDs, sst.ID)
+	}
+	if payload.AddSortedRun != nil {
+		for _, sst := range payload.AddSortedRun.SSTs {
+			addedIDs = append(addedIDs, sst.ID)
+		}
+	}
+	if len(addedIDs) > 0 {
+		if err := clearPendingSSTDeleteMarks(ctx, c.store, addedIDs); err != nil {
+			slog.Warn("isledb: clear pending sst delete marks failed after compaction append", "error", err, "count", len(addedIDs), "seq", entry.Seq)
+		}
+	}
+
+	return nil
 }
 
 func (c *Compactor) IsFenced() bool {
