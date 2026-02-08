@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,23 @@ var (
 	ErrPreconditionFailed = errors.New("precondition failed")
 	ErrBucketNameRequired = errors.New("bucket name required for cloud providers")
 )
+
+type BatchDeleteError struct {
+	Failed map[string]error
+}
+
+func (e *BatchDeleteError) Error() string {
+	if e == nil || len(e.Failed) == 0 {
+		return "batch delete failed"
+	}
+	keys := make([]string, 0, len(e.Failed))
+	for key := range e.Failed {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	first := keys[0]
+	return fmt.Sprintf("batch delete failed for %d key(s), first key %q: %v", len(keys), first, e.Failed[first])
+}
 
 type Store struct {
 	bucket     *blob.Bucket
@@ -375,6 +393,46 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Store) BatchDelete(ctx context.Context, keys []string) error {
+	uniqueKeys := uniqueNonEmptyKeys(keys)
+	if len(uniqueKeys) == 0 {
+		return nil
+	}
+	return s.batchDeleteFallback(ctx, uniqueKeys)
+}
+
+func (s *Store) batchDeleteFallback(ctx context.Context, keys []string) error {
+	failed := make(map[string]error)
+	for _, key := range keys {
+		if err := s.Delete(ctx, key); err != nil {
+			failed[key] = err
+		}
+	}
+	if len(failed) == 0 {
+		return nil
+	}
+	return &BatchDeleteError{Failed: failed}
+}
+
+func uniqueNonEmptyKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
 }
 
 type ListOptions struct {

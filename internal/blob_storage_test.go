@@ -188,6 +188,48 @@ func TestBlobStorage_Delete(t *testing.T) {
 	}
 }
 
+func TestBlobStorage_BatchDelete(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	bs := NewBlobStorage(store, config.DefaultValueStorageConfig())
+
+	valueA := []byte("delete this blob A")
+	blobIDA, err := bs.Write(ctx, valueA)
+	if err != nil {
+		t.Fatalf("write A failed: %v", err)
+	}
+	valueB := []byte("delete this blob B")
+	blobIDB, err := bs.Write(ctx, valueB)
+	if err != nil {
+		t.Fatalf("write B failed: %v", err)
+	}
+
+	if err := bs.BatchDelete(ctx, [][32]byte{blobIDA, blobIDB, blobIDA}); err != nil {
+		t.Fatalf("batch delete failed: %v", err)
+	}
+
+	existsA, err := bs.Exists(ctx, blobIDA)
+	if err != nil {
+		t.Fatalf("exists A failed: %v", err)
+	}
+	if existsA {
+		t.Fatal("blob A should not exist after batch delete")
+	}
+	existsB, err := bs.Exists(ctx, blobIDB)
+	if err != nil {
+		t.Fatalf("exists B failed: %v", err)
+	}
+	if existsB {
+		t.Fatal("blob B should not exist after batch delete")
+	}
+
+	if err := bs.BatchDelete(ctx, [][32]byte{blobIDA, blobIDB}); err != nil {
+		t.Fatalf("batch delete idempotency failed: %v", err)
+	}
+}
+
 func TestBlobIDConversion(t *testing.T) {
 	original := sha256.Sum256([]byte("test conversion"))
 

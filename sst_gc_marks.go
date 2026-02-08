@@ -184,13 +184,18 @@ func clearPendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store, sst
 		}
 
 		filtered := set.Marks[:0]
+		changed := false
 		for _, mark := range set.Marks {
 			if _, ok := removeSet[mark.SSTID]; ok {
+				changed = true
 				continue
 			}
 			filtered = append(filtered, mark)
 		}
 		set.Marks = filtered
+		if !changed {
+			return nil
+		}
 
 		err = storePendingSSTDeleteMarkSetWithCAS(ctx, store, set, matchToken, exists)
 		if err == nil {
@@ -215,7 +220,7 @@ func loadGCMarkCheckpoint(ctx context.Context, store *blobstore.Store) (*gcMarkC
 }
 
 func loadGCMarkCheckpointWithCAS(ctx context.Context, store *blobstore.Store) (*gcMarkCheckpoint, string, bool, error) {
-	data, _, err := store.Read(ctx, gcCheckpointPath(store))
+	data, attrs, err := store.Read(ctx, gcCheckpointPath(store))
 	if err != nil {
 		if errors.Is(err, blobstore.ErrNotFound) {
 			return &gcMarkCheckpoint{Version: gcMarkSchemaVersion}, "", false, nil
@@ -230,10 +235,7 @@ func loadGCMarkCheckpointWithCAS(ctx context.Context, store *blobstore.Store) (*
 	if checkpoint.Version == 0 {
 		checkpoint.Version = gcMarkSchemaVersion
 	}
-	matchToken, err := currentObjectMatchToken(ctx, store, gcCheckpointPath(store))
-	if err != nil {
-		return nil, "", false, err
-	}
+	matchToken := matchTokenFromAttrs(attrs)
 	return &checkpoint, matchToken, true, nil
 }
 
@@ -312,7 +314,7 @@ func loadPendingSSTDeleteMarkSet(ctx context.Context, store *blobstore.Store) (*
 
 func loadPendingSSTDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store) (*pendingSSTDeleteMarkSet, string, bool, error) {
 	path := pendingSSTDeleteSetPath(store)
-	data, _, err := store.Read(ctx, path)
+	data, attrs, err := store.Read(ctx, path)
 	if err != nil {
 		if errors.Is(err, blobstore.ErrNotFound) {
 			return &pendingSSTDeleteMarkSet{Version: gcMarkSchemaVersion}, "", false, nil
@@ -327,11 +329,12 @@ func loadPendingSSTDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.St
 	if set.Version == 0 {
 		set.Version = gcMarkSchemaVersion
 	}
-	matchToken, err := currentObjectMatchToken(ctx, store, path)
-	if err != nil {
-		return nil, "", false, err
-	}
+	matchToken := matchTokenFromAttrs(attrs)
 	return &set, matchToken, true, nil
+}
+
+func storePendingSSTDeleteMarkSet(ctx context.Context, store *blobstore.Store, set *pendingSSTDeleteMarkSet) error {
+	return storePendingSSTDeleteMarkSetWithCAS(ctx, store, set, "", false)
 }
 
 func storePendingSSTDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store, set *pendingSSTDeleteMarkSet, matchToken string, exists bool) error {
@@ -378,18 +381,11 @@ func uniqueSSTIDs(ids []string) []string {
 	return out
 }
 
-func currentObjectMatchToken(ctx context.Context, store *blobstore.Store, key string) (string, error) {
-	attr, err := store.Attributes(ctx, key)
-	if err != nil {
-		if errors.Is(err, blobstore.ErrNotFound) {
-			return "", nil
-		}
-		return "", err
-	}
+func matchTokenFromAttrs(attr blobstore.Attributes) string {
 	if attr.Generation > 0 {
-		return fmt.Sprintf("%d", attr.Generation), nil
+		return fmt.Sprintf("%d", attr.Generation)
 	}
-	return attr.ETag, nil
+	return attr.ETag
 }
 
 func writeObjectCAS(ctx context.Context, store *blobstore.Store, key string, payload []byte, matchToken string, exists bool) error {

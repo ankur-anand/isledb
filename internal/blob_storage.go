@@ -76,6 +76,15 @@ func (b *BlobStorage) Delete(ctx context.Context, blobID [32]byte) error {
 	return b.store.Delete(ctx, blobPath)
 }
 
+func (b *BlobStorage) BatchDelete(ctx context.Context, blobIDs [][32]byte) error {
+	keys := make([]string, 0, len(blobIDs))
+	for _, blobID := range blobIDs {
+		blobIDHex := hex.EncodeToString(blobID[:])
+		keys = append(keys, b.store.BlobPath(blobIDHex))
+	}
+	return b.store.BatchDelete(ctx, keys)
+}
+
 func BlobIDToHex(blobID [32]byte) string {
 	return hex.EncodeToString(blobID[:])
 }

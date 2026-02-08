@@ -200,12 +200,23 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 			continue
 		}
 
+		c.runSSTSweeperBestEffort(ctx)
 		return nil
 	}
 
 	slog.Warn("isledb: compaction hit max iterations, possible infinite loop or excessive L0 accumulation",
 		"CompactionMaxIterations", CompactionMaxIterations)
+	c.runSSTSweeperBestEffort(ctx)
 	return nil
+}
+
+func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
+	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+		return
+	}
+	if _, err := runPendingSSTSweeper(ctx, c.store, c.manifestLog, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+		slog.Warn("isledb: compactor sst sweep failed", "error", err)
+	}
 }
 
 func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {

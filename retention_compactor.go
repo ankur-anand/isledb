@@ -245,7 +245,18 @@ func (c *RetentionCompactor) RunCleanup(ctx context.Context) error {
 		c.opts.OnCleanup(stats)
 	}
 
+	c.runSSTSweeperBestEffort(ctx)
+
 	return nil
+}
+
+func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
+	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+		return
+	}
+	if _, err := runPendingSSTSweeper(ctx, c.store, c.manifestLog, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+		slog.Warn("isledb: retention sst sweep failed", "error", err)
+	}
 }
 
 func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int, int64, error) {

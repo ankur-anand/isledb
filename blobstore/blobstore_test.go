@@ -588,3 +588,41 @@ func TestWriteIfNotExist_AlreadyExists(t *testing.T) {
 		}
 	})
 }
+
+func TestBatchDelete(t *testing.T) {
+	forEachStore(t, "test", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		store := h.store
+
+		keys := []string{
+			"batch/a.txt",
+			"batch/b.txt",
+			"batch/missing.txt",
+		}
+
+		if _, err := store.Write(ctx, keys[0], []byte("a")); err != nil {
+			t.Fatalf("write key %q failed: %v", keys[0], err)
+		}
+		if _, err := store.Write(ctx, keys[1], []byte("b")); err != nil {
+			t.Fatalf("write key %q failed: %v", keys[1], err)
+		}
+
+		if err := store.BatchDelete(ctx, []string{keys[0], keys[1], keys[2], keys[0], ""}); err != nil {
+			t.Fatalf("batch delete failed: %v", err)
+		}
+
+		for _, key := range keys {
+			exists, err := store.Exists(ctx, key)
+			if err != nil {
+				t.Fatalf("exists(%q) failed: %v", key, err)
+			}
+			if exists {
+				t.Fatalf("expected %q to be deleted", key)
+			}
+		}
+
+		if err := store.BatchDelete(ctx, keys); err != nil {
+			t.Fatalf("batch delete idempotency failed: %v", err)
+		}
+	})
+}
