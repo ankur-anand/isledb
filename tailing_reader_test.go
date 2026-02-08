@@ -208,6 +208,7 @@ func TestTailingReader_TailChannel(t *testing.T) {
 	defer tr.Close()
 
 	tailCtx, tailCancel := context.WithCancel(ctx)
+	defer tailCancel()
 	ch, errCh := tr.TailChannel(tailCtx, TailOptions{
 		MinKey:       []byte("stream:"),
 		MaxKey:       []byte("stream:~"),

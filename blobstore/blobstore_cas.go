@@ -77,7 +77,7 @@ func (s *Store) writeIfNotExistWithETag(ctx context.Context, key string, data []
 		gen := generationFromAttrs(attr)
 		return Attributes{
 			Size:       attr.Size,
-			ETag:       attr.ETag,
+			ETag:       s.stableETag(attr),
 			Generation: gen,
 		}, nil
 	}

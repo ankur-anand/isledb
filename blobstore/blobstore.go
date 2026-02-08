@@ -250,10 +250,23 @@ func (s *Store) Attributes(ctx context.Context, key string) (Attributes, error) 
 	gen := generationFromAttrs(attr)
 	return Attributes{
 		Size:       attr.Size,
-		ETag:       attr.ETag,
+		ETag:       s.stableETag(attr),
 		ModTime:    attr.ModTime,
 		Generation: gen,
 	}, nil
+}
+
+// stableETag returns a content-based ETag when the underlying provider
+// (e.g. fileblob) computes ETags from file metadata rather than content.
+// For such providers, we derive the ETag from the stored MD5 hash instead.
+func (s *Store) stableETag(attr *blob.Attributes) string {
+	if s.providerKind() != providerUnknown {
+		return attr.ETag
+	}
+	if len(attr.MD5) > 0 {
+		return fmt.Sprintf("%x", attr.MD5)
+	}
+	return attr.ETag
 }
 
 func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
@@ -275,7 +288,7 @@ func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes,
 	gen := generationFromAttrs(attr)
 	return Attributes{
 		Size:       attr.Size,
-		ETag:       attr.ETag,
+		ETag:       s.stableETag(attr),
 		Generation: gen,
 	}, nil
 }
@@ -334,7 +347,7 @@ func (s *Store) writeIfMatchFallback(ctx context.Context, key string, data []byt
 	if !objectExists {
 		return Attributes{}, ErrPreconditionFailed
 	}
-	if currentAttr.ETag != ifMatch {
+	if s.stableETag(currentAttr) != ifMatch {
 		return Attributes{}, ErrPreconditionFailed
 	}
 	return s.Write(ctx, key, data)
