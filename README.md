@@ -2,6 +2,11 @@
 
 <img src="docs/isledb.svg" width="100%" height="260" alt="isledb">
 
+[![CI Tests](https://github.com/ankur-anand/isledb/actions/workflows/go.yml/badge.svg)](https://github.com/ankur-anand/isledb/actions/workflows/go.yml)
+[![Coverage Status](https://coveralls.io/repos/github/ankur-anand/isledb/badge.svg?branch=main)](https://coveralls.io/github/ankur-anand/isledb?branch=main)
+[![GoDoc](https://pkg.go.dev/badge/github.com/ankur-anand/isledb.svg)](https://pkg.go.dev/github.com/ankur-anand/isledb)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 **IsleDB is an embedded key-value engine designed for object storage. It borrows ideas from LSM-trees but
 rethinks them for object storage.**
 
@@ -225,5 +230,14 @@ retention.Start()
 
 ### Examples
 - `examples/kvfile`: local file-backed KV usage with writer/reader/tailer.
-- `examples/walazblob`: WAL-style event stream on Azurite/Azure Blob (tailing events).
+- `examples/wal-azblob`: WAL-style event stream on Azurite/Azure Blob (tailing events).
 - `examples/eventhub-minio`: separate producer/consumer event hub demo on MinIO (S3 API).
+
+### Acknowledgments
+
+IsleDB's uses SSTable of [PebbleDB](https://github.com/cockroachdb/pebble). 
+Thanks to the CockroachDB team for building and open-sourcing such a well-engineered SSTable.
+
+### License
+
+IsleDB is licensed under the [Apache License 2.0](LICENSE).
