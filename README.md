@@ -21,8 +21,14 @@ minimize re-downloads—so read capacity scales horizontally without replicas.
 3. Object Store durability. 
 4. Readers scale horizontally-no replicas, no connection limits.
 5. Three compaction modes (Merge, FIFO, Time-Window)
+6. Separate Writer and Compaction Process
+7. Pluggable Manifest store
 
 <img src="docs/isledb_arch.png" alt="isledb architecture">
+
+### Full API Reference
+
+[API-Reference](api.md)
 
 ### Getting Started
 
