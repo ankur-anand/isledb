@@ -26,7 +26,7 @@
 
       .cls-8 {
         stroke: url(#linear-gradient);
-        stroke-width: 5px;
+        stroke-width: 7px;
       }
 
       .cls-8, .cls-3, .cls-5 {
@@ -35,9 +35,9 @@
       }
 
       .cls-3 {
-        opacity: .5;
+        opacity: .85;
         stroke: url(#linear-gradient-2);
-        stroke-width: 4px;
+        stroke-width: 5.5px;
       }
 
       .cls-4 {
@@ -45,14 +45,14 @@
       }
 
       .cls-5 {
-        opacity: .3;
+        opacity: .72;
         stroke: url(#linear-gradient-3);
-        stroke-width: 3px;
+        stroke-width: 4.5px;
       }
     </style>
     <linearGradient id="linear-gradient" x1="-73.7" y1="545.45" x2="-71.57" y2="545.45" gradientTransform="translate(7723.57 3508.43) scale(104 -6)" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#517abd" stop-opacity=".7"/>
-      <stop offset="1" stop-color="#00b6d4" stop-opacity=".9"/>
+      <stop offset="0" stop-color="#67a3ff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#20d6ef" stop-opacity="1"/>
     </linearGradient>
     <linearGradient id="linear-gradient-2" x1="-73.71" y1="543.43" x2="-71.56" y2="543.43" gradientTransform="translate(7723.57 3518.43) scale(104 -6)" xlink:href="#linear-gradient"/>
     <linearGradient id="linear-gradient-3" x1="-73.7" y1="541.87" x2="-71.52" y2="541.87" gradientTransform="translate(7635.72 3528.43) scale(102.8 -6)" xlink:href="#linear-gradient"/>

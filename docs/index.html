@@ -1,0 +1,1470 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IsleDB — Embedded KV Engine on Object Storage</title>
+    <meta
+      name="description"
+      content="IsleDB is an embedded key-value engine designed for object storage. LSM-style architecture on S3, GCS, Azure Blob, or MinIO."
+    />
+    <meta
+      name="keywords"
+      content="embedded database,key-value store,object storage,s3 database,lsm tree,event streaming,tailing reader,go database,golang"
+    />
+
+    <meta property="og:title" content="IsleDB — An island of data in an ocean of storage." />
+    <meta
+      property="og:description"
+      content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="./social.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB — An island of data in an ocean of storage." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="IsleDB — An island of data in an ocean of storage." />
+    <meta
+      name="twitter:description"
+      content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
+    />
+    <meta name="twitter:image" content="./social.png" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="shortcut icon" href="./favicon.svg" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      :root {
+        --ink-950: #0a1424;
+        --ink-900: #13233a;
+        --ink-700: #2f4662;
+        --ink-500: #56718f;
+
+        --sky-50: #eef8ff;
+        --sky-100: #d8ecff;
+        --sky-200: #bedfff;
+        --sky-500: #2f87ff;
+        --sky-600: #1f6fe0;
+
+        --teal-400: #2dc4b8;
+        --teal-500: #0fb2a4;
+
+        --amber-400: #ffbe66;
+        --green-500: #22c55e;
+
+        --slate-100: #eef3f8;
+        --slate-200: #dfe8f2;
+        --slate-300: #c7d6e4;
+        --slate-500: #6f859f;
+        --slate-700: #334b66;
+        --slate-900: #172436;
+
+        --page: #f9fbfe;
+        --panel: rgba(255, 255, 255, 0.9);
+        --shadow: 0 22px 56px rgba(15, 33, 59, 0.15);
+        --radius-lg: 20px;
+        --radius-md: 14px;
+        --max: 1160px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        background:
+          radial-gradient(52% 40% at 8% 6%, #fff4d8 0%, transparent 70%),
+          radial-gradient(44% 32% at 92% 12%, #daf8f4 0%, transparent 70%),
+          var(--page);
+        color: var(--ink-950);
+        font-family: "Space Grotesk", sans-serif;
+        line-height: 1.6;
+      }
+
+      code,
+      pre {
+        font-family: "IBM Plex Mono", monospace;
+      }
+
+      .wrap {
+        width: min(var(--max), calc(100% - 2rem));
+        margin: 0 auto;
+      }
+
+      nav {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 100;
+        backdrop-filter: blur(12px);
+        background: rgba(255, 255, 255, 0.82);
+        border-bottom: 1px solid rgba(19, 35, 58, 0.08);
+      }
+
+      .nav-inner {
+        max-width: var(--max);
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 66px;
+        padding: 0 1rem;
+      }
+
+      .nav-logo {
+        display: inline-flex;
+        align-items: center;
+        text-decoration: none;
+        padding: 0;
+      }
+
+      .nav-logo img {
+        height: 32px;
+        width: auto;
+        display: block;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 1.2rem;
+      }
+
+      .nav-links a {
+        text-decoration: none;
+        color: var(--ink-700);
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink-900);
+      }
+
+      .nav-cta {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.45rem 0.88rem;
+        border-radius: 10px;
+        color: #fff !important;
+        background: var(--ink-950);
+      }
+
+      .hero {
+        padding: 9rem 1rem 4.5rem;
+        position: relative;
+      }
+
+      .hero-layout {
+        max-width: 980px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: minmax(0, 1.18fr) minmax(0, 0.82fr);
+        align-items: center;
+        gap: 1.4rem;
+      }
+
+      .hero-copy {
+        text-align: left;
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: -1px;
+        height: 56px;
+        background: linear-gradient(to bottom, transparent, var(--page));
+        pointer-events: none;
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-size: clamp(2.15rem, 6vw, 4.4rem);
+        line-height: 1.07;
+        letter-spacing: -0.03em;
+        font-weight: 700;
+      }
+
+      .gradient {
+        background: linear-gradient(140deg, var(--sky-600), var(--teal-500));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .hero-features {
+        width: 100%;
+        max-width: 430px;
+        justify-self: end;
+        border-radius: 16px;
+        border: 1px solid var(--slate-200);
+        background: rgba(255, 255, 255, 0.8);
+        padding: 1rem 1.1rem;
+      }
+
+      .hero-features h3 {
+        margin: 0;
+        font-size: 0.82rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--ink-500);
+      }
+
+      .hero-feature-list {
+        list-style: none;
+        margin: 0.7rem 0 0;
+        padding: 0;
+        display: grid;
+        gap: 0.72rem;
+      }
+
+      .hero-feature-list li {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.58rem;
+        color: var(--ink-700);
+        font-size: 1rem;
+        line-height: 1.45;
+      }
+
+      .hero-feature-icon {
+        width: 1.3rem;
+        height: 1.3rem;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.75rem;
+        color: #fff;
+        background: linear-gradient(140deg, var(--sky-500), var(--teal-500));
+        flex: 0 0 auto;
+        margin-top: 0.08rem;
+      }
+
+      .hero-actions {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.72rem;
+        flex-wrap: wrap;
+      }
+
+      .hero-cta {
+        max-width: 980px;
+        margin: 1.1rem auto 0;
+      }
+
+      .btn-primary,
+      .btn-secondary {
+        text-decoration: none;
+        font-weight: 700;
+        border-radius: 11px;
+        padding: 0.78rem 1.25rem;
+        font-size: 0.95rem;
+        transition: transform 150ms ease, box-shadow 150ms ease;
+      }
+
+      .btn-primary:hover,
+      .btn-secondary:hover {
+        transform: translateY(-1px);
+      }
+
+      .btn-primary {
+        background: linear-gradient(130deg, var(--sky-600), var(--sky-500));
+        color: #fff;
+        box-shadow: 0 12px 22px rgba(31, 111, 224, 0.25);
+      }
+
+      .btn-secondary {
+        background: #fff;
+        color: var(--ink-900);
+        border: 1.5px solid var(--slate-300);
+      }
+
+      .install-bar {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.58rem;
+        margin-top: 1.35rem;
+        border-radius: 10px;
+        border: 0;
+        background: #0f1f33;
+        padding: 0.62rem 0.9rem;
+        color: #d7e4f2;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .install-bar:hover {
+        background: #172a42;
+      }
+
+      .install-bar:focus-visible {
+        outline: 2px solid var(--sky-500);
+        outline-offset: 2px;
+      }
+
+      .install-bar .prompt {
+        color: #4ade80;
+      }
+
+      .install-bar .hint {
+        color: #7e96b0;
+        font-size: 0.72rem;
+      }
+
+      .hero-install {
+        margin-top: 1.1rem;
+        display: flex;
+        justify-content: center;
+      }
+
+      .code-hero {
+        max-width: 860px;
+        margin: 2.7rem auto 0;
+        overflow: hidden;
+        border-radius: 16px;
+        box-shadow: var(--shadow);
+        text-align: left;
+        background: #0d1d32;
+      }
+
+      .code-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.38rem;
+        padding: 0.72rem 0.9rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        background: #132640;
+      }
+
+      .code-dot {
+        width: 11px;
+        height: 11px;
+        border-radius: 999px;
+      }
+
+      .code-dot.r {
+        background: #ff5f57;
+      }
+
+      .code-dot.y {
+        background: #febc2e;
+      }
+
+      .code-dot.g {
+        background: #28c840;
+      }
+
+      .code-fname {
+        margin-left: 0.45rem;
+        color: #93a9c3;
+        font-size: 0.75rem;
+      }
+
+      .code-hero pre {
+        margin: 0;
+        padding: 1.2rem;
+        overflow-x: auto;
+        font-size: 0.81rem;
+        line-height: 1.72;
+      }
+
+      .code-hero code {
+        color: #d8e4f1;
+      }
+
+      .kw {
+        color: #5cb2ff;
+      }
+
+      .fn {
+        color: #ffc978;
+      }
+
+      .str {
+        color: #67d19a;
+      }
+
+      .cm {
+        color: #7992ad;
+      }
+
+      section {
+        padding: 4.8rem 1rem;
+      }
+
+      .section-inner {
+        max-width: var(--max);
+        margin: 0 auto;
+      }
+
+      .section-label {
+        display: inline-block;
+        font-size: 0.76rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--sky-600);
+        margin-bottom: 0.6rem;
+      }
+
+      .section-title {
+        margin: 0;
+        font-size: clamp(1.7rem, 4vw, 2.45rem);
+        letter-spacing: -0.02em;
+      }
+
+      .section-desc {
+        margin: 0.85rem 0 2rem;
+        color: var(--ink-700);
+        max-width: 700px;
+      }
+
+      .how-section {
+        background: var(--slate-100);
+      }
+
+      .how-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.7rem;
+      }
+
+      .how-step {
+        background: #fff;
+        border: 1px solid var(--slate-200);
+        border-radius: var(--radius-md);
+        padding: 1rem;
+      }
+
+      .how-icon {
+        width: 50px;
+        height: 50px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.35rem;
+        margin-bottom: 0.75rem;
+      }
+
+      .how-step h4 {
+        margin: 0 0 0.3rem;
+        font-size: 0.96rem;
+      }
+
+      .how-step p {
+        margin: 0;
+        color: var(--ink-700);
+        font-size: 0.84rem;
+      }
+
+      .how-step code {
+        font-size: 0.72rem;
+        background: var(--slate-100);
+        border-radius: 5px;
+        padding: 0 0.35rem;
+      }
+
+      .features-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1rem;
+      }
+
+      .f-card {
+        background: #fff;
+        border: 1px solid var(--slate-200);
+        border-radius: var(--radius-md);
+        padding: 1.2rem;
+        transition: transform 150ms ease, box-shadow 150ms ease;
+      }
+
+      .f-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 12px 24px rgba(19, 35, 58, 0.09);
+      }
+
+      .f-icon {
+        width: 42px;
+        height: 42px;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.2rem;
+        margin-bottom: 0.7rem;
+      }
+
+      .f-card h3 {
+        margin: 0 0 0.35rem;
+        font-size: 0.98rem;
+      }
+
+      .f-card p {
+        margin: 0;
+        font-size: 0.86rem;
+        color: var(--ink-700);
+      }
+
+      .arch-section {
+        background: var(--slate-900);
+        color: #fff;
+      }
+
+      .arch-section .section-label {
+        color: var(--teal-400);
+      }
+
+      .arch-section .section-desc {
+        color: #b8c5d3;
+      }
+
+      .arch-visual {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+
+      .arch-box {
+        min-width: 190px;
+        text-align: center;
+        border-radius: var(--radius-md);
+        padding: 1.2rem 1.5rem;
+      }
+
+      .arch-box h4 {
+        margin: 0 0 0.2rem;
+        font-size: 0.93rem;
+      }
+
+      .arch-box p {
+        margin: 0;
+        color: #b4c4d7;
+        font-size: 0.78rem;
+      }
+
+      .arch-writer {
+        background: rgba(255, 190, 102, 0.12);
+        border: 1px solid rgba(255, 190, 102, 0.3);
+      }
+
+      .arch-writer h4 {
+        color: var(--amber-400);
+      }
+
+      .arch-bucket {
+        background: linear-gradient(140deg, rgba(47, 135, 255, 0.2), rgba(15, 178, 164, 0.14));
+        border: 1px solid rgba(47, 135, 255, 0.33);
+      }
+
+      .arch-bucket h4 {
+        color: #84bfff;
+      }
+
+      .arch-readers {
+        background: rgba(45, 196, 184, 0.12);
+        border: 1px solid rgba(45, 196, 184, 0.3);
+      }
+
+      .arch-readers h4 {
+        color: var(--teal-400);
+      }
+
+      .arch-arrow {
+        color: #7f95ad;
+        font-size: 1.5rem;
+      }
+
+      .arch-details {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 0.8rem;
+        margin-top: 1.4rem;
+      }
+
+      .arch-detail {
+        border-radius: 10px;
+        padding: 0.88rem;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .arch-detail h5 {
+        margin: 0 0 0.25rem;
+        color: #90c4ff;
+        font-size: 0.8rem;
+      }
+
+      .arch-detail p {
+        margin: 0;
+        color: #bbcadb;
+        font-size: 0.76rem;
+      }
+
+      .code-section {
+        background: var(--slate-100);
+      }
+
+      .code-tabs {
+        display: flex;
+        gap: 0;
+        border-bottom: 2px solid var(--slate-200);
+      }
+
+      .code-tab {
+        border: none;
+        background: none;
+        margin-bottom: -2px;
+        border-bottom: 2px solid transparent;
+        padding: 0.62rem 1rem;
+        font: inherit;
+        font-size: 0.84rem;
+        font-weight: 700;
+        color: var(--ink-500);
+        cursor: pointer;
+      }
+
+      .code-tab.active {
+        color: var(--sky-600);
+        border-bottom-color: var(--sky-600);
+      }
+
+      .code-panel {
+        display: none;
+        background: #0f2238;
+        border-radius: 0 0 var(--radius-md) var(--radius-md);
+        overflow: hidden;
+      }
+
+      .code-panel.active {
+        display: block;
+      }
+
+      .code-panel pre {
+        margin: 0;
+        padding: 1.2rem;
+        overflow-x: auto;
+        font-size: 0.81rem;
+        line-height: 1.68;
+      }
+
+      .code-panel code {
+        color: #d7e3ef;
+      }
+
+      .uc-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1rem;
+      }
+
+      .uc-card {
+        background: #fff;
+        border: 1px solid var(--slate-200);
+        border-radius: var(--radius-md);
+        padding: 1.2rem;
+      }
+
+      .uc-card .emoji {
+        font-size: 1.8rem;
+        margin-bottom: 0.5rem;
+      }
+
+      .uc-card h3 {
+        margin: 0 0 0.35rem;
+        font-size: 0.98rem;
+      }
+
+      .uc-card p {
+        margin: 0;
+        color: var(--ink-700);
+        font-size: 0.84rem;
+      }
+
+      .uc-card .replaces {
+        margin-top: 0.6rem;
+        color: var(--ink-500);
+        font-size: 0.76rem;
+      }
+
+      .fit-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+      }
+
+      .fit-card {
+        border-radius: var(--radius-md);
+        padding: 1.1rem;
+        border: 1px solid var(--slate-200);
+        background: #fff;
+      }
+
+      .fit-card h3 {
+        margin: 0 0 0.6rem;
+        font-size: 0.96rem;
+      }
+
+      .fit-card ul {
+        margin: 0;
+        padding-left: 1rem;
+      }
+
+      .fit-card li {
+        margin: 0.55rem 0;
+        color: var(--ink-700);
+        font-size: 0.84rem;
+      }
+
+      .fit-card.bad {
+        border-color: #fecaca;
+        background: #fff7f7;
+      }
+
+      .fit-card.good {
+        border-color: #bbf7d0;
+        background: #f3fff7;
+      }
+
+      .quote-section {
+        background: linear-gradient(150deg, #edf7ff, #eafbf8);
+        text-align: center;
+      }
+
+      .quote-block {
+        max-width: 740px;
+        margin: 0 auto;
+      }
+
+      .quote-block blockquote {
+        margin: 0 0 0.72rem;
+        font-size: 1.24rem;
+        font-style: italic;
+        color: var(--ink-900);
+      }
+
+      .quote-block cite {
+        color: var(--ink-500);
+        font-size: 0.86rem;
+        font-style: normal;
+      }
+
+      .cta {
+        text-align: center;
+        background: linear-gradient(to bottom, #fff, #edf6ff);
+      }
+
+      .cta h2 {
+        margin: 0;
+        font-size: clamp(1.9rem, 4vw, 3rem);
+        letter-spacing: -0.02em;
+      }
+
+      .cta p {
+        max-width: 620px;
+        margin: 0.9rem auto 1.5rem;
+        color: var(--ink-700);
+      }
+
+      .cta .hero-actions {
+        justify-content: center;
+      }
+
+      footer {
+        background: #0e1d30;
+        color: #b0c0d3;
+        padding: 3rem 1rem 2rem;
+      }
+
+      .footer-inner {
+        max-width: var(--max);
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 2fr 1fr 1fr;
+        gap: 1.4rem;
+      }
+
+      .footer-brand img {
+        height: 30px;
+      }
+
+      .footer-brand p {
+        margin: 0.7rem 0 0;
+        max-width: 300px;
+        font-size: 0.84rem;
+        color: #94aac2;
+      }
+
+      .footer-col h4 {
+        margin: 0 0 0.5rem;
+        font-size: 0.75rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #7f95ad;
+      }
+
+      .footer-col a {
+        display: block;
+        text-decoration: none;
+        color: #b0c0d3;
+        font-size: 0.85rem;
+        margin: 0.25rem 0;
+      }
+
+      .footer-col a:hover {
+        color: #fff;
+      }
+
+      .footer-bottom {
+        max-width: var(--max);
+        margin: 1.4rem auto 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        padding-top: 1rem;
+        font-size: 0.79rem;
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+
+      @media (max-width: 1000px) {
+        .hero-layout {
+          grid-template-columns: 1fr;
+          gap: 1rem;
+        }
+
+        .hero-copy {
+          text-align: center;
+        }
+
+        .hero-features {
+          justify-self: center;
+          max-width: 640px;
+        }
+
+        .how-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .footer-inner {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      @media (max-width: 900px) {
+        .fit-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .hero-feature-list li {
+          font-size: 0.95rem;
+        }
+
+        .nav-inner {
+          height: auto;
+          min-height: 66px;
+          align-items: flex-start;
+          padding: 0.55rem 1rem;
+        }
+
+        .nav-links {
+          flex-wrap: wrap;
+          justify-content: flex-end;
+          gap: 0.45rem 0.7rem;
+          max-width: 78%;
+        }
+
+        .nav-links a {
+          font-size: 0.82rem;
+        }
+
+        .nav-logo img {
+          height: 30px;
+        }
+
+        .hero {
+          padding-top: 8.4rem;
+        }
+
+        section {
+          padding: 3.6rem 1rem;
+        }
+
+        .how-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .arch-arrow {
+          transform: rotate(90deg);
+        }
+
+        .footer-inner {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <div class="nav-inner">
+        <a href="./" class="nav-logo" aria-label="IsleDB home">
+          <img src="isledb.svg" alt="IsleDB logo" />
+        </a>
+        <div class="nav-links">
+          <a href="#features">Features</a>
+          <a href="#architecture">Architecture</a>
+          <a href="https://github.com/ankur-anand/isledb/blob/main/api.md">API</a>
+          <a href="#use-cases">Use Cases</a>
+          <a href="https://github.com/ankur-anand/isledb" class="nav-cta">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <section class="hero">
+      <div class="hero-layout">
+        <div class="hero-copy">
+          <h1>
+            An island of data<br />
+            <span class="gradient">in an ocean of storage.</span>
+          </h1>
+        </div>
+        <aside class="hero-features" aria-label="Feature highlights">
+          <h3>Feature</h3>
+          <ul class="hero-feature-list">
+            <li>
+              <span class="hero-feature-icon" aria-hidden="true">☁</span>
+              <span>Object Storage Native</span>
+            </li>
+            <li>
+              <span class="hero-feature-icon" aria-hidden="true">⚙</span>
+              <span>Separate Writer + Compactor Process</span>
+            </li>
+            <li>
+              <span class="hero-feature-icon" aria-hidden="true">⇄</span>
+              <span>Horizontal Reader Scale</span>
+            </li>
+          </ul>
+        </aside>
+      </div>
+      <div class="hero-cta">
+        <div class="hero-actions">
+          <a href="https://github.com/ankur-anand/isledb" class="btn-primary">Get Started</a>
+          <a href="#architecture" class="btn-secondary">See Architecture</a>
+        </div>
+        <div class="hero-install">
+          <button
+            class="install-bar"
+            id="copy-install-btn"
+            type="button"
+            data-copy="go get github.com/ankur-anand/isledb"
+            aria-label="Copy go get command"
+          >
+            <span class="prompt">$</span>
+            <span class="cmd">go get github.com/ankur-anand/isledb</span>
+            <span class="hint">click to copy</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="code-hero">
+        <div class="code-bar">
+          <div class="code-dot r"></div>
+          <div class="code-dot y"></div>
+          <div class="code-dot g"></div>
+          <span class="code-fname">main.go</span>
+        </div>
+        <pre><code><span class="cm">// Connect to object storage</span>
+store, _ := blobstore.<span class="fn">Open</span>(ctx, <span class="str">"s3://my-bucket?region=us-east-1"</span>, <span class="str">"db1"</span>)
+db, _ := isledb.<span class="fn">OpenDB</span>(ctx, store, isledb.DBOptions{})
+
+<span class="cm">// Write</span>
+writer, _ := db.<span class="fn">OpenWriter</span>(ctx, isledb.<span class="fn">DefaultWriterOptions</span>())
+writer.<span class="fn">Put</span>([]<span class="kw">byte</span>(<span class="str">"hello"</span>), []<span class="kw">byte</span>(<span class="str">"world"</span>))
+writer.<span class="fn">Flush</span>(ctx)
+
+<span class="cm">// Read</span>
+reader, _ := isledb.<span class="fn">OpenReader</span>(ctx, store, isledb.ReaderOpenOptions{CacheDir: <span class="str">"./cache"</span>})
+val, ok, _ := reader.<span class="fn">Get</span>(ctx, []<span class="kw">byte</span>(<span class="str">"hello"</span>))
+
+<span class="cm">// Tail</span>
+tr, _ := isledb.<span class="fn">OpenTailingReader</span>(ctx, store, tailOpts)
+tr.<span class="fn">Tail</span>(ctx, opts, <span class="kw">func</span>(kv isledb.KV) <span class="kw">error</span> { <span class="kw">return</span> <span class="kw">nil</span> })</code></pre>
+      </div>
+    </section>
+
+    <section class="how-section" id="how">
+      <div class="section-inner">
+        <span class="section-label">How It Works</span>
+        <h2 class="section-title">LSM-tree ideas, adapted for object storage.</h2>
+        <p class="section-desc">
+          Memtable writes, immutable SST flushes, and reader-side caching provide predictable performance
+          while your bucket handles durability and scale.
+        </p>
+
+        <div class="how-grid">
+          <div class="how-step">
+            <div class="how-icon" style="background: var(--sky-100)">✎</div>
+            <h4>Put(key, value)</h4>
+            <p>Writes land in the memtable. Large values can be stored as blobs.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-icon" style="background: #fff4dc">⚡</div>
+            <h4>Flush(ctx)</h4>
+            <p>Memtable is flushed into immutable SST files on object storage.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-icon" style="background: #defaf6">☁</div>
+            <h4>S3 / GCS / Azure</h4>
+            <p>Capacity and durability scale with your bucket.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-icon" style="background: #e9f7ff">↠</div>
+            <h4>Tail(handler)</h4>
+            <p>Stream new writes continuously, like <code>tail -f</code> for data.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="section-inner">
+        <span class="section-label">Features</span>
+        <h2 class="section-title">Complete data building blocks in one Go library.</h2>
+        <p class="section-desc">
+          IsleDB combines write/read APIs, compaction strategies, streaming tailing readers, TTL, and fence-based ownership.
+        </p>
+
+        <div class="features-grid">
+          <div class="f-card">
+            <div class="f-icon" style="background: var(--sky-100)">☁</div>
+            <h3>Object Storage Native</h3>
+            <p>Use S3, GCS, Azure Blob, MinIO, or local object-compatible storage.</p>
+          </div>
+          <div class="f-card">
+            <div class="f-icon" style="background: #e8fbf9">↠</div>
+            <h3>Tailing Reader</h3>
+            <p>Continuously consume new writes via polling and ordered replay.</p>
+          </div>
+          <div class="f-card">
+            <div class="f-icon" style="background: #fff4dc">⇄</div>
+            <h3>Horizontal Readers</h3>
+            <p>Scale reads by adding more readers against the same prefix.</p>
+          </div>
+          <div class="f-card">
+            <div class="f-icon" style="background: #eef3ff">⚙</div>
+            <h3>Three Compaction Modes</h3>
+            <p>Merge compaction, age-based retention, and time-window retention.</p>
+          </div>
+          <div class="f-card">
+            <div class="f-icon" style="background: #e7f8ee">⏱</div>
+            <h3>Per-Key TTL</h3>
+            <p>Use TTL APIs to manage data lifetime without external schedulers.</p>
+          </div>
+          <div class="f-card">
+            <div class="f-icon" style="background: #ffecec">🔒</div>
+            <h3>Epoch Fencing</h3>
+            <p>Prevent split-brain writer/compactor ownership with manifest fencing.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="arch-section" id="architecture">
+      <div class="section-inner">
+        <span class="section-label">Architecture</span>
+        <h2 class="section-title">Writer → Object Storage → Readers</h2>
+        <p class="section-desc">
+          One writer flushes SSTs, many readers serve queries, and tailers stream changes.
+          Manifest fencing protects ownership during contention.
+        </p>
+
+        <div class="arch-visual">
+          <div class="arch-box arch-writer">
+            <h4>✎ Writer</h4>
+            <p>Memtable → SST → Upload</p>
+          </div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-box arch-bucket">
+            <h4>☁ Bucket</h4>
+            <p>SSTs + blobs + manifest</p>
+          </div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-box arch-readers">
+            <h4>🔎 Readers</h4>
+            <p>Get · Scan · Tail</p>
+          </div>
+        </div>
+
+        <div class="arch-details">
+          <div class="arch-detail">
+            <h5>Memtable</h5>
+            <p>Buffers writes to reduce object-store PUT overhead.</p>
+          </div>
+          <div class="arch-detail">
+            <h5>SST Files</h5>
+            <p>Immutable sorted files that support efficient reads.</p>
+          </div>
+          <div class="arch-detail">
+            <h5>Manifest Log</h5>
+            <p>Tracks applied state and replay ordering.</p>
+          </div>
+          <div class="arch-detail">
+            <h5>Local Cache</h5>
+            <p>Readers cache SST and blocks to avoid repeated downloads.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="code-section" id="code">
+      <div class="section-inner">
+        <span class="section-label">Code</span>
+        <h2 class="section-title">Core flow in a few tabs.</h2>
+        <p class="section-desc">Core usage patterns in a compact view.</p>
+
+        <div class="code-tabs" role="tablist" aria-label="Code examples">
+          <button
+            class="code-tab active"
+            id="tab-btn-connect"
+            role="tab"
+            aria-selected="true"
+            aria-controls="tab-connect"
+            tabindex="0"
+            data-tab="connect"
+            type="button"
+          >
+            Connect
+          </button>
+          <button
+            class="code-tab"
+            id="tab-btn-write"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tab-write"
+            tabindex="-1"
+            data-tab="write"
+            type="button"
+          >
+            Write
+          </button>
+          <button
+            class="code-tab"
+            id="tab-btn-read"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tab-read"
+            tabindex="-1"
+            data-tab="read"
+            type="button"
+          >
+            Read
+          </button>
+          <button
+            class="code-tab"
+            id="tab-btn-tail"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tab-tail"
+            tabindex="-1"
+            data-tab="tail"
+            type="button"
+          >
+            Tail
+          </button>
+          <button
+            class="code-tab"
+            id="tab-btn-compact"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tab-compact"
+            tabindex="-1"
+            data-tab="compact"
+            type="button"
+          >
+            Compact
+          </button>
+        </div>
+
+        <div class="code-panel active" id="tab-connect" role="tabpanel" aria-labelledby="tab-btn-connect">
+          <pre><code>ctx := context.<span class="fn">Background</span>()
+store, err := blobstore.<span class="fn">Open</span>(ctx, <span class="str">"s3://my-bucket?region=us-east-1"</span>, <span class="str">"db1"</span>)
+db, err := isledb.<span class="fn">OpenDB</span>(ctx, store, isledb.DBOptions{})
+<span class="kw">defer</span> db.<span class="fn">Close</span>()</code></pre>
+        </div>
+
+        <div class="code-panel" id="tab-write" role="tabpanel" aria-labelledby="tab-btn-write" hidden>
+          <pre><code>writer, _ := db.<span class="fn">OpenWriter</span>(ctx, isledb.<span class="fn">DefaultWriterOptions</span>())
+<span class="kw">defer</span> writer.<span class="fn">Close</span>()
+writer.<span class="fn">Put</span>([]<span class="kw">byte</span>(<span class="str">"k"</span>), []<span class="kw">byte</span>(<span class="str">"v"</span>))
+writer.<span class="fn">PutWithTTL</span>([]<span class="kw">byte</span>(<span class="str">"session"</span>), data, 24*time.Hour)
+writer.<span class="fn">Flush</span>(ctx)</code></pre>
+        </div>
+
+        <div class="code-panel" id="tab-read" role="tabpanel" aria-labelledby="tab-btn-read" hidden>
+          <pre><code>reader, _ := isledb.<span class="fn">OpenReader</span>(ctx, store, isledb.ReaderOpenOptions{CacheDir: <span class="str">"./cache"</span>})
+<span class="kw">defer</span> reader.<span class="fn">Close</span>()
+value, ok, _ := reader.<span class="fn">Get</span>(ctx, []<span class="kw">byte</span>(<span class="str">"k"</span>))
+rows, _ := reader.<span class="fn">Scan</span>(ctx, []<span class="kw">byte</span>(<span class="str">"a"</span>), []<span class="kw">byte</span>(<span class="str">"z"</span>))</code></pre>
+        </div>
+
+        <div class="code-panel" id="tab-tail" role="tabpanel" aria-labelledby="tab-btn-tail" hidden>
+          <pre><code>tr, _ := isledb.<span class="fn">OpenTailingReader</span>(ctx, store, isledb.TailingReaderOpenOptions{})
+<span class="kw">defer</span> tr.<span class="fn">Close</span>()
+_ = tr.<span class="fn">Start</span>()
+_ = tr.<span class="fn">Tail</span>(ctx, isledb.TailOptions{}, <span class="kw">func</span>(kv isledb.KV) <span class="kw">error</span> {
+  <span class="kw">return</span> <span class="kw">nil</span>
+})</code></pre>
+        </div>
+
+        <div class="code-panel" id="tab-compact" role="tabpanel" aria-labelledby="tab-btn-compact" hidden>
+          <pre><code><span class="cm">// Merge compactor for KV workloads</span>
+mergeCompactor, _ := db.<span class="fn">OpenCompactor</span>(ctx, isledb.<span class="fn">DefaultCompactorOptions</span>())
+mergeCompactor.<span class="fn">Start</span>()
+
+<span class="cm">// FIFO compactor for event streams (keep recent data)</span>
+fifoCompactor, _ := db.<span class="fn">OpenRetentionCompactor</span>(ctx, isledb.RetentionCompactorOptions{
+  Mode:            isledb.CompactByAge,
+  RetentionPeriod: 7 * 24 * time.Hour,
+  RetentionCount:  10,
+})
+fifoCompactor.<span class="fn">Start</span>()</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="use-cases">
+      <div class="section-inner">
+        <span class="section-label">Use Cases</span>
+        <h2 class="section-title">One library, many workloads.</h2>
+        <p class="section-desc">
+          The same storage and replay model can power event ingestion, state materialization,
+          key-value APIs, and object-storage-first data pipelines.
+        </p>
+
+        <div class="uc-grid">
+          <div class="uc-card">
+            <div class="emoji">📨</div>
+            <h3>Event Hub</h3>
+            <p>Ingest app events and fan out with tailing readers.</p>
+            <div class="replaces">Common alternative: managed brokers + sinks.</div>
+          </div>
+          <div class="uc-card">
+            <div class="emoji">📚</div>
+            <h3>Event Store</h3>
+            <p>Append ordered events and build projections from replay.</p>
+            <div class="replaces">Common alternative: dedicated event databases.</div>
+          </div>
+          <div class="uc-card">
+            <div class="emoji">🔑</div>
+            <h3>KV API Backing Store</h3>
+            <p>Serve Get/Scan workloads with object-store durability.</p>
+            <div class="replaces">Common alternative: managed key-value services.</div>
+          </div>
+          <div class="uc-card">
+            <div class="emoji">📈</div>
+            <h3>CDC Pipeline Buffer</h3>
+            <p>Stage changes in object storage before indexing and analytics.</p>
+            <div class="replaces">Common alternative: Kafka-centric pipelines.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="fit">
+      <div class="section-inner">
+        <span class="section-label">Decision Guide</span>
+        <h2 class="section-title">When not to use IsleDB</h2>
+        <p class="section-desc">
+          Pick the right tool for the workload. IsleDB is strongest in object-storage-first, append-heavy systems.
+        </p>
+
+        <div class="fit-grid">
+          <article class="fit-card bad">
+            <h3>❌ Better choices elsewhere</h3>
+            <ul>
+              <li><strong>Sub-10ms latency SLAs</strong><br />→ Use low-latency serving data stores</li>
+              <li><strong>High-frequency point updates to same keys</strong><br />→ Use update-optimized transactional stores</li>
+              <li><strong>Complex queries / joins / transactions</strong><br />→ Use relational transactional databases</li>
+              <li><strong>Small hot datasets (&lt;1GB)</strong><br />→ Use in-memory stores</li>
+            </ul>
+          </article>
+
+          <article class="fit-card good">
+            <h3>✅ Strong fit for IsleDB</h3>
+            <ul>
+              <li>Append-heavy workloads (logs, events, CDC)</li>
+              <li>Large datasets where 1–10 second read latency is acceptable</li>
+              <li>Multi-reader / fan-out architectures</li>
+              <li>Cost-sensitive storage at scale</li>
+              <li>Serverless / ephemeral compute</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="quote-section">
+      <div class="section-inner">
+        <div class="quote-block">
+          <blockquote>
+            "An isle is self-contained, durable, and reachable from anywhere. That's the model for your data on IsleDB."
+          </blockquote>
+          <cite>IsleDB philosophy — an island of data in an ocean of storage.</cite>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta">
+      <h2>Start with a bucket. Build anything.</h2>
+      <p>
+        One <code>go get</code>, one bucket prefix, and a pragmatic API surface for write, read, replay, and stream.
+      </p>
+      <div class="hero-actions">
+        <a href="https://github.com/ankur-anand/isledb" class="btn-primary">View on GitHub</a>
+        <a href="https://github.com/ankur-anand/isledb/blob/main/api.md" class="btn-secondary"
+          >Read the API</a
+        >
+      </div>
+    </section>
+
+    <footer>
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <img src="isledb.svg" alt="IsleDB logo" />
+          <p>An embedded key-value engine for object storage.</p>
+        </div>
+        <div class="footer-col">
+          <h4>Product</h4>
+          <a href="#features">Features</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#code">Code</a>
+          <a href="#use-cases">Use Cases</a>
+        </div>
+        <div class="footer-col">
+          <h4>Community</h4>
+          <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+          <a href="https://github.com/ankur-anand/isledb/blob/main/README.md">Documentation</a>
+          <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 IsleDB. Open source · MIT License.</span>
+        <span>Built by <a href="https://github.com/ankur-anand" style="color: #bcd0e6">@ankur-anand</a></span>
+      </div>
+    </footer>
+
+    <script>
+      const tabs = Array.from(document.querySelectorAll(".code-tab"));
+      const panels = Array.from(document.querySelectorAll(".code-panel"));
+
+      function activateTab(tab) {
+        const target = tab.getAttribute("data-tab");
+        tabs.forEach((t) => {
+          const active = t === tab;
+          t.classList.toggle("active", active);
+          t.setAttribute("aria-selected", active ? "true" : "false");
+          t.setAttribute("tabindex", active ? "0" : "-1");
+        });
+
+        panels.forEach((panel) => {
+          const active = panel.id === `tab-${target}`;
+          panel.classList.toggle("active", active);
+          panel.hidden = !active;
+        });
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => activateTab(tab));
+        tab.addEventListener("keydown", (event) => {
+          const currentIndex = tabs.indexOf(tab);
+          if (currentIndex === -1) {
+            return;
+          }
+
+          let nextIndex = currentIndex;
+          if (event.key === "ArrowRight") {
+            nextIndex = (currentIndex + 1) % tabs.length;
+          } else if (event.key === "ArrowLeft") {
+            nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+          } else if (event.key === "Home") {
+            nextIndex = 0;
+          } else if (event.key === "End") {
+            nextIndex = tabs.length - 1;
+          } else {
+            return;
+          }
+
+          event.preventDefault();
+          tabs[nextIndex].focus();
+          activateTab(tabs[nextIndex]);
+        });
+      });
+
+      if (tabs.length > 0) {
+        const initialTab = tabs.find((tab) => tab.classList.contains("active")) || tabs[0];
+        activateTab(initialTab);
+      }
+
+      const copyInstallBtn = document.getElementById("copy-install-btn");
+      if (copyInstallBtn) {
+        const copyHint = copyInstallBtn.querySelector(".hint");
+        const defaultHint = copyHint ? copyHint.textContent : "";
+
+        copyInstallBtn.addEventListener("click", async () => {
+          const copyText = copyInstallBtn.getAttribute("data-copy") || "";
+          let copied = false;
+
+          try {
+            if (navigator.clipboard && window.isSecureContext) {
+              await navigator.clipboard.writeText(copyText);
+              copied = true;
+            } else {
+              const tempInput = document.createElement("textarea");
+              tempInput.value = copyText;
+              tempInput.setAttribute("readonly", "");
+              tempInput.style.position = "fixed";
+              tempInput.style.top = "-1000px";
+              tempInput.style.opacity = "0";
+              document.body.appendChild(tempInput);
+              tempInput.select();
+              copied = document.execCommand("copy");
+              document.body.removeChild(tempInput);
+            }
+          } catch (_err) {
+            copied = false;
+          }
+
+          if (copyHint) {
+            copyHint.textContent = copied ? "copied" : "copy failed";
+            window.setTimeout(() => {
+              copyHint.textContent = defaultHint;
+            }, 1400);
+          }
+        });
+      }
+    </script>
+  </body>
+</html>
