@@ -31,6 +31,34 @@ minimize re-downloads—so read capacity scales horizontally without replicas.
 
 <img src="docs/isledb_arch.png" alt="isledb architecture">
 
+### Use Cases
+
+One library, many workloads. The same storage and replay model can power event ingestion, state materialization, key-value APIs, and object-storage-first data pipelines.
+
+- **Event Hub** — Ingest app events and fan out with tailing readers. *Common alternative: managed brokers + sinks.*
+- **Event Store** — Append ordered events and build projections from replay. *Common alternative: dedicated event databases.*
+- **KV API Backing Store** — Serve Get/Scan workloads with object-store durability. *Common alternative: managed key-value services.*
+- **CDC Pipeline Buffer** — Stage changes in object storage before indexing and analytics.
+
+### When not to use IsleDB
+
+Pick the right tool for the workload. IsleDB is strongest in object-storage-first, append-heavy systems.
+
+#### Strong fit for IsleDB
+
+- Append-heavy workloads (logs, events, CDC)
+- Large datasets where 1-10 second read latency is acceptable
+- Multi-reader / fan-out architectures
+- Cost-sensitive storage at scale
+- Serverless / ephemeral compute
+
+#### Better choices elsewhere
+
+- **Sub-10ms latency SLAs** → Use low-latency serving data stores
+- **High-frequency point updates to same keys** → Use update-optimized transactional stores
+- **Complex queries / joins / transactions** → Use relational transactional databases
+- **Small hot datasets (<1GB)** → Use in-memory stores
+
 ### Full API Reference
 
 [API-Reference](api.md)
