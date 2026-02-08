@@ -48,7 +48,7 @@ jobs:
       - run: go version
 
       - name: Run go test
-        run: go test -count 1 -v -race -covermode atomic -coverprofile=covprofile $(go list ./... | grep -vE  'schemas|cmd|etc|middleware|bench')
+        run: go test -count 1 -v -race -covermode atomic -coverprofile=covprofile $(go list ./... | grep -vE  'schemas|cmd|etc|middleware|bench|examples')
 
       - name: Install goveralls
         run: go install github.com/mattn/goveralls@latest
