@@ -220,3 +220,4 @@ retention.Start()
 ### Examples
 - `examples/kvfile`: local file-backed KV usage with writer/reader/tailer.
 - `examples/walazblob`: WAL-style event stream on Azurite/Azure Blob (tailing events).
+- `examples/eventhub-minio`: separate producer/consumer event hub demo on MinIO (S3 API).
