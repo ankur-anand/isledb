@@ -28,6 +28,8 @@ type WriterOptions struct {
 	OnFlushError func(error)
 	ValueStorage config.ValueStorageConfig
 	OwnerID      string
+
+	Metrics *WriterMetrics
 }
 
 func DefaultWriterOptions() WriterOptions {

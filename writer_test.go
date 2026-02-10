@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
@@ -260,8 +262,8 @@ func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
 	t.Fatalf("expected ErrBackpressure from deletes")
 }
 
-func TestWriter_PutBlobWriteFailureDoesNotAdvanceSeq(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestWriter_PutBlobWriteFailureLeavesSequenceHole(t *testing.T) {
+	ctx := context.Background()
 	store := blobstore.NewMemory("writer-putblob-seq-rollback")
 	defer store.Close()
 
@@ -278,13 +280,146 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSeq(t *testing.T) {
 	defer w.close()
 
 	seqBefore := w.seq
+	blobCtx, cancel := context.WithCancel(context.Background())
 	cancel()
+	w.ctx = blobCtx
 
 	err = w.put([]byte("k"), []byte("v"))
 	if err == nil {
-		t.Fatalf("expected put blob error with canceled context")
+		t.Fatalf("expected put blob error with canceled blob write context")
 	}
-	if w.seq != seqBefore {
-		t.Fatalf("blob write error should not advance seq: before=%d after=%d", seqBefore, w.seq)
+	if w.seq != seqBefore+1 {
+		t.Fatalf("blob write error should leave a sequence hole: before=%d after=%d", seqBefore, w.seq)
+	}
+}
+
+func TestWriter_OpenContextCancellationDoesNotBlockWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := blobstore.NewMemory("writer-open-context-cancel")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.FlushInterval = 0
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	cancel()
+
+	if err := w.put([]byte("k-inline"), []byte("v")); err != nil {
+		t.Fatalf("put inline after opening ctx cancel: %v", err)
+	}
+	if err := w.delete([]byte("k-inline")); err != nil {
+		t.Fatalf("delete after opening ctx cancel: %v", err)
+	}
+	w.valueConfig.BlobThreshold = 1
+	if err := w.put([]byte("k-blob"), []byte("b")); err != nil {
+		t.Fatalf("put blob after opening ctx cancel: %v", err)
+	}
+}
+
+func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-partial-metrics")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.FlushInterval = 0
+	opts.MemtableSize = 512
+	opts.MaxImmutableMemtables = 1
+	opts.Metrics = &WriterMetrics{}
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	val := bytes.Repeat([]byte("v"), 128)
+	lastErr := error(nil)
+	for i := 0; i < 10000; i++ {
+		lastErr = w.put([]byte(fmt.Sprintf("k%06d", i)), val)
+		if errors.Is(lastErr, ErrBackpressure) {
+			break
+		}
+		if lastErr != nil {
+			t.Fatalf("put %d: %v", i, lastErr)
+		}
+	}
+	if !errors.Is(lastErr, ErrBackpressure) {
+		t.Fatalf("expected ErrBackpressure, got %v", lastErr)
+	}
+
+	if err := w.delete([]byte("k-final")); err != nil && !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
+func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-metrics-coverage")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.FlushInterval = 0
+	opts.ValueStorage.BlobThreshold = 1
+	opts.Metrics = DefaultWriterMetrics(nil)
+
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	blobValue := []byte("blob-value")
+	if err := w.putWithTTL([]byte("k1"), blobValue, time.Second); err != nil {
+		t.Fatalf("putWithTTL success: %v", err)
+	}
+	if err := w.putWithTTL(nil, []byte("bad"), time.Second); err == nil {
+		t.Fatalf("expected putWithTTL error for empty key")
+	}
+	if err := w.deleteWithTTL([]byte("k1"), time.Second); err != nil {
+		t.Fatalf("deleteWithTTL: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	metrics := opts.Metrics
+	if got := testutil.ToFloat64(metrics.PutTotal); got != 2 {
+		t.Fatalf("put_total mismatch: got %v want 2", got)
+	}
+	if got := testutil.ToFloat64(metrics.PutErrors); got != 1 {
+		t.Fatalf("put_errors_total mismatch: got %v want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.PutBlobTotal); got != 1 {
+		t.Fatalf("put_blob_total mismatch: got %v want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.PutBlobErrors); got != 0 {
+		t.Fatalf("put_blob_errors_total mismatch: got %v want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlobBytesTotal); got != float64(len(blobValue)) {
+		t.Fatalf("blob_bytes_total mismatch: got %v want %d", got, len(blobValue))
+	}
+	if got := testutil.ToFloat64(metrics.DeleteTotal); got != 1 {
+		t.Fatalf("delete_total mismatch: got %v want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.FlushTotal); got != 1 {
+		t.Fatalf("flush_total mismatch: got %v want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.FlushErrors); got != 0 {
+		t.Fatalf("flush_errors mismatch: got %v want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.FlushBytes); got <= 0 {
+		t.Fatalf("flush_bytes_total must be > 0, got %v", got)
 	}
 }

@@ -42,7 +42,8 @@ type writer struct {
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
 
-	closed atomic.Bool
+	closed  atomic.Bool
+	metrics *WriterMetrics
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
@@ -74,13 +75,14 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		manifestLog:             manifestLog,
 		opts:                    opts,
 		valueConfig:             valueConfig,
-		ctx:                     ctx,
+		ctx:                     context.Background(),
 		memtable:                internal.NewMemtable(opts.MemtableSize*2, memtableInlineThreshold),
 		memtableInlineThreshold: memtableInlineThreshold,
 		seq:                     m.MaxSeqNum(),
 		epoch:                   m.NextEpoch,
 		blobStorage:             internal.NewBlobStorage(store, valueConfig),
 		stopCh:                  make(chan struct{}),
+		metrics:                 opts.Metrics,
 	}
 
 	ownerID := opts.OwnerID
@@ -106,7 +108,11 @@ func (w *writer) put(key, value []byte) error {
 	return w.putWithTTL(key, value, 0)
 }
 
-func (w *writer) putWithTTL(key, value []byte, ttl time.Duration) error {
+func (w *writer) putWithTTL(key, value []byte, ttl time.Duration) (err error) {
+	defer func() {
+		w.metrics.ObservePut(err)
+	}()
+
 	if w.closed.Load() {
 		return errors.New("writer closed")
 	}
@@ -148,7 +154,12 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 	return nil
 }
 
-func (w *writer) putBlob(key, value []byte, expireAt int64) error {
+func (w *writer) putBlob(key, value []byte, expireAt int64) (err error) {
+	start := time.Now()
+	defer func() {
+		w.metrics.ObservePutBlob(len(value), time.Since(start), err)
+	}()
+
 	ctx := w.ctx
 
 	w.mu.Lock()
@@ -163,19 +174,11 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) error {
 
 	blobID, err := w.blobStorage.Write(ctx, value)
 	if err != nil {
-		w.mu.Lock()
-		if w.seq == seq {
-			w.seq--
-		}
-		w.mu.Unlock()
 		return fmt.Errorf("write blob: %w", err)
 	}
 
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
-		if w.seq == seq {
-			w.seq--
-		}
 		w.mu.Unlock()
 		_ = w.blobStorage.Delete(ctx, blobID)
 		return err
@@ -190,6 +193,8 @@ func (w *writer) delete(key []byte) error {
 }
 
 func (w *writer) deleteWithTTL(key []byte, ttl time.Duration) error {
+	w.metrics.ObserveDelete()
+
 	if w.closed.Load() {
 		return errors.New("writer closed")
 	}
@@ -227,6 +232,7 @@ func (w *writer) ensureCapacityLocked() error {
 		return nil
 	}
 	if w.opts.MaxImmutableMemtables > 0 && len(w.immQueue) >= w.opts.MaxImmutableMemtables {
+		w.metrics.ObserveBackpressure()
 		return ErrBackpressure
 	}
 	if w.memtable.ApproxSize() > 0 {
@@ -254,7 +260,10 @@ func (w *writer) flush(ctx context.Context) error {
 	w.mu.Unlock()
 
 	for i, mt := range toFlush {
-		if err := w.flushMemtable(ctx, mt); err != nil {
+		start := time.Now()
+		err := w.flushMemtable(ctx, mt)
+		w.metrics.ObserveFlush(time.Since(start), err)
+		if err != nil {
 			if errors.Is(err, ErrEmptyIterator) {
 				continue
 			}
@@ -304,7 +313,10 @@ func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error
 		}
 		return fmt.Errorf("update manifest: %w", appendErr)
 	}
+	w.metrics.ObserveFlushBytes(result.Meta.Size)
 
+	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", result.Meta.ID,
+		"size", result.Meta.Size, "epoch", epoch)
 	return nil
 }
 
@@ -314,15 +326,16 @@ func (w *writer) flushLoop() {
 		select {
 		case <-w.flushTicker.C:
 			if err := w.flush(context.Background()); err != nil {
-
 				if isFenceError(err) {
-					slog.Error("isledb: writer fenced, stopping background flush")
+					slog.Error("isledb: writer fenced, stopping background flush",
+						"component", "writer", "epoch", w.epoch)
 					return
 				}
 				if w.opts.OnFlushError != nil {
 					w.opts.OnFlushError(err)
 				} else {
-					slog.Error("isledb: background flush failed", "error", err)
+					slog.Error("isledb: background flush failed",
+						"component", "writer", "error", err)
 				}
 			}
 		case <-w.stopCh:

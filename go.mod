@@ -15,6 +15,7 @@ require (
 	github.com/dgraph-io/badger/v4 v4.9.0
 	github.com/fsouza/fake-gcs-server v1.53.1
 	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3
+	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.19.0
 	google.golang.org/api v0.264.0
@@ -92,7 +93,6 @@ require (
 	github.com/pkg/xattr v0.4.12 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
