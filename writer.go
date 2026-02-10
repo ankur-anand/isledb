@@ -104,6 +104,16 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 	return w, nil
 }
 
+func (w *writer) ensureWritable() error {
+	if w.closed.Load() {
+		return errors.New("writer closed")
+	}
+	if w.fenced.Load() {
+		return manifest.ErrFenced
+	}
+	return nil
+}
+
 func (w *writer) put(key, value []byte) error {
 	return w.putWithTTL(key, value, 0)
 }
@@ -113,11 +123,8 @@ func (w *writer) putWithTTL(key, value []byte, ttl time.Duration) (err error) {
 		w.metrics.ObservePut(err)
 	}()
 
-	if w.closed.Load() {
-		return errors.New("writer closed")
-	}
-	if w.fenced.Load() {
-		return manifest.ErrFenced
+	if err := w.ensureWritable(); err != nil {
+		return err
 	}
 
 	if len(key) == 0 {
@@ -195,11 +202,8 @@ func (w *writer) delete(key []byte) error {
 func (w *writer) deleteWithTTL(key []byte, ttl time.Duration) error {
 	w.metrics.ObserveDelete()
 
-	if w.closed.Load() {
-		return errors.New("writer closed")
-	}
-	if w.fenced.Load() {
-		return manifest.ErrFenced
+	if err := w.ensureWritable(); err != nil {
+		return err
 	}
 
 	if len(key) == 0 {
