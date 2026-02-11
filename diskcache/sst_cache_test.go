@@ -115,3 +115,30 @@ func TestSSTCache_SetFromFile(t *testing.T) {
 	_, err = os.Stat(localPath)
 	require.NoError(t, err)
 }
+
+func TestSSTCache_EvictOldest_SkipsStaleListNode(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewSSTCache(SSTCacheOptions{
+		Dir:     dir,
+		MaxSize: 60,
+	})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	require.NoError(t, cache.Set("k1", make([]byte, 30)))
+	require.NoError(t, cache.Set("k2", make([]byte, 30)))
+
+	sc := cache.(*sstCache)
+	sc.mu.Lock()
+	sc.order.PushFront("stale-key")
+	sc.mu.Unlock()
+
+	require.NoError(t, cache.Set("k3", make([]byte, 30)))
+
+	stats := cache.Stats()
+	require.LessOrEqual(t, stats.Size, int64(60), "cache should still respect max size")
+
+	_, ok := cache.Get("k3")
+	require.True(t, ok, "newly inserted key should exist")
+}
