@@ -53,8 +53,21 @@ jobs:
       - name: Install goveralls
         run: go install github.com/mattn/goveralls@latest
 
-      - name: Install goveralls
-        run: go install github.com/mattn/goveralls@latest
+      - name: Configure Coveralls fail-on-drop threshold
+        if: ${{ secrets.COVERALLS_API_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          COVERALLS_API_TOKEN: ${{ secrets.COVERALLS_API_TOKEN }}
+          COVERALLS_OWNER: ${{ github.repository_owner }}
+          COVERALLS_REPO: ${{ github.event.repository.name }}
+        run: |
+          curl --fail --show-error --silent \
+            -X PUT \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: token ${COVERALLS_API_TOKEN}" \
+            -d '{"repo":{"commit_status_fail_change_threshold":10}}' \
+            "https://coveralls.io/api/repos/github/${COVERALLS_OWNER}/${COVERALLS_REPO}"
 
       - name: Send coverage
         continue-on-error: true
