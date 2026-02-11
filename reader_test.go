@@ -9,6 +9,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) writeSSTResult {
@@ -497,5 +498,272 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 
 	if _, ok := reader.sstCache.Get(path); ok {
 		t.Fatalf("expected sst cache entry removed after iterator close")
+	}
+}
+
+func TestReader_MetricsGetScanRefresh(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-metrics")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriter(ctx, "reader-metrics-writer"); err != nil {
+		t.Fatalf("claim writer fence: %v", err)
+	}
+
+	l1Entries := []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-a")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-c")},
+		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-d")},
+	}
+	writeTestSST(t, ctx, store, ms, l1Entries, 1, 1)
+
+	l0Entries := []internal.MemEntry{
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-b")},
+	}
+	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir: t.TempDir(),
+		Metrics:  metrics,
+	})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	if _, found, err := reader.Get(ctx, []byte("b")); err != nil || !found {
+		t.Fatalf("Get hit failed: found=%v err=%v", found, err)
+	}
+	if _, found, err := reader.Get(ctx, []byte("missing")); err != nil || found {
+		t.Fatalf("Get miss failed: found=%v err=%v", found, err)
+	}
+	if _, _, err := reader.Get(ctx, nil); err == nil {
+		t.Fatalf("expected Get error for empty key")
+	}
+
+	results, err := reader.Scan(ctx, []byte("a"), []byte("d"))
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("unexpected Scan result count: got=%d want=4", len(results))
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := reader.Scan(cancelCtx, []byte("a"), []byte("d")); err == nil {
+		t.Fatalf("expected Scan error with canceled context")
+	}
+
+	results, err = reader.ScanLimit(ctx, []byte("a"), []byte("d"), 2)
+	if err != nil {
+		t.Fatalf("ScanLimit: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("unexpected ScanLimit result count: got=%d want=2", len(results))
+	}
+
+	if _, err := reader.ScanLimit(cancelCtx, []byte("a"), []byte("d"), 2); err == nil {
+		t.Fatalf("expected ScanLimit error with canceled context")
+	}
+
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.GetTotal); got != 3 {
+		t.Fatalf("get_total mismatch: got=%v want=3", got)
+	}
+	if got := testutil.ToFloat64(metrics.GetHits); got != 1 {
+		t.Fatalf("get_hits_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.GetMisses); got != 1 {
+		t.Fatalf("get_misses_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.GetErrors); got != 1 {
+		t.Fatalf("get_errors_total mismatch: got=%v want=1", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.ScanTotal); got != 2 {
+		t.Fatalf("scan_total mismatch: got=%v want=2", got)
+	}
+	if got := testutil.ToFloat64(metrics.ScanErrors); got != 1 {
+		t.Fatalf("scan_errors_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ScanResults); got != 4 {
+		t.Fatalf("scan_results_total mismatch: got=%v want=4", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.ScanLimitTotal); got != 2 {
+		t.Fatalf("scan_limit_total mismatch: got=%v want=2", got)
+	}
+	if got := testutil.ToFloat64(metrics.ScanLimitErrors); got != 1 {
+		t.Fatalf("scan_limit_errors_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ScanLimitResults); got != 2 {
+		t.Fatalf("scan_limit_results_total mismatch: got=%v want=2", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.RefreshTotal); got != 1 {
+		t.Fatalf("refresh_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.RefreshErrors); got != 0 {
+		t.Fatalf("refresh_errors_total mismatch: got=%v want=0", got)
+	}
+}
+
+func TestReader_MetricsBlobFetch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-metrics-blob")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	wOpts.ValueStorage.BlobThreshold = 1
+
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	blobValue := []byte("blob-value")
+	if err := w.put([]byte("blob-key"), blobValue); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir: t.TempDir(),
+		Metrics:  metrics,
+	})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	got, found, err := reader.Get(ctx, []byte("blob-key"))
+	if err != nil || !found {
+		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, blobValue) {
+		t.Fatalf("Get #1 value mismatch: got=%q want=%q", got, blobValue)
+	}
+
+	got, found, err = reader.Get(ctx, []byte("blob-key"))
+	if err != nil || !found {
+		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, blobValue) {
+		t.Fatalf("Get #2 value mismatch: got=%q want=%q", got, blobValue)
+	}
+
+	if got := testutil.ToFloat64(metrics.BlobFetchTotal); got != 2 {
+		t.Fatalf("blob_fetch_total mismatch: got=%v want=2", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlobFetchErrors); got != 0 {
+		t.Fatalf("blob_fetch_errors_total mismatch: got=%v want=0", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlobCacheHits); got != 1 {
+		t.Fatalf("blob_cache_hits_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlobCacheMisses); got != 1 {
+		t.Fatalf("blob_cache_misses_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.BlobBytesTotal); got != float64(len(blobValue)*2) {
+		t.Fatalf("blob_bytes_total mismatch: got=%v want=%d", got, len(blobValue)*2)
+	}
+}
+
+func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-metrics-sst-cache")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+	}
+	_ = writeTestSST(t, ctx, store, ms, entries, 0, 1)
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir: t.TempDir(),
+		Metrics:  metrics,
+	})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	if _, found, err := reader.Get(ctx, []byte("k")); err != nil || !found {
+		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
+	}
+	if _, found, err := reader.Get(ctx, []byte("k")); err != nil || !found {
+		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
+	}
+
+	if got := testutil.ToFloat64(metrics.SSTCacheMisses); got != 1 {
+		t.Fatalf("sst_cache_misses_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTCacheHits); got != 1 {
+		t.Fatalf("sst_cache_hits_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTDownloadTotal); got != 1 {
+		t.Fatalf("sst_download_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTDownloadErrors); got != 0 {
+		t.Fatalf("sst_download_errors_total mismatch: got=%v want=0", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTDownloadBytes); got <= 0 {
+		t.Fatalf("sst_download_bytes_total must be > 0, got=%v", got)
+	}
+}
+
+func TestReader_MetricsSSTDownloadError(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-metrics-sst-download-error")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	entries := []internal.MemEntry{
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+	}
+	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
+	if err := store.Delete(ctx, store.SSTPath(res.Meta.ID)); err != nil {
+		t.Fatalf("delete sst: %v", err)
+	}
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, ReaderOptions{
+		CacheDir: t.TempDir(),
+		Metrics:  metrics,
+	})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	if _, _, err := reader.Get(ctx, []byte("k")); err == nil {
+		t.Fatalf("expected Get error with missing sst object")
+	}
+
+	if got := testutil.ToFloat64(metrics.SSTCacheMisses); got != 1 {
+		t.Fatalf("sst_cache_misses_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTCacheHits); got != 0 {
+		t.Fatalf("sst_cache_hits_total mismatch: got=%v want=0", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTDownloadTotal); got != 1 {
+		t.Fatalf("sst_download_total mismatch: got=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTDownloadErrors); got != 1 {
+		t.Fatalf("sst_download_errors_total mismatch: got=%v want=1", got)
 	}
 }
