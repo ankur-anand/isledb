@@ -48,71 +48,10 @@ jobs:
       - run: go version
 
       - name: Run go test
-        run: go test -count 1 -v -race -covermode atomic -coverprofile=unit.cov $(go list ./... | grep -vE  'schemas|cmd|etc|middleware|bench|examples')
+        run: go test -count 1 -v -race -covermode atomic -coverprofile=covprofile $(go list ./... | grep -vE  'schemas|cmd|etc|middleware|bench|examples')
 
-      - name: Upload unit coverage profile
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-coverage-profile
-          path: unit.cov
-
-  integration-azure:
-    runs-on: ubuntu-latest
-    services:
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite
-        ports:
-          - 10000:10000
-          - 10001:10001
-          - 10002:10002
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '^1.25.0'
-      - name: Run Azure integration tests
-        env:
-          AZURE_STORAGE_ACCOUNT: devstoreaccount1
-          AZURE_STORAGE_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-        run: go test -count 1 -v -race -covermode atomic -coverprofile=azure-integration.cov -tags="integration,azure" ./blobstore/...
-
-      - name: Upload azure integration coverage profile
-        uses: actions/upload-artifact@v4
-        with:
-          name: azure-integration-coverage-profile
-          path: azure-integration.cov
-
-  coverage:
-    needs: [test, integration-azure]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '^1.25.0'
-
-      - name: Download unit coverage profile
-        uses: actions/download-artifact@v4
-        with:
-          name: unit-coverage-profile
-          path: coverage/unit
-
-      - name: Download azure integration coverage profile
-        uses: actions/download-artifact@v4
-        with:
-          name: azure-integration-coverage-profile
-          path: coverage/azure
-
-      - name: Install coverage tools
-        run: |
-          go install github.com/mattn/goveralls@latest
-          go install github.com/wadey/gocovmerge@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Merge coverage profiles
-        run: |
-          gocovmerge coverage/unit/unit.cov coverage/azure/azure-integration.cov > covprofile
+      - name: Install goveralls
+        run: go install github.com/mattn/goveralls@latest
 
       - name: Configure Coveralls fail-on-drop threshold
         continue-on-error: true
@@ -133,4 +72,48 @@ jobs:
         continue-on-error: true
         env:
           COVERALLS_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
-        run: goveralls -coverprofile=covprofile -service=github
+        run: goveralls -coverprofile=covprofile -service=github -parallel -flagname=unit
+
+  integration-azure:
+    runs-on: ubuntu-latest
+    services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite
+        ports:
+          - 10000:10000
+          - 10001:10001
+          - 10002:10002
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.25.0'
+      - name: Run Azure integration tests
+        env:
+          AZURE_STORAGE_ACCOUNT: devstoreaccount1
+          AZURE_STORAGE_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+        run: go test -count 1 -v -race -covermode atomic -coverprofile=covprofile -tags="integration,azure" ./blobstore/...
+
+      - name: Install goveralls
+        run: go install github.com/mattn/goveralls@latest
+
+      - name: Send coverage
+        continue-on-error: true
+        env:
+          COVERALLS_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+        run: goveralls -coverprofile=covprofile -service=github -parallel -flagname=azure-integration
+
+  coverage-finish:
+    needs: [test, integration-azure]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.25.0'
+      - name: Install goveralls
+        run: go install github.com/mattn/goveralls@latest
+      - name: Finish coverage
+        continue-on-error: true
+        env:
+          COVERALLS_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+        run: goveralls -parallel-finish -service=github
