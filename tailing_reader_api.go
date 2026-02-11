@@ -42,6 +42,7 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 		RangeReadMinSSTSize:      opts.ReaderOptions.RangeReadMinSSTSize,
 		ValidateSSTChecksum:      opts.ReaderOptions.ValidateSSTChecksum,
 		SSTHashVerifier:          opts.ReaderOptions.SSTHashVerifier,
+		Metrics:                  opts.ReaderOptions.Metrics,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

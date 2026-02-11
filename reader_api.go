@@ -42,6 +42,8 @@ type ReaderOpenOptions struct {
 	// If provided and the SST has a signature, verification is enforced.
 	SSTHashVerifier SSTHashVerifier
 
+	Metrics *ReaderMetrics
+
 	BlobReadOptions config.BlobReadOptions
 	ManifestStorage manifest.Storage
 }
@@ -73,6 +75,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
 		SSTHashVerifier:          opts.SSTHashVerifier,
+		Metrics:                  opts.Metrics,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
 			BlobReadOptions: blobReadOpts,

@@ -52,6 +52,7 @@ type Reader struct {
 
 	mu       sync.RWMutex
 	manifest *Manifest
+	metrics  *ReaderMetrics
 }
 
 type KV struct {
@@ -120,6 +121,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 		ownsSSTCache:             ownsSSTCache,
 		ownsBlockCache:           ownsBlockCache,
 		ownsBlobCache:            ownsBlobCache,
+		metrics:                  opts.Metrics,
 	}
 	cleanupSSTCache = false
 	cleanupBlockCache = false
@@ -175,8 +177,14 @@ func initBlobCache(opts ReaderOptions) (diskcache.Cache, bool, error) {
 }
 
 // Refresh reloads the manifest and invalidates caches for removed SSTs.
-func (r *Reader) Refresh(ctx context.Context) error {
-	m, err := r.manifestStore.Replay(ctx)
+func (r *Reader) Refresh(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.ObserveRefresh(time.Since(start), err)
+	}()
+
+	var m *Manifest
+	m, err = r.manifestStore.Replay(ctx)
 	if err != nil {
 		return err
 	}
@@ -250,7 +258,12 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 }
 
 // Get returns the value for key if present and not deleted/expired.
-func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
+func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool, err error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.ObserveGet(time.Since(start), found, err)
+	}()
+
 	if len(key) == 0 {
 		return nil, false, errors.New("empty key")
 	}
@@ -267,15 +280,15 @@ func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 		if !keyInRange(key, sst.MinKey, sst.MaxKey) {
 			continue
 		}
-		value, found, deleted, err := r.getFromSST(ctx, sst, key)
+		val, got, deleted, err := r.getFromSST(ctx, sst, key)
 		if err != nil {
 			return nil, false, err
 		}
-		if found {
+		if got {
 			if deleted {
 				return nil, false, nil
 			}
-			return value, true, nil
+			return val, true, nil
 		}
 	}
 
@@ -286,15 +299,15 @@ func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 			continue
 		}
 
-		value, found, deleted, err := r.getFromSST(ctx, *sst, key)
+		val, got, deleted, err := r.getFromSST(ctx, *sst, key)
 		if err != nil {
 			return nil, false, err
 		}
-		if found {
+		if got {
 			if deleted {
 				return nil, false, nil
 			}
-			return value, true, nil
+			return val, true, nil
 		}
 	}
 
@@ -302,7 +315,12 @@ func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 }
 
 // Scan returns all key-value pairs in the given key range.
-func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
+func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.ObserveScan(time.Since(start), len(out), err)
+	}()
+
 	r.mu.RLock()
 	m := r.manifest
 	r.mu.RUnlock()
@@ -357,7 +375,6 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 	mergeIter := newMergeIterator(allIters)
 
 	nowMs := time.Now().UnixMilli()
-	var out []KV
 	for mergeIter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -401,7 +418,12 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) 
 	return out, nil
 }
 
-func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error) {
+func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.ObserveScanLimit(time.Since(start), len(out), err)
+	}()
+
 	r.mu.RLock()
 	m := r.manifest
 	r.mu.RUnlock()
@@ -455,7 +477,6 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	mergeIter := newMergeIterator(allIters)
 
 	nowMs := time.Now().UnixMilli()
-	var out []KV
 	for mergeIter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -646,19 +667,32 @@ func (r *Reader) entryValue(ctx context.Context, entry internal.CompactionEntry)
 	return nil, errors.New("corrupt entry: non-inline, non-blob")
 }
 
-func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error) {
+type blobFetchResult struct {
+	data     []byte
+	cacheHit bool
+}
+
+func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, err error) {
+	start := time.Now()
+	cacheHit := false
+	defer func() {
+		r.metrics.ObserveBlobFetch(time.Since(start), len(value), cacheHit, err)
+	}()
+
 	blobIDHex := internal.BlobIDToHex(blobID)
 
 	if r.blobCache != nil {
 		if data, ok := r.blobCache.Get(blobIDHex); ok {
+			cacheHit = true
 			return data, nil
 		}
 	}
 
-	value, err, _ := r.blobLoads.Do(blobIDHex, func() (interface{}, error) {
+	var sfValue interface{}
+	sfValue, err, _ = r.blobLoads.Do(blobIDHex, func() (interface{}, error) {
 		if r.blobCache != nil {
 			if data, ok := r.blobCache.Get(blobIDHex); ok {
-				return data, nil
+				return blobFetchResult{data: data, cacheHit: true}, nil
 			}
 		}
 
@@ -669,12 +703,17 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) ([]byte, error)
 		if r.blobCache != nil {
 			r.blobCache.Set(blobIDHex, data)
 		}
-		return data, nil
+		return blobFetchResult{data: data, cacheHit: false}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return value.([]byte), nil
+	result, ok := sfValue.(blobFetchResult)
+	if !ok {
+		return nil, errors.New("internal error: unexpected blob fetch result")
+	}
+	cacheHit = result.cacheHit
+	return result.data, nil
 }
 
 func (r *Reader) sstPayloadSize(meta SSTMeta) (int64, error) {
@@ -695,11 +734,13 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 	path := r.store.SSTPath(sstMeta.ID)
 
 	if cached, ok := r.sstCache.Acquire(path); ok {
+		r.metrics.ObserveSSTCacheLookup(true)
 		release := func() {
 			r.sstCache.Release(path)
 		}
 		return r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
 	}
+	r.metrics.ObserveSSTCacheLookup(false)
 
 	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
 		return nil, nil, err
@@ -759,7 +800,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta SSTMeta, path str
 			return nil, nil, err
 		}
 	}
-	readable := newSSTRangeReadable(r.store, path, sstMeta.ID, size, r.blockCache)
+	readable := newSSTRangeReadable(r.store, path, sstMeta.ID, size, r.blockCache, r.metrics)
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil)
 }
 
@@ -891,13 +932,18 @@ func trimSSTData(meta SSTMeta, data []byte) ([]byte, error) {
 	return data[:meta.Size], nil
 }
 
-func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error {
+func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) (err error) {
 	if cache, ok := r.sstCache.(diskcache.FileBackedCache); ok {
 		return r.cacheSSTStream(ctx, cache, meta, path)
 	}
 
+	start := time.Now()
+	var downloadedBytes int64
+	defer func() {
+		r.metrics.ObserveSSTDownload(time.Since(start), downloadedBytes, err)
+	}()
+
 	var data []byte
-	var err error
 	if meta != nil && meta.Size > 0 {
 		data, err = r.store.ReadRange(ctx, path, 0, meta.Size)
 	} else {
@@ -906,6 +952,7 @@ func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) error
 	if err != nil {
 		return fmt.Errorf("read sst %s: %w", path, err)
 	}
+	downloadedBytes = int64(len(data))
 
 	if meta != nil {
 		if err := r.validateSSTData(*meta, data); err != nil {
@@ -935,7 +982,13 @@ func (r *Reader) ensureSSTCached(ctx context.Context, meta *SSTMeta, path string
 	return err
 }
 
-func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *SSTMeta, path string) error {
+func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *SSTMeta, path string) (err error) {
+	start := time.Now()
+	var downloadedBytes int64
+	defer func() {
+		r.metrics.ObserveSSTDownload(time.Since(start), downloadedBytes, err)
+	}()
+
 	tmpFile, err := os.CreateTemp(cache.CacheDir(), "sst-*")
 	if err != nil {
 		return fmt.Errorf("create temp sst %s: %w", path, err)
@@ -971,6 +1024,7 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 		cleanup()
 		return fmt.Errorf("download sst %s: %w", path, err)
 	}
+	downloadedBytes = written
 
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmpPath)

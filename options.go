@@ -88,6 +88,8 @@ type ReaderOptions struct {
 	// SSTHashVerifier verifies SST signatures when present.
 	// If provided and the SST has a signature, verification is enforced.
 	SSTHashVerifier SSTHashVerifier
+
+	Metrics *ReaderMetrics
 }
 
 func DefaultReaderOptions() ReaderOptions {
