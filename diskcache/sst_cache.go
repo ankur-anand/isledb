@@ -1,6 +1,7 @@
 package diskcache
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -25,6 +26,7 @@ type sstEntry struct {
 	mmap      []byte
 	file      *os.File
 	refs      atomic.Int32
+	elem      *list.Element
 }
 
 type sstCache struct {
@@ -34,7 +36,7 @@ type sstCache struct {
 	currentSize int64
 
 	index map[string]*sstEntry
-	order []string
+	order *list.List
 
 	pending map[string]struct{}
 
@@ -61,7 +63,7 @@ func NewSSTCache(opts SSTCacheOptions) (RefCountedCache, error) {
 		dir:     opts.Dir,
 		maxSize: maxSize,
 		index:   make(map[string]*sstEntry),
-		order:   make([]string, 0),
+		order:   list.New(),
 		pending: make(map[string]struct{}),
 	}, nil
 }
@@ -100,7 +102,7 @@ func (c *sstCache) Set(key string, data []byte) error {
 	}
 
 	dataSize := int64(len(data))
-	for c.currentSize+dataSize > c.maxSize && len(c.order) > 0 {
+	for c.currentSize+dataSize > c.maxSize && c.order.Len() > 0 {
 		if !c.evictOldest() {
 			break
 		}
@@ -133,8 +135,8 @@ func (c *sstCache) Set(key string, data []byte) error {
 		file:      f,
 	}
 
+	entry.elem = c.order.PushBack(key)
 	c.index[key] = entry
-	c.order = append(c.order, key)
 	c.currentSize += dataSize
 
 	return nil
@@ -160,7 +162,7 @@ func (c *sstCache) SetFromFile(key, tempPath string, size int64) error {
 		size = info.Size()
 	}
 
-	for c.currentSize+size > c.maxSize && len(c.order) > 0 {
+	for c.currentSize+size > c.maxSize && c.order.Len() > 0 {
 		if !c.evictOldest() {
 			break
 		}
@@ -194,8 +196,8 @@ func (c *sstCache) SetFromFile(key, tempPath string, size int64) error {
 		file:      f,
 	}
 
+	entry.elem = c.order.PushBack(key)
 	c.index[key] = entry
-	c.order = append(c.order, key)
 	c.currentSize += size
 
 	return nil
@@ -229,11 +231,15 @@ func (c *sstCache) removeLocked(key string) {
 		entry.file.Close()
 	}
 
+	if entry.elem != nil {
+		c.order.Remove(entry.elem)
+		entry.elem = nil
+	}
+
 	os.Remove(entry.localPath)
 	c.currentSize -= entry.size
 	delete(c.index, key)
 	delete(c.pending, key)
-	c.removeFromOrder(key)
 }
 
 func (c *sstCache) Clear() error {
@@ -251,7 +257,8 @@ func (c *sstCache) Clear() error {
 	}
 
 	c.index = make(map[string]*sstEntry)
-	c.order = make([]string, 0)
+	c.order.Init()
+	c.pending = make(map[string]struct{})
 	c.currentSize = 0
 
 	return nil
@@ -266,7 +273,7 @@ func (c *sstCache) Stats() Stats {
 		Misses:     c.misses.Load(),
 		Size:       c.currentSize,
 		MaxSize:    c.maxSize,
-		EntryCount: len(c.index),
+		EntryCount: c.order.Len(),
 	}
 }
 
@@ -275,21 +282,19 @@ func (c *sstCache) Close() error {
 }
 
 func (c *sstCache) Acquire(key string) ([]byte, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	entry, ok := c.index[key]
-	c.mu.RUnlock()
 
 	if !ok {
 		c.misses.Add(1)
 		return nil, false
 	}
 
-	c.hits.Add(1)
 	entry.refs.Add(1)
-
-	c.mu.Lock()
 	c.moveToEnd(key)
-	c.mu.Unlock()
+	c.hits.Add(1)
 
 	return entry.mmap, true
 }
@@ -315,28 +320,37 @@ func (c *sstCache) Release(key string) {
 }
 
 func (c *sstCache) evictOldest() bool {
-	for _, key := range c.order {
+	for e := c.order.Front(); e != nil; {
+		next := e.Next()
+		key, ok := e.Value.(string)
+		if !ok {
+			e = next
+			continue
+		}
+
 		entry := c.index[key]
+		if entry == nil {
+			c.order.Remove(e)
+			e = next
+			continue
+		}
+
 		if entry.refs.Load() == 0 {
 			c.removeLocked(key)
 			return true
 		}
+
+		e = next
 	}
 	return false
 }
 
 func (c *sstCache) moveToEnd(key string) {
-	c.removeFromOrder(key)
-	c.order = append(c.order, key)
-}
-
-func (c *sstCache) removeFromOrder(key string) {
-	for i, k := range c.order {
-		if k == key {
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			return
-		}
+	entry, ok := c.index[key]
+	if !ok || entry.elem == nil {
+		return
 	}
+	c.order.MoveToBack(entry.elem)
 }
 
 func cacheFileName(key string) string {
