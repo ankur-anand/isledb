@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/manifest"
 )
 
 func TestRetentionCompactor_FIFO(t *testing.T) {
@@ -607,6 +608,51 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 	}
 	if checkpoint.LastAppliedSeq == 0 {
 		t.Fatalf("expected checkpoint to advance")
+	}
+}
+
+func TestComputeGCMarkCatchupWindow_FullReplayFromSnapshotBoundary(t *testing.T) {
+	window := computeGCMarkCatchupWindow(
+		&gcMarkCheckpoint{LastAppliedSeq: 7, LastSeenLogSeqStart: 1},
+		&manifest.Current{LogSeqStart: 100, NextSeq: 140},
+		15,
+	)
+
+	if !window.fullReplay {
+		t.Fatalf("expected fullReplay=true")
+	}
+	if window.startSeq != 100 {
+		t.Fatalf("startSeq mismatch: got=%d want=100", window.startSeq)
+	}
+	if window.endSeq != 115 {
+		t.Fatalf("endSeq mismatch: got=%d want=115", window.endSeq)
+	}
+}
+
+func TestComputeGCMarkCatchupWindow_ClampsDeltaRange(t *testing.T) {
+	window := computeGCMarkCatchupWindow(
+		&gcMarkCheckpoint{LastAppliedSeq: 40, LastSeenLogSeqStart: 100},
+		&manifest.Current{LogSeqStart: 100, NextSeq: 130},
+		20,
+	)
+
+	if window.fullReplay {
+		t.Fatalf("expected fullReplay=false")
+	}
+	if window.startSeq != 100 {
+		t.Fatalf("startSeq mismatch: got=%d want=100", window.startSeq)
+	}
+	if window.endSeq != 120 {
+		t.Fatalf("endSeq mismatch: got=%d want=120", window.endSeq)
+	}
+
+	window = computeGCMarkCatchupWindow(
+		&gcMarkCheckpoint{LastAppliedSeq: 999, LastSeenLogSeqStart: 100},
+		&manifest.Current{LogSeqStart: 100, NextSeq: 130},
+		20,
+	)
+	if window.startSeq != 130 || window.endSeq != 130 {
+		t.Fatalf("expected clamped terminal range, got start=%d end=%d", window.startSeq, window.endSeq)
 	}
 }
 

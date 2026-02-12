@@ -3,11 +3,69 @@ package isledb
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
+
+func TestPlanPendingSSTSweep_ClearsLiveAndStopsAtNotDueBoundary(t *testing.T) {
+	now := time.Now().UTC()
+	byID := map[string]pendingSSTDeleteMark{
+		"live-1": {
+			SSTID: "live-1",
+			DueAt: now.Add(-time.Minute),
+		},
+		"due-1": {
+			SSTID: "due-1",
+			DueAt: now.Add(-time.Minute),
+		},
+		"not-due-1": {
+			SSTID: "not-due-1",
+			DueAt: now.Add(time.Minute),
+		},
+	}
+	liveSet := map[string]struct{}{
+		"live-1": {},
+	}
+
+	plan := planPendingSSTSweep(byID, liveSet, now, time.Hour, 10)
+	if plan.clearedLive != 1 {
+		t.Fatalf("clearedLive mismatch: got=%d want=1", plan.clearedLive)
+	}
+	if !plan.changed {
+		t.Fatalf("expected plan.changed=true when live marks are cleared")
+	}
+	if _, exists := byID["live-1"]; exists {
+		t.Fatalf("expected live mark to be removed from map")
+	}
+	wantDeleteIDs := []string{"due-1"}
+	if !reflect.DeepEqual(plan.deleteIDs, wantDeleteIDs) {
+		t.Fatalf("delete ids mismatch: got=%v want=%v", plan.deleteIDs, wantDeleteIDs)
+	}
+}
+
+func TestPlanPendingSSTSweep_RespectsBatchSizeAndOrder(t *testing.T) {
+	now := time.Now().UTC()
+	byID := map[string]pendingSSTDeleteMark{
+		"c": {SSTID: "c", DueAt: now.Add(-30 * time.Second)},
+		"a": {SSTID: "a", DueAt: now.Add(-time.Minute)},
+		"b": {SSTID: "b", DueAt: now.Add(-time.Minute)},
+	}
+
+	plan := planPendingSSTSweep(byID, map[string]struct{}{}, now, 0, 2)
+	wantDeleteIDs := []string{"a", "b"}
+	if !reflect.DeepEqual(plan.deleteIDs, wantDeleteIDs) {
+		t.Fatalf("delete ids mismatch: got=%v want=%v", plan.deleteIDs, wantDeleteIDs)
+	}
+	if plan.clearedLive != 0 {
+		t.Fatalf("unexpected live clears: got=%d want=0", plan.clearedLive)
+	}
+	if plan.changed {
+		t.Fatalf("expected plan.changed=false without live clears")
+	}
+}
 
 func TestRunPendingSSTSweeper_DeletesDueOrphan(t *testing.T) {
 	ctx := context.Background()

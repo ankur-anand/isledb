@@ -446,75 +446,121 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Co
 	if err != nil {
 		return err
 	}
-
-	fullReplay := checkpoint.LastSeenLogSeqStart != current.LogSeqStart
-	startSeq := checkpoint.LastAppliedSeq
-	if fullReplay {
-		startSeq = current.LogSeqStart
-	}
-	if startSeq < current.LogSeqStart {
-		startSeq = current.LogSeqStart
-	}
-	if startSeq > current.NextSeq {
-		startSeq = current.NextSeq
-	}
-
-	endSeq := current.NextSeq
-	if startSeq < current.NextSeq {
-		endSeq = startSeq + batchSize
-		if endSeq > current.NextSeq {
-			endSeq = current.NextSeq
-		}
-	}
+	window := computeGCMarkCatchupWindow(checkpoint, current, batchSize)
 
 	var lastErr error
 	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
-		pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore)
-		if err != nil {
-			return err
+		retry, err := c.catchupPendingSSTDeleteMarksAttempt(ctx, current, checkpoint, window)
+		if err == nil {
+			return nil
 		}
-		marksByID := pendingMarkMapFromSet(pendingSet)
-		now := time.Now().UTC()
-		marksChanged := false
-
-		if fullReplay {
-			changed, err := c.applyOrphanSSTMarkScanToMap(ctx, marksByID, current.NextSeq, now)
-			if err != nil {
-				return fmt.Errorf("orphan sst mark scan: %w", err)
-			}
-			marksChanged = marksChanged || changed
+		if retry {
+			lastErr = err
+			continue
 		}
-
-		for seq := startSeq; seq < endSeq; seq++ {
-			logPath := c.manifestLog.Storage().LogPath(fmt.Sprintf("%020d", seq))
-			entry, err := c.manifestLog.Read(ctx, logPath)
-			if err != nil {
-				return fmt.Errorf("read manifest log seq=%d path=%q: %w", seq, logPath, err)
-			}
-			marksChanged = c.applyManifestLogEntryToDeleteMarksMap(marksByID, entry, now) || marksChanged
-		}
-
-		if marksChanged {
-			pendingMarkMapToSet(pendingSet, marksByID)
-			err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore, pendingSet, matchToken, exists)
-			if isGCMarkCASConflict(err) {
-				lastErr = err
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("store pending sst delete mark set: %w", err)
-			}
-		}
-
-		checkpoint.LastAppliedSeq = endSeq
-		checkpoint.LastSeenLogSeqStart = current.LogSeqStart
-		return storeGCMarkCheckpointWithStorage(ctx, c.gcMarkStore, checkpoint)
+		return err
 	}
 
 	if lastErr != nil {
 		return fmt.Errorf("store pending sst delete mark set after retries: %w", lastErr)
 	}
 	return fmt.Errorf("store pending sst delete mark set exceeded retries")
+}
+
+type gcMarkCatchupWindow struct {
+	fullReplay bool
+	startSeq   uint64
+	endSeq     uint64
+}
+
+func computeGCMarkCatchupWindow(checkpoint *gcMarkCheckpoint, current *manifest.Current, batchSize uint64) gcMarkCatchupWindow {
+	window := gcMarkCatchupWindow{}
+	if checkpoint == nil || current == nil {
+		return window
+	}
+
+	window.fullReplay = checkpoint.LastSeenLogSeqStart != current.LogSeqStart
+	window.startSeq = checkpoint.LastAppliedSeq
+	if window.fullReplay {
+		window.startSeq = current.LogSeqStart
+	}
+	if window.startSeq < current.LogSeqStart {
+		window.startSeq = current.LogSeqStart
+	}
+	if window.startSeq > current.NextSeq {
+		window.startSeq = current.NextSeq
+	}
+
+	window.endSeq = current.NextSeq
+	if window.startSeq < current.NextSeq && batchSize > 0 {
+		window.endSeq = window.startSeq + batchSize
+		if window.endSeq > current.NextSeq {
+			window.endSeq = current.NextSeq
+		}
+	}
+
+	return window
+}
+
+func (c *RetentionCompactor) catchupPendingSSTDeleteMarksAttempt(ctx context.Context, current *manifest.Current, checkpoint *gcMarkCheckpoint, window gcMarkCatchupWindow) (bool, error) {
+	pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore)
+	if err != nil {
+		return false, err
+	}
+
+	marksByID := pendingMarkMapFromSet(pendingSet)
+	now := time.Now().UTC()
+	marksChanged, err := c.applyCatchupWindowToDeleteMarks(ctx, marksByID, window, current.NextSeq, now)
+	if err != nil {
+		return false, err
+	}
+
+	if marksChanged {
+		pendingMarkMapToSet(pendingSet, marksByID)
+		err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore, pendingSet, matchToken, exists)
+		if isGCMarkCASConflict(err) {
+			return true, err
+		}
+		if err != nil {
+			return false, fmt.Errorf("store pending sst delete mark set: %w", err)
+		}
+	}
+
+	checkpoint.LastAppliedSeq = window.endSeq
+	checkpoint.LastSeenLogSeqStart = current.LogSeqStart
+	return false, storeGCMarkCheckpointWithStorage(ctx, c.gcMarkStore, checkpoint)
+}
+
+func (c *RetentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, window gcMarkCatchupWindow, seq uint64, now time.Time) (bool, error) {
+	marksChanged := false
+
+	if window.fullReplay {
+		changed, err := c.applyOrphanSSTMarkScanToMap(ctx, marksByID, seq, now)
+		if err != nil {
+			return false, fmt.Errorf("orphan sst mark scan: %w", err)
+		}
+		marksChanged = marksChanged || changed
+	}
+
+	changed, err := c.applyManifestLogRangeToDeleteMarksMap(ctx, marksByID, window.startSeq, window.endSeq, now)
+	if err != nil {
+		return false, err
+	}
+	marksChanged = marksChanged || changed
+	return marksChanged, nil
+}
+
+func (c *RetentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, startSeq, endSeq uint64, now time.Time) (bool, error) {
+	changed := false
+	for seq := startSeq; seq < endSeq; seq++ {
+		logPath := c.manifestLog.Storage().LogPath(fmt.Sprintf("%020d", seq))
+		entry, err := c.manifestLog.Read(ctx, logPath)
+		if err != nil {
+			return false, fmt.Errorf("read manifest log seq=%d path=%q: %w", seq, logPath, err)
+		}
+		changed = c.applyManifestLogEntryToDeleteMarksMap(marksByID, entry, now) || changed
+	}
+	return changed, nil
 }
 
 func (c *RetentionCompactor) applyOrphanSSTMarkScanToMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, seq uint64, now time.Time) (bool, error) {

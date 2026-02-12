@@ -79,9 +79,8 @@ func newGCMarkStorage(store *blobstore.Store) manifest.GCMarkStorage {
 	return gcMarkStorageAdapter{store: store}
 }
 
-func (s gcMarkStorageAdapter) LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error) {
-	key := pendingSSTDeleteSetPath(s.store)
-	data, attrs, err := s.store.Read(ctx, key)
+func readObjectWithCAS(ctx context.Context, store *blobstore.Store, key string) ([]byte, string, bool, error) {
+	data, attrs, err := store.Read(ctx, key)
 	if err != nil {
 		if errors.Is(err, blobstore.ErrNotFound) {
 			return nil, "", false, nil
@@ -89,6 +88,10 @@ func (s gcMarkStorageAdapter) LoadPendingDeleteMarks(ctx context.Context) ([]byt
 		return nil, "", false, err
 	}
 	return data, matchTokenFromAttrs(attrs), true, nil
+}
+
+func (s gcMarkStorageAdapter) LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error) {
+	return readObjectWithCAS(ctx, s.store, pendingSSTDeleteSetPath(s.store))
 }
 
 func (s gcMarkStorageAdapter) StorePendingDeleteMarks(ctx context.Context, data []byte, matchToken string, exists bool) error {
@@ -96,15 +99,7 @@ func (s gcMarkStorageAdapter) StorePendingDeleteMarks(ctx context.Context, data 
 }
 
 func (s gcMarkStorageAdapter) LoadGCCheckpoint(ctx context.Context) ([]byte, string, bool, error) {
-	key := gcCheckpointPath(s.store)
-	data, attrs, err := s.store.Read(ctx, key)
-	if err != nil {
-		if errors.Is(err, blobstore.ErrNotFound) {
-			return nil, "", false, nil
-		}
-		return nil, "", false, err
-	}
-	return data, matchTokenFromAttrs(attrs), true, nil
+	return readObjectWithCAS(ctx, s.store, gcCheckpointPath(s.store))
 }
 
 func (s gcMarkStorageAdapter) StoreGCCheckpoint(ctx context.Context, data []byte, matchToken string, exists bool) error {
@@ -125,8 +120,7 @@ func enqueuePendingSSTDeleteMarksWithStorage(ctx context.Context, storage manife
 		return errors.New("nil gc mark storage")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
+	return withGCMarkCASRetries("store pending mark set", func() error {
 		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, storage)
 		if err != nil {
 			return err
@@ -138,21 +132,8 @@ func enqueuePendingSSTDeleteMarksWithStorage(ctx context.Context, storage manife
 		}
 		pendingMarkMapToSet(set, byID)
 
-		err = storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
-		if err == nil {
-			return nil
-		}
-		if isGCMarkCASConflict(err) {
-			lastErr = err
-			continue
-		}
-		return err
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("store pending mark set after retries: %w", lastErr)
-	}
-	return fmt.Errorf("store pending mark set exceeded retries")
+		return storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
+	})
 }
 
 func clearPendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store, sstIDs []string) error {
@@ -168,8 +149,7 @@ func clearPendingSSTDeleteMarksWithStorage(ctx context.Context, storage manifest
 		return errors.New("nil gc mark storage")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
+	return withGCMarkCASRetries("clear pending mark set", func() error {
 		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, storage)
 		if err != nil {
 			return err
@@ -181,21 +161,8 @@ func clearPendingSSTDeleteMarksWithStorage(ctx context.Context, storage manifest
 		}
 		pendingMarkMapToSet(set, byID)
 
-		err = storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
-		if err == nil {
-			return nil
-		}
-		if isGCMarkCASConflict(err) {
-			lastErr = err
-			continue
-		}
-		return err
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("clear pending mark set after retries: %w", lastErr)
-	}
-	return fmt.Errorf("clear pending mark set exceeded retries")
+		return storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
+	})
 }
 
 func loadGCMarkCheckpoint(ctx context.Context, store *blobstore.Store) (*gcMarkCheckpoint, error) {
@@ -246,8 +213,7 @@ func storeGCMarkCheckpointWithStorage(ctx context.Context, storage manifest.GCMa
 		return errors.New("nil gc checkpoint")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
+	return withGCMarkCASRetries("store gc checkpoint", func() error {
 		current, matchToken, exists, err := loadGCMarkCheckpointWithStorageCAS(ctx, storage)
 		if err != nil {
 			return err
@@ -270,20 +236,8 @@ func storeGCMarkCheckpointWithStorage(ctx context.Context, storage manifest.GCMa
 			return err
 		}
 		err = storage.StoreGCCheckpoint(ctx, payload, matchToken, exists)
-		if err == nil {
-			return nil
-		}
-		if isGCMarkCASConflict(err) {
-			lastErr = err
-			continue
-		}
 		return err
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("store gc checkpoint after retries: %w", lastErr)
-	}
-	return fmt.Errorf("store gc checkpoint exceeded retries")
+	})
 }
 
 func loadPendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store) ([]pendingSSTDeleteMark, error) {
@@ -413,4 +367,24 @@ func writeObjectCAS(ctx context.Context, store *blobstore.Store, key string, pay
 
 func isGCMarkCASConflict(err error) bool {
 	return errors.Is(err, blobstore.ErrPreconditionFailed) || errors.Is(err, manifest.ErrPreconditionFailed)
+}
+
+func withGCMarkCASRetries(op string, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if isGCMarkCASConflict(err) {
+			lastErr = err
+			continue
+		}
+		return err
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("%s after retries: %w", op, lastErr)
+	}
+	return fmt.Errorf("%s exceeded retries", op)
 }
