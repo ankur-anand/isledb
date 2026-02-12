@@ -342,43 +342,11 @@ func (r *Reader) scanInternal(ctx context.Context, minKey, maxKey []byte, limit 
 		return nil, errors.New("manifest not loaded")
 	}
 
-	var allIters []sstable.Iterator
-	upper := maxKey
-	if len(maxKey) > 0 {
-		upper = incrementKey(maxKey)
+	allIters, err := r.openRangeIters(ctx, m, minKey, maxKey)
+	if err != nil {
+		return nil, err
 	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
-	}
-
-	defer cleanup()
+	defer closeSSTIters(allIters)
 
 	if len(allIters) == 0 {
 		return nil, nil
@@ -432,6 +400,46 @@ func (r *Reader) scanInternal(ctx context.Context, minKey, maxKey []byte, limit 
 	}
 
 	return out, nil
+}
+
+func closeSSTIters(iters []sstable.Iterator) {
+	for _, it := range iters {
+		_ = it.Close()
+	}
+}
+
+func (r *Reader) openRangeIters(ctx context.Context, m *Manifest, minKey, maxKey []byte) ([]sstable.Iterator, error) {
+	var allIters []sstable.Iterator
+	upper := maxKey
+	if len(maxKey) > 0 {
+		upper = incrementKey(maxKey)
+	}
+
+	for _, sst := range m.L0SSTs {
+		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+			continue
+		}
+		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
+		if err != nil {
+			closeSSTIters(allIters)
+			return nil, err
+		}
+		allIters = append(allIters, iter)
+	}
+
+	for _, sr := range m.SortedRuns {
+		overlapping := sr.OverlappingSSTs(minKey, maxKey)
+		for _, sst := range overlapping {
+			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
+			if err != nil {
+				closeSSTIters(allIters)
+				return nil, err
+			}
+			allIters = append(allIters, iter)
+		}
+	}
+
+	return allIters, nil
 }
 
 func keyInRange(key, minKey, maxKey []byte) bool {
@@ -1019,40 +1027,9 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		return nil, errors.New("manifest not loaded")
 	}
 
-	var allIters []sstable.Iterator
-	upper := opts.MaxKey
-	if len(opts.MaxKey) > 0 {
-		upper = incrementKey(opts.MaxKey)
-	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, opts.MinKey, opts.MaxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(opts.MinKey, opts.MaxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
+	allIters, err := r.openRangeIters(ctx, m, opts.MinKey, opts.MaxKey)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(allIters) == 0 {
