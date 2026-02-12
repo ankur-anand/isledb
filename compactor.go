@@ -42,6 +42,7 @@ type CompactionJob struct {
 type Compactor struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
+	gcMarkStore manifest.GCMarkStorage
 	opts        CompactorOptions
 
 	mu       sync.Mutex
@@ -69,6 +70,9 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 	opts.Compression = cmp.Or(opts.Compression, d.Compression)
 	opts.CheckInterval = cmp.Or(opts.CheckInterval, d.CheckInterval)
 	opts.TargetSSTSize = cmp.Or(opts.TargetSSTSize, d.TargetSSTSize)
+	if opts.GCMarkStorage == nil {
+		opts.GCMarkStorage = newGCMarkStorage(store)
+	}
 
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
@@ -78,6 +82,7 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 	c := &Compactor{
 		store:       store,
 		manifestLog: manifestLog,
+		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
 		stopCh:      make(chan struct{}),
@@ -214,7 +219,7 @@ func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
-	if _, err := runPendingSSTSweeper(ctx, c.store, c.manifestLog, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
 		slog.Warn("isledb: compactor sst sweep failed", "error", err)
 	}
 }
@@ -418,7 +423,7 @@ func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.Compa
 	}
 
 	if len(payload.RemoveSSTableIDs) > 0 {
-		if err := enqueuePendingSSTDeleteMarks(ctx, c.store, payload.RemoveSSTableIDs, "compaction", entry.Seq); err != nil {
+		if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, payload.RemoveSSTableIDs, "compaction", entry.Seq); err != nil {
 			slog.Warn("isledb: enqueue pending sst delete marks failed after compaction append", "error", err, "count", len(payload.RemoveSSTableIDs), "seq", entry.Seq)
 		}
 	}
@@ -433,7 +438,7 @@ func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.Compa
 		}
 	}
 	if len(addedIDs) > 0 {
-		if err := clearPendingSSTDeleteMarks(ctx, c.store, addedIDs); err != nil {
+		if err := clearPendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, addedIDs); err != nil {
 			slog.Warn("isledb: clear pending sst delete marks failed after compaction append", "error", err, "count", len(addedIDs), "seq", entry.Seq)
 		}
 	}

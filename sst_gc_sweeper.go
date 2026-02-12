@@ -24,12 +24,19 @@ type sstSweepStats struct {
 }
 
 func runPendingSSTSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, batchSize int, gracePeriod time.Duration) (sstSweepStats, error) {
+	return runPendingSSTSweeperWithStorage(ctx, store, manifestLog, newGCMarkStorage(store), batchSize, gracePeriod)
+}
+
+func runPendingSSTSweeperWithStorage(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, markStorage manifest.GCMarkStorage, batchSize int, gracePeriod time.Duration) (sstSweepStats, error) {
 	stats := sstSweepStats{}
 	if batchSize <= 0 {
 		batchSize = defaultSSTSweepBatchSize
 	}
 	if gracePeriod < 0 {
 		gracePeriod = 0
+	}
+	if markStorage == nil {
+		return stats, errors.New("nil gc mark storage")
 	}
 
 	liveSet, err := currentLiveSSTSet(ctx, manifestLog)
@@ -41,7 +48,7 @@ func runPendingSSTSweeper(ctx context.Context, store *blobstore.Store, manifestL
 	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
 		stats = sstSweepStats{}
 
-		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithCAS(ctx, store)
+		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, markStorage)
 		if err != nil {
 			return stats, err
 		}
@@ -116,8 +123,8 @@ func runPendingSSTSweeper(ctx context.Context, store *blobstore.Store, manifestL
 		}
 
 		pendingMarkMapToSet(set, byID)
-		if err := storePendingSSTDeleteMarkSetWithCAS(ctx, store, set, matchToken, exists); err != nil {
-			if errors.Is(err, blobstore.ErrPreconditionFailed) {
+		if err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, markStorage, set, matchToken, exists); err != nil {
+			if isGCMarkCASConflict(err) {
 				lastErr = err
 				continue
 			}
