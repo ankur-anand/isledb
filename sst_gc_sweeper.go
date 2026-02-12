@@ -23,6 +23,12 @@ type sstSweepStats struct {
 	Failed      int
 }
 
+type sstSweepPlan struct {
+	deleteIDs   []string
+	clearedLive int
+	changed     bool
+}
+
 func runPendingSSTSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, batchSize int, gracePeriod time.Duration) (sstSweepStats, error) {
 	return runPendingSSTSweeperWithStorage(ctx, store, manifestLog, newGCMarkStorage(store), batchSize, gracePeriod)
 }
@@ -57,67 +63,17 @@ func runPendingSSTSweeperWithStorage(ctx context.Context, store *blobstore.Store
 		}
 
 		byID := pendingMarkMapFromSet(set)
-		changed := false
 		now := time.Now().UTC()
+		plan := planPendingSSTSweep(byID, liveSet, now, gracePeriod, batchSize)
+		stats.ClearedLive = plan.clearedLive
 
-		for id := range liveSet {
-			if _, ok := byID[id]; !ok {
-				continue
-			}
-			delete(byID, id)
-			stats.ClearedLive++
-			changed = true
-		}
+		deleteKeys := deleteKeysForSSTIDs(store, plan.deleteIDs)
+		stats.Attempted = len(plan.deleteIDs)
+		deleted, failed, deleteChanged := applySweepDeleteBatch(ctx, store, byID, plan.deleteIDs, deleteKeys)
+		stats.Deleted = deleted
+		stats.Failed = failed
 
-		ids := sortedPendingMarkIDs(byID, now, gracePeriod)
-		processed := 0
-		deleteIDs := make([]string, 0, batchSize)
-		deleteKeys := make([]string, 0, batchSize)
-		for _, id := range ids {
-			if processed >= batchSize {
-				break
-			}
-			mark, ok := byID[id]
-			if !ok {
-				continue
-			}
-
-			dueAt := pendingMarkDueAt(mark, now, gracePeriod)
-			if now.Before(dueAt) {
-				break
-			}
-			processed++
-			deleteIDs = append(deleteIDs, id)
-			deleteKeys = append(deleteKeys, store.SSTPath(id))
-		}
-
-		if len(deleteIDs) > 0 {
-			stats.Attempted += len(deleteIDs)
-
-			failedByKey := map[string]error{}
-			if err := store.BatchDelete(ctx, deleteKeys); err != nil {
-				var batchErr *blobstore.BatchDeleteError
-				if errors.As(err, &batchErr) {
-					failedByKey = batchErr.Failed
-				} else {
-					for _, key := range deleteKeys {
-						failedByKey[key] = err
-					}
-				}
-			}
-
-			for i, id := range deleteIDs {
-				key := deleteKeys[i]
-				if _, failed := failedByKey[key]; failed {
-					stats.Failed++
-					continue
-				}
-				delete(byID, id)
-				stats.Deleted++
-				changed = true
-			}
-		}
-
+		changed := plan.changed || deleteChanged
 		if !changed {
 			return stats, nil
 		}
@@ -137,6 +93,86 @@ func runPendingSSTSweeperWithStorage(ctx context.Context, store *blobstore.Store
 		return stats, fmt.Errorf("store pending sst delete marks after retries: %w", lastErr)
 	}
 	return stats, fmt.Errorf("store pending sst delete marks exceeded retries")
+}
+
+func planPendingSSTSweep(byID map[string]pendingSSTDeleteMark, liveSet map[string]struct{}, now time.Time, gracePeriod time.Duration, batchSize int) sstSweepPlan {
+	deleteCap := 0
+	if batchSize > 0 {
+		deleteCap = batchSize
+	}
+	plan := sstSweepPlan{
+		deleteIDs: make([]string, 0, deleteCap),
+	}
+
+	liveIDs := make([]string, 0, len(liveSet))
+	for id := range liveSet {
+		liveIDs = append(liveIDs, id)
+	}
+	beforeLiveClear := len(byID)
+	if applyPendingSSTDeleteMarkClears(byID, liveIDs) {
+		plan.changed = true
+		plan.clearedLive = beforeLiveClear - len(byID)
+	}
+
+	if batchSize <= 0 {
+		return plan
+	}
+
+	ids := sortedPendingMarkIDs(byID, now, gracePeriod)
+	for _, id := range ids {
+		if len(plan.deleteIDs) >= batchSize {
+			break
+		}
+		mark, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if now.Before(pendingMarkDueAt(mark, now, gracePeriod)) {
+			break
+		}
+		plan.deleteIDs = append(plan.deleteIDs, id)
+	}
+
+	return plan
+}
+
+func deleteKeysForSSTIDs(store *blobstore.Store, ids []string) []string {
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, store.SSTPath(id))
+	}
+	return keys
+}
+
+func applySweepDeleteBatch(ctx context.Context, store *blobstore.Store, byID map[string]pendingSSTDeleteMark, deleteIDs, deleteKeys []string) (deleted, failed int, changed bool) {
+	if len(deleteIDs) == 0 {
+		return 0, 0, false
+	}
+
+	failedByKey := map[string]error{}
+	if err := store.BatchDelete(ctx, deleteKeys); err != nil {
+		var batchErr *blobstore.BatchDeleteError
+		if errors.As(err, &batchErr) {
+			failedByKey = batchErr.Failed
+		} else {
+			for _, key := range deleteKeys {
+				failedByKey[key] = err
+			}
+		}
+	}
+
+	successfulDeleteIDs := make([]string, 0, len(deleteIDs))
+	for i, id := range deleteIDs {
+		key := deleteKeys[i]
+		if _, hadFailure := failedByKey[key]; hadFailure {
+			failed++
+			continue
+		}
+		successfulDeleteIDs = append(successfulDeleteIDs, id)
+	}
+	changed = applyPendingSSTDeleteMarkClears(byID, successfulDeleteIDs)
+	deleted = len(successfulDeleteIDs)
+	return deleted, failed, changed
 }
 
 func currentLiveSSTSet(ctx context.Context, manifestLog *manifest.Store) (map[string]struct{}, error) {
