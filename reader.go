@@ -321,101 +321,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		r.metrics.ObserveScan(time.Since(start), len(out), err)
 	}()
 
-	r.mu.RLock()
-	m := r.manifest
-	r.mu.RUnlock()
-
-	if m == nil {
-		return nil, errors.New("manifest not loaded")
-	}
-
-	var allIters []sstable.Iterator
-	upper := maxKey
-	if len(maxKey) > 0 {
-		upper = incrementKey(maxKey)
-	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
-	}
-
-	defer cleanup()
-
-	if len(allIters) == 0 {
-		return nil, nil
-	}
-
-	mergeIter := newMergeIterator(allIters)
-
-	nowMs := time.Now().UnixMilli()
-	for mergeIter.Next() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		entry, err := mergeIter.entry()
-		if err != nil {
-			return nil, err
-		}
-
-		if len(minKey) > 0 && bytes.Compare(entry.Key, minKey) < 0 {
-			continue
-		}
-		if len(maxKey) > 0 && bytes.Compare(entry.Key, maxKey) > 0 {
-			break
-		}
-
-		if entry.IsExpired(nowMs) {
-			continue
-		}
-
-		if entry.Kind == internal.OpDelete {
-			continue
-		}
-
-		value, err := r.entryValue(ctx, entry)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, KV{
-			Key:   append([]byte(nil), entry.Key...),
-			Value: value,
-		})
-	}
-
-	if err := mergeIter.Err(); err != nil {
-		return nil, err
-	}
-
-	return out, nil
+	return r.scanInternal(ctx, minKey, maxKey, 0)
 }
 
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
@@ -424,6 +330,10 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		r.metrics.ObserveScanLimit(time.Since(start), len(out), err)
 	}()
 
+	return r.scanInternal(ctx, minKey, maxKey, limit)
+}
+
+func (r *Reader) scanInternal(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
 	r.mu.RLock()
 	m := r.manifest
 	r.mu.RUnlock()
@@ -432,43 +342,11 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		return nil, errors.New("manifest not loaded")
 	}
 
-	var allIters []sstable.Iterator
-	upper := maxKey
-	if len(maxKey) > 0 {
-		upper = incrementKey(maxKey)
+	allIters, err := r.openRangeIters(ctx, m, minKey, maxKey)
+	if err != nil {
+		return nil, err
 	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
-	}
-
-	defer cleanup()
+	defer closeSSTIters(allIters)
 
 	if len(allIters) == 0 {
 		return nil, nil
@@ -524,6 +402,46 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	return out, nil
 }
 
+func closeSSTIters(iters []sstable.Iterator) {
+	for _, it := range iters {
+		_ = it.Close()
+	}
+}
+
+func (r *Reader) openRangeIters(ctx context.Context, m *Manifest, minKey, maxKey []byte) ([]sstable.Iterator, error) {
+	var allIters []sstable.Iterator
+	upper := maxKey
+	if len(maxKey) > 0 {
+		upper = incrementKey(maxKey)
+	}
+
+	for _, sst := range m.L0SSTs {
+		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+			continue
+		}
+		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
+		if err != nil {
+			closeSSTIters(allIters)
+			return nil, err
+		}
+		allIters = append(allIters, iter)
+	}
+
+	for _, sr := range m.SortedRuns {
+		overlapping := sr.OverlappingSSTs(minKey, maxKey)
+		for _, sst := range overlapping {
+			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
+			if err != nil {
+				closeSSTIters(allIters)
+				return nil, err
+			}
+			allIters = append(allIters, iter)
+		}
+	}
+
+	return allIters, nil
+}
+
 func keyInRange(key, minKey, maxKey []byte) bool {
 	if len(minKey) > 0 && bytes.Compare(key, minKey) < 0 {
 		return false
@@ -532,22 +450,6 @@ func keyInRange(key, minKey, maxKey []byte) bool {
 		return false
 	}
 	return true
-}
-
-func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
-	if len(aMin) == 0 || len(aMax) == 0 {
-		return false
-	}
-	if len(bMin) == 0 && len(bMax) == 0 {
-		return true
-	}
-	if len(bMin) == 0 {
-		return bytes.Compare(aMin, bMax) <= 0
-	}
-	if len(bMax) == 0 {
-		return bytes.Compare(bMin, aMax) <= 0
-	}
-	return bytes.Compare(aMin, bMax) <= 0 && bytes.Compare(bMin, aMax) <= 0
 }
 
 func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([]byte, bool, bool, error) {
@@ -1125,40 +1027,9 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		return nil, errors.New("manifest not loaded")
 	}
 
-	var allIters []sstable.Iterator
-	upper := opts.MaxKey
-	if len(opts.MaxKey) > 0 {
-		upper = incrementKey(opts.MaxKey)
-	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, opts.MinKey, opts.MaxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(opts.MinKey, opts.MaxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
+	allIters, err := r.openRangeIters(ctx, m, opts.MinKey, opts.MaxKey)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(allIters) == 0 {
