@@ -37,6 +37,9 @@ type RetentionCompactorOptions struct {
 	OnCleanup func(CleanupStats)
 
 	OnCleanupError func(error)
+	// GCMarkStorage allows using a custom storage backend for GC mark state.
+	// If nil, the blob store is used.
+	GCMarkStorage manifest.GCMarkStorage
 }
 
 type CleanupStats struct {
@@ -58,6 +61,7 @@ func DefaultRetentionCompactorOptions() RetentionCompactorOptions {
 type RetentionCompactor struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
+	gcMarkStore manifest.GCMarkStorage
 	opts        RetentionCompactorOptions
 
 	startStopMu sync.Mutex
@@ -88,6 +92,9 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 	if opts.SegmentDuration <= 0 {
 		opts.SegmentDuration = defaults.SegmentDuration
 	}
+	if opts.GCMarkStorage == nil {
+		opts.GCMarkStorage = newGCMarkStorage(store)
+	}
 
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
@@ -102,6 +109,7 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 	return &RetentionCompactor{
 		store:       store,
 		manifestLog: manifestLog,
+		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
 		stopCh:      make(chan struct{}),
@@ -254,7 +262,7 @@ func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
-	if _, err := runPendingSSTSweeper(ctx, c.store, c.manifestLog, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
 		slog.Warn("isledb: retention sst sweep failed", "error", err)
 	}
 }
@@ -325,7 +333,7 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
 
-	if err := enqueuePendingSSTDeleteMarks(ctx, c.store, toDelete, "retention_fifo", entry.Seq); err != nil {
+	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_fifo", entry.Seq); err != nil {
 		slog.Warn("isledb: enqueue pending sst delete marks failed after retention manifest update", "mode", "fifo", "error", err, "count", len(toDelete), "seq", entry.Seq)
 	}
 
@@ -414,7 +422,7 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
 
-	if err := enqueuePendingSSTDeleteMarks(ctx, c.store, toDelete, "retention_segmented", entry.Seq); err != nil {
+	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_segmented", entry.Seq); err != nil {
 		slog.Warn("isledb: enqueue pending sst delete marks failed after retention manifest update", "mode", "segmented", "error", err, "count", len(toDelete), "seq", entry.Seq)
 	}
 
@@ -434,7 +442,7 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Co
 		return nil
 	}
 
-	checkpoint, err := loadGCMarkCheckpoint(ctx, c.store)
+	checkpoint, err := loadGCMarkCheckpointWithStorage(ctx, c.gcMarkStore)
 	if err != nil {
 		return err
 	}
@@ -461,7 +469,7 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Co
 
 	var lastErr error
 	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
-		pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithCAS(ctx, c.store)
+		pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore)
 		if err != nil {
 			return err
 		}
@@ -488,8 +496,8 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Co
 
 		if marksChanged {
 			pendingMarkMapToSet(pendingSet, marksByID)
-			err := storePendingSSTDeleteMarkSetWithCAS(ctx, c.store, pendingSet, matchToken, exists)
-			if errors.Is(err, blobstore.ErrPreconditionFailed) {
+			err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore, pendingSet, matchToken, exists)
+			if isGCMarkCASConflict(err) {
 				lastErr = err
 				continue
 			}
@@ -500,7 +508,7 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Co
 
 		checkpoint.LastAppliedSeq = endSeq
 		checkpoint.LastSeenLogSeqStart = current.LogSeqStart
-		return storeGCMarkCheckpoint(ctx, c.store, checkpoint)
+		return storeGCMarkCheckpointWithStorage(ctx, c.gcMarkStore, checkpoint)
 	}
 
 	if lastErr != nil {

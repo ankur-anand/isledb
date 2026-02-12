@@ -51,6 +51,7 @@ func (w *Writer) Close() error {
 type DB struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
+	gcMarkStorage manifest.GCMarkStorage
 	mu            sync.Mutex
 	closers       []dbCloser
 	closed        atomic.Bool
@@ -65,11 +66,18 @@ type DBOptions struct {
 	// ManifestStorage allows using a custom manifest storage backend.
 	// If nil, the blob store is used.
 	ManifestStorage manifest.Storage
+	// GCMarkStorage allows using a custom storage backend for GC mark state.
+	// If nil, the blob store is used.
+	GCMarkStorage manifest.GCMarkStorage
 }
 
 // OpenDB opens a database and initializes it.
 func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
 	manifestStore := newManifestStore(store, opts.ManifestStorage)
+	gcMarkStorage := opts.GCMarkStorage
+	if gcMarkStorage == nil {
+		gcMarkStorage = newGCMarkStorage(store)
+	}
 
 	if _, err := manifestStore.Replay(ctx); err != nil {
 		return nil, err
@@ -78,6 +86,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 	return &DB{
 		store:         store,
 		manifestStore: manifestStore,
+		gcMarkStorage: gcMarkStorage,
 	}, nil
 }
 
@@ -105,6 +114,9 @@ func (db *DB) OpenCompactor(ctx context.Context, opts CompactorOptions) (*Compac
 	if db.closed.Load() {
 		return nil, errors.New("db closed")
 	}
+	if opts.GCMarkStorage == nil {
+		opts.GCMarkStorage = db.gcMarkStorage
+	}
 
 	compactor, err := newCompactor(ctx, db.store, db.manifestStore, opts)
 	if err != nil {
@@ -121,6 +133,9 @@ func (db *DB) OpenCompactor(ctx context.Context, opts CompactorOptions) (*Compac
 func (db *DB) OpenRetentionCompactor(ctx context.Context, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
 	if db.closed.Load() {
 		return nil, errors.New("db closed")
+	}
+	if opts.GCMarkStorage == nil {
+		opts.GCMarkStorage = db.gcMarkStorage
 	}
 
 	retentionCompactor, err := newRetentionCompactor(ctx, db.store, db.manifestStore, opts)

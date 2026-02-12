@@ -136,6 +136,8 @@ type CompactorOptions struct {
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
 	OwnerID           string
+	// GCMarkStorage allows using a custom storage backend for GC mark state.
+	GCMarkStorage manifest.GCMarkStorage
 }
 
 func DefaultCompactorOptions() CompactorOptions {

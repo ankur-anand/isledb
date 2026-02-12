@@ -49,6 +49,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 ```go
 type DBOptions struct {
     ManifestStorage manifest.Storage // Optional custom manifest storage backend
+    GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
 }
 ```
 
@@ -238,6 +239,7 @@ type CompactorOptions struct {
     OnCompactionStart     func(CompactionJob)      // Compaction start callback
     OnCompactionEnd       func(CompactionJob, error) // Compaction end callback
     OwnerID               string                   // Compactor owner identifier
+    GCMarkStorage         manifest.GCMarkStorage   // Optional custom GC mark storage backend
 }
 
 func DefaultCompactorOptions() CompactorOptions
@@ -277,6 +279,7 @@ type RetentionCompactorOptions struct {
     SegmentDuration time.Duration          // Time window segment size (default: 1 hour)
     OnCleanup       func(CleanupStats)     // Cleanup complete callback
     OnCleanupError  func(error)            // Cleanup error callback
+    GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
 }
 
 func DefaultRetentionCompactorOptions() RetentionCompactorOptions
@@ -414,6 +417,19 @@ Verifies SST hash signatures.
 ```go
 type SSTHashVerifier interface {
     VerifyHash(hash []byte, sig SSTSignature) error
+}
+```
+
+### manifest.GCMarkStorage
+
+Stores GC coordination state (pending SST delete marks and GC checkpoint) with CAS semantics.
+
+```go
+type GCMarkStorage interface {
+    LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error)
+    StorePendingDeleteMarks(ctx context.Context, data []byte, matchToken string, exists bool) error
+    LoadGCCheckpoint(ctx context.Context) ([]byte, string, bool, error)
+    StoreGCCheckpoint(ctx context.Context, data []byte, matchToken string, exists bool) error
 }
 ```
 
