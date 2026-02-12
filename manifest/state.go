@@ -3,6 +3,8 @@ package manifest
 import (
 	"bytes"
 	"sort"
+
+	"github.com/ankur-anand/isledb/internal"
 )
 
 func DefaultCompactionConfig() CompactionConfig {
@@ -59,22 +61,6 @@ func (m *Manifest) Clone() *Manifest {
 	}
 
 	return clone
-}
-
-func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
-	if len(aMin) == 0 || len(aMax) == 0 {
-		return false
-	}
-	if len(bMin) == 0 && len(bMax) == 0 {
-		return true
-	}
-	if len(bMin) == 0 {
-		return bytes.Compare(aMin, bMax) <= 0
-	}
-	if len(bMax) == 0 {
-		return bytes.Compare(bMin, aMax) <= 0
-	}
-	return bytes.Compare(aMin, bMax) <= 0 && bytes.Compare(bMin, aMax) <= 0
 }
 
 func (m *Manifest) L0SSTCount() int {
@@ -259,7 +245,7 @@ func (sr *SortedRun) OverlappingSSTs(minKey, maxKey []byte) []SSTMeta {
 
 	var result []SSTMeta
 	for _, sst := range sr.SSTs {
-		if overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+		if internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			result = append(result, sst)
 		}
 	}

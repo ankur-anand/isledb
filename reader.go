@@ -343,7 +343,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 	}
 
 	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
 		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
@@ -445,7 +445,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	}
 
 	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
 		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
@@ -532,22 +532,6 @@ func keyInRange(key, minKey, maxKey []byte) bool {
 		return false
 	}
 	return true
-}
-
-func overlapsRange(aMin, aMax, bMin, bMax []byte) bool {
-	if len(aMin) == 0 || len(aMax) == 0 {
-		return false
-	}
-	if len(bMin) == 0 && len(bMax) == 0 {
-		return true
-	}
-	if len(bMin) == 0 {
-		return bytes.Compare(aMin, bMax) <= 0
-	}
-	if len(bMax) == 0 {
-		return bytes.Compare(bMin, aMax) <= 0
-	}
-	return bytes.Compare(aMin, bMax) <= 0 && bytes.Compare(bMin, aMax) <= 0
 }
 
 func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([]byte, bool, bool, error) {
@@ -1138,7 +1122,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 	}
 
 	for _, sst := range m.L0SSTs {
-		if !overlapsRange(sst.MinKey, sst.MaxKey, opts.MinKey, opts.MaxKey) {
+		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, opts.MinKey, opts.MaxKey) {
 			continue
 		}
 		_, iter, err := r.openSSTIterBounded(ctx, sst, opts.MinKey, upper)
