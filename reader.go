@@ -321,101 +321,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		r.metrics.ObserveScan(time.Since(start), len(out), err)
 	}()
 
-	r.mu.RLock()
-	m := r.manifest
-	r.mu.RUnlock()
-
-	if m == nil {
-		return nil, errors.New("manifest not loaded")
-	}
-
-	var allIters []sstable.Iterator
-	upper := maxKey
-	if len(maxKey) > 0 {
-		upper = incrementKey(maxKey)
-	}
-
-	cleanup := func() {
-		for _, it := range allIters {
-			_ = it.Close()
-		}
-
-	}
-
-	for _, sst := range m.L0SSTs {
-		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			continue
-		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
-		allIters = append(allIters, iter)
-	}
-
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			allIters = append(allIters, iter)
-		}
-	}
-
-	defer cleanup()
-
-	if len(allIters) == 0 {
-		return nil, nil
-	}
-
-	mergeIter := newMergeIterator(allIters)
-
-	nowMs := time.Now().UnixMilli()
-	for mergeIter.Next() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		entry, err := mergeIter.entry()
-		if err != nil {
-			return nil, err
-		}
-
-		if len(minKey) > 0 && bytes.Compare(entry.Key, minKey) < 0 {
-			continue
-		}
-		if len(maxKey) > 0 && bytes.Compare(entry.Key, maxKey) > 0 {
-			break
-		}
-
-		if entry.IsExpired(nowMs) {
-			continue
-		}
-
-		if entry.Kind == internal.OpDelete {
-			continue
-		}
-
-		value, err := r.entryValue(ctx, entry)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, KV{
-			Key:   append([]byte(nil), entry.Key...),
-			Value: value,
-		})
-	}
-
-	if err := mergeIter.Err(); err != nil {
-		return nil, err
-	}
-
-	return out, nil
+	return r.scanInternal(ctx, minKey, maxKey, 0)
 }
 
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
@@ -424,6 +330,10 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		r.metrics.ObserveScanLimit(time.Since(start), len(out), err)
 	}()
 
+	return r.scanInternal(ctx, minKey, maxKey, limit)
+}
+
+func (r *Reader) scanInternal(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
 	r.mu.RLock()
 	m := r.manifest
 	r.mu.RUnlock()
