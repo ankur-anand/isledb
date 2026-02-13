@@ -174,9 +174,6 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) (err error) {
 		w.mu.Unlock()
 		return err
 	}
-	// we reserve sequence before blob I/O so concurrent operations don't invert order.
-	w.seq++
-	seq := w.seq
 	w.mu.Unlock()
 
 	blobID, err := w.blobStorage.Write(ctx, value)
@@ -190,6 +187,8 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) (err error) {
 		_ = w.blobStorage.Delete(ctx, blobID)
 		return err
 	}
+	w.seq++
+	seq := w.seq
 	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
 	w.mu.Unlock()
 	return nil

@@ -262,7 +262,7 @@ func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
 	t.Fatalf("expected ErrBackpressure from deletes")
 }
 
-func TestWriter_PutBlobWriteFailureLeavesSequenceHole(t *testing.T) {
+func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-putblob-seq-rollback")
 	defer store.Close()
@@ -288,8 +288,8 @@ func TestWriter_PutBlobWriteFailureLeavesSequenceHole(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected put blob error with canceled blob write context")
 	}
-	if w.seq != seqBefore+1 {
-		t.Fatalf("blob write error should leave a sequence hole: before=%d after=%d", seqBefore, w.seq)
+	if w.seq != seqBefore {
+		t.Fatalf("blob write error should not advance sequence: before=%d after=%d", seqBefore, w.seq)
 	}
 }
 
