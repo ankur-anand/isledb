@@ -13,7 +13,7 @@
       content="embedded database,key-value store,object storage,s3 database,lsm tree,event streaming,tailing reader,go database,golang"
     />
 
-    <meta property="og:title" content="IsleDB — An island of data in an ocean of storage." />
+    <meta property="og:title" content="IsleDB — Your data island on object storage." />
     <meta
       property="og:description"
       content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
@@ -23,9 +23,9 @@
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="IsleDB — An island of data in an ocean of storage." />
+    <meta property="og:image:alt" content="IsleDB — Your data island on object storage." />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="IsleDB — An island of data in an ocean of storage." />
+    <meta name="twitter:title" content="IsleDB — Your data island on object storage." />
     <meta
       name="twitter:description"
       content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
@@ -947,8 +947,8 @@
       <div class="hero-layout">
         <div class="hero-copy">
           <h1>
-            An island of data<br />
-            <span class="gradient">in an ocean of storage.</span>
+            Your data island<br />
+            <span class="gradient">on object storage.</span>
           </h1>
         </div>
         <aside class="hero-features" aria-label="Feature highlights">
@@ -1260,8 +1260,8 @@ fifoCompactor.<span class="fn">Start</span>()</code></pre>
         <span class="section-label">Use Cases</span>
         <h2 class="section-title">One library, many workloads.</h2>
         <p class="section-desc">
-          The same storage and replay model can power event ingestion, state materialization,
-          key-value APIs, and object-storage-first data pipelines.
+          One storage-and-replay model powers event ingestion, state materialization, key-value APIs,
+          and object-storage-first data pipelines.
         </p>
 
         <div class="uc-grid">
@@ -1288,6 +1288,12 @@ fifoCompactor.<span class="fn">Start</span>()</code></pre>
             <h3>CDC Pipeline Buffer</h3>
             <p>Stage changes in object storage before indexing and analytics.</p>
             <div class="replaces">Common alternative: Kafka-centric pipelines.</div>
+          </div>
+          <div class="uc-card">
+            <div class="emoji">🏗️</div>
+            <h3>Lakehouse Landing Zone</h3>
+            <p>Capture bronze data on object storage, then feed Iceberg/Delta/Hudi compaction and analytics pipelines.</p>
+            <div class="replaces">Common alternative: bespoke ingestion services ahead of lakehouse tables.</div>
           </div>
         </div>
       </div>
@@ -1332,7 +1338,7 @@ fifoCompactor.<span class="fn">Start</span>()</code></pre>
           <blockquote>
             "An isle is self-contained, durable, and reachable from anywhere. That's the model for your data on IsleDB."
           </blockquote>
-          <cite>IsleDB philosophy — an island of data in an ocean of storage.</cite>
+          <cite>IsleDB philosophy — Your data island on object storage.</cite>
         </div>
       </div>
     </section>
