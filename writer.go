@@ -184,7 +184,6 @@ func (w *writer) putBlob(key, value []byte, expireAt int64) (err error) {
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
-		_ = w.blobStorage.Delete(ctx, blobID)
 		return err
 	}
 	w.seq++
