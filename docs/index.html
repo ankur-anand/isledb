@@ -1377,12 +1377,17 @@ fifoCompactor.<span class="fn">Start</span>()</code></pre>
         </div>
       </div>
       <div class="footer-bottom">
-        <span>© 2026 IsleDB. Open source · MIT License.</span>
-        <span>Built by <a href="https://github.com/ankur-anand" style="color: #bcd0e6">@ankur-anand</a></span>
+        <span>© <span id="footer-year"></span> IsleDB. Apache License.</span>
+        <span>Built by <a href="https://x.com/in_aanand" style="color: #bcd0e6">@in_aanand</a></span>
       </div>
     </footer>
 
     <script>
+      const footerYear = document.getElementById("footer-year");
+      if (footerYear) {
+        footerYear.textContent = String(new Date().getFullYear());
+      }
+
       const tabs = Array.from(document.querySelectorAll(".code-tab"));
       const panels = Array.from(document.querySelectorAll(".code-panel"));
 
