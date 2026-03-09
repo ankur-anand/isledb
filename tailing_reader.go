@@ -182,11 +182,13 @@ func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler fun
 
 	for {
 
-		if err := tr.Refresh(ctx); err != nil {
-			if tr.opts.OnRefreshError != nil {
-				tr.opts.OnRefreshError(err)
-			}
+		if !tr.running.Load() {
+			if err := tr.Refresh(ctx); err != nil {
+				if tr.opts.OnRefreshError != nil {
+					tr.opts.OnRefreshError(err)
+				}
 
+			}
 		}
 
 		minKey := opts.MinKey
