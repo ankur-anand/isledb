@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -540,4 +541,75 @@ func TestFindConsecutiveSimilarRuns_ExampleScenario(t *testing.T) {
 			t.Error("512MB run should not be included")
 		}
 	}
+}
+
+func TestManifest_MaxKey(t *testing.T) {
+	t.Run("nil manifest", func(t *testing.T) {
+		var m *Manifest
+		if got := m.MaxKey(); got != nil {
+			t.Fatalf("expected nil max key, got %q", got)
+		}
+	})
+
+	t.Run("empty manifest", func(t *testing.T) {
+		m := &Manifest{}
+		if got := m.MaxKey(); got != nil {
+			t.Fatalf("expected nil max key, got %q", got)
+		}
+	})
+
+	t.Run("largest across l0 and sorted runs", func(t *testing.T) {
+		m := &Manifest{
+			L0SSTs: []SSTMeta{
+				{ID: "l0-a", MaxKey: []byte("k")},
+				{ID: "l0-b", MaxKey: []byte("t")},
+			},
+			SortedRuns: []SortedRun{
+				{
+					ID: 1,
+					SSTs: []SSTMeta{
+						{ID: "sr1-a", MinKey: []byte("a"), MaxKey: []byte("g")},
+						{ID: "sr1-b", MinKey: []byte("h"), MaxKey: []byte("r")},
+					},
+				},
+				{
+					ID: 2,
+					SSTs: []SSTMeta{
+						{ID: "sr2-a", MinKey: []byte("s"), MaxKey: []byte("z")},
+					},
+				},
+			},
+		}
+
+		got := m.MaxKey()
+		if string(got) != "z" {
+			t.Fatalf("expected max key z, got %q", got)
+		}
+	})
+
+	t.Run("returns a copy", func(t *testing.T) {
+		m := &Manifest{
+			L0SSTs: []SSTMeta{
+				{ID: "l0-a", MaxKey: []byte("m")},
+			},
+			SortedRuns: []SortedRun{
+				{
+					ID: 1,
+					SSTs: []SSTMeta{
+						{ID: "sr-a", MinKey: []byte("n"), MaxKey: []byte("z")},
+					},
+				},
+			},
+		}
+
+		got := m.MaxKey()
+		if !bytes.Equal(got, []byte("z")) {
+			t.Fatalf("expected max key z, got %q", got)
+		}
+
+		got[0] = 'a'
+		if !bytes.Equal(m.SortedRuns[0].SSTs[0].MaxKey, []byte("z")) {
+			t.Fatalf("manifest max key was mutated via returned slice: %q", m.SortedRuns[0].SSTs[0].MaxKey)
+		}
+	})
 }
