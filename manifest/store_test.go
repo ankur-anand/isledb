@@ -947,3 +947,125 @@ func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T
 		}
 	}
 }
+
+func TestReplay_FallsBackToFullReplayWhenCurrentNextSeqRegresses(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	ms := NewStore(store)
+	backend := NewBlobStoreBackend(store)
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "regressed-window.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	m, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay after append: %v", err)
+	}
+	if m.LookupSST("regressed-window.sst") == nil {
+		t.Fatalf("expected regressed-window.sst before CURRENT regression")
+	}
+
+	currentData, currentETag, err := backend.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	current, err := DecodeCurrent(currentData)
+	if err != nil {
+		t.Fatalf("decode current: %v", err)
+	}
+	if current.NextSeq == 0 {
+		t.Fatal("expected current.NextSeq > 0")
+	}
+	current.NextSeq--
+
+	updatedCurrentData, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, updatedCurrentData, currentETag); err != nil {
+		t.Fatalf("write regressed current: %v", err)
+	}
+
+	m, err = ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay after CURRENT regression: %v", err)
+	}
+	if m.LookupSST("regressed-window.sst") != nil {
+		t.Fatalf("expected regressed-window.sst to be absent after CURRENT.NextSeq regression")
+	}
+}
+
+func TestReplay_IncrementalMatchesFullWhenFenceClaimLogIsMissing(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	observer := NewStoreWithStorage(base)
+	writer1 := NewStoreWithStorage(base)
+
+	if _, err := observer.Replay(ctx); err != nil {
+		t.Fatalf("observer replay: %v", err)
+	}
+	if _, err := writer1.Replay(ctx); err != nil {
+		t.Fatalf("writer1 replay: %v", err)
+	}
+	if _, err := writer1.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer1: %v", err)
+	}
+	if _, err := writer1.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "base.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append base.sst: %v", err)
+	}
+
+	if _, err := observer.Replay(ctx); err != nil {
+		t.Fatalf("observer seed replay: %v", err)
+	}
+
+	failStorage := &failNthWriteLogStorage{Storage: base, failAt: 1}
+	writer2 := NewStoreWithStorage(failStorage)
+	if _, err := writer2.Replay(ctx); err != nil {
+		t.Fatalf("writer2 replay: %v", err)
+	}
+	if _, err := writer2.ClaimWriter(ctx, "writer-2"); err == nil {
+		t.Fatal("expected writer2 claim failure due injected fence-claim log write error")
+	}
+	if writer2.WriterEpoch() != 2 {
+		t.Fatalf("expected writer2 local epoch=2 after claim CAS, got %d", writer2.WriterEpoch())
+	}
+
+	if _, err := writer1.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "stale-after-fence.sst", Epoch: 1, Level: 0}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("expected ErrFenced for stale writer append, got %v", err)
+	}
+
+	if _, err := writer2.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "valid-epoch2.sst", Epoch: 2, Level: 0}); err != nil {
+		t.Fatalf("append valid-epoch2.sst: %v", err)
+	}
+
+	mIncremental, err := observer.Replay(ctx)
+	if err != nil {
+		t.Fatalf("observer replay: %v", err)
+	}
+	mFull, err := NewStoreWithStorage(base).Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh full replay: %v", err)
+	}
+
+	if (mIncremental.LookupSST("base.sst") != nil) != (mFull.LookupSST("base.sst") != nil) {
+		t.Fatalf("base.sst presence mismatch between incremental and full replay")
+	}
+	if (mIncremental.LookupSST("stale-after-fence.sst") != nil) != (mFull.LookupSST("stale-after-fence.sst") != nil) {
+		t.Fatalf("stale-after-fence.sst presence mismatch between incremental and full replay")
+	}
+	if (mIncremental.LookupSST("valid-epoch2.sst") != nil) != (mFull.LookupSST("valid-epoch2.sst") != nil) {
+		t.Fatalf("valid-epoch2.sst presence mismatch between incremental and full replay")
+	}
+}
