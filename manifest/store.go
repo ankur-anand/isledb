@@ -679,7 +679,7 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 	} else {
 		s.nextSeq = maxSeq + 1
 	}
-	
+
 	if current != nil {
 		s.rcache = &replayCache{
 			manifest:             m.Clone(),
