@@ -319,3 +319,30 @@ func (m *Manifest) AllSSTIDs() []string {
 
 	return ids
 }
+
+// MaxKey returns the lexicographically largest MaxKey across all SSTs
+// (L0 and sorted runs). Returns nil if the manifest has no SSTs.
+func (m *Manifest) MaxKey() []byte {
+	if m == nil {
+		return nil
+	}
+
+	var maxKey []byte
+
+	for _, sst := range m.L0SSTs {
+		if bytes.Compare(sst.MaxKey, maxKey) > 0 {
+			maxKey = sst.MaxKey
+		}
+	}
+
+	for _, sr := range m.SortedRuns {
+		if mk := sr.MaxKey(); bytes.Compare(mk, maxKey) > 0 {
+			maxKey = mk
+		}
+	}
+
+	if maxKey == nil {
+		return nil
+	}
+	return append([]byte(nil), maxKey...)
+}
