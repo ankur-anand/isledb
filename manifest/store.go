@@ -25,6 +25,29 @@ const (
 	FenceRoleCompactor
 )
 
+type replayCache struct {
+	manifest *Manifest
+
+	// snapshot and logSeqStart identify the base; if either changes we
+	// must fall back to a full replay.
+	snapshot    string
+	logSeqStart uint64
+
+	// nextSeq is the CURRENT.NextSeq at the time of the last replay.
+	// On an incremental replay we only read entries [nextSeq, current.NextSeq).
+	nextSeq uint64
+
+	// Cached active fence epochs so we can continue fence filtering
+	// correctly for the delta entries.
+	activeWriterEpoch    uint64
+	activeCompactorEpoch uint64
+
+	// Fence epochs from CURRENT used to build this cache. If CURRENT fence
+	// epochs change, incremental replay must fall back to full replay.
+	writerFenceEpoch    uint64
+	compactorFenceEpoch uint64
+}
+
 type Store struct {
 	storage Storage
 	mu      sync.Mutex
@@ -35,6 +58,8 @@ type Store struct {
 
 	writerFence    *FenceToken
 	compactorFence *FenceToken
+
+	rcache *replayCache
 }
 
 func NewStore(store *blobstore.Store) *Store {
@@ -394,7 +419,137 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 		return nil, err
 	}
 
+	// Attempt incremental replay: if the snapshot and log window base haven't
+	// changed, we only need to read the new delta entries.
+	if m, ok := s.tryIncrementalReplay(ctx, current); ok {
+		return m, nil
+	}
+
+	return s.fullReplay(ctx, current)
+}
+
+// tryIncrementalReplay checks whether we can avoid a full replay by applying
+// only the log entries that appeared since the last successful Replay call.
+// It returns (manifest, true) on success, or (nil, false) when a full replay
+// is required.
+func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Manifest, bool) {
+	s.mu.Lock()
+	rc := s.rcache
+	s.mu.Unlock()
+
+	if rc == nil || current == nil {
+		return nil, false
+	}
+
+	// If the snapshot or log window base changed, we must do a full replay.
+	if current.Snapshot != rc.snapshot || current.LogSeqStart != rc.logSeqStart {
+		return nil, false
+	}
+
+	if tokenEpoch(current.WriterFence) != rc.writerFenceEpoch ||
+		tokenEpoch(current.CompactorFence) != rc.compactorFenceEpoch {
+		return nil, false
+	}
+
+	// No new entries since last replay — return cached manifest directly.
+	// If NextSeq regresses, we must fall back to full replay.
+	if current.NextSeq == rc.nextSeq {
+		m := rc.manifest.Clone()
+		if current.NextEpoch > m.NextEpoch {
+			m.NextEpoch = current.NextEpoch
+		}
+		s.mu.Lock()
+		if current.NextSeq > 0 {
+			s.nextSeq = current.NextSeq
+		}
+		s.mu.Unlock()
+		return m, true
+	}
+	if current.NextSeq < rc.nextSeq {
+		return nil, false
+	}
+
+	// Read only the delta entries: [rc.nextSeq, current.NextSeq)
+	m := rc.manifest.Clone()
+	activeWriterEpoch := rc.activeWriterEpoch
+	activeCompactorEpoch := rc.activeCompactorEpoch
+	var maxSeq uint64
+
+	for seq := rc.nextSeq; seq < current.NextSeq; seq++ {
+		path := s.logPath(seq)
+		entry, err := s.Read(ctx, path)
+		if err != nil {
+			// read error means we can't trust the incremental path.
+			return nil, false
+		}
+		if entry.Seq > maxSeq {
+			maxSeq = entry.Seq
+		}
+
+		if entry.Op == LogOpFenceClaim {
+			if entry.Role == FenceRoleWriter && entry.Epoch > activeWriterEpoch {
+				activeWriterEpoch = entry.Epoch
+			} else if entry.Role == FenceRoleCompactor && entry.Epoch > activeCompactorEpoch {
+				activeCompactorEpoch = entry.Epoch
+			}
+			continue
+		}
+
+		if entry.Role == FenceRoleWriter && entry.Epoch < activeWriterEpoch {
+			continue
+		}
+		if entry.Role == FenceRoleCompactor && entry.Epoch < activeCompactorEpoch {
+			continue
+		}
+
+		m = ApplyLogEntry(m, entry)
+	}
+
+	// epoch and sequence bookkeeping.
+	maxEpoch := activeWriterEpoch
+	if activeCompactorEpoch > maxEpoch {
+		maxEpoch = activeCompactorEpoch
+	}
+	if maxEpoch >= m.NextEpoch {
+		m.NextEpoch = maxEpoch + 1
+	}
+	if current.NextEpoch > m.NextEpoch {
+		m.NextEpoch = current.NextEpoch
+	}
+	if current.NextSeq > 0 {
+		m.LogSeq = current.NextSeq - 1
+	} else if maxSeq > m.LogSeq {
+		m.LogSeq = maxSeq
+	}
+
+	s.mu.Lock()
+	if current.NextSeq > 0 {
+		s.nextSeq = current.NextSeq
+	} else {
+		s.nextSeq = maxSeq + 1
+	}
+	// Update the cache with the new state.
+	s.rcache = &replayCache{
+		manifest:             m.Clone(),
+		snapshot:             current.Snapshot,
+		logSeqStart:          current.LogSeqStart,
+		nextSeq:              current.NextSeq,
+		activeWriterEpoch:    activeWriterEpoch,
+		activeCompactorEpoch: activeCompactorEpoch,
+		writerFenceEpoch:     tokenEpoch(current.WriterFence),
+		compactorFenceEpoch:  tokenEpoch(current.CompactorFence),
+	}
+	s.mu.Unlock()
+
+	return m, true
+}
+
+// fullReplay performs the original full manifest replay from snapshot + all log
+// entries. It updates the replay cache on success.
+func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, error) {
 	var m *Manifest
+	var err error
+
 	if current != nil && current.Snapshot != "" {
 		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot)
 		if err != nil {
@@ -523,6 +678,19 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 		s.nextSeq = current.NextSeq
 	} else {
 		s.nextSeq = maxSeq + 1
+	}
+
+	if current != nil {
+		s.rcache = &replayCache{
+			manifest:             m.Clone(),
+			snapshot:             current.Snapshot,
+			logSeqStart:          current.LogSeqStart,
+			nextSeq:              current.NextSeq,
+			activeWriterEpoch:    activeWriterEpoch,
+			activeCompactorEpoch: activeCompactorEpoch,
+			writerFenceEpoch:     tokenEpoch(current.WriterFence),
+			compactorFenceEpoch:  tokenEpoch(current.CompactorFence),
+		}
 	}
 	s.mu.Unlock()
 
@@ -825,4 +993,11 @@ func nextEpochFromEntry(current uint64, entry *ManifestLogEntry) uint64 {
 	}
 
 	return next
+}
+
+func tokenEpoch(token *FenceToken) uint64 {
+	if token == nil {
+		return 0
+	}
+	return token.Epoch
 }
