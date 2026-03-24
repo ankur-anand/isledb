@@ -50,8 +50,14 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 type DBOptions struct {
     ManifestStorage manifest.Storage // Optional custom manifest storage backend
     GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
+    CommittedLSNExtractor isledb.CommittedLSNExtractor // Optional CURRENT max_lsn updater for append-only monotonic keyspaces
 }
 ```
+
+`CommittedLSNExtractor` is intended for append-only, monotonic keyspaces where the
+lexicographically largest key is also the latest logical position, such as
+8-byte big-endian WAL/LSN keys. If it is not configured, `Reader.MaxCommittedLSN`
+and `TailingReader.MaxCommittedLSN` return `found=false`.
 
 ---
 
@@ -100,6 +106,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key |
+| MaxCommittedLSN | `(ctx context.Context) (uint64, bool, error)` | Read latest committed LSN from `CURRENT` for append-only monotonic keyspaces |
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
@@ -127,6 +134,10 @@ type ReaderOpenOptions struct {
 
 func DefaultReaderOpenOptions() ReaderOpenOptions
 ```
+
+`MaxCommittedLSN` is a fast path backed by `CURRENT`. Use it only for workloads
+where max key equals latest logical position. It is not a general-purpose
+replacement for manifest replay or arbitrary KV ordering.
 
 #### KV
 
@@ -176,6 +187,7 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 | Refresh | `(ctx context.Context) error` | Manually refresh manifest |
 | LastRefresh | `() time.Time` | Time of last refresh |
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value |
+| MaxCommittedLSN | `(ctx context.Context) (uint64, bool, error)` | Read latest committed LSN from `CURRENT` for append-only monotonic keyspaces |
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan key range |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create iterator |

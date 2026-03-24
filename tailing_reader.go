@@ -138,6 +138,12 @@ func (tr *TailingReader) Get(ctx context.Context, key []byte) ([]byte, bool, err
 	return tr.reader.Get(ctx, key)
 }
 
+// MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.
+// See Reader.MaxCommittedLSN for usage constraints.
+func (tr *TailingReader) MaxCommittedLSN(ctx context.Context) (uint64, bool, error) {
+	return tr.reader.MaxCommittedLSN(ctx)
+}
+
 // Scan returns all key-value pairs in the given range.
 func (tr *TailingReader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
 	return tr.reader.Scan(ctx, minKey, maxKey)
