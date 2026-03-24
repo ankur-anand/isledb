@@ -16,6 +16,9 @@ type SSTSignature = manifest.SSTSignature
 type SortedRun = manifest.SortedRun
 type CompactionLogPayload = manifest.CompactionLogPayload
 
+// CommittedLSNExtractor extracts an application-defined committed LSN from an SST MaxKey.
+type CommittedLSNExtractor = manifest.CommittedLSNExtractor
+
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {
 		return storage
@@ -38,7 +41,15 @@ func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.St
 }
 
 func newManifestStore(store *blobstore.Store, storage manifest.Storage) *manifest.Store {
-	return manifest.NewStoreWithStorage(resolveManifestStorage(store, storage))
+	return newManifestStoreWithExtractor(store, storage, nil)
+}
+
+func newManifestStoreWithExtractor(store *blobstore.Store, storage manifest.Storage, extractor CommittedLSNExtractor) *manifest.Store {
+	ms := manifest.NewStoreWithStorage(resolveManifestStorage(store, storage))
+	if extractor != nil {
+		ms.SetCommittedLSNExtractor(extractor)
+	}
+	return ms
 }
 
 func newManifestStoreWithCache(store *blobstore.Store, opts *ReaderOptions) *manifest.Store {

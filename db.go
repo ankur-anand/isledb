@@ -69,11 +69,18 @@ type DBOptions struct {
 	// GCMarkStorage allows using a custom storage backend for GC mark state.
 	// If nil, the blob store is used.
 	GCMarkStorage manifest.GCMarkStorage
+	// CommittedLSNExtractor extracts an application-defined committed LSN
+	// from the SST MaxKey when CURRENT is advanced.
+	//
+	// This is intended for append-only, monotonic keyspaces where the
+	// lexicographically largest key also represents the latest logical
+	// position, such as 8-byte big-endian WAL/LSN keys.
+	CommittedLSNExtractor CommittedLSNExtractor
 }
 
 // OpenDB opens a database and initializes it.
 func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
-	manifestStore := newManifestStore(store, opts.ManifestStorage)
+	manifestStore := newManifestStoreWithExtractor(store, opts.ManifestStorage, opts.CommittedLSNExtractor)
 	gcMarkStorage := opts.GCMarkStorage
 	if gcMarkStorage == nil {
 		gcMarkStorage = newGCMarkStorage(store)

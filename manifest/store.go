@@ -48,6 +48,9 @@ type replayCache struct {
 	compactorFenceEpoch uint64
 }
 
+// CommittedLSNExtractor extracts an application-defined committed LSN from an SST MaxKey.
+type CommittedLSNExtractor func(maxKey []byte) (uint64, bool)
+
 type Store struct {
 	storage Storage
 	mu      sync.Mutex
@@ -59,7 +62,8 @@ type Store struct {
 	writerFence    *FenceToken
 	compactorFence *FenceToken
 
-	rcache *replayCache
+	rcache                *replayCache
+	committedLSNExtractor CommittedLSNExtractor
 }
 
 func NewStore(store *blobstore.Store) *Store {
@@ -72,6 +76,13 @@ func NewStoreWithStorage(storage Storage) *Store {
 
 func (s *Store) Storage() Storage {
 	return s.storage
+}
+
+// SetCommittedLSNExtractor configures how CURRENT.MaxCommittedLSN is derived from SST MaxKey values.
+func (s *Store) SetCommittedLSNExtractor(extractor CommittedLSNExtractor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.committedLSNExtractor = extractor
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
@@ -772,6 +783,9 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if current == nil {
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
+	if current.MaxCommittedLSN == nil {
+		s.applyCommittedLSNFromManifest(current, m)
+	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
 	if current.NextEpoch < m.NextEpoch {
@@ -807,6 +821,11 @@ func formatLogSeq(seq uint64) string {
 func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
 	current, _, err := s.readCurrentWithETag(ctx)
 	return current, err
+}
+
+// ReadCurrentData reads and decodes CURRENT using the most direct storage path available.
+func (s *Store) ReadCurrentData(ctx context.Context) (*Current, error) {
+	return s.readCurrentData(ctx)
 }
 
 func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
@@ -909,6 +928,7 @@ func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) erro
 		}
 		updated.NextSeq = nextSeq
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, entry)
+		s.applyCommittedLSNFromEntry(&updated, entry)
 
 		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -927,6 +947,58 @@ func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) erro
 	}
 
 	return ErrFenceConflict
+}
+
+func (s *Store) applyCommittedLSNFromEntry(current *Current, entry *ManifestLogEntry) {
+	if current == nil || entry == nil || entry.Op != LogOpAddSSTable || entry.SSTable == nil {
+		return
+	}
+
+	extractor := s.getCommittedLSNExtractor()
+	if extractor == nil {
+		return
+	}
+
+	maxKey := append([]byte(nil), entry.SSTable.MaxKey...)
+	lsn, ok := extractor(maxKey)
+	if !ok {
+		return
+	}
+
+	if current.MaxCommittedLSN == nil || lsn > *current.MaxCommittedLSN {
+		current.MaxCommittedLSN = &lsn
+	}
+}
+
+func (s *Store) applyCommittedLSNFromManifest(current *Current, m *Manifest) {
+	if current == nil || m == nil {
+		return
+	}
+
+	extractor := s.getCommittedLSNExtractor()
+	if extractor == nil {
+		return
+	}
+
+	maxKey := m.MaxKey()
+	if len(maxKey) == 0 {
+		return
+	}
+
+	lsn, ok := extractor(maxKey)
+	if !ok {
+		return
+	}
+
+	if current.MaxCommittedLSN == nil || lsn > *current.MaxCommittedLSN {
+		current.MaxCommittedLSN = &lsn
+	}
+}
+
+func (s *Store) getCommittedLSNExtractor() CommittedLSNExtractor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.committedLSNExtractor
 }
 
 func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {

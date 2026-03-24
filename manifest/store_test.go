@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -93,6 +94,61 @@ func TestWriteLog_DoesNotOverwriteExistingEntry(t *testing.T) {
 	}
 	if _, err := backend.WriteLog(ctx, logName, data); !errors.Is(err, ErrPreconditionFailed) {
 		t.Fatalf("expected ErrPreconditionFailed, got %v", err)
+	}
+}
+
+func TestAppendAddSSTableWithFence_UpdatesCurrentCommittedLSN(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	ms := NewStore(store)
+	ms.SetCommittedLSNExtractor(func(maxKey []byte) (uint64, bool) {
+		if len(maxKey) != 8 {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(maxKey), true
+	})
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	makeKey := func(v uint64) []byte {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, v)
+		return key
+	}
+
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{
+		ID:     "a.sst",
+		Epoch:  1,
+		Level:  0,
+		MaxKey: makeKey(41),
+	}); err != nil {
+		t.Fatalf("append first sst: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{
+		ID:     "b.sst",
+		Epoch:  2,
+		Level:  0,
+		MaxKey: makeKey(99),
+	}); err != nil {
+		t.Fatalf("append second sst: %v", err)
+	}
+
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if current == nil || current.MaxCommittedLSN == nil {
+		t.Fatal("expected current max committed lsn to be set")
+	}
+	if got := *current.MaxCommittedLSN; got != 99 {
+		t.Fatalf("unexpected max committed lsn: got=%d want=99", got)
 	}
 }
 
@@ -810,6 +866,46 @@ func TestWriteSnapshot_DoesNotRegressCurrentNextSeqOnFreshStore(t *testing.T) {
 
 	if after.NextSeq < before.NextSeq {
 		t.Fatalf("next_seq regressed after snapshot: before=%d after=%d", before.NextSeq, after.NextSeq)
+	}
+}
+
+func TestWriteSnapshot_BackfillsCurrentCommittedLSNFromManifest(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	ms := NewStore(store)
+	ms.SetCommittedLSNExtractor(func(maxKey []byte) (uint64, bool) {
+		if len(maxKey) != 8 {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(maxKey), true
+	})
+
+	maxKey := make([]byte, 8)
+	binary.BigEndian.PutUint64(maxKey, 77)
+
+	manifest := &Manifest{
+		NextEpoch: 1,
+		LogSeq:    1,
+		L0SSTs: []SSTMeta{
+			{ID: "a.sst", Epoch: 1, Level: 0, MaxKey: maxKey},
+		},
+	}
+
+	if _, err := ms.WriteSnapshot(ctx, manifest); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if current == nil || current.MaxCommittedLSN == nil {
+		t.Fatal("expected current max committed lsn to be backfilled")
+	}
+	if got := *current.MaxCommittedLSN; got != 77 {
+		t.Fatalf("unexpected max committed lsn: got=%d want=77", got)
 	}
 }
 

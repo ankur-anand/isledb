@@ -257,6 +257,26 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 	return r.manifest
 }
 
+// MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.
+//
+// This fast path is available only when writers were opened with
+// DBOptions.CommittedLSNExtractor and the workload uses a monotonic key
+// encoding where max key == latest logical position. It returns found=false
+// when the value is not present.
+func (r *Reader) MaxCommittedLSN(ctx context.Context) (uint64, bool, error) {
+	current, err := r.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		if errors.Is(err, manifest.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if current == nil || current.MaxCommittedLSN == nil {
+		return 0, false, nil
+	}
+	return *current.MaxCommittedLSN, true, nil
+}
+
 // Get returns the value for key if present and not deleted/expired.
 func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool, err error) {
 	start := time.Now()

@@ -77,11 +77,13 @@ func TestSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCurrentRoundTrip(t *testing.T) {
+	maxCommittedLSN := uint64(42)
 	c := &Current{
-		Snapshot:    "snapshots/000000001.manifest",
-		LogSeqStart: 7,
-		NextSeq:     12,
-		NextEpoch:   5,
+		Snapshot:        "snapshots/000000001.manifest",
+		LogSeqStart:     7,
+		NextSeq:         12,
+		NextEpoch:       5,
+		MaxCommittedLSN: &maxCommittedLSN,
 	}
 
 	data, err := EncodeCurrent(c)
@@ -93,6 +95,9 @@ func TestCurrentRoundTrip(t *testing.T) {
 		t.Fatalf("decode current: %v", err)
 	}
 	if got.Snapshot != c.Snapshot || got.LogSeqStart != c.LogSeqStart || got.NextSeq != c.NextSeq || got.NextEpoch != c.NextEpoch {
+		t.Fatalf("current mismatch")
+	}
+	if got.MaxCommittedLSN == nil || *got.MaxCommittedLSN != *c.MaxCommittedLSN {
 		t.Fatalf("current mismatch")
 	}
 }

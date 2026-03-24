@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -196,5 +197,56 @@ func TestOpenDBCompactorOptionsOverrideGCMarkStorage(t *testing.T) {
 	}
 	if retentionCompactor.gcMarkStore != retentionStorage {
 		t.Fatal("retention compactor gc mark storage override not applied")
+	}
+}
+
+func TestReaderMaxCommittedLSN(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-max-committed-lsn")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{
+		CommittedLSNExtractor: BigEndianUint64LSNExtractor,
+	})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer writer.Close()
+
+	putLSN := func(lsn uint64, value string) {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, lsn)
+		if err := writer.Put(key, []byte(value)); err != nil {
+			t.Fatalf("Put(%d): %v", lsn, err)
+		}
+	}
+
+	putLSN(7, "v7")
+	putLSN(42, "v42")
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer reader.Close()
+
+	lsn, found, err := reader.MaxCommittedLSN(ctx)
+	if err != nil {
+		t.Fatalf("MaxCommittedLSN: %v", err)
+	}
+	if !found {
+		t.Fatal("expected max committed lsn to be found")
+	}
+	if lsn != 42 {
+		t.Fatalf("unexpected max committed lsn: got=%d want=42", lsn)
 	}
 }
