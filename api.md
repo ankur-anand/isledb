@@ -193,6 +193,7 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create iterator |
 | Manifest | `() *Manifest` | Get manifest snapshot |
 | Reader | `() *Reader` | Access underlying Reader |
+| CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Refresh once and emit currently visible records |
 | Tail | `(ctx context.Context, opts TailOptions, handler func(KV) error) error` | Continuously scan for new keys |
 | TailChannel | `(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error)` | Tail as channels |
 
@@ -205,6 +206,21 @@ type TailingReaderOpenOptions struct {
 }
 
 func DefaultTailingReaderOpenOptions() TailingReaderOpenOptions
+```
+
+```go
+type CatchUpOptions struct {
+    MinKey        []byte // Inclusive lower bound
+    MaxKey        []byte // Inclusive upper bound
+    StartAfterKey []byte // Resume from next key after this value
+    Limit         int    // 0 means unlimited
+}
+
+type CatchUpResult struct {
+    LastKey   []byte // Last key successfully delivered to the handler
+    Count     int    // Number of delivered records
+    Truncated bool   // True when the call stopped because Limit was reached
+}
 ```
 
 ```go

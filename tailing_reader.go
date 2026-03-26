@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -169,6 +170,15 @@ func (tr *TailingReader) Reader() *Reader {
 	return tr.reader
 }
 
+// CatchUp refreshes the manifest once, emits the currently visible records in
+// the requested range, and then returns progress suitable for checkpointing.
+func (tr *TailingReader) CatchUp(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
+	if err := tr.Refresh(ctx); err != nil {
+		return CatchUpResult{}, err
+	}
+	return tr.catchUpNoRefresh(ctx, opts, handler)
+}
+
 // Tail continuously scans for new keys and calls handler for each result.
 func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler func(KV) error) error {
 	if opts.PollInterval == 0 {
@@ -187,57 +197,33 @@ func (tr *TailingReader) Tail(ctx context.Context, opts TailOptions, handler fun
 	defer timer.Stop()
 
 	for {
-
 		if !tr.running.Load() {
 			if err := tr.Refresh(ctx); err != nil {
 				if tr.opts.OnRefreshError != nil {
 					tr.opts.OnRefreshError(err)
 				}
-
 			}
 		}
 
-		minKey := opts.MinKey
-		if lastKey != nil {
-
-			minKey = incrementKey(lastKey)
+		catchUpOpts := CatchUpOptions{
+			MaxKey: opts.MaxKey,
+		}
+		if len(lastKey) > 0 {
+			catchUpOpts.StartAfterKey = lastKey
+		} else {
+			catchUpOpts.MinKey = opts.MinKey
 		}
 
-		iter, err := tr.reader.NewIterator(ctx, IteratorOptions{
-			MinKey: minKey,
-			MaxKey: opts.MaxKey,
-		})
+		result, err := tr.catchUpNoRefresh(ctx, catchUpOpts, handler)
 		if err != nil {
 			return err
 		}
-
-		for iter.Next() {
-			kv := KV{
-				Key:   iter.Key(),
-				Value: iter.Value(),
-			}
-
-			if err := handler(kv); err != nil {
-				iter.Close()
-				return err
-			}
-
-			lastKey = append(lastKey[:0], kv.Key...)
+		if len(result.LastKey) > 0 {
+			lastKey = append(lastKey[:0], result.LastKey...)
 		}
 
-		if err := iter.Err(); err != nil {
-			iter.Close()
+		if err := waitForTailPoll(ctx, timer, opts.PollInterval); err != nil {
 			return err
-		}
-		iter.Close()
-
-		timer.Stop()
-		timer.Reset(opts.PollInterval)
-
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	}
 }
@@ -266,4 +252,65 @@ func (tr *TailingReader) TailChannel(ctx context.Context, opts TailOptions) (<-c
 	}()
 
 	return ch, errCh
+}
+
+func (tr *TailingReader) catchUpNoRefresh(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
+	iter, err := tr.reader.NewIterator(ctx, IteratorOptions{
+		MinKey: catchUpMinKey(opts.MinKey, opts.StartAfterKey),
+		MaxKey: opts.MaxKey,
+	})
+	if err != nil {
+		return CatchUpResult{}, err
+	}
+	defer iter.Close()
+
+	var result CatchUpResult
+
+	for iter.Next() {
+		kv := KV{
+			Key:   iter.Key(),
+			Value: iter.Value(),
+		}
+
+		if err := handler(kv); err != nil {
+			return result, err
+		}
+
+		result.LastKey = append(result.LastKey[:0], kv.Key...)
+		result.Count++
+
+		if opts.Limit > 0 && result.Count >= opts.Limit {
+			result.Truncated = true
+			return result, nil
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func catchUpMinKey(minKey, startAfterKey []byte) []byte {
+	if len(startAfterKey) == 0 {
+		return minKey
+	}
+
+	nextKey := incrementKey(startAfterKey)
+	if len(minKey) == 0 || bytes.Compare(nextKey, minKey) > 0 {
+		return nextKey
+	}
+	return minKey
+}
+
+func waitForTailPoll(ctx context.Context, timer *time.Timer, pollInterval time.Duration) error {
+	timer.Reset(pollInterval)
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
