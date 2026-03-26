@@ -309,6 +309,262 @@ func TestTailingReader_StartAfterKey(t *testing.T) {
 	}
 }
 
+func TestTailingReader_StartAfterKeyOverridesMinKey(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("log:%03d", i)
+		value := fmt.Sprintf("entry:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTailingReader failed: %v", err)
+	}
+	defer tr.Close()
+
+	tailCtx, tailCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer tailCancel()
+
+	var received []string
+	_ = tr.Tail(tailCtx, TailOptions{
+		MinKey:        []byte("log:007"),
+		MaxKey:        []byte("log:~"),
+		StartAfterKey: []byte("log:004"),
+		PollInterval:  50 * time.Millisecond,
+	}, func(kv KV) error {
+		received = append(received, string(kv.Key))
+		if len(received) >= 5 {
+			return context.Canceled
+		}
+		return nil
+	})
+
+	if len(received) != 5 {
+		t.Fatalf("Expected 5 entries, got %d: %v", len(received), received)
+	}
+	if received[0] != "log:005" {
+		t.Fatalf("Expected first key log:005, got %s", received[0])
+	}
+}
+
+func TestTailingReader_CatchUp(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTailingReader failed: %v", err)
+	}
+	defer tr.Close()
+
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("wal:%03d", i)
+		value := fmt.Sprintf("entry:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	var received []string
+	result, err := tr.CatchUp(ctx, CatchUpOptions{
+		MinKey:        []byte("wal:"),
+		MaxKey:        []byte("wal:~"),
+		StartAfterKey: []byte("wal:001"),
+	}, func(kv KV) error {
+		received = append(received, string(kv.Key))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CatchUp failed: %v", err)
+	}
+
+	if len(received) != 3 {
+		t.Fatalf("Expected 3 entries, got %d: %v", len(received), received)
+	}
+	if received[0] != "wal:002" {
+		t.Fatalf("Expected first key wal:002, got %s", received[0])
+	}
+	if result.Count != 3 {
+		t.Fatalf("Expected result.Count=3, got %d", result.Count)
+	}
+	if result.Truncated {
+		t.Fatal("Expected result.Truncated=false")
+	}
+	if string(result.LastKey) != "wal:004" {
+		t.Fatalf("Expected result.LastKey=wal:004, got %q", result.LastKey)
+	}
+}
+
+func TestTailingReader_CatchUpLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("log:%03d", i)
+		value := fmt.Sprintf("entry:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTailingReader failed: %v", err)
+	}
+	defer tr.Close()
+
+	var received []string
+	result, err := tr.CatchUp(ctx, CatchUpOptions{
+		MinKey: []byte("log:"),
+		MaxKey: []byte("log:~"),
+		Limit:  2,
+	}, func(kv KV) error {
+		received = append(received, string(kv.Key))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CatchUp failed: %v", err)
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("Expected 2 entries, got %d: %v", len(received), received)
+	}
+	if result.Count != 2 {
+		t.Fatalf("Expected result.Count=2, got %d", result.Count)
+	}
+	if !result.Truncated {
+		t.Fatal("Expected result.Truncated=true")
+	}
+	if string(result.LastKey) != "log:001" {
+		t.Fatalf("Expected result.LastKey=log:001, got %q", result.LastKey)
+	}
+}
+
+func TestTailingReader_CatchUpHandlerErrorProgress(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("stream:%03d", i)
+		value := fmt.Sprintf("entry:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTailingReader failed: %v", err)
+	}
+	defer tr.Close()
+
+	handlerErr := errors.New("stop after two")
+	var received []string
+	result, err := tr.CatchUp(ctx, CatchUpOptions{
+		MinKey: []byte("stream:"),
+		MaxKey: []byte("stream:~"),
+	}, func(kv KV) error {
+		received = append(received, string(kv.Key))
+		if len(received) == 3 {
+			return handlerErr
+		}
+		return nil
+	})
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("Expected handler error, got %v", err)
+	}
+
+	if result.Count != 2 {
+		t.Fatalf("Expected result.Count=2, got %d", result.Count)
+	}
+	if result.Truncated {
+		t.Fatal("Expected result.Truncated=false")
+	}
+	if string(result.LastKey) != "stream:001" {
+		t.Fatalf("Expected result.LastKey=stream:001, got %q", result.LastKey)
+	}
+	if len(received) != 3 {
+		t.Fatalf("Expected handler to be called 3 times, got %d", len(received))
+	}
+}
+
 func TestIncrementKey(t *testing.T) {
 	tests := []struct {
 		input    []byte

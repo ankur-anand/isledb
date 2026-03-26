@@ -166,6 +166,34 @@ type IteratorOptions struct {
 	MaxKey []byte
 }
 
+// CatchUpOptions controls a single refresh-and-drain pass for a TailingReader.
+type CatchUpOptions struct {
+	// MinKey and MaxKey constrain the catch-up range (inclusive bounds).
+	MinKey []byte
+	MaxKey []byte
+
+	// StartAfterKey resumes from the next key after this value.
+	// If set, CatchUp starts from the greater of MinKey and incrementKey(StartAfterKey).
+	StartAfterKey []byte
+
+	// Limit bounds the number of records emitted in a single call.
+	// A zero value means unlimited.
+	Limit int
+}
+
+// CatchUpResult reports the progress made by a CatchUp call.
+type CatchUpResult struct {
+	// LastKey is the last key successfully delivered to the handler.
+	// It is nil when no records were emitted.
+	LastKey []byte
+
+	// Count is the number of records successfully delivered to the handler.
+	Count int
+
+	// Truncated reports whether the call stopped because Limit was reached.
+	Truncated bool
+}
+
 // TailOptions controls tailing behavior for a TailingReader.
 type TailOptions struct {
 	// MinKey and MaxKey constrain the tailing range (inclusive bounds).
