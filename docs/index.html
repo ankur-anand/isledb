@@ -3,36 +3,76 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>IsleDB — Embedded KV Engine on Object Storage</title>
+    <title>IsleDB | Embedded Go Key-Value Database for Object Storage</title>
     <meta
       name="description"
-      content="IsleDB is an embedded key-value engine designed for object storage. LSM-style architecture on S3, GCS, Azure Blob, or MinIO."
+      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
     />
-    <meta
-      name="keywords"
-      content="embedded database,key-value store,object storage,s3 database,lsm tree,event streaming,tailing reader,go database,golang"
-    />
-
-    <meta property="og:title" content="IsleDB — Your data island on object storage." />
+    <link rel="canonical" href="https://isledb.com/" />
+    <meta name="robots" content="index,follow" />
+    <meta property="og:title" content="IsleDB | Embedded Go Key-Value Database for Object Storage" />
     <meta
       property="og:description"
-      content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
+      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:image" content="./social.png" />
+    <meta property="og:url" content="https://isledb.com/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="IsleDB — Your data island on object storage." />
+    <meta
+      property="og:image:alt"
+      content="IsleDB homepage preview for an embedded Go key-value database on object storage."
+    />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="IsleDB — Your data island on object storage." />
+    <meta name="twitter:title" content="IsleDB | Embedded Go Key-Value Database for Object Storage" />
     <meta
       name="twitter:description"
-      content="Embedded KV engine on object storage. Write data in. Tail it out. No servers. Just a bucket."
+      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
     />
-    <meta name="twitter:image" content="./social.png" />
+    <meta name="twitter:image" content="https://isledb.com/social.png" />
+    <meta
+      name="twitter:image:alt"
+      content="IsleDB homepage preview for an embedded Go key-value database on object storage."
+    />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="shortcut icon" href="./favicon.svg" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        "name": "IsleDB",
+        "url": "https://isledb.com/",
+        "description": "IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction.",
+        "codeRepository": "https://github.com/ankur-anand/isledb",
+        "programmingLanguage": "Go",
+        "runtimePlatform": "Go",
+        "license": "https://github.com/ankur-anand/isledb/blob/main/LICENSE",
+        "keywords": [
+          "embedded database",
+          "key-value database",
+          "object storage database",
+          "S3 database",
+          "Go database",
+          "tailing reader"
+        ]
+      }
+    </script>
+
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -181,6 +221,13 @@
 
       .hero-copy {
         text-align: left;
+      }
+
+      .hero-subhead {
+        max-width: 700px;
+        margin: 1rem 0 0;
+        color: var(--ink-700);
+        font-size: clamp(1rem, 2vw, 1.12rem);
       }
 
       .hero::after {
@@ -947,9 +994,13 @@
       <div class="hero-layout">
         <div class="hero-copy">
           <h1>
-            Your data island<br />
-            <span class="gradient">on object storage.</span>
+            Embedded Go key-value<br />
+            <span class="gradient">database for object storage.</span>
           </h1>
+          <p class="hero-subhead">
+            IsleDB is a Go database library for S3, GCS, Azure Blob, and MinIO, built for
+            writes, scans, tailing readers, compaction, and object-storage-first workloads.
+          </p>
         </div>
         <aside class="hero-features" aria-label="Feature highlights">
           <h3>Feature</h3>
