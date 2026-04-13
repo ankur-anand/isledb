@@ -194,6 +194,7 @@ func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts Tailing
 | Manifest | `() *Manifest` | Get manifest snapshot |
 | Reader | `() *Reader` | Access underlying Reader |
 | CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Refresh once and emit currently visible records |
+| CatchUpCurrent | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Emit records from the current manifest snapshot without refreshing |
 | Tail | `(ctx context.Context, opts TailOptions, handler func(KV) error) error` | Continuously scan for new keys |
 | TailChannel | `(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error)` | Tail as channels |
 

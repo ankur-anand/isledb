@@ -436,6 +436,89 @@ func TestTailingReader_CatchUp(t *testing.T) {
 	}
 }
 
+func TestTailingReader_CatchUpCurrentUsesCurrentSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+
+	manifestStore := newManifestStore(store, nil)
+
+	wOpts := DefaultWriterOptions()
+	wOpts.FlushInterval = 0
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter failed: %v", err)
+	}
+	defer w.close()
+
+	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		ReaderOptions: ReaderOptions{
+			CacheDir: t.TempDir(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTailingReader failed: %v", err)
+	}
+	defer tr.Close()
+
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("snap:%03d", i)
+		value := fmt.Sprintf("entry:%03d", i)
+		if err := w.put([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	var staleView []string
+	result, err := tr.CatchUpCurrent(ctx, CatchUpOptions{
+		MinKey: []byte("snap:"),
+		MaxKey: []byte("snap:~"),
+	}, func(kv KV) error {
+		staleView = append(staleView, string(kv.Key))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CatchUpCurrent failed on stale snapshot: %v", err)
+	}
+	if len(staleView) != 0 {
+		t.Fatalf("Expected stale snapshot to return no entries, got %v", staleView)
+	}
+	if result.Count != 0 {
+		t.Fatalf("Expected stale result.Count=0, got %d", result.Count)
+	}
+	if result.LastKey != nil {
+		t.Fatalf("Expected stale result.LastKey=nil, got %q", result.LastKey)
+	}
+
+	if err := tr.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh failed: %v", err)
+	}
+
+	var refreshedView []string
+	result, err = tr.CatchUpCurrent(ctx, CatchUpOptions{
+		MinKey: []byte("snap:"),
+		MaxKey: []byte("snap:~"),
+	}, func(kv KV) error {
+		refreshedView = append(refreshedView, string(kv.Key))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CatchUpCurrent failed after refresh: %v", err)
+	}
+	if len(refreshedView) != 3 {
+		t.Fatalf("Expected refreshed snapshot to return 3 entries, got %d: %v", len(refreshedView), refreshedView)
+	}
+	if result.Count != 3 {
+		t.Fatalf("Expected refreshed result.Count=3, got %d", result.Count)
+	}
+	if string(result.LastKey) != "snap:002" {
+		t.Fatalf("Expected refreshed result.LastKey=snap:002, got %q", result.LastKey)
+	}
+}
+
 func TestTailingReader_CatchUpLimit(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
