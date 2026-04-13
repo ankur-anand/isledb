@@ -181,9 +181,6 @@ func (tr *TailingReader) CatchUp(ctx context.Context, opts CatchUpOptions, handl
 
 // CatchUpCurrent emits the currently visible records from the reader's current
 // manifest snapshot without performing a refresh first.
-//
-// This is useful when refresh ownership is coordinated externally and many
-// logical consumers need to catch up against the same already-refreshed view.
 func (tr *TailingReader) CatchUpCurrent(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
 	return tr.catchUpNoRefresh(ctx, opts, handler)
 }
