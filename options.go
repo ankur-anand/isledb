@@ -166,7 +166,7 @@ type IteratorOptions struct {
 	MaxKey []byte
 }
 
-// CatchUpOptions controls a single refresh-and-drain pass for a TailingReader.
+// CatchUpOptions controls a single catch-up pass for a TailingReader.
 type CatchUpOptions struct {
 	// MinKey and MaxKey constrain the catch-up range (inclusive bounds).
 	MinKey []byte
