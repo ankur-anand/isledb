@@ -261,41 +261,7 @@ func (tr *TailingReader) TailChannel(ctx context.Context, opts TailOptions) (<-c
 }
 
 func (tr *TailingReader) catchUpNoRefresh(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
-	iter, err := tr.reader.NewIterator(ctx, IteratorOptions{
-		MinKey: catchUpMinKey(opts.MinKey, opts.StartAfterKey),
-		MaxKey: opts.MaxKey,
-	})
-	if err != nil {
-		return CatchUpResult{}, err
-	}
-	defer iter.Close()
-
-	var result CatchUpResult
-
-	for iter.Next() {
-		kv := KV{
-			Key:   iter.Key(),
-			Value: iter.Value(),
-		}
-
-		if err := handler(kv); err != nil {
-			return result, err
-		}
-
-		result.LastKey = append(result.LastKey[:0], kv.Key...)
-		result.Count++
-
-		if opts.Limit > 0 && result.Count >= opts.Limit {
-			result.Truncated = true
-			return result, nil
-		}
-	}
-
-	if err := iter.Err(); err != nil {
-		return result, err
-	}
-
-	return result, nil
+	return catchUpWithManifest(ctx, tr.reader, tr.reader.currentManifest(), opts, handler)
 }
 
 func catchUpMinKey(minKey, startAfterKey []byte) []byte {

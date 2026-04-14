@@ -257,6 +257,21 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 	return r.manifest
 }
 
+func (r *Reader) currentManifest() *Manifest {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.manifest
+}
+
+func (r *Reader) manifestSnapshot() *Manifest {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.manifest == nil {
+		return nil
+	}
+	return r.manifest.Clone()
+}
+
 // MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.
 //
 // This fast path is available only when writers were opened with
@@ -288,10 +303,10 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 		return nil, false, errors.New("empty key")
 	}
 
-	r.mu.RLock()
-	m := r.manifest
-	r.mu.RUnlock()
+	return r.getWithManifest(ctx, r.currentManifest(), key)
+}
 
+func (r *Reader) getWithManifest(ctx context.Context, m *Manifest, key []byte) ([]byte, bool, error) {
 	if m == nil {
 		return nil, false, errors.New("manifest not loaded")
 	}
@@ -341,7 +356,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		r.metrics.ObserveScan(time.Since(start), len(out), err)
 	}()
 
-	return r.scanInternal(ctx, minKey, maxKey, 0)
+	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, 0)
 }
 
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
@@ -350,14 +365,10 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		r.metrics.ObserveScanLimit(time.Since(start), len(out), err)
 	}()
 
-	return r.scanInternal(ctx, minKey, maxKey, limit)
+	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, limit)
 }
 
-func (r *Reader) scanInternal(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
-	r.mu.RLock()
-	m := r.manifest
-	r.mu.RUnlock()
-
+func (r *Reader) scanInternalWithManifest(ctx context.Context, m *Manifest, minKey, maxKey []byte, limit int) (out []KV, err error) {
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
@@ -1039,10 +1050,10 @@ type iterEntry struct {
 }
 
 func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
-	r.mu.RLock()
-	m := r.manifest
-	r.mu.RUnlock()
+	return r.newIteratorWithManifest(ctx, r.currentManifest(), opts)
+}
 
+func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts IteratorOptions) (*Iterator, error) {
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}

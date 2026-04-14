@@ -63,6 +63,34 @@ func (m *Manifest) Clone() *Manifest {
 	return clone
 }
 
+func (f *FenceToken) Clone() *FenceToken {
+	if f == nil {
+		return nil
+	}
+	clone := *f
+	return &clone
+}
+
+func (c *Current) Clone() *Current {
+	if c == nil {
+		return nil
+	}
+
+	clone := &Current{
+		Snapshot:       c.Snapshot,
+		LogSeqStart:    c.LogSeqStart,
+		NextSeq:        c.NextSeq,
+		NextEpoch:      c.NextEpoch,
+		WriterFence:    c.WriterFence.Clone(),
+		CompactorFence: c.CompactorFence.Clone(),
+	}
+	if c.MaxCommittedLSN != nil {
+		lsn := *c.MaxCommittedLSN
+		clone.MaxCommittedLSN = &lsn
+	}
+	return clone
+}
+
 func (m *Manifest) L0SSTCount() int {
 	return len(m.L0SSTs)
 }
