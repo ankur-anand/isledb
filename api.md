@@ -95,6 +95,52 @@ func DefaultWriterOptions() WriterOptions
 
 ---
 
+### Coordinator
+
+Shared refresh owner that publishes immutable read views over loaded manifest state.
+
+```go
+func OpenCoordinator(ctx context.Context, store *blobstore.Store, opts CoordinatorOptions) (*Coordinator, error)
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Refresh | `(ctx context.Context) (View, bool, error)` | Reload storage state only when CURRENT advanced and return the latest published view |
+| Current | `() View` | Return the latest published immutable view without I/O |
+| Close | `() error` | Close the shared reader runtime after outstanding views are released |
+
+```go
+type CoordinatorOptions struct {
+    ReaderOptions ReaderOpenOptions
+}
+
+func DefaultCoordinatorOptions() CoordinatorOptions
+```
+
+#### View
+
+Immutable read handle over one loaded manifest snapshot.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Version | `() Version` | Return an opaque identifier for the loaded visible state |
+| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key from this fixed view |
+| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create a bounded iterator over this fixed view |
+| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Read up to limit records from this fixed view |
+| MaxCommittedLSN | `() (uint64, bool)` | Return the head/high-watermark captured with this view |
+| CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Emit visible records after the requested checkpoint from this fixed view |
+| Close | `() error` | Release the caller reference to the view |
+
+```go
+type Version struct { ... }
+type View interface { ... }
+```
+
+`CatchUp` on a `View` runs against one fixed visible manifest state. It does
+not refresh while scanning.
+
+---
+
 ### Reader
 
 Read-only handle for database access. Supports point lookups, range scans, and iteration.
@@ -105,6 +151,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
+| RefreshAndPrefetchSSTs | `(ctx context.Context) error` | Reload manifest and proactively warm newly visible SSTs into cache |
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key |
 | MaxCommittedLSN | `(ctx context.Context) (uint64, bool, error)` | Read latest committed LSN from `CURRENT` for append-only monotonic keyspaces |
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range |
@@ -116,6 +163,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | Close | `() error` | Close reader and caches |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
+| ManifestLogCacheStats | `() cachestore.ManifestLogCacheStats` | Manifest-log cache statistics |
 
 ```go
 type ReaderOpenOptions struct {

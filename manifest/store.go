@@ -78,6 +78,14 @@ func (s *Store) Storage() Storage {
 	return s.storage
 }
 
+// CurrentData returns the last decoded CURRENT snapshot cached by the store.
+// It does not perform I/O.
+func (s *Store) CurrentData() *Current {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current.Clone()
+}
+
 // SetCommittedLSNExtractor configures how CURRENT.MaxCommittedLSN is derived from SST MaxKey values.
 func (s *Store) SetCommittedLSNExtractor(extractor CommittedLSNExtractor) {
 	s.mu.Lock()
