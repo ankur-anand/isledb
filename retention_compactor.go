@@ -332,6 +332,12 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
+	updated := m.Clone()
+	updated.RemoveL0SSTs(toDelete)
+	updated.RemoveSSTsFromSortedRuns(toDelete)
+	if err := c.manifestLog.UpdateCurrentLowWatermarkLSN(ctx, updated); err != nil {
+		return 0, 0, fmt.Errorf("update current low watermark: %w", err)
+	}
 
 	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_fifo", entry.Seq); err != nil {
 		slog.Warn("isledb: enqueue pending sst delete marks failed after retention manifest update", "mode", "fifo", "error", err, "count", len(toDelete), "seq", entry.Seq)
@@ -420,6 +426,12 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 	entry, err := c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete)
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
+	}
+	updated := m.Clone()
+	updated.RemoveL0SSTs(toDelete)
+	updated.RemoveSSTsFromSortedRuns(toDelete)
+	if err := c.manifestLog.UpdateCurrentLowWatermarkLSN(ctx, updated); err != nil {
+		return 0, 0, fmt.Errorf("update current low watermark: %w", err)
 	}
 
 	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_segmented", entry.Seq); err != nil {

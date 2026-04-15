@@ -290,7 +290,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 		RemoveSSTableIDs: job.InputSSTs,
 		AddSortedRun:     newRun,
 	}
-	if err := c.appendCompaction(ctx, payload); err != nil {
+	if err := c.appendCompaction(ctx, payload, manifestAfterCompaction(m, payload)); err != nil {
 		if c.opts.OnCompactionEnd != nil {
 			c.opts.OnCompactionEnd(job, err)
 		}
@@ -399,7 +399,7 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 		RemoveSortedRunIDs: job.InputRuns,
 		AddSortedRun:       newRun,
 	}
-	if err := c.appendCompaction(ctx, payload); err != nil {
+	if err := c.appendCompaction(ctx, payload, manifestAfterCompaction(m, payload)); err != nil {
 		if c.opts.OnCompactionEnd != nil {
 			c.opts.OnCompactionEnd(*job, err)
 		}
@@ -413,13 +413,18 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 	return nil
 }
 
-func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
+func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload, updatedManifest *Manifest) error {
 	entry, err := c.manifestLog.AppendCompactionWithFence(ctx, payload)
 	if err != nil && isFenceError(err) {
 		c.fenced.Store(true)
 	}
 	if err != nil {
 		return err
+	}
+	if updatedManifest != nil {
+		if err := c.manifestLog.UpdateCurrentLowWatermarkLSN(ctx, updatedManifest); err != nil {
+			return err
+		}
 	}
 
 	if len(payload.RemoveSSTableIDs) > 0 {
@@ -444,6 +449,28 @@ func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.Compa
 	}
 
 	return nil
+}
+
+func manifestAfterCompaction(m *Manifest, payload manifest.CompactionLogPayload) *Manifest {
+	if m == nil {
+		return nil
+	}
+
+	updated := m.Clone()
+	if len(payload.RemoveSSTableIDs) > 0 {
+		updated.RemoveL0SSTs(payload.RemoveSSTableIDs)
+		updated.RemoveSSTsFromSortedRuns(payload.RemoveSSTableIDs)
+	}
+	if len(payload.RemoveSortedRunIDs) > 0 {
+		updated.RemoveSortedRuns(payload.RemoveSortedRunIDs)
+	}
+	for _, sst := range payload.AddSSTables {
+		updated.AddL0SST(sst)
+	}
+	if payload.AddSortedRun != nil {
+		updated.AddSortedRun(payload.AddSortedRun.SSTs)
+	}
+	return updated
 }
 
 func (c *Compactor) IsFenced() bool {

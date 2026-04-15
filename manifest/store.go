@@ -48,8 +48,10 @@ type replayCache struct {
 	compactorFenceEpoch uint64
 }
 
-// CommittedLSNExtractor extracts an application-defined committed LSN from an SST MaxKey.
-type CommittedLSNExtractor func(maxKey []byte) (uint64, bool)
+// CommittedLSNExtractor extracts an application-defined LSN from an SST
+// boundary key. The store uses it for CURRENT.MaxCommittedLSN from MaxKey and
+// CURRENT.LowWatermarkLSN from MinKey.
+type CommittedLSNExtractor func(boundaryKey []byte) (uint64, bool)
 
 type Store struct {
 	storage Storage
@@ -86,7 +88,8 @@ func (s *Store) CurrentData() *Current {
 	return s.current.Clone()
 }
 
-// SetCommittedLSNExtractor configures how CURRENT.MaxCommittedLSN is derived from SST MaxKey values.
+// SetCommittedLSNExtractor configures how CURRENT LSN metadata is derived from
+// monotonic SST boundary keys.
 func (s *Store) SetCommittedLSNExtractor(extractor CommittedLSNExtractor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -794,6 +797,9 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if current.MaxCommittedLSN == nil {
 		s.applyCommittedLSNFromManifest(current, m)
 	}
+	if current.LowWatermarkLSN == nil {
+		s.applyLowWatermarkLSNFromManifest(current, m)
+	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
 	if current.NextEpoch < m.NextEpoch {
@@ -937,6 +943,7 @@ func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) erro
 		updated.NextSeq = nextSeq
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, entry)
 		s.applyCommittedLSNFromEntry(&updated, entry)
+		s.applyLowWatermarkLSNFromEntry(&updated, entry)
 
 		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -978,6 +985,46 @@ func (s *Store) applyCommittedLSNFromEntry(current *Current, entry *ManifestLogE
 	}
 }
 
+func (s *Store) applyLowWatermarkLSNFromEntry(current *Current, entry *ManifestLogEntry) {
+	if current == nil || entry == nil {
+		return
+	}
+
+	extractor := s.getCommittedLSNExtractor()
+	if extractor == nil {
+		return
+	}
+
+	applyMinKey := func(minKey []byte) {
+		lsn, ok := extractor(append([]byte(nil), minKey...))
+		if !ok {
+			return
+		}
+		if current.LowWatermarkLSN == nil || lsn < *current.LowWatermarkLSN {
+			current.LowWatermarkLSN = &lsn
+		}
+	}
+
+	switch entry.Op {
+	case LogOpAddSSTable:
+		if entry.SSTable != nil {
+			applyMinKey(entry.SSTable.MinKey)
+		}
+	case LogOpCompaction:
+		if entry.Compaction == nil {
+			return
+		}
+		for _, sst := range entry.Compaction.AddSSTables {
+			applyMinKey(sst.MinKey)
+		}
+		if entry.Compaction.AddSortedRun != nil {
+			for _, sst := range entry.Compaction.AddSortedRun.SSTs {
+				applyMinKey(sst.MinKey)
+			}
+		}
+	}
+}
+
 func (s *Store) applyCommittedLSNFromManifest(current *Current, m *Manifest) {
 	if current == nil || m == nil {
 		return
@@ -1001,6 +1048,63 @@ func (s *Store) applyCommittedLSNFromManifest(current *Current, m *Manifest) {
 	if current.MaxCommittedLSN == nil || lsn > *current.MaxCommittedLSN {
 		current.MaxCommittedLSN = &lsn
 	}
+}
+
+func (s *Store) applyLowWatermarkLSNFromManifest(current *Current, m *Manifest) {
+	if current == nil || m == nil {
+		return
+	}
+
+	extractor := s.getCommittedLSNExtractor()
+	if extractor == nil {
+		return
+	}
+
+	minKey := m.MinKey()
+	if len(minKey) == 0 {
+		current.LowWatermarkLSN = nil
+		return
+	}
+
+	lsn, ok := extractor(minKey)
+	if !ok {
+		return
+	}
+
+	current.LowWatermarkLSN = &lsn
+}
+
+// UpdateCurrentLowWatermarkLSN recomputes CURRENT.LowWatermarkLSN from the
+// provided manifest. Callers should pass the manifest state that is already
+// visible after their metadata update.
+func (s *Store) UpdateCurrentLowWatermarkLSN(ctx context.Context, m *Manifest) error {
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		current, etag, err := s.readCurrentWithETag(ctx)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			current = &Current{NextEpoch: 1}
+		}
+
+		updated := *current
+		if m != nil && updated.NextEpoch < m.NextEpoch {
+			updated.NextEpoch = m.NextEpoch
+		}
+		s.applyLowWatermarkLSNFromManifest(&updated, m)
+
+		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
+			if errors.Is(err, ErrPreconditionFailed) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+
+	return ErrFenceConflict
 }
 
 func (s *Store) getCommittedLSNExtractor() CommittedLSNExtractor {

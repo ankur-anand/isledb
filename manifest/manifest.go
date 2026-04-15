@@ -75,6 +75,7 @@ type Current struct {
 	NextEpoch   uint64 `json:"next_epoch"`
 
 	MaxCommittedLSN *uint64 `json:"max_committed_lsn,omitempty"`
+	LowWatermarkLSN *uint64 `json:"low_watermark_lsn,omitempty"`
 
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`

@@ -397,6 +397,14 @@ func TestCoordinatorViewMaxCommittedLSN(t *testing.T) {
 	if lsn != 42 {
 		t.Fatalf("unexpected max committed lsn: got=%d want=42", lsn)
 	}
+
+	low, found := view.LowWatermarkLSN()
+	if !found {
+		t.Fatal("expected low watermark lsn to be found")
+	}
+	if low != 7 {
+		t.Fatalf("unexpected low watermark lsn: got=%d want=7", low)
+	}
 }
 
 func sameVersion(left, right Version) bool {

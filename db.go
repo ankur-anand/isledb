@@ -69,12 +69,12 @@ type DBOptions struct {
 	// GCMarkStorage allows using a custom storage backend for GC mark state.
 	// If nil, the blob store is used.
 	GCMarkStorage manifest.GCMarkStorage
-	// CommittedLSNExtractor extracts an application-defined committed LSN
-	// from the SST MaxKey when CURRENT is advanced.
+	// CommittedLSNExtractor extracts an application-defined LSN from monotonic
+	// SST boundary keys when CURRENT is advanced.
 	//
-	// This is intended for append-only, monotonic keyspaces where the
-	// lexicographically largest key also represents the latest logical
-	// position, such as 8-byte big-endian WAL/LSN keys.
+	// This is intended for append-only, monotonic keyspaces where the SST key
+	// boundaries represent logical positions, such as 8-byte big-endian
+	// WAL/LSN keys.
 	CommittedLSNExtractor CommittedLSNExtractor
 }
 
