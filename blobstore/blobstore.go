@@ -121,10 +121,6 @@ func (s *Store) SSTPath(id string) string {
 	return s.path("sstable", id)
 }
 
-func (s *Store) VLogPath(id string) string {
-	return s.path("vlogs", id+".vlog")
-}
-
 func (s *Store) BlobPath(blobID string) string {
 	if len(blobID) < 2 {
 		return s.path("blobs", blobID+".blob")
@@ -496,14 +492,6 @@ func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error)
 
 func (s *Store) ListSSTFiles(ctx context.Context) ([]ObjectInfo, error) {
 	result, err := s.List(ctx, ListOptions{Prefix: "sstable/"})
-	if err != nil {
-		return nil, err
-	}
-	return result.Objects, nil
-}
-
-func (s *Store) ListVLogFiles(ctx context.Context) ([]ObjectInfo, error) {
-	result, err := s.List(ctx, ListOptions{Prefix: "vlogs/"})
 	if err != nil {
 		return nil, err
 	}

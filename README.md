@@ -29,7 +29,82 @@ minimize re-downloads—so read capacity scales horizontally without replicas.
 6. Separate Writer and Compaction Process
 7. Pluggable Manifest store
 
+### Architecture
+
+One IsleDB database maps to one object-store prefix. Under that prefix, IsleDB stores:
+
+- hot manifest metadata for discovery and fencing
+- immutable SST files for committed data
+- optional blob objects for large values
+- GC coordination state for asynchronous cleanup
+
+The important boundary is visibility: a write is not visible to readers just because it exists in writer memory. It becomes visible when the writer publishes manifest state that references the new SST files.
+
+For the exact per-file object-store schema and JSON examples, see [Object Store Schema](docs/object-store-schema.md).
+
 <img src="docs/isledb_arch.png" alt="isledb architecture">
+
+#### Core Components
+
+| Component | Role |
+| --- | --- |
+| `blobstore.Store` | Resolves object paths under one prefix and reads/writes objects on S3, GCS, Azure Blob, MinIO, or local file-backed storage. |
+| `DB` | Shared control plane for a single prefix. Opens writers and maintenance processes against the same manifest state. |
+| `Writer` | Buffers writes in memory, spills them into immutable SSTs, uploads those SSTs, and publishes manifest changes. Large values can be written as separate blob objects. |
+| `Manifest store` | Tracks the durable visible state of the database. `manifest/CURRENT` is the hot pointer; snapshots and logs define the full topology. |
+| `Reader` | Replays manifest state, fetches SSTs and blobs on demand, and uses local caches to avoid repeated downloads. |
+| `TailingReader` | Polls for manifest changes and emits new keys in order for log/event-style consumption. |
+| `Compactor` | Rewrites L0 SSTs and sorted runs into a more efficient layout, then publishes the new topology through the manifest. |
+| `RetentionCompactor` | Applies FIFO or time-window retention, advances low-watermark metadata, and coordinates physical deletion of obsolete SSTs. |
+| `GC mark storage` | Stores pending-delete marks and replay checkpoints so cleanup can proceed safely across restarts. |
+| `SST files` | Immutable data files stored in object storage. Readers open these directly; compactors create replacement SSTs rather than modifying them in place. |
+| `Blob storage` | Optional external-value storage. Values above the configured threshold are written to `blobs/` and referenced from SST entries. |
+
+#### Object Layout Under One Prefix
+
+For a database opened with prefix `demo/p000`, the object-store layout can include:
+
+```text
+demo/p000/
+  manifest/
+    CURRENT
+    snapshots/
+      <id>.manifest
+    log/
+      <seq>.json
+    gc/
+      pending-sst/
+        pending.json
+      checkpoint.json
+  sstable/
+    <sst-id>
+  blobs/
+    <prefix>/
+      <blob-id>.blob
+```
+
+What each object family does:
+
+| Path | Format | Written by | Read by | Purpose |
+| --- | --- | --- | --- | --- |
+| `manifest/CURRENT` | JSON | writer, compactor, retention compactor | reader, tailing reader, maintenance processes | Hot control record. Points at the current snapshot and log replay window and carries fast-path metadata such as fences and optional `max_committed_lsn` / `low_watermark_lsn`. |
+| `manifest/snapshots/<id>.manifest` | JSON | snapshot publication path via `manifest.Store.WriteSnapshot` | reader, compactor, retention compactor | Optional full manifest snapshot describing the complete visible SST topology at a point in time. |
+| `manifest/log/<seq>.json` | JSON | writer, compactor, retention compactor | reader, compactor, retention compactor | Incremental manifest mutations after the snapshot boundary. |
+| `manifest/gc/pending-sst/pending.json` | JSON | compactor, retention compactor | compactor, retention compactor | Tracks SSTs that are no longer referenced and are waiting for physical deletion. |
+| `manifest/gc/checkpoint.json` | JSON | retention compactor | retention compactor | Stores GC replay progress over manifest history. |
+| `sstable/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. |
+| `blobs/<prefix>/<blob-id>.blob` | Binary | writer | reader | External value objects used when large values are stored out-of-line. |
+
+#### Write, Read, and Cleanup Lifecycle
+
+1. `Writer.Put` buffers keys in the active memtable. If a value crosses the blob threshold, the value bytes are uploaded to `blobs/` first and the memtable stores a blob reference.
+2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to `sstable/`.
+3. After the SST objects exist, the writer appends manifest log records and updates `manifest/CURRENT` using CAS semantics. This is the visibility boundary for readers.
+4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/log files, then read the newly visible SSTs and blobs on demand.
+5. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.
+6. `RetentionCompactor` removes old SSTs from visible manifest state, advances low-watermark metadata when configured, records pending-delete marks in `manifest/gc/*`, and later deletes obsolete SST objects.
+
+For append-only monotonic keyspaces, `DBOptions.CommittedLSNExtractor` lets IsleDB publish `max_committed_lsn` and `low_watermark_lsn` into `manifest/CURRENT`. That gives readers a cheap way to discover the committed head and retention floor without replaying the full manifest.
 
 ### Use Cases
 
