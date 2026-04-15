@@ -145,6 +145,12 @@ func (tr *TailingReader) MaxCommittedLSN(ctx context.Context) (uint64, bool, err
 	return tr.reader.MaxCommittedLSN(ctx)
 }
 
+// LowWatermarkLSN returns the earliest still-visible application LSN recorded
+// in CURRENT. See Reader.LowWatermarkLSN for usage constraints.
+func (tr *TailingReader) LowWatermarkLSN(ctx context.Context) (uint64, bool, error) {
+	return tr.reader.LowWatermarkLSN(ctx)
+}
+
 // Scan returns all key-value pairs in the given range.
 func (tr *TailingReader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error) {
 	return tr.reader.Scan(ctx, minKey, maxKey)

@@ -88,6 +88,10 @@ func (c *Current) Clone() *Current {
 		lsn := *c.MaxCommittedLSN
 		clone.MaxCommittedLSN = &lsn
 	}
+	if c.LowWatermarkLSN != nil {
+		lsn := *c.LowWatermarkLSN
+		clone.LowWatermarkLSN = &lsn
+	}
 	return clone
 }
 
@@ -373,4 +377,36 @@ func (m *Manifest) MaxKey() []byte {
 		return nil
 	}
 	return append([]byte(nil), maxKey...)
+}
+
+// MinKey returns the lexicographically smallest MinKey across all SSTs
+// (L0 and sorted runs). Returns nil if the manifest has no SSTs.
+func (m *Manifest) MinKey() []byte {
+	if m == nil {
+		return nil
+	}
+
+	var minKey []byte
+	found := false
+
+	for _, sst := range m.L0SSTs {
+		if !found || bytes.Compare(sst.MinKey, minKey) < 0 {
+			minKey = sst.MinKey
+			found = true
+		}
+	}
+
+	for _, sr := range m.SortedRuns {
+		if mk := sr.MinKey(); len(mk) > 0 {
+			if !found || bytes.Compare(mk, minKey) < 0 {
+				minKey = mk
+				found = true
+			}
+		}
+	}
+
+	if !found {
+		return nil
+	}
+	return append([]byte(nil), minKey...)
 }

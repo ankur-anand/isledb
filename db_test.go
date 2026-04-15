@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
@@ -248,5 +249,105 @@ func TestReaderMaxCommittedLSN(t *testing.T) {
 	}
 	if lsn != 42 {
 		t.Fatalf("unexpected max committed lsn: got=%d want=42", lsn)
+	}
+
+	low, found, err := reader.LowWatermarkLSN(ctx)
+	if err != nil {
+		t.Fatalf("LowWatermarkLSN: %v", err)
+	}
+	if !found {
+		t.Fatal("expected low watermark lsn to be found")
+	}
+	if low != 7 {
+		t.Fatalf("unexpected low watermark lsn: got=%d want=7", low)
+	}
+}
+
+func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-low-watermark-retention")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{
+		CommittedLSNExtractor: BigEndianUint64LSNExtractor,
+	})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer writer.Close()
+
+	put := func(lsn uint64, value string) {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, lsn)
+		if err := writer.Put(key, []byte(value)); err != nil {
+			t.Fatalf("Put(%d): %v", lsn, err)
+		}
+	}
+
+	put(10, "v10")
+	put(11, "v11")
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("Flush batch 1: %v", err)
+	}
+
+	put(20, "v20")
+	put(21, "v21")
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("Flush batch 2: %v", err)
+	}
+
+	put(30, "v30")
+	put(31, "v31")
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("Flush batch 3: %v", err)
+	}
+
+	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{
+		Mode:            CompactByAge,
+		RetentionPeriod: time.Nanosecond,
+		RetentionCount:  2,
+		CheckInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("OpenRetentionCompactor: %v", err)
+	}
+	defer retentionCompactor.Close()
+
+	if err := retentionCompactor.RunCleanup(ctx); err != nil {
+		t.Fatalf("RunCleanup: %v", err)
+	}
+
+	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer reader.Close()
+
+	low, found, err := reader.LowWatermarkLSN(ctx)
+	if err != nil {
+		t.Fatalf("LowWatermarkLSN: %v", err)
+	}
+	if !found {
+		t.Fatal("expected low watermark lsn to be found")
+	}
+	if low != 20 {
+		t.Fatalf("unexpected low watermark lsn after cleanup: got=%d want=20", low)
+	}
+
+	max, found, err := reader.MaxCommittedLSN(ctx)
+	if err != nil {
+		t.Fatalf("MaxCommittedLSN: %v", err)
+	}
+	if !found {
+		t.Fatal("expected max committed lsn to be found")
+	}
+	if max != 31 {
+		t.Fatalf("unexpected max committed lsn after cleanup: got=%d want=31", max)
 	}
 }

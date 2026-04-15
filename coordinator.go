@@ -35,6 +35,7 @@ type View interface {
 	NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
 	ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
 	MaxCommittedLSN() (uint64, bool)
+	LowWatermarkLSN() (uint64, bool)
 	CatchUp(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)
 	Close() error
 }
@@ -56,6 +57,8 @@ type viewState struct {
 	version         Version
 	maxCommittedLSN uint64
 	hasCommittedLSN bool
+	lowWatermarkLSN uint64
+	hasLowWatermark bool
 }
 
 type coordinatorView struct {
@@ -182,6 +185,13 @@ func (v *coordinatorView) MaxCommittedLSN() (uint64, bool) {
 	return v.state.maxCommittedLSN, v.state.hasCommittedLSN
 }
 
+func (v *coordinatorView) LowWatermarkLSN() (uint64, bool) {
+	if v == nil || v.state == nil {
+		return 0, false
+	}
+	return v.state.lowWatermarkLSN, v.state.hasLowWatermark
+}
+
 func (v *coordinatorView) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	if err := v.ensureOpen(); err != nil {
 		return nil, false, err
@@ -232,11 +242,14 @@ func (v *coordinatorView) ensureOpen() error {
 
 func newViewState(m *Manifest, current *manifest.Current) *viewState {
 	maxCommittedLSN, hasCommittedLSN := currentCommittedLSN(current)
+	lowWatermarkLSN, hasLowWatermark := currentLowWatermarkLSN(current)
 	return &viewState{
 		manifest:        m,
 		version:         versionFromCurrent(current),
 		maxCommittedLSN: maxCommittedLSN,
 		hasCommittedLSN: hasCommittedLSN,
+		lowWatermarkLSN: lowWatermarkLSN,
+		hasLowWatermark: hasLowWatermark,
 	}
 }
 
@@ -247,19 +260,29 @@ func currentCommittedLSN(current *manifest.Current) (uint64, bool) {
 	return *current.MaxCommittedLSN, true
 }
 
+func currentLowWatermarkLSN(current *manifest.Current) (uint64, bool) {
+	if current == nil || current.LowWatermarkLSN == nil {
+		return 0, false
+	}
+	return *current.LowWatermarkLSN, true
+}
+
 func versionFromCurrent(current *manifest.Current) Version {
 	if current == nil {
 		return Version{}
 	}
 
 	maxCommittedLSN, hasCommittedLSN := currentCommittedLSN(current)
+	lowWatermarkLSN, hasLowWatermark := currentLowWatermarkLSN(current)
 	return Version{
-		value: fmt.Sprintf("%s:%d:%d:%t:%d",
+		value: fmt.Sprintf("%s:%d:%d:%t:%d:%t:%d",
 			current.Snapshot,
 			current.LogSeqStart,
 			current.NextSeq,
 			hasCommittedLSN,
 			maxCommittedLSN,
+			hasLowWatermark,
+			lowWatermarkLSN,
 		),
 	}
 }
