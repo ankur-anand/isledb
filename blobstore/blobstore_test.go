@@ -216,7 +216,6 @@ func TestPathHelpers(t *testing.T) {
 			want string
 		}{
 			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/seg1.sst"},
-			{"VLogPath", store.VLogPath("abc123"), "vlogs/abc123.vlog"},
 			{"ManifestPath", store.ManifestPath(), "manifest/CURRENT"},
 			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/log/001.json"},
 			{"ManifestSnapshotPath", store.ManifestSnapshotPath("001"), "manifest/snapshots/001.manifest"},
@@ -465,14 +464,12 @@ func TestListFunctions(t *testing.T) {
 			store.ManifestLogPath("001"): 2,
 			store.ManifestLogPath("002"): 3,
 			store.SSTPath("seg1.sst"):    4,
-			store.VLogPath("abc123"):     5,
 		}
 
 		payloads := map[string][]byte{
 			store.ManifestLogPath("001"): []byte("m1"),
 			store.ManifestLogPath("002"): []byte("log"),
 			store.SSTPath("seg1.sst"):    []byte("data"),
-			store.VLogPath("abc123"):     []byte("vlog!"),
 		}
 
 		for key, data := range payloads {
@@ -517,14 +514,6 @@ func TestListFunctions(t *testing.T) {
 		}
 		if len(sst) != 1 || sst[0].Key != store.SSTPath("seg1.sst") {
 			t.Errorf("ListSSTFiles = %#v", sst)
-		}
-
-		vlogs, err := store.ListVLogFiles(ctx)
-		if err != nil {
-			t.Fatalf("ListVLogFiles failed: %v", err)
-		}
-		if len(vlogs) != 1 || vlogs[0].Key != store.VLogPath("abc123") {
-			t.Errorf("ListVLogFiles = %#v", vlogs)
 		}
 
 		logs, err := store.ListManifestLogs(ctx)
