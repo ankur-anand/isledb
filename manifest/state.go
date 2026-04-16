@@ -30,15 +30,7 @@ func (m *Manifest) Clone() *Manifest {
 
 	if len(m.L0SSTs) > 0 {
 		clone.L0SSTs = make([]SSTMeta, len(m.L0SSTs))
-		for i, sst := range m.L0SSTs {
-			clone.L0SSTs[i] = sst
-			if len(sst.MinKey) > 0 {
-				clone.L0SSTs[i].MinKey = append([]byte(nil), sst.MinKey...)
-			}
-			if len(sst.MaxKey) > 0 {
-				clone.L0SSTs[i].MaxKey = append([]byte(nil), sst.MaxKey...)
-			}
-		}
+		copy(clone.L0SSTs, m.L0SSTs)
 	}
 
 	if len(m.SortedRuns) > 0 {
@@ -48,15 +40,7 @@ func (m *Manifest) Clone() *Manifest {
 				ID:   sr.ID,
 				SSTs: make([]SSTMeta, len(sr.SSTs)),
 			}
-			for j, sst := range sr.SSTs {
-				clone.SortedRuns[i].SSTs[j] = sst
-				if len(sst.MinKey) > 0 {
-					clone.SortedRuns[i].SSTs[j].MinKey = append([]byte(nil), sst.MinKey...)
-				}
-				if len(sst.MaxKey) > 0 {
-					clone.SortedRuns[i].SSTs[j].MaxKey = append([]byte(nil), sst.MaxKey...)
-				}
-			}
+			copy(clone.SortedRuns[i].SSTs, sr.SSTs)
 		}
 	}
 
@@ -275,10 +259,24 @@ func (sr *SortedRun) OverlappingSSTs(minKey, maxKey []byte) []SSTMeta {
 		return nil
 	}
 
+	// SSTs in a sorted run are non overlapping and sorted by MinKey,
+	// so MaxKey is monotonic.
+	lo := 0
+	if len(minKey) > 0 {
+		lo = sort.Search(len(sr.SSTs), func(i int) bool {
+			// skip ahead the SST whose MaxKey >= minKey
+			return bytes.Compare(sr.SSTs[i].MaxKey, minKey) >= 0
+		})
+	}
+
 	var result []SSTMeta
-	for _, sst := range sr.SSTs {
-		if internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
-			result = append(result, sst)
+	for i := lo; i < len(sr.SSTs); i++ {
+		// upperBound should exit if sr.SSTs[i].MinKey > maxKey
+		if len(maxKey) > 0 && bytes.Compare(sr.SSTs[i].MinKey, maxKey) > 0 {
+			break
+		}
+		if internal.OverlapsRange(sr.SSTs[i].MinKey, sr.SSTs[i].MaxKey, minKey, maxKey) {
+			result = append(result, sr.SSTs[i])
 		}
 	}
 	return result
@@ -337,7 +335,17 @@ func (m *Manifest) MaxSeqNum() uint64 {
 }
 
 func (m *Manifest) AllSSTIDs() []string {
-	var ids []string
+
+	total := len(m.L0SSTs)
+	for _, sr := range m.SortedRuns {
+		total += len(sr.SSTs)
+	}
+
+	if total == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, total)
 
 	for _, sst := range m.L0SSTs {
 		ids = append(ids, sst.ID)
