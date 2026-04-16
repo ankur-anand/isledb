@@ -196,6 +196,8 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 		r.invalidateRemovedSSTs(r.manifest, m)
 	}
 
+	// Publish a new manifest pointer. Existing readers/views may still retain
+	// the previous manifest as an immutable snapshot.
 	r.manifest = m
 	return nil
 }
@@ -257,19 +259,16 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 	return r.manifest
 }
 
+// currentManifest returns the currently published manifest pointer.
+// Callers must treat it as read-only.
+//
+// It is safe for Coordinator views to retain this pointer because Refresh
+// swaps r.manifest to a new manifest; it does not mutate the previous
+// manifest in place.
 func (r *Reader) currentManifest() *Manifest {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.manifest
-}
-
-func (r *Reader) manifestSnapshot() *Manifest {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.manifest == nil {
-		return nil
-	}
-	return r.manifest.Clone()
 }
 
 // MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.

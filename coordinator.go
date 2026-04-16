@@ -53,6 +53,8 @@ type Coordinator struct {
 }
 
 type viewState struct {
+	// manifest is a shared read-only snapshot published by Reader.Refresh.
+	// View consumers must never mutate it.
 	manifest        *Manifest
 	version         Version
 	maxCommittedLSN uint64
@@ -74,7 +76,7 @@ func newCoordinator(reader *Reader) *Coordinator {
 }
 
 func (c *Coordinator) initCurrentView() error {
-	state := newViewState(c.reader.manifestSnapshot(), c.reader.manifestStore.CurrentData())
+	state := newViewState(c.reader.currentManifest(), c.reader.manifestStore.CurrentData())
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -106,7 +108,7 @@ func (c *Coordinator) Refresh(ctx context.Context) (View, bool, error) {
 		return nil, false, err
 	}
 
-	state := newViewState(c.reader.manifestSnapshot(), c.reader.manifestStore.CurrentData())
+	state := newViewState(c.reader.currentManifest(), c.reader.manifestStore.CurrentData())
 
 	c.mu.Lock()
 	if c.closing || c.closed {

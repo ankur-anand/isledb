@@ -90,6 +90,66 @@ func TestCoordinatorRefreshPublishesImmutableViews(t *testing.T) {
 	}
 }
 
+func TestCoordinatorPublishesReaderManifestPointer(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("coordinator-pointer")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+	}, 0, 1)
+
+	opts := DefaultCoordinatorOptions()
+	opts.ReaderOptions.CacheDir = t.TempDir()
+
+	coord, err := OpenCoordinator(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("OpenCoordinator: %v", err)
+	}
+	defer coord.Close()
+
+	view1, ok := coord.Current().(*coordinatorView)
+	if !ok || view1 == nil {
+		t.Fatal("Current() did not return coordinatorView")
+	}
+	defer view1.Close()
+
+	if got, want := view1.state.manifest, coord.reader.currentManifest(); got != want {
+		t.Fatal("current view should publish reader manifest pointer directly")
+	}
+
+	oldManifest := view1.state.manifest
+
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
+	}, 0, 1)
+
+	view2Raw, changed, err := coord.Refresh(ctx)
+	if err != nil {
+		t.Fatalf("Refresh changed: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changed=true after new SST")
+	}
+
+	view2, ok := view2Raw.(*coordinatorView)
+	if !ok || view2 == nil {
+		t.Fatal("Refresh() did not return coordinatorView")
+	}
+	defer view2.Close()
+
+	if got, want := view2.state.manifest, coord.reader.currentManifest(); got != want {
+		t.Fatal("refreshed view should publish current reader manifest pointer directly")
+	}
+	if view2.state.manifest == oldManifest {
+		t.Fatal("expected refresh to publish a new manifest pointer")
+	}
+	if view1.state.manifest != oldManifest {
+		t.Fatal("old view should retain its original manifest pointer")
+	}
+}
+
 func TestCoordinatorViewCatchUpUsesFixedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("coordinator-catchup")
