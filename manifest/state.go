@@ -95,13 +95,15 @@ func (m *Manifest) RemoveL0SSTs(ids []string) {
 		idSet[id] = true
 	}
 
-	newL0 := make([]SSTMeta, 0, len(m.L0SSTs))
+	n := 0
 	for _, sst := range m.L0SSTs {
 		if !idSet[sst.ID] {
-			newL0 = append(newL0, sst)
+			m.L0SSTs[n] = sst
+			n++
 		}
 	}
-	m.L0SSTs = newL0
+	clear(m.L0SSTs[n:])
+	m.L0SSTs = m.L0SSTs[:n]
 }
 
 func (m *Manifest) SortedRunCount() int {
@@ -203,13 +205,15 @@ func (m *Manifest) RemoveSortedRuns(ids []uint32) {
 		idSet[id] = true
 	}
 
-	newRuns := make([]SortedRun, 0, len(m.SortedRuns))
+	n := 0
 	for _, sr := range m.SortedRuns {
 		if !idSet[sr.ID] {
-			newRuns = append(newRuns, sr)
+			m.SortedRuns[n] = sr
+			n++
 		}
 	}
-	m.SortedRuns = newRuns
+	clear(m.SortedRuns[n:])
+	m.SortedRuns = m.SortedRuns[:n]
 }
 
 func (m *Manifest) RemoveSSTsFromSortedRuns(sstIDs []string) {
@@ -219,22 +223,27 @@ func (m *Manifest) RemoveSSTsFromSortedRuns(sstIDs []string) {
 	}
 
 	for i := range m.SortedRuns {
-		newSSTs := make([]SSTMeta, 0, len(m.SortedRuns[i].SSTs))
-		for _, sst := range m.SortedRuns[i].SSTs {
+		ssts := m.SortedRuns[i].SSTs
+		n := 0
+		for _, sst := range ssts {
 			if !idSet[sst.ID] {
-				newSSTs = append(newSSTs, sst)
+				ssts[n] = sst
+				n++
 			}
 		}
-		m.SortedRuns[i].SSTs = newSSTs
+		clear(ssts[n:])
+		m.SortedRuns[i].SSTs = ssts[:n]
 	}
 
-	newRuns := make([]SortedRun, 0, len(m.SortedRuns))
+	n := 0
 	for _, sr := range m.SortedRuns {
 		if len(sr.SSTs) > 0 {
-			newRuns = append(newRuns, sr)
+			m.SortedRuns[n] = sr
+			n++
 		}
 	}
-	m.SortedRuns = newRuns
+	clear(m.SortedRuns[n:])
+	m.SortedRuns = m.SortedRuns[:n]
 }
 
 func (sr *SortedRun) FindSST(key []byte) *SSTMeta {

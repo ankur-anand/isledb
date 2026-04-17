@@ -109,31 +109,38 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 				removeSet[id] = true
 			}
 
-			var newL0 []SSTMeta
+			n := 0
 			for _, sst := range m.L0SSTs {
 				if !removeSet[sst.ID] {
-					newL0 = append(newL0, sst)
+					m.L0SSTs[n] = sst
+					n++
 				}
 			}
-			m.L0SSTs = newL0
+			clear(m.L0SSTs[n:])
+			m.L0SSTs = m.L0SSTs[:n]
 
 			for i := range m.SortedRuns {
-				var newSSTs []SSTMeta
-				for _, sst := range m.SortedRuns[i].SSTs {
+				ssts := m.SortedRuns[i].SSTs
+				k := 0
+				for _, sst := range ssts {
 					if !removeSet[sst.ID] {
-						newSSTs = append(newSSTs, sst)
+						ssts[k] = sst
+						k++
 					}
 				}
-				m.SortedRuns[i].SSTs = newSSTs
+				clear(ssts[k:])
+				m.SortedRuns[i].SSTs = ssts[:k]
 			}
 
-			var newRuns []SortedRun
+			r := 0
 			for _, sr := range m.SortedRuns {
 				if len(sr.SSTs) > 0 {
-					newRuns = append(newRuns, sr)
+					m.SortedRuns[r] = sr
+					r++
 				}
 			}
-			m.SortedRuns = newRuns
+			clear(m.SortedRuns[r:])
+			m.SortedRuns = m.SortedRuns[:r]
 		}
 
 	case LogOpCheckpoint:
@@ -154,13 +161,15 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 					removeSet[id] = true
 				}
 
-				var newL0 []SSTMeta
+				n := 0
 				for _, sst := range m.L0SSTs {
 					if !removeSet[sst.ID] {
-						newL0 = append(newL0, sst)
+						m.L0SSTs[n] = sst
+						n++
 					}
 				}
-				m.L0SSTs = newL0
+				clear(m.L0SSTs[n:])
+				m.L0SSTs = m.L0SSTs[:n]
 
 				m.RemoveSSTsFromSortedRuns(c.RemoveSSTableIDs)
 			}
