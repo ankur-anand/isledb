@@ -83,14 +83,18 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 			sst := *entry.SSTable
 
 			if sst.Level == 0 {
-				m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+				m.L0SSTs = append(m.L0SSTs, SSTMeta{})
+				copy(m.L0SSTs[1:], m.L0SSTs[:len(m.L0SSTs)-1])
+				m.L0SSTs[0] = sst
 			} else {
 				sr := SortedRun{
 					ID:   m.NextSortedRunID,
 					SSTs: []SSTMeta{sst},
 				}
 				m.NextSortedRunID++
-				m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+				m.SortedRuns = append(m.SortedRuns, SortedRun{})
+				copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
+				m.SortedRuns[0] = sr
 			}
 
 			if sst.Epoch >= m.NextEpoch {
@@ -171,19 +175,25 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 				if sr.ID >= m.NextSortedRunID {
 					m.NextSortedRunID = sr.ID + 1
 				}
-				m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+				m.SortedRuns = append(m.SortedRuns, SortedRun{})
+				copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
+				m.SortedRuns[0] = sr
 			}
 
 			for _, sst := range c.AddSSTables {
 				if sst.Level == 0 {
-					m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+					m.L0SSTs = append(m.L0SSTs, SSTMeta{})
+					copy(m.L0SSTs[1:], m.L0SSTs[:len(m.L0SSTs)-1])
+					m.L0SSTs[0] = sst
 				} else {
 					sr := SortedRun{
 						ID:   m.NextSortedRunID,
 						SSTs: []SSTMeta{sst},
 					}
 					m.NextSortedRunID++
-					m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+					m.SortedRuns = append(m.SortedRuns, SortedRun{})
+					copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
+					m.SortedRuns[0] = sr
 				}
 				if sst.Epoch >= m.NextEpoch {
 					m.NextEpoch = sst.Epoch + 1
