@@ -84,7 +84,9 @@ func (m *Manifest) L0SSTCount() int {
 }
 
 func (m *Manifest) AddL0SST(sst SSTMeta) {
-	m.L0SSTs = append([]SSTMeta{sst}, m.L0SSTs...)
+	m.L0SSTs = append(m.L0SSTs, SSTMeta{})
+	copy(m.L0SSTs[1:], m.L0SSTs[:len(m.L0SSTs)-1])
+	m.L0SSTs[0] = sst
 }
 
 func (m *Manifest) RemoveL0SSTs(ids []string) {
@@ -189,7 +191,9 @@ func (m *Manifest) AddSortedRun(ssts []SSTMeta) uint32 {
 		return bytes.Compare(sr.SSTs[i].MinKey, sr.SSTs[j].MinKey) < 0
 	})
 
-	m.SortedRuns = append([]SortedRun{sr}, m.SortedRuns...)
+	m.SortedRuns = append(m.SortedRuns, SortedRun{})
+	copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
+	m.SortedRuns[0] = sr
 	return id
 }
 
