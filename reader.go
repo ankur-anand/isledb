@@ -262,13 +262,27 @@ func (r *Reader) ManifestUnsafe() *Manifest {
 // currentManifest returns the currently published manifest pointer.
 // Callers must treat it as read-only.
 //
-// It is safe for Coordinator views to retain this pointer because Refresh
-// swaps r.manifest to a new manifest; it does not mutate the previous
-// manifest in place.
+// It is safe for snapshots to retain this pointer because Refresh swaps
+// r.manifest to a new manifest; it does not mutate the previous manifest in
+// place.
 func (r *Reader) currentManifest() *Manifest {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.manifest
+}
+
+// Snapshot returns an immutable read handle over the Reader's currently loaded
+// manifest state. The returned snapshot does not refresh, even if the Reader is
+// refreshed later.
+func (r *Reader) Snapshot() *Snapshot {
+	if r == nil {
+		return nil
+	}
+	m := r.currentManifest()
+	if m == nil {
+		return nil
+	}
+	return newSnapshot(r, m, r.manifestStore.CurrentData())
 }
 
 // MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.
