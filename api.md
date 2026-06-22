@@ -95,31 +95,11 @@ func DefaultWriterOptions() WriterOptions
 
 ---
 
-### Coordinator
+### Snapshot
 
-Shared refresh owner that publishes immutable read views over loaded manifest state.
-
-```go
-func OpenCoordinator(ctx context.Context, store *blobstore.Store, opts CoordinatorOptions) (*Coordinator, error)
-```
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Refresh | `(ctx context.Context) (View, bool, error)` | Reload storage state only when CURRENT advanced and return the latest published view |
-| Current | `() View` | Return the latest published immutable view without I/O |
-| Close | `() error` | Close the shared reader runtime after outstanding views are released |
-
-```go
-type CoordinatorOptions struct {
-    ReaderOptions ReaderOpenOptions
-}
-
-func DefaultCoordinatorOptions() CoordinatorOptions
-```
-
-#### View
-
-Immutable read handle over one loaded manifest snapshot.
+Immutable read handle over one loaded reader state. A snapshot does not refresh.
+It keeps reading the same visible state even if its parent `Reader` is refreshed
+later.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -128,15 +108,16 @@ Immutable read handle over one loaded manifest snapshot.
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create a bounded iterator over this fixed view |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Read up to limit records from this fixed view |
 | MaxCommittedLSN | `() (uint64, bool)` | Return the head/high-watermark captured with this view |
+| LowWatermarkLSN | `() (uint64, bool)` | Return the low watermark captured with this view |
 | CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Emit visible records after the requested checkpoint from this fixed view |
 | Close | `() error` | Release the caller reference to the view |
 
 ```go
 type Version struct { ... }
-type View interface { ... }
+type Snapshot struct { ... }
 ```
 
-`CatchUp` on a `View` runs against one fixed visible manifest state. It does
+`CatchUp` on a `Snapshot` runs against one fixed visible manifest state. It does
 not refresh while scanning.
 
 ---
@@ -158,6 +139,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
 | Refresh | `(ctx context.Context) error` | Reload manifest and invalidate removed SSTs |
+| Snapshot | `() *Snapshot` | Pin the current loaded state for consistent multi-operation reads |
 | Manifest | `() *Manifest` | Return cloned manifest snapshot |
 | ManifestUnsafe | `() *Manifest` | Return manifest without copying |
 | Close | `() error` | Close reader and caches |
