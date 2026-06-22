@@ -215,7 +215,7 @@ func TestPathHelpers(t *testing.T) {
 			got  string
 			want string
 		}{
-			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/seg1.sst"},
+			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/9e6/seg1.sst"},
 			{"ManifestPath", store.ManifestPath(), "manifest/CURRENT"},
 			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/log/001.json"},
 			{"ManifestSnapshotPath", store.ManifestSnapshotPath("001"), "manifest/snapshots/001.manifest"},
@@ -229,6 +229,25 @@ func TestPathHelpers(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestSSTBucket(t *testing.T) {
+	tests := []struct {
+		id   string
+		want string
+	}{
+		{id: "seg1.sst", want: "9e6"},
+		{id: "1-1-10-abcdef.sst", want: "d22"},
+		{id: "", want: "000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			if got := SSTBucket(tt.id); got != tt.want {
+				t.Fatalf("SSTBucket(%q) = %q, want %q", tt.id, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestBasicOperations(t *testing.T) {
