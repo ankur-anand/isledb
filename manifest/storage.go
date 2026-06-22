@@ -23,3 +23,9 @@ type Storage interface {
 
 	LogPath(name string) string
 }
+
+type PageStorage interface {
+	ReadPage(ctx context.Context, path string) ([]byte, error)
+	WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error)
+	PagePath(level uint8, id string) string
+}

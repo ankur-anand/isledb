@@ -53,6 +53,21 @@ func (b *BlobStoreBackend) WriteSnapshot(ctx context.Context, id string, data []
 	return path, b.mapError(err)
 }
 
+func (b *BlobStoreBackend) ReadPage(ctx context.Context, path string) ([]byte, error) {
+	data, _, err := b.store.Read(ctx, path)
+	return data, b.mapError(err)
+}
+
+func (b *BlobStoreBackend) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
+	path := b.store.ManifestPagePath(level, id)
+	_, err := b.store.WriteIfNotExist(ctx, path, data)
+	return path, b.mapError(err)
+}
+
+func (b *BlobStoreBackend) PagePath(level uint8, id string) string {
+	return b.store.ManifestPagePath(level, id)
+}
+
 func (b *BlobStoreBackend) ReadLog(ctx context.Context, path string) ([]byte, error) {
 	data, _, err := b.store.Read(ctx, path)
 	return data, b.mapError(err)

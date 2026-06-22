@@ -11,6 +11,7 @@ import (
 type Manifest = manifest.Manifest
 type CompactionConfig = manifest.CompactionConfig
 type SSTMeta = manifest.SSTMeta
+type ChangeBatchMeta = manifest.ChangeBatchMeta
 type BloomMeta = manifest.BloomMeta
 type SSTSignature = manifest.SSTSignature
 type SortedRun = manifest.SortedRun

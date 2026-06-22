@@ -49,12 +49,12 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 		t.Fatalf("manifest CURRENT missing: %v", err)
 	}
 
-	logs, err := store.ListManifestLogs(ctx)
+	logs, err := manifestStore.List(ctx)
 	if err != nil {
-		t.Fatalf("ListManifestLogs: %v", err)
+		t.Fatalf("manifest list: %v", err)
 	}
 	if len(logs) == 0 {
-		t.Fatalf("expected manifest log entries")
+		t.Fatalf("expected committed manifest entries")
 	}
 
 	ssts, err := store.List(ctx, blobstore.ListOptions{Prefix: "sstable/"})
@@ -63,6 +63,88 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	}
 	if len(ssts.Objects) == 0 {
 		t.Fatalf("expected at least one sstable object")
+	}
+}
+
+func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-change-feed")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
+		MemtableSize:          1 << 20,
+		FlushInterval:         0,
+		BloomBitsPerKey:       0,
+		BlockSize:             4096,
+		Compression:           "none",
+		MaxImmutableMemtables: 0,
+	})
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close()
+
+	if err := w.put([]byte("b"), []byte("vb")); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+	if err := w.delete([]byte("a")); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+	if err := w.put([]byte("c"), []byte("vc")); err != nil {
+		t.Fatalf("put c: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	logPaths, err := manifestStore.List(ctx)
+	if err != nil {
+		t.Fatalf("manifest log list: %v", err)
+	}
+	var meta *manifest.ChangeBatchMeta
+	for _, logPath := range logPaths {
+		entry, err := manifestStore.Read(ctx, logPath)
+		if err != nil {
+			t.Fatalf("read manifest log %s: %v", logPath, err)
+		}
+		if entry.Op == manifest.LogOpAddSSTable && entry.ChangeBatch != nil {
+			meta = entry.ChangeBatch
+			break
+		}
+	}
+	if meta == nil {
+		t.Fatal("committed add_sstable entry did not include change batch metadata")
+	}
+	if meta.SeqLo != 1 || meta.SeqHi != 3 || meta.Count != 3 || meta.Path == "" {
+		t.Fatalf("change batch meta mismatch: %+v", *meta)
+	}
+
+	data, attrs, err := store.Read(ctx, meta.Path)
+	if err != nil {
+		t.Fatalf("read change batch: %v", err)
+	}
+	if attrs.Size != meta.Size {
+		t.Fatalf("change batch size attr=%d meta=%d", attrs.Size, meta.Size)
+	}
+	batch, err := DecodeChangeBatch(data)
+	if err != nil {
+		t.Fatalf("DecodeChangeBatch: %v", err)
+	}
+	if batch.Epoch != meta.Epoch || batch.SeqLo != meta.SeqLo || batch.SeqHi != meta.SeqHi {
+		t.Fatalf("batch header mismatch: %+v meta=%+v", batch, meta)
+	}
+	if got := len(batch.Changes); got != 3 {
+		t.Fatalf("change count=%d want 3", got)
+	}
+	if batch.Changes[0].Seq != 1 || string(batch.Changes[0].Key) != "b" || string(batch.Changes[0].Value) != "vb" {
+		t.Fatalf("change[0] mismatch: %+v", batch.Changes[0])
+	}
+	if batch.Changes[1].Seq != 2 || batch.Changes[1].Kind != ChangeDelete || string(batch.Changes[1].Key) != "a" {
+		t.Fatalf("change[1] mismatch: %+v", batch.Changes[1])
+	}
+	if batch.Changes[2].Seq != 3 || string(batch.Changes[2].Key) != "c" || string(batch.Changes[2].Value) != "vc" {
+		t.Fatalf("change[2] mismatch: %+v", batch.Changes[2])
 	}
 }
 
@@ -112,12 +194,12 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 		t.Fatalf("Flush2: %v", err)
 	}
 
-	logs, err := store.ListManifestLogs(ctx)
+	logs, err := manifestStore.List(ctx)
 	if err != nil {
-		t.Fatalf("ListManifestLogs: %v", err)
+		t.Fatalf("manifest list: %v", err)
 	}
 	if len(logs) < 2 {
-		t.Fatalf("expected at least 2 manifest log entries, got %d", len(logs))
+		t.Fatalf("expected at least 2 committed manifest entries, got %d", len(logs))
 	}
 }
 
@@ -127,12 +209,12 @@ type failOnceStorage struct {
 	failOnWrite int32
 }
 
-func (s *failOnceStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
+func (s *failOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	count := s.writeCount.Add(1)
 	if count == s.failOnWrite {
-		return "", errors.New("inject log write failure")
+		return "", errors.New("inject current write failure")
 	}
-	return s.Storage.WriteLog(ctx, name, data)
+	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
 func TestWriter_Backpressure(t *testing.T) {
@@ -191,8 +273,9 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	defer store.Close()
 
 	baseStorage := manifest.NewBlobStoreBackend(store)
-	// Fail on second write (first write is the fence claim entry)
-	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 2}
+	// Fail the flush publish. The first two CURRENT writes claim the writer fence
+	// and commit the fence-claim entry.
+	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 3}
 	manifestStore := manifest.NewStoreWithStorage(failStorage)
 
 	w, err := newWriter(ctx, store, manifestStore, WriterOptions{

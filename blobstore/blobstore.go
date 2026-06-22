@@ -132,11 +132,21 @@ func (s *Store) SSTPath(id string) string {
 	return s.path("sstable", SSTBucket(id), id)
 }
 
+func (s *Store) ChangeBatchPath(id string) string {
+	return s.path("changes", ChangeBatchBucket(id), id)
+}
+
 // SSTBucket returns the deterministic object-store bucket for an SST ID.
 // The bucket is part of the object layout; changing it changes every SST key.
 func SSTBucket(id string) string {
 	sum := crc32.Checksum([]byte(id), sstBucketTable)
 	return fmt.Sprintf("%0*x", SSTBucketHexLen, sum&sstBucketMask)
+}
+
+// ChangeBatchBucket returns the deterministic object-store bucket for a change
+// batch ID. It intentionally uses the same CRC32C layout as SSTBucket.
+func ChangeBatchBucket(id string) string {
+	return SSTBucket(id)
 }
 
 func (s *Store) BlobPath(blobID string) string {
@@ -164,6 +174,10 @@ func (s *Store) ManifestLogPath(id string) string {
 
 func (s *Store) ManifestSnapshotPath(id string) string {
 	return s.path("manifest", "snapshots", id+".manifest")
+}
+
+func (s *Store) ManifestPagePath(level uint8, id string) string {
+	return s.path("manifest", "pages", fmt.Sprintf("l%02d", level), id+".json")
 }
 
 type Attributes struct {

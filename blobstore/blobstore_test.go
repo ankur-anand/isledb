@@ -216,9 +216,11 @@ func TestPathHelpers(t *testing.T) {
 			want string
 		}{
 			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/9e6/seg1.sst"},
+			{"ChangeBatchPath", store.ChangeBatchPath("batch1.chg"), "changes/" + ChangeBatchBucket("batch1.chg") + "/batch1.chg"},
 			{"ManifestPath", store.ManifestPath(), "manifest/CURRENT"},
 			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/log/001.json"},
 			{"ManifestSnapshotPath", store.ManifestSnapshotPath("001"), "manifest/snapshots/001.manifest"},
+			{"ManifestPagePath", store.ManifestPagePath(0, "p001"), "manifest/pages/l00/p001.json"},
 		}
 
 		for _, tt := range tests {

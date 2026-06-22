@@ -84,6 +84,27 @@ func (s *CachingStorage) WriteSnapshot(ctx context.Context, id string, data []by
 	return s.storage.WriteSnapshot(ctx, id, data)
 }
 
+func (s *CachingStorage) ReadPage(ctx context.Context, path string) ([]byte, error) {
+	if pages, ok := s.storage.(manifest.PageStorage); ok {
+		return pages.ReadPage(ctx, path)
+	}
+	return nil, manifest.ErrNotFound
+}
+
+func (s *CachingStorage) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
+	if pages, ok := s.storage.(manifest.PageStorage); ok {
+		return pages.WritePage(ctx, level, id, data)
+	}
+	return "", manifest.ErrPreconditionFailed
+}
+
+func (s *CachingStorage) PagePath(level uint8, id string) string {
+	if pages, ok := s.storage.(manifest.PageStorage); ok {
+		return pages.PagePath(level, id)
+	}
+	return ""
+}
+
 func (s *CachingStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
 	if data, ok := s.manifestCache.Get(path); ok {
 		return data, nil

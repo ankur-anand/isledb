@@ -126,8 +126,8 @@ func TestIncrementalReplay_DeltaEntries(t *testing.T) {
 	}
 
 	logReads := cs.readLogCalls.Load()
-	if logReads != 3 {
-		t.Fatalf("expected 3 ReadLog calls for delta replay, got %d", logReads)
+	if logReads != 0 {
+		t.Fatalf("expected 0 ReadLog calls for delta replay from CURRENT, got %d", logReads)
 	}
 
 	for i := 0; i < 13; i++ {
@@ -176,8 +176,8 @@ func TestIncrementalReplay_FallsBackAfterSnapshot(t *testing.T) {
 	}
 
 	logReads := cs.readLogCalls.Load()
-	if logReads != 2 {
-		t.Fatalf("expected 2 ReadLog calls after snapshot (new log window), got %d", logReads)
+	if logReads != 0 {
+		t.Fatalf("expected 0 ReadLog calls after snapshot from CURRENT, got %d", logReads)
 	}
 }
 
@@ -340,11 +340,8 @@ func TestIncrementalReplay_RepeatedCalls(t *testing.T) {
 		}
 
 		logReads := cs.readLogCalls.Load()
-		if round == 0 && logReads != 4 {
-			t.Fatalf("round %d: expected 4 ReadLog calls, got %d", round, logReads)
-		}
-		if round > 0 && logReads != 3 {
-			t.Fatalf("round %d: expected 3 ReadLog calls, got %d", round, logReads)
+		if logReads != 0 {
+			t.Fatalf("round %d: expected 0 ReadLog calls from CURRENT, got %d", round, logReads)
 		}
 	}
 }

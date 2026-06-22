@@ -798,28 +798,28 @@ func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing
 	}
 }
 
-func TestRetentionCompactor_RunCleanup_MissingManifestLogReturnsError(t *testing.T) {
+func TestRetentionCompactor_RunCleanup_MissingManifestPageReturnsError(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 	defer store.Close()
 
 	manifestStore := newManifestStore(store, nil)
-
-	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
-	w, err := newWriter(ctx, store, manifestStore, wOpts)
-	if err != nil {
-		t.Fatalf("newWriter failed: %v", err)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
 	}
-	defer w.close()
+	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
 
-	for i := 0; i < 4; i++ {
-		key := fmt.Sprintf("missing-log-key:%03d", i)
-		if err := w.put([]byte(key), []byte("value")); err != nil {
-			t.Fatalf("put failed: %v", err)
-		}
-		if err := w.flush(ctx); err != nil {
-			t.Fatalf("flush failed: %v", err)
+	// Force CURRENT.active_entries to rotate into an immutable committed page.
+	for i := 0; i < 1024; i++ {
+		_, err := manifestStore.AppendAddSSTableWithFence(ctx, manifest.SSTMeta{
+			ID:    fmt.Sprintf("missing-page-sst-%04d", i),
+			Epoch: 1,
+			Level: 0,
+		})
+		if err != nil {
+			t.Fatalf("append manifest entry %d: %v", i, err)
 		}
 	}
 
@@ -838,25 +838,21 @@ func TestRetentionCompactor_RunCleanup_MissingManifestLogReturnsError(t *testing
 	if err != nil {
 		t.Fatalf("read CURRENT: %v", err)
 	}
-	if current == nil || current.NextSeq == 0 {
-		t.Fatalf("expected non-empty CURRENT")
+	if current == nil || len(current.IndexFrontier) == 0 {
+		t.Fatalf("expected CURRENT to reference at least one committed page")
 	}
-	missingSeq := current.LogSeqStart
-	if missingSeq >= current.NextSeq {
-		t.Fatalf("invalid log window: start=%d next=%d", current.LogSeqStart, current.NextSeq)
-	}
-	missingPath := manifestStore.Storage().LogPath(fmt.Sprintf("%020d", missingSeq))
+	missingPath := current.IndexFrontier[0].Path
 	if err := store.Delete(ctx, missingPath); err != nil {
-		t.Fatalf("delete manifest log %s: %v", missingPath, err)
+		t.Fatalf("delete manifest page %s: %v", missingPath, err)
 	}
 
-	orphanID := "orphan-after-missing-log"
+	orphanID := "orphan-after-missing-page"
 	if _, err := store.Write(ctx, store.SSTPath(orphanID), []byte("orphan-data")); err != nil {
 		t.Fatalf("write orphan sst: %v", err)
 	}
 
 	if err := cleaner.RunCleanup(ctx); err == nil {
-		t.Fatalf("expected RunCleanup to fail when manifest log is missing")
+		t.Fatalf("expected RunCleanup to fail when a committed manifest page is missing")
 	}
 
 	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)

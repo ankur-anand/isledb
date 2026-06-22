@@ -776,14 +776,14 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 	}
 }
 
-func TestReplay_SurvivesTransientWriteLogFailureWithoutSequenceGap(t *testing.T) {
+func TestReplay_SurvivesTransientCurrentCASConflictWithoutSequenceGap(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
 
 	base := NewBlobStoreBackend(store)
-	failStorage := &failNthWriteLogStorage{Storage: base, failAt: 2}
-	ms := NewStoreWithStorage(failStorage)
+	inject := &casInjectStorage{base: base}
+	ms := NewStoreWithStorage(inject)
 
 	if _, err := ms.Replay(ctx); err != nil {
 		t.Fatalf("replay: %v", err)
@@ -792,21 +792,28 @@ func TestReplay_SurvivesTransientWriteLogFailureWithoutSequenceGap(t *testing.T)
 		t.Fatalf("claim writer: %v", err)
 	}
 
-	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "failed.sst", Epoch: 1, Level: 0}); err == nil {
-		t.Fatal("expected injected append error")
-	}
+	inject.mu.Lock()
+	inject.failNextCAS = true
+	inject.mu.Unlock()
 
-	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "applied.sst", Epoch: 1, Level: 0}); err != nil {
-		t.Fatalf("append retry: %v", err)
+	entry, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "applied.sst", Epoch: 1, Level: 0})
+	if err != nil {
+		t.Fatalf("append after transient CAS conflict: %v", err)
+	}
+	if entry.Seq != 1 {
+		t.Fatalf("expected applied.sst seq=1 after fence claim seq=0, got %d", entry.Seq)
 	}
 
 	replayStore := NewStoreWithStorage(base)
 	m, err := replayStore.Replay(ctx)
 	if err != nil {
-		t.Fatalf("replay after transient write failure: %v", err)
+		t.Fatalf("replay after transient CAS conflict: %v", err)
 	}
 	if m.LookupSST("applied.sst") == nil {
 		t.Fatalf("expected applied.sst to be present after replay")
+	}
+	if m.LogSeq != 1 {
+		t.Fatalf("expected highest log seq=1, got %d", m.LogSeq)
 	}
 }
 
@@ -1100,7 +1107,7 @@ func TestReplay_FallsBackToFullReplayWhenCurrentNextSeqRegresses(t *testing.T) {
 	}
 }
 
-func TestReplay_IncrementalMatchesFullWhenFenceClaimLogIsMissing(t *testing.T) {
+func TestReplay_IncrementalMatchesFullAfterFenceHandoff(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -1126,16 +1133,12 @@ func TestReplay_IncrementalMatchesFullWhenFenceClaimLogIsMissing(t *testing.T) {
 		t.Fatalf("observer seed replay: %v", err)
 	}
 
-	failStorage := &failNthWriteLogStorage{Storage: base, failAt: 1}
-	writer2 := NewStoreWithStorage(failStorage)
+	writer2 := NewStoreWithStorage(base)
 	if _, err := writer2.Replay(ctx); err != nil {
 		t.Fatalf("writer2 replay: %v", err)
 	}
-	if _, err := writer2.ClaimWriter(ctx, "writer-2"); err == nil {
-		t.Fatal("expected writer2 claim failure due injected fence-claim log write error")
-	}
-	if writer2.WriterEpoch() != 2 {
-		t.Fatalf("expected writer2 local epoch=2 after claim CAS, got %d", writer2.WriterEpoch())
+	if _, err := writer2.ClaimWriter(ctx, "writer-2"); err != nil {
+		t.Fatalf("claim writer2: %v", err)
 	}
 
 	if _, err := writer1.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "stale-after-fence.sst", Epoch: 1, Level: 0}); !errors.Is(err, ErrFenced) {
@@ -1158,10 +1161,46 @@ func TestReplay_IncrementalMatchesFullWhenFenceClaimLogIsMissing(t *testing.T) {
 	if (mIncremental.LookupSST("base.sst") != nil) != (mFull.LookupSST("base.sst") != nil) {
 		t.Fatalf("base.sst presence mismatch between incremental and full replay")
 	}
-	if (mIncremental.LookupSST("stale-after-fence.sst") != nil) != (mFull.LookupSST("stale-after-fence.sst") != nil) {
-		t.Fatalf("stale-after-fence.sst presence mismatch between incremental and full replay")
+	if mIncremental.LookupSST("stale-after-fence.sst") != nil || mFull.LookupSST("stale-after-fence.sst") != nil {
+		t.Fatalf("stale-after-fence.sst should not be visible after stale writer append")
 	}
 	if (mIncremental.LookupSST("valid-epoch2.sst") != nil) != (mFull.LookupSST("valid-epoch2.sst") != nil) {
 		t.Fatalf("valid-epoch2.sst presence mismatch between incremental and full replay")
+	}
+}
+
+func TestReplay_DetectsCommittedPageChecksumMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	ms := NewStoreWithStorage(base)
+	ms.activeEntryLimit = 2
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append a.sst: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "b.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append b.sst: %v", err)
+	}
+
+	current := ms.CurrentData()
+	if current == nil || len(current.IndexFrontier) == 0 {
+		t.Fatalf("expected committed page ref in CURRENT")
+	}
+	if _, err := store.Write(ctx, current.IndexFrontier[0].Path, []byte(`{"corrupt":true}`)); err != nil {
+		t.Fatalf("overwrite committed page: %v", err)
+	}
+
+	_, err := NewStoreWithStorage(base).Replay(ctx)
+	if err == nil {
+		t.Fatalf("expected replay to fail on committed page checksum mismatch")
 	}
 }

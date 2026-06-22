@@ -61,12 +61,23 @@ func (c *Current) Clone() *Current {
 	}
 
 	clone := &Current{
-		Snapshot:       c.Snapshot,
-		LogSeqStart:    c.LogSeqStart,
-		NextSeq:        c.NextSeq,
-		NextEpoch:      c.NextEpoch,
-		WriterFence:    c.WriterFence.Clone(),
-		CompactorFence: c.CompactorFence.Clone(),
+		LayoutVersion:      c.LayoutVersion,
+		Format:             c.Format,
+		Snapshot:           c.Snapshot,
+		LogSeqStart:        c.LogSeqStart,
+		NextSeq:            c.NextSeq,
+		NextEpoch:          c.NextEpoch,
+		ChangeFeedLogStart: c.ChangeFeedLogStart,
+		WriterFence:        c.WriterFence.Clone(),
+		CompactorFence:     c.CompactorFence.Clone(),
+	}
+	if len(c.ActiveEntries) > 0 {
+		clone.ActiveEntries = make([]ManifestLogEntry, len(c.ActiveEntries))
+		copy(clone.ActiveEntries, c.ActiveEntries)
+	}
+	if len(c.IndexFrontier) > 0 {
+		clone.IndexFrontier = make([]PageRef, len(c.IndexFrontier))
+		copy(clone.IndexFrontier, c.IndexFrontier)
 	}
 	if c.MaxCommittedLSN != nil {
 		lsn := *c.MaxCommittedLSN
