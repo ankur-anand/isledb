@@ -77,7 +77,8 @@ demo/p000/
         pending.json
       checkpoint.json
   sstable/
-    <sst-id>
+    <bucket>/
+      <sst-id>
   blobs/
     <prefix>/
       <blob-id>.blob
@@ -92,13 +93,13 @@ What each object family does:
 | `manifest/log/<seq>.json` | JSON | writer, compactor, retention compactor | reader, compactor, retention compactor | Incremental manifest mutations after the snapshot boundary. |
 | `manifest/gc/pending-sst/pending.json` | JSON | compactor, retention compactor | compactor, retention compactor | Tracks SSTs that are no longer referenced and are waiting for physical deletion. |
 | `manifest/gc/checkpoint.json` | JSON | retention compactor | retention compactor | Stores GC replay progress over manifest history. |
-| `sstable/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. |
+| `sstable/<bucket>/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. The bucket is deterministically derived from the SST ID. |
 | `blobs/<prefix>/<blob-id>.blob` | Binary | writer | reader | External value objects used when large values are stored out-of-line. |
 
 #### Write, Read, and Cleanup Lifecycle
 
 1. `Writer.Put` buffers keys in the active memtable. If a value crosses the blob threshold, the value bytes are uploaded to `blobs/` first and the memtable stores a blob reference.
-2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to `sstable/`.
+2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths.
 3. After the SST objects exist, the writer appends manifest log records and updates `manifest/CURRENT` using CAS semantics. This is the visibility boundary for readers.
 4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/log files, then read the newly visible SSTs and blobs on demand.
 5. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.

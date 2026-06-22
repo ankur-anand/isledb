@@ -17,7 +17,8 @@ demo/p000/
         pending.json
       checkpoint.json
   sstable/
-    <sst-id>
+    <bucket>/
+      <sst-id>
   blobs/
     <prefix>/
       <blob-id>.blob
@@ -57,7 +58,9 @@ This is a representative JSON-style view of the object families under one prefix
       }
     },
     "sstable": {
-      "<sst-id>": "<binary>"
+      "<bucket>": {
+        "<sst-id>": "<binary>"
+      }
     },
     "blobs": {
       "<prefix>": {
@@ -411,21 +414,26 @@ Example:
 }
 ```
 
-## `sstable/<sst-id>`
+## `sstable/<bucket>/<sst-id>`
 
 Immutable SST data file. This object is binary, not JSON.
+
+The bucket is deterministically derived from the SST ID using IsleDB's
+`blobstore.SSTBucket` function. Readers do not list `sstable/` to find files;
+they read the manifest, get `SSTMeta.ID`, compute `SSTPath(ID)`, and range-read
+the SST object directly.
 
 Path:
 
 ```text
-demo/p000/sstable/sst-a100
+demo/p000/sstable/9e6/seg1.sst
 ```
 
 JSON-style descriptor:
 
 ```json
 {
-  "path": "demo/p000/sstable/sst-a100",
+  "path": "demo/p000/sstable/9e6/seg1.sst",
   "encoding": "binary",
   "written_by": [
     "writer",

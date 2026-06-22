@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,6 +34,16 @@ var (
 	ErrPreconditionFailed = errors.New("precondition failed")
 	ErrBucketNameRequired = errors.New("bucket name required for cloud providers")
 )
+
+const (
+	SSTBucketBits   = 12
+	SSTBucketHexLen = 3
+	SSTBucketCount  = 1 << SSTBucketBits
+)
+
+const sstBucketMask uint32 = SSTBucketCount - 1
+
+var sstBucketTable = crc32.MakeTable(crc32.Castagnoli)
 
 type BatchDeleteError struct {
 	Failed map[string]error
@@ -118,7 +129,14 @@ func (s *Store) path(parts ...string) string {
 }
 
 func (s *Store) SSTPath(id string) string {
-	return s.path("sstable", id)
+	return s.path("sstable", SSTBucket(id), id)
+}
+
+// SSTBucket returns the deterministic object-store bucket for an SST ID.
+// The bucket is part of the object layout; changing it changes every SST key.
+func SSTBucket(id string) string {
+	sum := crc32.Checksum([]byte(id), sstBucketTable)
+	return fmt.Sprintf("%0*x", SSTBucketHexLen, sum&sstBucketMask)
 }
 
 func (s *Store) BlobPath(blobID string) string {
