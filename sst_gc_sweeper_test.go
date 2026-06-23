@@ -2,12 +2,14 @@ package isledb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/manifest"
 )
 
 func TestPlanPendingSSTSweep_ClearsLiveAndStopsAtNotDueBoundary(t *testing.T) {
@@ -235,6 +237,116 @@ func TestRunPendingSSTSweeper_KeepsNotDueMark(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected not-due mark to remain")
+	}
+}
+
+func TestRunPendingSSTSweeper_DeletesMalformedDueMark(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+
+	orphanID := fmt.Sprintf("sweep-malformed-%d", time.Now().UnixNano())
+	if _, err := store.Write(ctx, store.SSTPath(orphanID), []byte("orphan-data")); err != nil {
+		t.Fatalf("write orphan sst: %v", err)
+	}
+
+	if err := storePendingSSTDeleteMarkSet(ctx, store, &pendingSSTDeleteMarkSet{
+		Marks: []pendingSSTDeleteMark{
+			{
+				Version: gcMarkSchemaVersion,
+				SSTID:   orphanID,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("store pending marks: %v", err)
+	}
+
+	stats, err := runPendingSSTSweeper(ctx, store, manifestStore, 10, time.Hour)
+	if err != nil {
+		t.Fatalf("run sweeper: %v", err)
+	}
+	if stats.Deleted != 1 {
+		t.Fatalf("deleted mismatch: got=%d want=1", stats.Deleted)
+	}
+
+	exists, err := store.Exists(ctx, store.SSTPath(orphanID))
+	if err != nil {
+		t.Fatalf("exists orphan sst: %v", err)
+	}
+	if exists {
+		t.Fatalf("malformed due mark orphan should be deleted")
+	}
+
+	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)
+	if err != nil {
+		t.Fatalf("lookup malformed mark: %v", err)
+	}
+	if found {
+		t.Fatalf("expected malformed pending mark to be removed")
+	}
+}
+
+func TestRunPendingSSTSweeper_RetriesPendingMarkCASConflict(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+
+	orphanID := fmt.Sprintf("sweep-cas-retry-%d", time.Now().UnixNano())
+	if _, err := store.Write(ctx, store.SSTPath(orphanID), []byte("orphan-data")); err != nil {
+		t.Fatalf("write orphan sst: %v", err)
+	}
+
+	now := time.Now().UTC()
+	initial := &pendingSSTDeleteMarkSet{
+		Version: gcMarkSchemaVersion,
+		Marks: []pendingSSTDeleteMark{
+			{
+				Version:                 gcMarkSchemaVersion,
+				SSTID:                   orphanID,
+				FirstSeenUnreferencedAt: now.Add(-2 * time.Hour),
+				LastSeenUnreferencedAt:  now.Add(-2 * time.Hour),
+				DueAt:                   now.Add(-time.Minute),
+			},
+		},
+	}
+	payload, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatalf("marshal initial pending marks: %v", err)
+	}
+	storage := &fakeGCMarkStorage{
+		pendingData:      payload,
+		pendingETag:      "pending-etag-1",
+		pendingFailUntil: 1,
+		pendingFailErr:   manifest.ErrPreconditionFailed,
+	}
+
+	stats, err := runPendingSSTSweeperWithStorage(ctx, store, manifestStore, storage, 10, time.Hour)
+	if err != nil {
+		t.Fatalf("run sweeper with retry: %v", err)
+	}
+	if storage.pendingStoreCalls != 2 {
+		t.Fatalf("pending store calls=%d, want=2", storage.pendingStoreCalls)
+	}
+	if stats.Deleted != 1 {
+		t.Fatalf("deleted mismatch: got=%d want=1", stats.Deleted)
+	}
+
+	set, _, _, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, storage)
+	if err != nil {
+		t.Fatalf("load pending marks: %v", err)
+	}
+	if len(set.Marks) != 0 {
+		t.Fatalf("expected pending marks to be cleared after retry, got=%+v", set.Marks)
+	}
+
+	exists, err := store.Exists(ctx, store.SSTPath(orphanID))
+	if err != nil {
+		t.Fatalf("exists orphan sst: %v", err)
+	}
+	if exists {
+		t.Fatalf("orphan sst should be deleted after retry")
 	}
 }
 

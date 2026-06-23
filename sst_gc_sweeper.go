@@ -228,5 +228,5 @@ func pendingMarkDueAt(mark pendingSSTDeleteMark, now time.Time, gracePeriod time
 	if !mark.LastSeenUnreferencedAt.IsZero() {
 		return mark.LastSeenUnreferencedAt.Add(gracePeriod)
 	}
-	return now.Add(gracePeriod)
+	return now
 }
