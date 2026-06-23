@@ -621,17 +621,17 @@ func TestReader_MetricsBlobFetch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
-	wOpts.ValueStorage.BlobThreshold = 1
+	wOpts.Flush.Interval = 0
+	wOpts.Values.BlobThreshold = 1
 
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	blobValue := []byte("blob-value")
-	if err := w.put([]byte("blob-key"), blobValue); err != nil {
+	if err := w.put(ctx, []byte("blob-key"), blobValue); err != nil {
 		t.Fatalf("put blob: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {

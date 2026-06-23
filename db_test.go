@@ -41,11 +41,11 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	}
 	defer db.Close()
 
-	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	compactor, err := db.OpenCompactor(ctx, CompactorOptions{})
 	if err != nil {
@@ -83,7 +83,7 @@ func TestOpenDBClosed(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if _, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1}); err == nil {
+	if _, err := db.OpenWriter(ctx, WriterOptions{}); err == nil {
 		t.Fatal("expected OpenWriter to fail after DB is closed")
 	}
 	if _, err := db.OpenCompactor(ctx, CompactorOptions{}); err == nil {
@@ -104,7 +104,7 @@ func TestDBCloseClosesHandles(t *testing.T) {
 		t.Fatalf("OpenDB: %v", err)
 	}
 
-	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
@@ -214,16 +214,16 @@ func TestReaderMaxCommittedLSN(t *testing.T) {
 	}
 	defer db.Close()
 
-	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	putLSN := func(lsn uint64, value string) {
 		key := make([]byte, 8)
 		binary.BigEndian.PutUint64(key, lsn)
-		if err := writer.Put(key, []byte(value)); err != nil {
+		if err := writer.Put(ctx, key, []byte(value)); err != nil {
 			t.Fatalf("Put(%d): %v", lsn, err)
 		}
 	}
@@ -276,16 +276,16 @@ func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
 	}
 	defer db.Close()
 
-	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	put := func(lsn uint64, value string) {
 		key := make([]byte, 8)
 		binary.BigEndian.PutUint64(key, lsn)
-		if err := writer.Put(key, []byte(value)); err != nil {
+		if err := writer.Put(ctx, key, []byte(value)); err != nil {
 			t.Fatalf("Put(%d): %v", lsn, err)
 		}
 	}

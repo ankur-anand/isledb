@@ -18,8 +18,8 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 512
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 512
 
 	compactorOpts := CompactorOptions{
 		L0CompactionThreshold: 1,
@@ -40,14 +40,14 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key-%03d", i)
 		val := fmt.Sprintf("value-%03d", i)
-		if err := writer1.put([]byte(key), []byte(val)); err != nil {
+		if err := writer1.put(ctx, []byte(key), []byte(val)); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
 	if err := writer1.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	_ = writer1.close()
+	_ = writer1.close(ctx)
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
@@ -62,7 +62,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	if err != nil {
 		t.Fatalf("newWriter(2): %v", err)
 	}
-	_ = writer2.close()
+	_ = writer2.close(ctx)
 
 	compactor2, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {

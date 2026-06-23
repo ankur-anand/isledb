@@ -125,14 +125,14 @@ func TestRunPendingSSTSweeper_ClearsLiveMarkWithoutDelete(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("live-key"), []byte("value")); err != nil {
+	if err := w.put(ctx, []byte("live-key"), []byte("value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -245,14 +245,14 @@ func TestRunPendingSSTSweeper_ClearsLiveMarksPastNotDueBoundary(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("live-boundary-key"), []byte("value")); err != nil {
+	if err := w.put(ctx, []byte("live-boundary-key"), []byte("value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {

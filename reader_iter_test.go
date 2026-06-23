@@ -15,19 +15,19 @@ func TestReader_ScanLimit(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -93,19 +93,19 @@ func TestReader_Iterator(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -173,15 +173,15 @@ func TestReader_Iterator_Empty(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.FlushInterval = 0
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("other:key"), []byte("value")); err != nil {
+	if err := w.put(ctx, []byte("other:key"), []byte("value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -226,19 +226,19 @@ func TestReader_Iterator_SeekGE(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 1; i <= 10; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -309,26 +309,26 @@ func TestReader_Iterator_WithDeletes(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
 
 	for i := 0; i < 10; i += 2 {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.delete([]byte(key)); err != nil {
+		if err := w.delete(ctx, []byte(key)); err != nil {
 			t.Fatalf("delete failed: %v", err)
 		}
 	}
@@ -370,26 +370,26 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.delete([]byte(key)); err != nil {
+		if err := w.delete(ctx, []byte(key)); err != nil {
 			t.Fatalf("delete failed: %v", err)
 		}
 	}
@@ -426,19 +426,19 @@ func TestReader_Iterator_SeekGE_RepositionAfterMiss(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 1; i <= 10; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -486,19 +486,19 @@ func TestReader_Iterator_SeekGE_AfterExhaustion(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 1; i <= 3; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}

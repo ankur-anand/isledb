@@ -81,7 +81,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open writer: %v", err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	seq := lastSeq
 	published := 0
@@ -121,7 +121,7 @@ func main() {
 			log.Fatalf("marshal event: %v", err)
 		}
 		key := shared.EventKey(*topic, now, seq)
-		if err := writer.Put([]byte(key), value); err != nil {
+		if err := writer.Put(ctx, []byte(key), value); err != nil {
 			log.Fatalf("put event: %v", err)
 		}
 		published++

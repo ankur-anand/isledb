@@ -14,6 +14,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+func testWriterOptions(memtableBytes int64, maxFrozen int) WriterOptions {
+	return WriterOptions{
+		Memtable: WriterMemtableOptions{
+			TargetBytes: memtableBytes,
+			MaxFrozen:   maxFrozen,
+		},
+		SST: WriterSSTOptions{
+			BlockBytes:  4096,
+			Compression: "none",
+		},
+	}
+}
+
 func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-test")
@@ -21,26 +34,19 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          1 << 20,
-		FlushInterval:         0,
-		BloomBitsPerKey:       0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 0,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := w.put([]byte("a"), []byte("value-1")); err != nil {
+	if err := w.put(ctx, []byte("a"), []byte("value-1")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
-	if err := w.close(); err != nil {
+	if err := w.close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
@@ -66,32 +72,58 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 	}
 }
 
+func TestWriter_RejectsNilContext(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-nil-context")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	if _, err := newWriter(nil, store, manifestStore, WriterOptions{}); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("newWriter(nil) error=%v, want %v", err, ErrNilContext)
+	}
+
+	w, err := newWriter(ctx, store, manifestStore, WriterOptions{})
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(nil, []byte("a"), []byte("v")); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("put(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := w.delete(nil, []byte("a")); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("delete(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := w.flush(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("flush(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := w.close(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("close(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("writer should remain usable after nil-context errors: %v", err)
+	}
+}
+
 func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-change-feed")
 	defer store.Close()
 
 	manifestStore := newManifestStore(store, nil)
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          1 << 20,
-		FlushInterval:         0,
-		BloomBitsPerKey:       0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 0,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("b"), []byte("vb")); err != nil {
+	if err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
-	if err := w.delete([]byte("a")); err != nil {
+	if err := w.delete(ctx, []byte("a")); err != nil {
 		t.Fatalf("delete a: %v", err)
 	}
-	if err := w.put([]byte("c"), []byte("vc")); err != nil {
+	if err := w.put(ctx, []byte("c"), []byte("vc")); err != nil {
 		t.Fatalf("put c: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -155,39 +187,27 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          1 << 20,
-		FlushInterval:         0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 0,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if err := w.put([]byte("a"), []byte("v1")); err != nil {
+	if err := w.put(ctx, []byte("a"), []byte("v1")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	if err := w.close(); err != nil {
+	if err := w.close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	w2, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          1 << 20,
-		FlushInterval:         0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 0,
-	})
+	w2, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
 	if err != nil {
 		t.Fatalf("newWriter(2): %v", err)
 	}
-	defer w2.close()
+	defer w2.close(ctx)
 
-	if err := w2.put([]byte("b"), []byte("v2")); err != nil {
+	if err := w2.put(ctx, []byte("b"), []byte("v2")); err != nil {
 		t.Fatalf("Put2: %v", err)
 	}
 	if err := w2.flush(ctx); err != nil {
@@ -217,6 +237,67 @@ func (s *failOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expe
 	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
+type blockingCurrentStorage struct {
+	manifest.Storage
+	block   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingCurrentStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	if s.block.CompareAndSwap(true, false) {
+		close(s.started)
+		<-s.release
+	}
+	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
+}
+
+func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-close-retry")
+	defer store.Close()
+
+	storage := &blockingCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+
+	opts := testWriterOptions(1<<20, 0)
+	opts.Flush.Interval = 10 * time.Millisecond
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	storage.block.Store(true)
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background flush did not reach blocking CURRENT write")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = w.close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := w.close(retryCtx); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
+
 func TestWriter_Backpressure(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-backpressure")
@@ -224,23 +305,17 @@ func TestWriter_Backpressure(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          512,
-		FlushInterval:         0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 1,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(512, 1))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	val := bytes.Repeat([]byte("v"), 128)
 	var lastErr error
 	for i := 0; i < 10000; i++ {
 		key := []byte(fmt.Sprintf("k%06d", i))
-		lastErr = w.put(key, val)
+		lastErr = w.put(ctx, key, val)
 		if errors.Is(lastErr, ErrBackpressure) {
 			break
 		}
@@ -262,7 +337,7 @@ func TestWriter_Backpressure(t *testing.T) {
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	if err := w.put([]byte("post"), []byte("v")); err != nil {
+	if err := w.put(ctx, []byte("post"), []byte("v")); err != nil {
 		t.Fatalf("put after flush: %v", err)
 	}
 }
@@ -278,19 +353,13 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 3}
 	manifestStore := manifest.NewStoreWithStorage(failStorage)
 
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          1 << 20,
-		FlushInterval:         0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 0,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("a"), []byte("v")); err != nil {
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -317,21 +386,15 @@ func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 
-	w, err := newWriter(ctx, store, manifestStore, WriterOptions{
-		MemtableSize:          512,
-		FlushInterval:         0,
-		BlockSize:             4096,
-		Compression:           "none",
-		MaxImmutableMemtables: 1,
-	})
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(512, 1))
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 10000; i++ {
 		seqBefore := w.seq
-		err := w.delete([]byte(fmt.Sprintf("k%06d", i)))
+		err := w.delete(ctx, []byte(fmt.Sprintf("k%06d", i)))
 		if errors.Is(err, ErrBackpressure) {
 			if w.seq != seqBefore {
 				t.Fatalf("delete error should not advance seq: before=%d after=%d", seqBefore, w.seq)
@@ -353,21 +416,20 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.FlushInterval = 0
-	opts.ValueStorage.BlobThreshold = 1
+	opts.Flush.Interval = 0
+	opts.Values.BlobThreshold = 1
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	seqBefore := w.seq
 	blobCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	w.ctx = blobCtx
 
-	err = w.put([]byte("k"), []byte("v"))
+	err = w.put(blobCtx, []byte("k"), []byte("v"))
 	if err == nil {
 		t.Fatalf("expected put blob error with canceled blob write context")
 	}
@@ -383,24 +445,25 @@ func TestWriter_OpenContextCancellationDoesNotBlockWrites(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
-	opts.FlushInterval = 0
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(context.Background())
 
 	cancel()
 
-	if err := w.put([]byte("k-inline"), []byte("v")); err != nil {
+	opCtx := context.Background()
+	if err := w.put(opCtx, []byte("k-inline"), []byte("v")); err != nil {
 		t.Fatalf("put inline after opening ctx cancel: %v", err)
 	}
-	if err := w.delete([]byte("k-inline")); err != nil {
+	if err := w.delete(opCtx, []byte("k-inline")); err != nil {
 		t.Fatalf("delete after opening ctx cancel: %v", err)
 	}
 	w.valueConfig.BlobThreshold = 1
-	if err := w.put([]byte("k-blob"), []byte("b")); err != nil {
+	if err := w.put(opCtx, []byte("k-blob"), []byte("b")); err != nil {
 		t.Fatalf("put blob after opening ctx cancel: %v", err)
 	}
 }
@@ -412,21 +475,21 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
-	opts.FlushInterval = 0
-	opts.MemtableSize = 512
-	opts.MaxImmutableMemtables = 1
+	opts.Flush.Interval = 0
+	opts.Memtable.TargetBytes = 512
+	opts.Memtable.MaxFrozen = 1
 	opts.Metrics = &WriterMetrics{}
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	val := bytes.Repeat([]byte("v"), 128)
 	lastErr := error(nil)
 	for i := 0; i < 10000; i++ {
-		lastErr = w.put([]byte(fmt.Sprintf("k%06d", i)), val)
+		lastErr = w.put(ctx, []byte(fmt.Sprintf("k%06d", i)), val)
 		if errors.Is(lastErr, ErrBackpressure) {
 			break
 		}
@@ -438,7 +501,7 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 		t.Fatalf("expected ErrBackpressure, got %v", lastErr)
 	}
 
-	if err := w.delete([]byte("k-final")); err != nil && !errors.Is(err, ErrBackpressure) {
+	if err := w.delete(ctx, []byte("k-final")); err != nil && !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -453,24 +516,24 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
-	opts.FlushInterval = 0
-	opts.ValueStorage.BlobThreshold = 1
+	opts.Flush.Interval = 0
+	opts.Values.BlobThreshold = 1
 	opts.Metrics = DefaultWriterMetrics(nil)
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	blobValue := []byte("blob-value")
-	if err := w.putWithTTL([]byte("k1"), blobValue, time.Second); err != nil {
+	if err := w.putWithTTL(ctx, []byte("k1"), blobValue, time.Second); err != nil {
 		t.Fatalf("putWithTTL success: %v", err)
 	}
-	if err := w.putWithTTL(nil, []byte("bad"), time.Second); err == nil {
+	if err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
 		t.Fatalf("expected putWithTTL error for empty key")
 	}
-	if err := w.deleteWithTTL([]byte("k1"), time.Second); err != nil {
+	if err := w.deleteWithTTL(ctx, []byte("k1"), time.Second); err != nil {
 		t.Fatalf("deleteWithTTL: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {

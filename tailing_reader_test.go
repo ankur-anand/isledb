@@ -19,14 +19,14 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("key:001"), []byte("value:001")); err != nil {
+	if err := w.put(ctx, []byte("key:001"), []byte("value:001")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -61,7 +61,7 @@ func TestTailingReader_AutoRefresh(t *testing.T) {
 		t.Errorf("Expected value:001, got %s (found=%v)", val, found)
 	}
 
-	if err := w.put([]byte("key:002"), []byte("value:002")); err != nil {
+	if err := w.put(ctx, []byte("key:002"), []byte("value:002")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -92,12 +92,12 @@ func TestTailingReader_Tail(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	trOpts := TailingReaderOptions{
 		RefreshInterval: 20 * time.Millisecond,
@@ -114,7 +114,7 @@ func TestTailingReader_Tail(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("wal:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -147,7 +147,7 @@ func TestTailingReader_Tail(t *testing.T) {
 	for i := 5; i < 10; i++ {
 		key := fmt.Sprintf("wal:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -178,17 +178,17 @@ func TestTailingReader_TailChannel(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("stream:%03d", i)
 		value := fmt.Sprintf("data:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -255,17 +255,17 @@ func TestTailingReader_StartAfterKey(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("log:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -316,17 +316,17 @@ func TestTailingReader_StartAfterKeyOverridesMinKey(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("log:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -377,12 +377,12 @@ func TestTailingReader_CatchUp(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 50 * time.Millisecond,
@@ -398,7 +398,7 @@ func TestTailingReader_CatchUp(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("wal:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -443,12 +443,12 @@ func TestTailingReader_CatchUpCurrentUsesCurrentSnapshot(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	tr, err := newTailingReader(ctx, store, TailingReaderOptions{
 		RefreshInterval: 50 * time.Millisecond,
@@ -464,7 +464,7 @@ func TestTailingReader_CatchUpCurrentUsesCurrentSnapshot(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("snap:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -526,17 +526,17 @@ func TestTailingReader_CatchUpLimit(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("log:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -589,17 +589,17 @@ func TestTailingReader_CatchUpHandlerErrorProgress(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("stream:%03d", i)
 		value := fmt.Sprintf("entry:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}

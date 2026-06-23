@@ -159,6 +159,10 @@ func (c *RetentionCompactor) Close() error {
 	return nil
 }
 
+func (c *RetentionCompactor) closeDB() error {
+	return c.Close()
+}
+
 func (c *RetentionCompactor) Refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {

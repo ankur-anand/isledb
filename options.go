@@ -16,29 +16,63 @@ const (
 )
 
 type WriterOptions struct {
-	MemtableSize    int64
-	FlushInterval   time.Duration
-	BloomBitsPerKey int
-	BlockSize       int
-	Compression     string
-	// MaxImmutableMemtables limits pending memtables waiting to be flushed.
-	// When the limit is reached, writers return ErrBackpressure.
-	MaxImmutableMemtables int
+	// OwnerID is the stable writer identity stored in the writer fence.
+	OwnerID string
+
+	// Memtable controls in-memory write buffering before SST creation.
+	Memtable WriterMemtableOptions
+
+	// Flush controls background flushing. A zero Interval disables auto-flush.
+	Flush WriterFlushOptions
+
+	// SST controls SST file encoding.
+	SST WriterSSTOptions
+
+	// Values controls inline-vs-blob value storage and value/key limits.
+	Values config.ValueStorageConfig
 
 	OnFlushError func(error)
-	ValueStorage config.ValueStorageConfig
-	OwnerID      string
+	Metrics      *WriterMetrics
+}
 
-	Metrics *WriterMetrics
+type WriterMemtableOptions struct {
+	// TargetBytes is the approximate active memtable size that triggers rotation.
+	TargetBytes int64
+
+	// MaxFrozen limits full memtables waiting for flush. When the limit is
+	// reached, writes return ErrBackpressure. Zero means unbounded.
+	MaxFrozen int
+}
+
+type WriterFlushOptions struct {
+	// Interval is the background flush cadence. Zero disables background flush.
+	Interval time.Duration
+}
+
+type WriterSSTOptions struct {
+	// BloomBitsPerKey controls SST bloom filter size.
+	BloomBitsPerKey int
+
+	// BlockBytes is the target SST data block size.
+	BlockBytes int
+
+	// Compression is the SST compression algorithm.
+	Compression string
 }
 
 func DefaultWriterOptions() WriterOptions {
 	return WriterOptions{
-		MemtableSize:    4 * 1024 * 1024,
-		FlushInterval:   time.Second,
-		BloomBitsPerKey: 10,
-		BlockSize:       4096,
-		Compression:     "snappy",
+		Memtable: WriterMemtableOptions{
+			TargetBytes: 4 * 1024 * 1024,
+		},
+		Flush: WriterFlushOptions{
+			Interval: time.Second,
+		},
+		SST: WriterSSTOptions{
+			BloomBitsPerKey: 10,
+			BlockBytes:      4096,
+			Compression:     "snappy",
+		},
 	}
 }
 

@@ -132,6 +132,10 @@ func (c *Compactor) Close() error {
 	return nil
 }
 
+func (c *Compactor) closeDB() error {
+	return c.Close()
+}
+
 func (c *Compactor) Refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
