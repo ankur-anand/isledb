@@ -5,16 +5,16 @@ import (
 	"sync/atomic"
 )
 
-const DefaultManifestLogCacheSize = 1024
+const DefaultManifestPageCacheSize = 1024
 
-type ManifestLogCacheStats struct {
+type ManifestPageCacheStats struct {
 	Hits       int64
 	Misses     int64
 	EntryCount int
 	MaxEntries int
 }
 
-type LruManifestLogCache struct {
+type LruManifestPageCache struct {
 	mu         sync.Mutex
 	maxEntries int
 	cache      map[string][]byte
@@ -24,18 +24,18 @@ type LruManifestLogCache struct {
 	misses atomic.Int64
 }
 
-func NewLRUManifestLogCache(maxEntries int) *LruManifestLogCache {
+func NewLRUManifestPageCache(maxEntries int) *LruManifestPageCache {
 	if maxEntries <= 0 {
-		maxEntries = DefaultManifestLogCacheSize
+		maxEntries = DefaultManifestPageCacheSize
 	}
-	return &LruManifestLogCache{
+	return &LruManifestPageCache{
 		maxEntries: maxEntries,
 		cache:      make(map[string][]byte),
 		order:      make([]string, 0),
 	}
 }
 
-func (c *LruManifestLogCache) Get(path string) ([]byte, bool) {
+func (c *LruManifestPageCache) Get(path string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -50,7 +50,7 @@ func (c *LruManifestLogCache) Get(path string) ([]byte, bool) {
 	return append([]byte(nil), data...), true
 }
 
-func (c *LruManifestLogCache) Set(path string, data []byte) {
+func (c *LruManifestPageCache) Set(path string, data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -70,7 +70,7 @@ func (c *LruManifestLogCache) Set(path string, data []byte) {
 	c.order = append(c.order, path)
 }
 
-func (c *LruManifestLogCache) Remove(path string) {
+func (c *LruManifestPageCache) Remove(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -86,7 +86,7 @@ func (c *LruManifestLogCache) Remove(path string) {
 	}
 }
 
-func (c *LruManifestLogCache) Clear() {
+func (c *LruManifestPageCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -94,11 +94,11 @@ func (c *LruManifestLogCache) Clear() {
 	c.order = c.order[:0]
 }
 
-func (c *LruManifestLogCache) Stats() ManifestLogCacheStats {
+func (c *LruManifestPageCache) Stats() ManifestPageCacheStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return ManifestLogCacheStats{
+	return ManifestPageCacheStats{
 		Hits:       c.hits.Load(),
 		Misses:     c.misses.Load(),
 		EntryCount: len(c.cache),
@@ -106,7 +106,7 @@ func (c *LruManifestLogCache) Stats() ManifestLogCacheStats {
 	}
 }
 
-func (c *LruManifestLogCache) touch(path string) {
+func (c *LruManifestPageCache) touch(path string) {
 	for i, cached := range c.order {
 		if cached == path {
 			c.order = append(c.order[:i], c.order[i+1:]...)
@@ -117,22 +117,22 @@ func (c *LruManifestLogCache) touch(path string) {
 	c.order = append(c.order, path)
 }
 
-type noopManifestLogCache struct{}
+type noopManifestPageCache struct{}
 
-func NewNoopManifestLogCache() ManifestLogCache {
-	return &noopManifestLogCache{}
+func NewNoopManifestPageCache() ManifestPageCache {
+	return &noopManifestPageCache{}
 }
 
-func (c *noopManifestLogCache) Get(path string) ([]byte, bool) {
+func (c *noopManifestPageCache) Get(path string) ([]byte, bool) {
 	return nil, false
 }
 
-func (c *noopManifestLogCache) Set(path string, data []byte) {}
+func (c *noopManifestPageCache) Set(path string, data []byte) {}
 
-func (c *noopManifestLogCache) Remove(path string) {}
+func (c *noopManifestPageCache) Remove(path string) {}
 
-func (c *noopManifestLogCache) Clear() {}
+func (c *noopManifestPageCache) Clear() {}
 
-func (c *noopManifestLogCache) Stats() ManifestLogCacheStats {
-	return ManifestLogCacheStats{}
+func (c *noopManifestPageCache) Stats() ManifestPageCacheStats {
+	return ManifestPageCacheStats{}
 }

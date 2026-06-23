@@ -10,8 +10,11 @@ demo/p000/
     CURRENT
     snapshots/
       <id>.manifest
-    log/
-      <seq>.json
+    pages/
+      l00/
+        <page-id>.json
+      l01/
+        <page-id>.json
     gc/
       pending-sst/
         pending.json
@@ -19,6 +22,9 @@ demo/p000/
   sstable/
     <bucket>/
       <sst-id>
+  changes/
+    <bucket>/
+      <change-batch-id>
   blobs/
     <prefix>/
       <blob-id>.blob
@@ -26,8 +32,8 @@ demo/p000/
 
 ## Serialization Notes
 
-- `manifest/CURRENT`, `manifest/snapshots/*.manifest`, `manifest/log/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
-- `sstable/*` and `blobs/*` are binary objects, not JSON.
+- `manifest/CURRENT`, `manifest/snapshots/*.manifest`, `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
+- `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
 - Manifest log `role` is numeric:
   - `0` = writer
@@ -47,8 +53,13 @@ This is a representative JSON-style view of the object families under one prefix
       "snapshots": {
         "<id>.manifest": "{...json...}"
       },
-      "log": {
-        "<seq>.json": "{...json...}"
+      "pages": {
+        "l00": {
+          "<page-id>.json": "{...json...}"
+        },
+        "l01": {
+          "<page-id>.json": "{...json...}"
+        }
       },
       "gc": {
         "pending-sst": {
@@ -62,6 +73,11 @@ This is a representative JSON-style view of the object families under one prefix
         "<sst-id>": "<binary>"
       }
     },
+    "changes": {
+      "<bucket>": {
+        "<change-batch-id>": "<binary>"
+      }
+    },
     "blobs": {
       "<prefix>": {
         "<blob-id>.blob": "<binary>"
@@ -73,7 +89,7 @@ This is a representative JSON-style view of the object families under one prefix
 
 ## `manifest/CURRENT`
 
-Hot control record. It points to the current snapshot and replay window and can carry fast-path metadata such as `max_committed_lsn` and `low_watermark_lsn`.
+Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs. It can also carry fast-path metadata such as `max_committed_lsn` and `low_watermark_lsn`.
 
 Path:
 
@@ -85,10 +101,34 @@ Example:
 
 ```json
 {
+  "layout_version": 1,
+  "format": "isledb-manifest-v1",
   "snapshot": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest",
   "log_seq_start": 412,
+  "change_feed_log_start": 412,
   "next_seq": 428,
   "next_epoch": 19,
+  "index_frontier": [
+    {
+      "level": 0,
+      "seq_lo": 412,
+      "seq_hi": 419,
+      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.json",
+      "count": 8,
+      "checksum": "sha256:abc",
+      "created_at": "2026-04-15T10:14:11Z"
+    }
+  ],
+  "active_entries": [
+    {
+      "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
+      "seq": 420,
+      "role": 0,
+      "epoch": 18,
+      "ts": "2026-04-15T10:14:11Z",
+      "op": "add_sstable"
+    }
+  ],
   "max_committed_lsn": 381,
   "low_watermark_lsn": 240,
   "writer_fence": {
@@ -195,17 +235,73 @@ Notes:
 - `MinKey` and `MaxKey` are raw key bytes encoded as base64 in JSON.
 - If your workload uses monotonic 8-byte big-endian keys, those bytes can be decoded into numeric LSNs or offsets.
 
-## `manifest/log/<seq>.json`
+## `manifest/pages/l<level>/<id>.json`
 
-Incremental manifest mutation after the snapshot boundary. Each file holds one `ManifestLogEntry`.
+Immutable committed manifest pages. A page is visible only when
+`manifest/CURRENT` references it through `index_frontier`. Candidate pages left
+behind by a failed CURRENT CAS are ignored by readers and can be cleaned by GC.
+
+Level `0` pages contain actual `ManifestLogEntry` objects. Higher levels contain
+`PageRef` children that point at lower-level pages. This keeps `CURRENT` bounded
+while allowing the committed history to grow.
 
 Path:
 
 ```text
-demo/p000/manifest/log/00000000000000000412.json
+demo/p000/manifest/pages/l00/412-419-2YBx.json
+demo/p000/manifest/pages/l01/412-1435-7Kq9.json
 ```
 
-Common header fields:
+Level 0 page example:
+
+```json
+{
+  "layout_version": 1,
+  "page_type": "commit_l00",
+  "level": 0,
+  "seq_lo": 412,
+  "seq_hi": 419,
+  "count": 8,
+  "entries": [
+    {
+      "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
+      "seq": 412,
+      "role": 0,
+      "epoch": 18,
+      "ts": "2026-04-15T10:14:11Z",
+      "op": "add_sstable"
+    }
+  ],
+  "created_at": "2026-04-15T10:14:11Z"
+}
+```
+
+Index page example:
+
+```json
+{
+  "layout_version": 1,
+  "page_type": "commit_index",
+  "level": 1,
+  "seq_lo": 412,
+  "seq_hi": 1435,
+  "count": 1024,
+  "children": [
+    {
+      "level": 0,
+      "seq_lo": 412,
+      "seq_hi": 419,
+      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.json",
+      "count": 8,
+      "checksum": "sha256:abc",
+      "created_at": "2026-04-15T10:14:11Z"
+    }
+  ],
+  "created_at": "2026-04-15T10:30:00Z"
+}
+```
+
+Common `ManifestLogEntry` header fields:
 
 ```json
 {
@@ -215,149 +311,6 @@ Common header fields:
   "epoch": 18,
   "ts": "2026-04-15T10:14:11Z",
   "op": "add_sstable"
-}
-```
-
-### `op = "add_sstable"`
-
-```json
-{
-  "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
-  "seq": 412,
-  "role": 0,
-  "epoch": 18,
-  "ts": "2026-04-15T10:14:11Z",
-  "op": "add_sstable",
-  "sstable": {
-    "ID": "sst-a101",
-    "Epoch": 18,
-    "SeqLo": 412,
-    "SeqHi": 417,
-    "MinKey": "AAAAAAAAAXQ=",
-    "MaxKey": "AAAAAAAAAXk=",
-    "Size": 1048576,
-    "Checksum": "sha256:ghi",
-    "Signature": null,
-    "Bloom": {
-      "BitsPerKey": 0,
-      "K": 0,
-      "Offset": 0,
-      "Length": 0
-    },
-    "CreatedAt": "2026-04-15T10:14:11Z",
-    "Level": 0,
-    "HasBlobRefs": false
-  }
-}
-```
-
-### `op = "remove_sstables"`
-
-```json
-{
-  "id": "2YBxhK8H0x8wyKj9kM8vT4W8f2B",
-  "seq": 414,
-  "role": 1,
-  "epoch": 7,
-  "ts": "2026-04-15T10:16:00Z",
-  "op": "remove_sstables",
-  "remove_sstable_ids": [
-    "sst-old-001",
-    "sst-old-002"
-  ]
-}
-```
-
-### `op = "compaction"`
-
-```json
-{
-  "id": "2YBxiwH4H6U4m2Q1Qx4T2m2qT3p",
-  "seq": 413,
-  "role": 1,
-  "epoch": 7,
-  "ts": "2026-04-15T10:14:20Z",
-  "op": "compaction",
-  "compaction": {
-    "remove_sstable_ids": [
-      "sst-a100",
-      "sst-a101"
-    ],
-    "add_sstables": [],
-    "add_sorted_run": {
-      "id": 13,
-      "ssts": [
-        {
-          "ID": "sst-c001",
-          "Epoch": 18,
-          "SeqLo": 400,
-          "SeqHi": 417,
-          "MinKey": "AAAAAAAAAWg=",
-          "MaxKey": "AAAAAAAAAXk=",
-          "Size": 2097152,
-          "Checksum": "sha256:jkl",
-          "Signature": null,
-          "Bloom": {
-            "BitsPerKey": 0,
-            "K": 0,
-            "Offset": 0,
-            "Length": 0
-          },
-          "CreatedAt": "2026-04-15T10:14:20Z",
-          "Level": 1,
-          "HasBlobRefs": false
-        }
-      ]
-    }
-  }
-}
-```
-
-### `op = "fence_claim"`
-
-```json
-{
-  "id": "2YBxk6fW9l5cgY2sS5pRrQp1M8a",
-  "seq": 415,
-  "role": 0,
-  "epoch": 19,
-  "ts": "2026-04-15T10:17:00Z",
-  "op": "fence_claim",
-  "fence_claim": {
-    "role": 0,
-    "epoch": 19,
-    "owner": "writer-p000",
-    "claimed_at": "2026-04-15T10:17:00Z"
-  }
-}
-```
-
-### `op = "checkpoint"`
-
-This variant embeds a full manifest payload under `checkpoint`.
-
-```json
-{
-  "id": "2YBxl9Zl7o3Wk4L5jG6nP2mV8Qd",
-  "seq": 416,
-  "role": 0,
-  "epoch": 19,
-  "ts": "2026-04-15T10:18:00Z",
-  "op": "checkpoint",
-  "checkpoint": {
-    "version": 1,
-    "next_epoch": 19,
-    "log_seq": 416,
-    "l0_ssts": [],
-    "sorted_runs": [],
-    "next_sorted_run_id": 13,
-    "compaction_config": {
-      "l0_compaction_threshold": 8,
-      "min_sources": 4,
-      "max_sources": 8,
-      "size_threshold": 4
-    }
-  }
 }
 ```
 
@@ -446,6 +399,30 @@ JSON-style descriptor:
   ],
   "contents": "immutable sstable bytes"
 }
+```
+
+## `changes/<bucket>/<change-batch-id>`
+
+Immutable, seq-ordered mutation batch written alongside a memtable flush. This
+object is binary, not JSON. It preserves puts, deletes, TTL metadata, inline
+values, and blob references in row-sequence order.
+
+The bucket is deterministically derived from the change-batch ID using
+`blobstore.ChangeBatchBucket`. Readers should not list `changes/` to discover
+history. They read manifest metadata, then open the exact path from
+`ChangeBatchMeta.Path`.
+
+Path:
+
+```text
+demo/p000/changes/9f3/18-412-417-1776257651000000000.chg
+```
+
+Visibility rule:
+
+```text
+SST object + change batch object may exist before commit.
+They become visible only when manifest/CURRENT commits the add_sstable entry.
 ```
 
 ## `blobs/<prefix>/<blob-id>.blob`

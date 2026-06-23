@@ -29,6 +29,18 @@ func TestLogEntryRoundTrip(t *testing.T) {
 			Level:       0,
 			HasBlobRefs: true,
 		},
+		ChangeBatch: &ChangeBatchMeta{
+			ID:        "1-1-2-abc.chg",
+			Path:      "changes/abc/1-1-2-abc.chg",
+			Epoch:     1,
+			SeqLo:     1,
+			SeqHi:     2,
+			Count:     2,
+			Size:      99,
+			Checksum:  "sha256:def",
+			CreatedAt: created,
+			Version:   1,
+		},
 	}
 
 	data, err := EncodeLogEntry(entry)
@@ -51,6 +63,9 @@ func TestLogEntryRoundTrip(t *testing.T) {
 	if !got.SSTable.HasBlobRefs {
 		t.Fatalf("hasBlobRefs mismatch")
 	}
+	if got.ChangeBatch == nil || got.ChangeBatch.ID != entry.ChangeBatch.ID || got.ChangeBatch.Count != 2 {
+		t.Fatalf("change batch mismatch: %+v", got.ChangeBatch)
+	}
 }
 
 func TestApplyLogEntryAddSSTable(t *testing.T) {
@@ -62,6 +77,14 @@ func TestApplyLogEntryAddSSTable(t *testing.T) {
 			SeqLo: 1,
 			SeqHi: 1,
 			Level: 0,
+		},
+		ChangeBatch: &ChangeBatchMeta{
+			ID:    "1-1-1-aaa.chg",
+			Path:  "changes/aaa/1-1-1-aaa.chg",
+			Epoch: 2,
+			SeqLo: 1,
+			SeqHi: 1,
+			Count: 1,
 		},
 	}
 

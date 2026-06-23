@@ -25,6 +25,7 @@ type ManifestLogEntry struct {
 	Timestamp        time.Time             `json:"ts"`
 	Op               LogOpType             `json:"op"`
 	SSTable          *SSTMeta              `json:"sstable,omitempty"`
+	ChangeBatch      *ChangeBatchMeta      `json:"change_batch,omitempty"`
 	RemoveSSTableIDs []string              `json:"remove_sstable_ids,omitempty"`
 	Checkpoint       *Manifest             `json:"checkpoint,omitempty"`
 	Compaction       *CompactionLogPayload `json:"compaction,omitempty"`

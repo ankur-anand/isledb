@@ -18,14 +18,7 @@ func writeLogEntry(t *testing.T, ctx context.Context, backend *BlobStoreBackend,
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
-	data, err := EncodeLogEntry(entry)
-	if err != nil {
-		t.Fatalf("encode entry: %v", err)
-	}
-	name := formatLogSeq(entry.Seq)
-	if _, err := backend.WriteLog(ctx, name, data); err != nil {
-		t.Fatalf("write log: %v", err)
-	}
+	commitEntriesForTest(t, ctx, backend, []*ManifestLogEntry{entry})
 }
 
 func writeSnapshot(t *testing.T, ctx context.Context, backend *BlobStoreBackend, id string, snap *Manifest) string {

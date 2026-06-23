@@ -145,7 +145,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | Close | `() error` | Close reader and caches |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
-| ManifestLogCacheStats | `() cachestore.ManifestLogCacheStats` | Manifest-log cache statistics |
+| ManifestPageCacheStats | `() cachestore.ManifestPageCacheStats` | Manifest commit-page cache statistics |
 
 ```go
 type ReaderOpenOptions struct {
@@ -418,6 +418,25 @@ type SSTMeta = manifest.SSTMeta
 | Level | `int` | LSM level (0 = L0) |
 | HasBlobRefs | `bool` | Contains external blob references |
 
+### ChangeBatchMeta
+
+```go
+type ChangeBatchMeta = manifest.ChangeBatchMeta
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| ID | `string` | Change batch identifier |
+| Path | `string` | Object path for the binary change batch |
+| Epoch | `uint64` | Writer epoch |
+| SeqLo | `uint64` | Lowest mutation sequence |
+| SeqHi | `uint64` | Highest mutation sequence |
+| Count | `uint32` | Number of changes in the batch |
+| Size | `int64` | Encoded object size |
+| Checksum | `string` | Encoded object checksum |
+| CreatedAt | `time.Time` | Creation time |
+| Version | `int` | Change batch format version |
+
 ### SortedRun
 
 ```go
@@ -516,6 +535,7 @@ func NewMemory(prefix string) *Store
 | Close | `() error` | Close the store |
 | Prefix | `() string` | Storage prefix |
 | SSTPath | `(id string) string` | Path for SST file |
+| ChangeBatchPath | `(id string) string` | Path for change batch file |
 | BlobPath | `(blobID string) string` | Path for blob file |
 | Read | `(ctx, key) ([]byte, Attributes, error)` | Read object |
 | ReadRange | `(ctx, key, offset, length) ([]byte, error)` | Read byte range |
@@ -587,7 +607,7 @@ type BlobGCOptions struct {
 
 ### manifest.Store
 
-Manages the manifest log and snapshots with fencing support.
+Manages manifest snapshots, committed entry pages, CURRENT, and writer/compactor fences.
 
 ```go
 func NewStore(store *blobstore.Store) *Store
@@ -600,8 +620,9 @@ func NewStoreWithStorage(storage Storage) *Store
 | ClaimCompactor | `(ctx, ownerID) (*FenceToken, error)` | Claim compactor fence |
 | CheckWriterFence | `(ctx) error` | Verify writer fence still valid |
 | CheckCompactorFence | `(ctx) error` | Verify compactor fence still valid |
-| Replay | `(ctx) (*Manifest, error)` | Rebuild manifest from log |
+| Replay | `(ctx) (*Manifest, error)` | Rebuild manifest from CURRENT, snapshots, and committed entries |
 | AppendAddSSTableWithFence | `(ctx, SSTMeta) (*ManifestLogEntry, error)` | Append SST add entry |
+| AppendAddSSTableWithChangeBatchWithFence | `(ctx, SSTMeta, *ChangeBatchMeta) (*ManifestLogEntry, error)` | Append paired SST and change-batch entry |
 | AppendRemoveSSTablesWithFence | `(ctx, []string) (*ManifestLogEntry, error)` | Append SST remove entry |
 | AppendCompactionWithFence | `(ctx, CompactionLogPayload) (*ManifestLogEntry, error)` | Append compaction entry |
 | WriteSnapshot | `(ctx, *Manifest) (string, error)` | Write manifest snapshot |

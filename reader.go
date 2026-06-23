@@ -1019,11 +1019,11 @@ func (r *Reader) SSTCacheStats() SSTCacheStats {
 	return r.sstCache.Stats()
 }
 
-func (r *Reader) ManifestLogCacheStats() cachestore.ManifestLogCacheStats {
+func (r *Reader) ManifestPageCacheStats() cachestore.ManifestPageCacheStats {
 	if cs, ok := r.manifestStore.Storage().(*cachestore.CachingStorage); ok {
 		return cs.CacheStats()
 	}
-	return cachestore.ManifestLogCacheStats{}
+	return cachestore.ManifestPageCacheStats{}
 }
 
 type sstReadable struct {

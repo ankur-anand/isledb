@@ -51,7 +51,7 @@ For the exact per-file object-store schema and JSON examples, see [Object Store 
 | `blobstore.Store` | Resolves object paths under one prefix and reads/writes objects on S3, GCS, Azure Blob, MinIO, or local file-backed storage. |
 | `DB` | Shared control plane for a single prefix. Opens writers and maintenance processes against the same manifest state. |
 | `Writer` | Buffers writes in memory, spills them into immutable SSTs, uploads those SSTs, and publishes manifest changes. Large values can be written as separate blob objects. |
-| `Manifest store` | Tracks the durable visible state of the database. `manifest/CURRENT` is the hot pointer; snapshots and logs define the full topology. |
+| `Manifest store` | Tracks the durable visible state of the database. `manifest/CURRENT` is the hot pointer; snapshots, bounded active entries, and immutable commit pages define the full topology. |
 | `Reader` | Replays manifest state, fetches SSTs and blobs on demand, and uses local caches to avoid repeated downloads. |
 | `TailingReader` | Polls for manifest changes and emits new keys in order for log/event-style consumption. |
 | `Compactor` | Rewrites L0 SSTs and sorted runs into a more efficient layout, then publishes the new topology through the manifest. |
@@ -70,8 +70,11 @@ demo/p000/
     CURRENT
     snapshots/
       <id>.manifest
-    log/
-      <seq>.json
+    pages/
+      l00/
+        <page-id>.json
+      l01/
+        <page-id>.json
     gc/
       pending-sst/
         pending.json
@@ -79,6 +82,9 @@ demo/p000/
   sstable/
     <bucket>/
       <sst-id>
+  changes/
+    <bucket>/
+      <change-batch-id>
   blobs/
     <prefix>/
       <blob-id>.blob
@@ -88,20 +94,21 @@ What each object family does:
 
 | Path | Format | Written by | Read by | Purpose |
 | --- | --- | --- | --- | --- |
-| `manifest/CURRENT` | JSON | writer, compactor, retention compactor | reader, tailing reader, maintenance processes | Hot control record. Points at the current snapshot and log replay window and carries fast-path metadata such as fences and optional `max_committed_lsn` / `low_watermark_lsn`. |
+| `manifest/CURRENT` | JSON | writer, compactor, retention compactor | reader, tailing reader, maintenance processes | Hot control record and visibility boundary. Holds fences, replay bounds, bounded active entries, immutable page refs, and optional `max_committed_lsn` / `low_watermark_lsn`. |
 | `manifest/snapshots/<id>.manifest` | JSON | snapshot publication path via `manifest.Store.WriteSnapshot` | reader, compactor, retention compactor | Optional full manifest snapshot describing the complete visible SST topology at a point in time. |
-| `manifest/log/<seq>.json` | JSON | writer, compactor, retention compactor | reader, compactor, retention compactor | Incremental manifest mutations after the snapshot boundary. |
+| `manifest/pages/lNN/<page-id>.json` | JSON | writer, compactor, retention compactor | reader, compactor, retention compactor | Immutable committed manifest pages. Level 0 pages hold entries; higher levels hold page refs. Only pages referenced by `CURRENT` are visible. |
 | `manifest/gc/pending-sst/pending.json` | JSON | compactor, retention compactor | compactor, retention compactor | Tracks SSTs that are no longer referenced and are waiting for physical deletion. |
 | `manifest/gc/checkpoint.json` | JSON | retention compactor | retention compactor | Stores GC replay progress over manifest history. |
 | `sstable/<bucket>/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. The bucket is deterministically derived from the SST ID. |
+| `changes/<bucket>/<change-batch-id>` | Binary | writer | future change-feed readers, maintenance processes | Immutable, seq-ordered committed mutation batch emitted with a memtable flush. Visibility still comes from the manifest, not raw object listing. |
 | `blobs/<prefix>/<blob-id>.blob` | Binary | writer | reader | External value objects used when large values are stored out-of-line. |
 
 #### Write, Read, and Cleanup Lifecycle
 
 1. `Writer.Put` buffers keys in the active memtable. If a value crosses the blob threshold, the value bytes are uploaded to `blobs/` first and the memtable stores a blob reference.
-2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths.
-3. After the SST objects exist, the writer appends manifest log records and updates `manifest/CURRENT` using CAS semantics. This is the visibility boundary for readers.
-4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/log files, then read the newly visible SSTs and blobs on demand.
+2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths. It also writes one seq-ordered change batch under `changes/` for each flushed memtable.
+3. After the SST and change-batch objects exist, the writer commits manifest state by CAS-updating `manifest/CURRENT`. Small recent entries stay in `CURRENT.active_entries`; older entries rotate into immutable `manifest/pages/` objects. This is the visibility boundary for readers and future change-feed consumers.
+4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/page files, then read the newly visible SSTs and blobs on demand.
 5. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.
 6. `RetentionCompactor` removes old SSTs from visible manifest state, advances low-watermark metadata when configured, records pending-delete marks in `manifest/gc/*`, and later deletes obsolete SST objects.
 

@@ -77,9 +77,9 @@ type ReaderOptions struct {
 	ValueStorageConfig config.ValueStorageConfig
 	ManifestStorage    manifest.Storage
 
-	ManifestLogCache     cachestore.ManifestLogCache
-	ManifestLogCacheSize int
-	DisableManifestCache bool
+	ManifestPageCache        cachestore.ManifestPageCache
+	ManifestPageCacheSize    int
+	DisableManifestPageCache bool
 
 	// ValidateSSTChecksum verifies SST checksums on first download.
 	// If enabled and checksum is missing or mismatched, reads fail.

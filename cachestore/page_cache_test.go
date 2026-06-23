@@ -4,12 +4,12 @@ import (
 	"testing"
 )
 
-func TestLRUManifestLogCache_BasicOps(t *testing.T) {
-	cache := NewLRUManifestLogCache(10)
+func TestLRUManifestPageCache_BasicOps(t *testing.T) {
+	cache := NewLRUManifestPageCache(10)
 
 	data, ok := cache.Get("path1")
 	if ok {
-		t.Error("expected miss on empty manifestCache")
+		t.Error("expected miss on empty pageCache")
 	}
 	if data != nil {
 		t.Error("expected nil data on miss")
@@ -41,21 +41,21 @@ func TestLRUManifestLogCache_BasicOps(t *testing.T) {
 	}
 }
 
-func TestLRUManifestLogCache_Eviction(t *testing.T) {
-	cache := NewLRUManifestLogCache(3)
+func TestLRUManifestPageCache_Eviction(t *testing.T) {
+	cache := NewLRUManifestPageCache(3)
 
 	cache.Set("path1", []byte("data1"))
 	cache.Set("path2", []byte("data2"))
 	cache.Set("path3", []byte("data3"))
 
 	if _, ok := cache.Get("path1"); !ok {
-		t.Error("path1 should still be in manifestCache")
+		t.Error("path1 should still be in pageCache")
 	}
 	if _, ok := cache.Get("path2"); !ok {
-		t.Error("path2 should still be in manifestCache")
+		t.Error("path2 should still be in pageCache")
 	}
 	if _, ok := cache.Get("path3"); !ok {
-		t.Error("path3 should still be in manifestCache")
+		t.Error("path3 should still be in pageCache")
 	}
 
 	cache.Set("path4", []byte("data4"))
@@ -65,18 +65,18 @@ func TestLRUManifestLogCache_Eviction(t *testing.T) {
 	}
 
 	if _, ok := cache.Get("path2"); !ok {
-		t.Error("path2 should still be in manifestCache")
+		t.Error("path2 should still be in pageCache")
 	}
 	if _, ok := cache.Get("path3"); !ok {
-		t.Error("path3 should still be in manifestCache")
+		t.Error("path3 should still be in pageCache")
 	}
 	if _, ok := cache.Get("path4"); !ok {
-		t.Error("path4 should be in manifestCache")
+		t.Error("path4 should be in pageCache")
 	}
 }
 
-func TestLRUManifestLogCache_LRUOrdering(t *testing.T) {
-	cache := NewLRUManifestLogCache(3)
+func TestLRUManifestPageCache_LRUOrdering(t *testing.T) {
+	cache := NewLRUManifestPageCache(3)
 
 	cache.Set("path1", []byte("data1"))
 	cache.Set("path2", []byte("data2"))
@@ -87,21 +87,21 @@ func TestLRUManifestLogCache_LRUOrdering(t *testing.T) {
 	cache.Set("path4", []byte("data4"))
 
 	if _, ok := cache.Get("path1"); !ok {
-		t.Error("path1 should still be in manifestCache (was accessed)")
+		t.Error("path1 should still be in pageCache (was accessed)")
 	}
 	if _, ok := cache.Get("path2"); ok {
 		t.Error("path2 should have been evicted (LRU)")
 	}
 	if _, ok := cache.Get("path3"); !ok {
-		t.Error("path3 should still be in manifestCache")
+		t.Error("path3 should still be in pageCache")
 	}
 	if _, ok := cache.Get("path4"); !ok {
-		t.Error("path4 should be in manifestCache")
+		t.Error("path4 should be in pageCache")
 	}
 }
 
-func TestLRUManifestLogCache_DataImmutability(t *testing.T) {
-	cache := NewLRUManifestLogCache(10)
+func TestLRUManifestPageCache_DataImmutability(t *testing.T) {
+	cache := NewLRUManifestPageCache(10)
 
 	original := []byte("original")
 	cache.Set("path1", original)
@@ -113,19 +113,19 @@ func TestLRUManifestLogCache_DataImmutability(t *testing.T) {
 		t.Error("expected hit")
 	}
 	if string(data) != "original" {
-		t.Errorf("manifestCache data should not have changed, got %s", string(data))
+		t.Errorf("pageCache data should not have changed, got %s", string(data))
 	}
 
 	data[0] = 'Y'
 
 	data2, _ := cache.Get("path1")
 	if string(data2) != "original" {
-		t.Errorf("manifestCache data should not have changed from Get modification, got %s", string(data2))
+		t.Errorf("pageCache data should not have changed from Get modification, got %s", string(data2))
 	}
 }
 
-func TestLRUManifestLogCache_Stats(t *testing.T) {
-	cache := NewLRUManifestLogCache(10)
+func TestLRUManifestPageCache_Stats(t *testing.T) {
+	cache := NewLRUManifestPageCache(10)
 
 	cache.Set("path1", []byte("data1"))
 	cache.Set("path2", []byte("data2"))
@@ -150,8 +150,8 @@ func TestLRUManifestLogCache_Stats(t *testing.T) {
 	}
 }
 
-func TestLRUManifestLogCache_Clear(t *testing.T) {
-	cache := NewLRUManifestLogCache(10)
+func TestLRUManifestPageCache_Clear(t *testing.T) {
+	cache := NewLRUManifestPageCache(10)
 
 	cache.Set("path1", []byte("data1"))
 	cache.Set("path2", []byte("data2"))
@@ -159,7 +159,7 @@ func TestLRUManifestLogCache_Clear(t *testing.T) {
 	cache.Clear()
 
 	if _, ok := cache.Get("path1"); ok {
-		t.Error("manifestCache should be empty after clear")
+		t.Error("pageCache should be empty after clear")
 	}
 
 	stats := cache.Stats()
@@ -168,27 +168,27 @@ func TestLRUManifestLogCache_Clear(t *testing.T) {
 	}
 }
 
-func TestLRUManifestLogCache_DefaultSize(t *testing.T) {
-	cache := NewLRUManifestLogCache(0)
+func TestLRUManifestPageCache_DefaultSize(t *testing.T) {
+	cache := NewLRUManifestPageCache(0)
 	stats := cache.Stats()
-	if stats.MaxEntries != DefaultManifestLogCacheSize {
-		t.Errorf("expected default size %d, got %d", DefaultManifestLogCacheSize, stats.MaxEntries)
+	if stats.MaxEntries != DefaultManifestPageCacheSize {
+		t.Errorf("expected default size %d, got %d", DefaultManifestPageCacheSize, stats.MaxEntries)
 	}
 
-	cache = NewLRUManifestLogCache(-1)
+	cache = NewLRUManifestPageCache(-1)
 	stats = cache.Stats()
-	if stats.MaxEntries != DefaultManifestLogCacheSize {
-		t.Errorf("expected default size %d for negative input, got %d", DefaultManifestLogCacheSize, stats.MaxEntries)
+	if stats.MaxEntries != DefaultManifestPageCacheSize {
+		t.Errorf("expected default size %d for negative input, got %d", DefaultManifestPageCacheSize, stats.MaxEntries)
 	}
 }
 
-func TestNoopManifestLogCache(t *testing.T) {
-	cache := NewNoopManifestLogCache()
+func TestNoopManifestPageCache(t *testing.T) {
+	cache := NewNoopManifestPageCache()
 
 	cache.Set("path1", []byte("data1"))
 
 	if data, ok := cache.Get("path1"); ok || data != nil {
-		t.Error("noop manifestCache should always miss")
+		t.Error("noop pageCache should always miss")
 	}
 
 	cache.Remove("path1")
@@ -196,6 +196,6 @@ func TestNoopManifestLogCache(t *testing.T) {
 
 	stats := cache.Stats()
 	if stats.Hits != 0 || stats.Misses != 0 || stats.EntryCount != 0 {
-		t.Error("noop manifestCache stats should be zero")
+		t.Error("noop pageCache stats should be zero")
 	}
 }

@@ -115,24 +115,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 		},
 	}
 
-	entryData, err := manifest.EncodeLogEntry(staleWriterEntry)
-	if err != nil {
-		t.Fatalf("encode stale writer entry: %v", err)
-	}
-	logName := fmt.Sprintf("%020d", staleWriterEntry.Seq)
-	if _, err := backend.WriteLog(ctx, logName, entryData); err != nil {
-		t.Fatalf("write stale writer log entry: %v", err)
-	}
-
-	entryData, err = manifest.EncodeLogEntry(staleCompactorEntry)
-	if err != nil {
-		t.Fatalf("encode stale compactor entry: %v", err)
-	}
-	logName = fmt.Sprintf("%020d", staleCompactorEntry.Seq)
-	if _, err := backend.WriteLog(ctx, logName, entryData); err != nil {
-		t.Fatalf("write stale compactor log entry: %v", err)
-	}
-
+	current.ActiveEntries = append(current.ActiveEntries, *staleWriterEntry, *staleCompactorEntry)
 	if current.LogSeqStart == current.NextSeq {
 		current.LogSeqStart = staleWriterEntry.Seq
 	}

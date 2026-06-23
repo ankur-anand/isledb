@@ -29,14 +29,6 @@ func (b *BlobStoreBackend) ReadCurrent(ctx context.Context) ([]byte, string, err
 	return data, b.etagFromAttrs(attr), nil
 }
 
-func (b *BlobStoreBackend) ReadCurrentData(ctx context.Context) ([]byte, error) {
-	data, _, err := b.store.Read(ctx, b.store.ManifestPath())
-	if err != nil {
-		return nil, b.mapError(err)
-	}
-	return data, nil
-}
-
 func (b *BlobStoreBackend) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	attr, err := b.store.WriteIfMatch(ctx, b.store.ManifestPath(), data, expectedETag)
 	return b.etagFromAttrs(attr), b.mapError(err)
@@ -53,35 +45,19 @@ func (b *BlobStoreBackend) WriteSnapshot(ctx context.Context, id string, data []
 	return path, b.mapError(err)
 }
 
-func (b *BlobStoreBackend) ReadLog(ctx context.Context, path string) ([]byte, error) {
+func (b *BlobStoreBackend) ReadPage(ctx context.Context, path string) ([]byte, error) {
 	data, _, err := b.store.Read(ctx, path)
 	return data, b.mapError(err)
 }
 
-func (b *BlobStoreBackend) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	path := b.store.ManifestLogPath(name)
+func (b *BlobStoreBackend) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
+	path := b.store.ManifestPagePath(level, id)
 	_, err := b.store.WriteIfNotExist(ctx, path, data)
 	return path, b.mapError(err)
 }
 
-func (b *BlobStoreBackend) ListLogs(ctx context.Context) ([]string, error) {
-	objects, err := b.store.ListManifestLogs(ctx)
-	if err != nil {
-		return nil, b.mapError(err)
-	}
-
-	var entries []string
-	for _, obj := range objects {
-		if obj.IsDir {
-			continue
-		}
-		entries = append(entries, obj.Key)
-	}
-	return entries, nil
-}
-
-func (b *BlobStoreBackend) LogPath(name string) string {
-	return b.store.ManifestLogPath(name)
+func (b *BlobStoreBackend) PagePath(level uint8, id string) string {
+	return b.store.ManifestPagePath(level, id)
 }
 
 func (b *BlobStoreBackend) etagFromAttrs(attr blobstore.Attributes) string {

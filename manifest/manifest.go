@@ -68,11 +68,34 @@ type SSTMeta struct {
 	HasBlobRefs bool
 }
 
+// ChangeBatchMeta describes one committed, seq-ordered mutation batch emitted
+// alongside a memtable flush. The object is visible only after the manifest
+// entry that references it is committed.
+type ChangeBatchMeta struct {
+	ID        string    `json:"id"`
+	Path      string    `json:"path"`
+	Epoch     uint64    `json:"epoch"`
+	SeqLo     uint64    `json:"seq_lo"`
+	SeqHi     uint64    `json:"seq_hi"`
+	Count     uint32    `json:"count"`
+	Size      int64     `json:"size"`
+	Checksum  string    `json:"checksum"`
+	CreatedAt time.Time `json:"created_at"`
+	Version   int       `json:"version,omitempty"`
+}
+
 type Current struct {
-	Snapshot    string `json:"snapshot"`
-	LogSeqStart uint64 `json:"log_seq_start,omitempty"`
-	NextSeq     uint64 `json:"next_seq"`
-	NextEpoch   uint64 `json:"next_epoch"`
+	LayoutVersion int    `json:"layout_version,omitempty"`
+	Format        string `json:"format,omitempty"`
+	Snapshot      string `json:"snapshot"`
+	LogSeqStart   uint64 `json:"log_seq_start,omitempty"`
+	NextSeq       uint64 `json:"next_seq"`
+	NextEpoch     uint64 `json:"next_epoch"`
+
+	ChangeFeedLogStart uint64 `json:"change_feed_log_start,omitempty"`
+
+	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
+	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
 
 	MaxCommittedLSN *uint64 `json:"max_committed_lsn,omitempty"`
 	LowWatermarkLSN *uint64 `json:"low_watermark_lsn,omitempty"`
@@ -81,16 +104,26 @@ type Current struct {
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
 }
 
-func (c *Current) LogPaths(pathFn func(seq uint64) string) []string {
-	if c == nil || pathFn == nil || c.NextSeq <= c.LogSeqStart {
-		return nil
-	}
+type PageRef struct {
+	Level     uint8     `json:"level"`
+	SeqLo     uint64    `json:"seq_lo"`
+	SeqHi     uint64    `json:"seq_hi"`
+	Path      string    `json:"path"`
+	Count     uint32    `json:"count"`
+	Checksum  string    `json:"checksum"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
-	paths := make([]string, 0, c.NextSeq-c.LogSeqStart)
-	for seq := c.LogSeqStart; seq < c.NextSeq; seq++ {
-		paths = append(paths, pathFn(seq))
-	}
-	return paths
+type CommitPage struct {
+	LayoutVersion int                `json:"layout_version"`
+	PageType      string             `json:"page_type"`
+	Level         uint8              `json:"level"`
+	SeqLo         uint64             `json:"seq_lo"`
+	SeqHi         uint64             `json:"seq_hi"`
+	Count         uint32             `json:"count"`
+	Entries       []ManifestLogEntry `json:"entries,omitempty"`
+	Children      []PageRef          `json:"children,omitempty"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 func EncodeSnapshot(m *Manifest) ([]byte, error) {

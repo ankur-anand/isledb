@@ -6,22 +6,22 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-type ManifestLogCache interface {
+type ManifestPageCache interface {
 	Get(path string) ([]byte, bool)
 	Set(path string, data []byte)
 	Remove(path string)
 	Clear()
-	Stats() ManifestLogCacheStats
+	Stats() ManifestPageCacheStats
 }
 
 type CachingStorage struct {
-	storage       manifest.Storage
-	manifestCache ManifestLogCache
+	storage   manifest.Storage
+	pageCache ManifestPageCache
 }
 
 type CachingStorageOptions struct {
-	ManifestCache ManifestLogCache
-	CacheSize     int
+	PageCache ManifestPageCache
+	CacheSize int
 }
 
 type cacheCandidate[T any] struct {
@@ -41,30 +41,30 @@ func chooseCache[T any](candidates ...cacheCandidate[T]) T {
 }
 
 func NewCachingStorage(storage manifest.Storage, opts CachingStorageOptions) *CachingStorage {
-	manifestCacheChoose := chooseCache(
-		cacheCandidate[ManifestLogCache]{
-			enabled: opts.ManifestCache != nil,
-			build: func() ManifestLogCache {
-				return opts.ManifestCache
+	pageCache := chooseCache(
+		cacheCandidate[ManifestPageCache]{
+			enabled: opts.PageCache != nil,
+			build: func() ManifestPageCache {
+				return opts.PageCache
 			},
 		},
-		cacheCandidate[ManifestLogCache]{
+		cacheCandidate[ManifestPageCache]{
 			enabled: opts.CacheSize > 0,
-			build: func() ManifestLogCache {
-				return NewLRUManifestLogCache(opts.CacheSize)
+			build: func() ManifestPageCache {
+				return NewLRUManifestPageCache(opts.CacheSize)
 			},
 		},
-		cacheCandidate[ManifestLogCache]{
+		cacheCandidate[ManifestPageCache]{
 			enabled: true,
-			build: func() ManifestLogCache {
-				return NewLRUManifestLogCache(DefaultManifestLogCacheSize)
+			build: func() ManifestPageCache {
+				return NewLRUManifestPageCache(DefaultManifestPageCacheSize)
 			},
 		},
 	)
 
 	return &CachingStorage{
-		storage:       storage,
-		manifestCache: manifestCacheChoose,
+		storage:   storage,
+		pageCache: pageCache,
 	}
 }
 
@@ -84,42 +84,46 @@ func (s *CachingStorage) WriteSnapshot(ctx context.Context, id string, data []by
 	return s.storage.WriteSnapshot(ctx, id, data)
 }
 
-func (s *CachingStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
-	if data, ok := s.manifestCache.Get(path); ok {
+func (s *CachingStorage) ReadPage(ctx context.Context, path string) ([]byte, error) {
+	if data, ok := s.pageCache.Get(path); ok {
 		return data, nil
 	}
-
-	data, err := s.storage.ReadLog(ctx, path)
+	pages, ok := s.storage.(manifest.PageStorage)
+	if !ok {
+		return nil, manifest.ErrNotFound
+	}
+	data, err := pages.ReadPage(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-
-	s.manifestCache.Set(path, data)
+	s.pageCache.Set(path, data)
 	return data, nil
 }
 
-func (s *CachingStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	path, err := s.storage.WriteLog(ctx, name, data)
+func (s *CachingStorage) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
+	pages, ok := s.storage.(manifest.PageStorage)
+	if !ok {
+		return "", manifest.ErrPreconditionFailed
+	}
+	path, err := pages.WritePage(ctx, level, id, data)
 	if err != nil {
 		return "", err
 	}
-
-	s.manifestCache.Set(path, data)
+	s.pageCache.Set(path, data)
 	return path, nil
 }
 
-func (s *CachingStorage) ListLogs(ctx context.Context) ([]string, error) {
-	return s.storage.ListLogs(ctx)
+func (s *CachingStorage) PagePath(level uint8, id string) string {
+	if pages, ok := s.storage.(manifest.PageStorage); ok {
+		return pages.PagePath(level, id)
+	}
+	return ""
 }
 
-func (s *CachingStorage) LogPath(name string) string {
-	return s.storage.LogPath(name)
-}
-
-func (s *CachingStorage) CacheStats() ManifestLogCacheStats {
-	return s.manifestCache.Stats()
+func (s *CachingStorage) CacheStats() ManifestPageCacheStats {
+	return s.pageCache.Stats()
 }
 
 func (s *CachingStorage) ClearCache() {
-	s.manifestCache.Clear()
+	s.pageCache.Clear()
 }
