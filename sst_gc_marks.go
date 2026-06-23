@@ -12,28 +12,17 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-// How we Mark SST:
-// 1. Read where we left off
-// Load checkpoint.json (last_applied_seq, last_seen_log_seq_start).
+// SST GC is a two-phase physical-delete protocol.
 //
-// 2. Decide replay mode
-// If manifest log_seq_start is same as checkpoint: do delta (only new logs).
-// If different: do full replay start from current log_seq_start and run orphan scan.
+// Compaction and retention first remove SSTs from the manifest, then record
+// pending delete marks. A later sweeper deletes only marked SST objects that
+// are still absent from the current manifest after a grace period.
 //
-// 3. Build marks in memory (not one-by-one writes)
-// For each remove event in logs: mark SST as unreferenced.
-// For each add event in logs: clear stale mark for that SST.
-// Orphan scan:
-// 	a. ist live SSTs from manifest,
-//	b. list SST files in storage,
-//  c. mark files not in manifest,
-//  d. clear marks for live ones.
-//
-// 4. Save once
-// 5. Move checkpoint forward
-// Update last_applied_seq to processed end seq.
-// Update last_seen_log_seq_start to current value.
-//
+// Retention also catches up marks from manifest history so a crash between
+// "manifest commit" and "pending mark write" does not leak obsolete SST files:
+// it replays remove/add entries from the last GC checkpoint, runs an orphan
+// scan when the manifest log window changes, stores the pending mark set once,
+// and advances the checkpoint.
 
 const (
 	pendingSSTDeletePrefix    = "manifest/gc/pending-sst"
