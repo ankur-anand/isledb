@@ -135,7 +135,7 @@ func (db *DB) OpenCompactor(ctx context.Context, opts CompactorOptions) (*Compac
 		return nil, err
 	}
 	if err := db.registerCloser(compactor); err != nil {
-		_ = compactor.Close()
+		_ = compactor.Close(ctx)
 		return nil, err
 	}
 	return compactor, nil
@@ -155,7 +155,7 @@ func (db *DB) OpenRetentionCompactor(ctx context.Context, opts RetentionCompacto
 		return nil, err
 	}
 	if err := db.registerCloser(retentionCompactor); err != nil {
-		_ = retentionCompactor.Close()
+		_ = retentionCompactor.Close(ctx)
 		return nil, err
 	}
 	return retentionCompactor, nil

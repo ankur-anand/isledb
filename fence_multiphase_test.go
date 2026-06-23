@@ -22,15 +22,19 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	writerOpts.Memtable.TargetBytes = 512
 
 	compactorOpts := CompactorOptions{
-		L0CompactionThreshold: 1,
-		MinSources:            1,
-		MaxSources:            4,
-		SizeThreshold:         1,
-		BloomBitsPerKey:       10,
-		BlockSize:             1024,
-		Compression:           "snappy",
-		TargetSSTSize:         64 * 1024,
-		CheckInterval:         time.Hour,
+		Trigger: CompactionTriggerOptions{
+			L0SSTCount:    1,
+			MinSources:    1,
+			MaxSources:    4,
+			SizeRatio:     1,
+			CheckInterval: time.Hour,
+		},
+		Output: CompactionOutputOptions{
+			BloomBitsPerKey: 10,
+			BlockBytes:      1024,
+			Compression:     "snappy",
+			TargetSSTBytes:  64 * 1024,
+		},
 	}
 
 	writer1, err := newWriter(ctx, store, manifestStore, writerOpts)
@@ -53,10 +57,10 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
-	_ = compactor.Close()
+	_ = compactor.Close(ctx)
 
 	writer2, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -68,7 +72,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	if err != nil {
 		t.Fatalf("newCompactor(2): %v", err)
 	}
-	_ = compactor2.Close()
+	_ = compactor2.Close(ctx)
 
 	backend := manifest.NewBlobStoreBackend(store)
 	currentData, currentETag, err := backend.ReadCurrent(ctx)

@@ -51,13 +51,13 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
 	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("OpenRetentionCompactor: %v", err)
 	}
-	defer retentionCompactor.Close()
+	defer retentionCompactor.Close(ctx)
 
 	if writer.w.manifestLog != db.manifestStore {
 		t.Fatal("writer does not share manifest store with db")
@@ -150,13 +150,13 @@ func TestOpenDBPropagatesGCMarkStorageToCompactors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
 	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("OpenRetentionCompactor: %v", err)
 	}
-	defer retentionCompactor.Close()
+	defer retentionCompactor.Close(ctx)
 
 	if compactor.gcMarkStore != custom {
 		t.Fatal("compactor did not inherit db gc mark storage")
@@ -185,13 +185,13 @@ func TestOpenDBCompactorOptionsOverrideGCMarkStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
 	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{GCMarkStorage: retentionStorage})
 	if err != nil {
 		t.Fatalf("OpenRetentionCompactor: %v", err)
 	}
-	defer retentionCompactor.Close()
+	defer retentionCompactor.Close(ctx)
 
 	if compactor.gcMarkStore != compactorStorage {
 		t.Fatal("compactor gc mark storage override not applied")
@@ -317,10 +317,10 @@ func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRetentionCompactor: %v", err)
 	}
-	defer retentionCompactor.Close()
+	defer retentionCompactor.Close(ctx)
 
-	if err := retentionCompactor.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup: %v", err)
+	if err := retentionCompactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
 	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})

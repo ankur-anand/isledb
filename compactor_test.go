@@ -3,12 +3,103 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/manifest"
 )
+
+type blockingReadCurrentStorage struct {
+	manifest.Storage
+	block   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingReadCurrentStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	if s.block.CompareAndSwap(true, false) {
+		close(s.started)
+		<-s.release
+	}
+	return s.Storage.ReadCurrent(ctx)
+}
+
+func TestCompactor_RejectsNilContext(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-nil-context")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	if _, err := newCompactor(nil, store, manifestStore, CompactorOptions{}); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("newCompactor(nil) error=%v, want %v", err, ErrNilContext)
+	}
+
+	c, err := newCompactor(ctx, store, manifestStore, CompactorOptions{})
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+	defer c.Close(ctx)
+
+	if err := c.Start(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("Start(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := c.RunOnce(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("RunOnce(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := c.Close(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("Close(nil) error=%v, want %v", err, ErrNilContext)
+	}
+}
+
+func TestCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-close-retry")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+
+	opts := DefaultCompactorOptions()
+	opts.Trigger.CheckInterval = 10 * time.Millisecond
+	c, err := newCompactor(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+
+	storage.block.Store(true)
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background compactor did not reach blocking CURRENT read")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = c.Close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := c.Close(retryCtx); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
 
 func TestCompactor_L0Compaction(t *testing.T) {
 	store := blobstore.NewMemory("test")
@@ -40,8 +131,8 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 4
-	compactorOpts.CheckInterval = time.Hour
+	compactorOpts.Trigger.L0SSTCount = 4
+	compactorOpts.Trigger.CheckInterval = time.Hour
 
 	var compactionStarted, compactionEnded bool
 	compactorOpts.OnCompactionStart = func(job CompactionJob) {
@@ -58,10 +149,10 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
 	if !compactionStarted || !compactionEnded {
@@ -76,7 +167,7 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	m := compactor.manifest.Clone()
 	compactor.mu.Unlock()
 
-	if m.L0SSTCount() >= compactorOpts.L0CompactionThreshold {
+	if m.L0SSTCount() >= compactorOpts.Trigger.L0SSTCount {
 		t.Errorf("L0 still has %d SSTs after compaction", m.L0SSTCount())
 	}
 
@@ -118,17 +209,17 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 4
+	compactorOpts.Trigger.L0SSTCount = 4
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
-	compactor.Close()
+	compactor.Close(ctx)
 
 	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 	if err != nil {
@@ -192,17 +283,17 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 4
+	compactorOpts.Trigger.L0SSTCount = 4
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
-	compactor.Close()
+	compactor.Close(ctx)
 
 	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 	if err != nil {
@@ -248,20 +339,20 @@ func TestCompactor_BackgroundLoop(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.CheckInterval = 10 * time.Millisecond
+	compactorOpts.Trigger.CheckInterval = 10 * time.Millisecond
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
 
-	compactor.Start()
+	if err := compactor.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	time.Sleep(50 * time.Millisecond)
 
-	compactor.Stop()
-
-	if err := compactor.Close(); err != nil {
+	if err := compactor.Close(ctx); err != nil {
 		t.Errorf("close: %v", err)
 	}
 }
@@ -276,7 +367,7 @@ func TestCompactor_Refresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
 	writer, err := newWriter(ctx, store, manifestStore, DefaultWriterOptions())
 	if err != nil {
@@ -339,18 +430,18 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 4
-	compactorOpts.TargetSSTSize = 4 * 1024
-	compactorOpts.CheckInterval = time.Hour
+	compactorOpts.Trigger.L0SSTCount = 4
+	compactorOpts.Output.TargetSSTBytes = 4 * 1024
+	compactorOpts.Trigger.CheckInterval = time.Hour
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
 	if err := compactor.Refresh(ctx); err != nil {
@@ -382,15 +473,19 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	compactorOpts := CompactorOptions{
-		L0CompactionThreshold: 2,
-		MinSources:            2,
-		MaxSources:            4,
-		SizeThreshold:         4,
-		BloomBitsPerKey:       10,
-		BlockSize:             1024,
-		Compression:           "snappy",
-		TargetSSTSize:         64 * 1024,
-		CheckInterval:         time.Hour,
+		Trigger: CompactionTriggerOptions{
+			L0SSTCount:    2,
+			MinSources:    2,
+			MaxSources:    4,
+			SizeRatio:     4,
+			CheckInterval: time.Hour,
+		},
+		Output: CompactionOutputOptions{
+			BloomBitsPerKey: 10,
+			BlockBytes:      1024,
+			Compression:     "snappy",
+			TargetSSTBytes:  64 * 1024,
+		},
 	}
 
 	writerOpts := DefaultWriterOptions()
@@ -435,8 +530,8 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("newCompactor: %v", err)
 		}
 
-		if err := compactor.RunCompaction(ctx); err != nil {
-			t.Fatalf("RunCompaction: %v", err)
+		if err := compactor.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce: %v", err)
 		}
 
 		if err := compactor.Refresh(ctx); err != nil {
@@ -446,7 +541,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		compactor.mu.Lock()
 		m := compactor.manifest.Clone()
 		compactor.mu.Unlock()
-		compactor.Close()
+		compactor.Close(ctx)
 
 		if m.L0SSTCount() != 0 {
 			t.Errorf("expected 0 L0 SSTs after compaction, got %d", m.L0SSTCount())
@@ -516,15 +611,15 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("newCompactor: %v", err)
 		}
 
-		if err := compactor.RunCompaction(ctx); err != nil {
-			t.Fatalf("RunCompaction: %v", err)
+		if err := compactor.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce: %v", err)
 		}
 
 		if err := compactor.Refresh(ctx); err != nil {
 			t.Fatalf("Refresh: %v", err)
 		}
 
-		compactor.Close()
+		compactor.Close(ctx)
 
 		reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 		if err != nil {
@@ -585,10 +680,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 				t.Fatalf("newCompactor: %v", err)
 			}
 
-			if err := compactor.RunCompaction(ctx); err != nil {
-				t.Fatalf("RunCompaction: %v", err)
+			if err := compactor.RunOnce(ctx); err != nil {
+				t.Fatalf("RunOnce: %v", err)
 			}
-			compactor.Close()
+			compactor.Close(ctx)
 		}
 
 		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
@@ -596,7 +691,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("newCompactor: %v", err)
 		}
 
-		compactor.Close()
+		compactor.Close(ctx)
 
 		reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 		if err != nil {
@@ -670,10 +765,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("newCompactor: %v", err)
 		}
 
-		if err := compactor.RunCompaction(ctx); err != nil {
-			t.Fatalf("RunCompaction: %v", err)
+		if err := compactor.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce: %v", err)
 		}
-		compactor.Close()
+		compactor.Close(ctx)
 
 		reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 		if err != nil {
@@ -746,15 +841,19 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	compactorOpts := CompactorOptions{
-		L0CompactionThreshold: 2,
-		MinSources:            2,
-		MaxSources:            4,
-		SizeThreshold:         4,
-		BloomBitsPerKey:       10,
-		BlockSize:             512,
-		Compression:           "snappy",
-		TargetSSTSize:         64 * 1024,
-		CheckInterval:         time.Hour,
+		Trigger: CompactionTriggerOptions{
+			L0SSTCount:    2,
+			MinSources:    2,
+			MaxSources:    4,
+			SizeRatio:     4,
+			CheckInterval: time.Hour,
+		},
+		Output: CompactionOutputOptions{
+			BloomBitsPerKey: 10,
+			BlockBytes:      512,
+			Compression:     "snappy",
+			TargetSSTBytes:  64 * 1024,
+		},
 	}
 
 	writerOpts := DefaultWriterOptions()
@@ -794,10 +893,10 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	if err := compactor1.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor1.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
-	compactor1.Close()
+	compactor1.Close(ctx)
 
 	writer2, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -832,11 +931,11 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	if err := compactor2.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor2.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
-	compactor2.Close()
+	compactor2.Close(ctx)
 
 	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
 	if err != nil {
@@ -902,15 +1001,15 @@ func TestCompactor_ValidateSSTChecksum(t *testing.T) {
 	}
 
 	cOpts := DefaultCompactorOptions()
-	cOpts.ValidateSSTChecksum = true
-	cOpts.L0CompactionThreshold = 1
+	cOpts.Safety.ValidateSSTChecksum = true
+	cOpts.Trigger.L0SSTCount = 1
 	c, err := newCompactor(ctx, store, manifestStore, cOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	defer c.Close()
+	defer c.Close(ctx)
 
-	if err := c.RunCompaction(ctx); err == nil {
+	if err := c.RunOnce(ctx); err == nil {
 		t.Fatalf("expected compaction to fail on checksum mismatch")
 	}
 }
@@ -922,15 +1021,19 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	compactorOpts := CompactorOptions{
-		L0CompactionThreshold: 1,
-		MinSources:            2,
-		MaxSources:            4,
-		SizeThreshold:         4,
-		BloomBitsPerKey:       10,
-		BlockSize:             512,
-		Compression:           "snappy",
-		TargetSSTSize:         64 * 1024,
-		CheckInterval:         time.Hour,
+		Trigger: CompactionTriggerOptions{
+			L0SSTCount:    1,
+			MinSources:    2,
+			MaxSources:    4,
+			SizeRatio:     4,
+			CheckInterval: time.Hour,
+		},
+		Output: CompactionOutputOptions{
+			BloomBitsPerKey: 10,
+			BlockBytes:      512,
+			Compression:     "snappy",
+			TargetSSTBytes:  64 * 1024,
+		},
 	}
 
 	writerOpts := DefaultWriterOptions()
@@ -962,11 +1065,11 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 		if err != nil {
 			t.Fatalf("newCompactor: %v", err)
 		}
-		if err := compactor.RunCompaction(ctx); err != nil {
-			t.Fatalf("RunCompaction: %v", err)
+		if err := compactor.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce: %v", err)
 		}
 
-		compactor.Close()
+		compactor.Close(ctx)
 	}
 
 	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
@@ -1054,17 +1157,17 @@ func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
 	}
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 2
-	compactorOpts.CheckInterval = time.Hour
+	compactorOpts.Trigger.L0SSTCount = 2
+	compactorOpts.Trigger.CheckInterval = time.Hour
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
 	for _, sst := range before.L0SSTs {

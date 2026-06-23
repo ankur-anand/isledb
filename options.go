@@ -150,41 +150,77 @@ func DefaultTailingReaderOptions() TailingReaderOptions {
 }
 
 type CompactorOptions struct {
-	L0CompactionThreshold int
+	// OwnerID is the stable compactor identity stored in the compactor fence.
+	OwnerID string
 
-	MinSources    int
-	MaxSources    int
-	SizeThreshold int
+	// Trigger controls when compaction work is selected.
+	Trigger CompactionTriggerOptions
 
-	BloomBitsPerKey int
-	BlockSize       int
-	Compression     string
-	TargetSSTSize   int64
+	// Output controls compacted SST file encoding and sizing.
+	Output CompactionOutputOptions
 
-	// ValidateSSTChecksum verifies SST checksums before compaction.
-	ValidateSSTChecksum bool
-	// SSTHashVerifier verifies SST signatures when present.
-	SSTHashVerifier SSTHashVerifier
+	// Safety controls source SST validation before compaction.
+	Safety CompactionSafetyOptions
 
-	CheckInterval     time.Duration
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
-	OwnerID           string
+
 	// GCMarkStorage allows using a custom storage backend for GC mark state.
 	GCMarkStorage manifest.GCMarkStorage
 }
 
+type CompactionTriggerOptions struct {
+	// CheckInterval is the background scheduler cadence used by Start.
+	CheckInterval time.Duration
+
+	// L0SSTCount is the number of L0 SSTs that triggers an L0 merge.
+	L0SSTCount int
+
+	// MinSources and MaxSources bound consecutive sorted-run merge candidates.
+	MinSources int
+	MaxSources int
+
+	// SizeRatio is the similarity threshold for consecutive sorted-run merges.
+	SizeRatio int
+}
+
+type CompactionOutputOptions struct {
+	// TargetSSTBytes is the target size for compacted SST outputs.
+	TargetSSTBytes int64
+
+	// BloomBitsPerKey controls output SST bloom filter size.
+	BloomBitsPerKey int
+
+	// BlockBytes is the target output SST data block size.
+	BlockBytes int
+
+	// Compression is the output SST compression algorithm.
+	Compression string
+}
+
+type CompactionSafetyOptions struct {
+	// ValidateSSTChecksum verifies SST checksums before compaction.
+	ValidateSSTChecksum bool
+
+	// SSTHashVerifier verifies SST signatures when present.
+	SSTHashVerifier SSTHashVerifier
+}
+
 func DefaultCompactorOptions() CompactorOptions {
 	return CompactorOptions{
-		L0CompactionThreshold: 8,
-		MinSources:            4,
-		MaxSources:            8,
-		SizeThreshold:         4,
-		BloomBitsPerKey:       10,
-		BlockSize:             4096,
-		Compression:           "snappy",
-		TargetSSTSize:         64 * 1024 * 1024,
-		CheckInterval:         time.Second * 5,
+		Trigger: CompactionTriggerOptions{
+			CheckInterval: 5 * time.Second,
+			L0SSTCount:    8,
+			MinSources:    4,
+			MaxSources:    8,
+			SizeRatio:     4,
+		},
+		Output: CompactionOutputOptions{
+			TargetSSTBytes:  64 * 1024 * 1024,
+			BloomBitsPerKey: 10,
+			BlockBytes:      4096,
+			Compression:     "snappy",
+		},
 	}
 }
 

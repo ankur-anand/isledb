@@ -64,12 +64,12 @@ type RetentionCompactor struct {
 	gcMarkStore manifest.GCMarkStorage
 	opts        RetentionCompactorOptions
 
-	startStopMu sync.Mutex
+	lifecycleMu sync.Mutex
 	mu          sync.Mutex
 	manifest    *Manifest
 
 	ticker *time.Ticker
-	stopCh chan struct{}
+	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
 	fenced  atomic.Bool
@@ -78,6 +78,9 @@ type RetentionCompactor struct {
 }
 
 func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 
 	defaults := DefaultRetentionCompactorOptions()
 	if opts.RetentionPeriod <= 0 {
@@ -112,55 +115,65 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
-		stopCh:      make(chan struct{}),
 	}, nil
 }
 
-func (c *RetentionCompactor) Start() {
-	c.startStopMu.Lock()
-	defer c.startStopMu.Unlock()
-
-	if c.running.Swap(true) {
-		return
+func (c *RetentionCompactor) Start(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
 	}
 
-	c.stopCh = make(chan struct{})
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	if c.closed.Load() {
+		return errors.New("retention compactor closed")
+	}
+	if !c.running.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	loopCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
 	c.ticker = time.NewTicker(c.opts.CheckInterval)
 	c.wg.Add(1)
-	stopCh := c.stopCh
-	ticks := c.ticker.C
-	go c.cleanupLoop(stopCh, ticks)
+	go c.cleanupLoop(loopCtx, c.ticker)
+	return nil
 }
 
-func (c *RetentionCompactor) Stop() {
-	c.startStopMu.Lock()
-	defer c.startStopMu.Unlock()
+func (c *RetentionCompactor) stopLoop() {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
 
-	if !c.running.Swap(false) {
-		return
-	}
-
-	if c.stopCh != nil {
-		close(c.stopCh)
-		c.stopCh = nil
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
 	}
 	if c.ticker != nil {
 		c.ticker.Stop()
 		c.ticker = nil
 	}
-	c.wg.Wait()
+	c.running.Store(false)
 }
 
-func (c *RetentionCompactor) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
-		return nil
+func (c *RetentionCompactor) Close(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
 	}
-	c.Stop()
-	return nil
+	if c.closed.CompareAndSwap(false, true) {
+		c.stopLoop()
+	}
+	return waitGroupContext(ctx, &c.wg)
 }
 
 func (c *RetentionCompactor) closeDB() error {
-	return c.Close()
+	return c.closeWithTimeout(30 * time.Second)
+}
+
+func (c *RetentionCompactor) closeWithTimeout(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.Close(ctx)
 }
 
 func (c *RetentionCompactor) Refresh(ctx context.Context) error {
@@ -174,13 +187,26 @@ func (c *RetentionCompactor) Refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *RetentionCompactor) cleanupLoop(stopCh <-chan struct{}, ticks <-chan time.Time) {
+func (c *RetentionCompactor) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
 	defer c.wg.Done()
+	defer func() {
+		ticker.Stop()
+		c.lifecycleMu.Lock()
+		if c.ticker == ticker {
+			c.ticker = nil
+			c.cancel = nil
+		}
+		c.lifecycleMu.Unlock()
+		c.running.Store(false)
+	}()
 
 	for {
 		select {
-		case <-ticks:
-			if err := c.RunCleanup(context.Background()); err != nil {
+		case <-ticker.C:
+			if err := c.RunOnce(ctx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
 				if isFenceError(err) {
 					if c.opts.OnCleanupError != nil {
 						c.opts.OnCleanupError(err)
@@ -189,19 +215,27 @@ func (c *RetentionCompactor) cleanupLoop(stopCh <-chan struct{}, ticks <-chan ti
 					}
 					return
 				}
+				if errors.Is(err, manifest.ErrFenceConflict) {
+					slog.Debug("isledb: retention cleanup skipped after concurrent manifest update")
+					continue
+				}
 				if c.opts.OnCleanupError != nil {
 					c.opts.OnCleanupError(err)
 				} else {
 					slog.Error("isledb: retention cleanup error", "error", err)
 				}
 			}
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (c *RetentionCompactor) RunCleanup(ctx context.Context) error {
+func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
 	start := time.Now()
 	if c.fenced.Load() {
 		return manifest.ErrFenced
@@ -267,6 +301,9 @@ func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 		return
 	}
 	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		slog.Warn("isledb: retention sst sweep failed", "error", err)
 	}
 }
