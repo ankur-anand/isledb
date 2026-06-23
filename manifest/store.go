@@ -3,13 +3,9 @@ package manifest
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -754,20 +750,7 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 	}
 
 	var entries []*ManifestLogEntry
-	if current == nil {
-		logs, listErr := s.List(ctx)
-		if listErr != nil {
-			return nil, listErr
-		}
-		entries = make([]*ManifestLogEntry, 0, len(logs))
-		for _, path := range logs {
-			entry, readErr := s.Read(ctx, path)
-			if readErr != nil {
-				return nil, readErr
-			}
-			entries = append(entries, entry)
-		}
-	} else {
+	if current != nil {
 		entries, err = s.entriesInRange(ctx, current, currentLogStart(current), currentNextSeq(current))
 		if err != nil {
 			return nil, err
@@ -884,60 +867,37 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 	return m, nil
 }
 
-func (s *Store) List(ctx context.Context) ([]string, error) {
+func (s *Store) ListEntries(ctx context.Context) ([]uint64, error) {
 	current, err := s.readCurrent(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if current != nil {
-		paths := currentLogs(current, s.logPath)
-		if paths == nil {
-			return []string{}, nil
-		}
-		return paths, nil
+	if current == nil || current.NextSeq <= current.ChangeFeedLogStart {
+		return []uint64{}, nil
 	}
-
-	objects, err := s.storage.ListLogs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list manifest logs: %w", err)
+	seqs := make([]uint64, 0, current.NextSeq-current.ChangeFeedLogStart)
+	for seq := current.ChangeFeedLogStart; seq < current.NextSeq; seq++ {
+		seqs = append(seqs, seq)
 	}
-	sort.Strings(objects)
-	return objects, nil
+	return seqs, nil
 }
 
-func (s *Store) Read(ctx context.Context, path string) (*ManifestLogEntry, error) {
-	if seq, ok := parseLogSeqPath(path); ok {
-		current, err := s.readCurrent(ctx)
-		if err != nil {
-			return nil, err
-		}
-		entries, err := s.entriesInRange(ctx, current, seq, seq+1)
-		if err != nil {
-			return nil, err
-		}
-		if len(entries) > 0 {
-			return entries[0], nil
-		}
-	}
-
-	data, err := s.storage.ReadLog(ctx, path)
+func (s *Store) ReadEntry(ctx context.Context, seq uint64) (*ManifestLogEntry, error) {
+	current, err := s.readCurrent(ctx)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, fmt.Errorf("log entry %s not found", path)
-		}
-		return nil, fmt.Errorf("read log entry: %w", err)
+		return nil, err
 	}
-	return DecodeLogEntry(data)
-}
-
-func parseLogSeqPath(p string) (uint64, bool) {
-	base := path.Base(p)
-	base = strings.TrimSuffix(base, ".json")
-	seq, err := strconv.ParseUint(base, 10, 64)
+	if current == nil || seq < current.ChangeFeedLogStart || seq >= current.NextSeq {
+		return nil, fmt.Errorf("manifest entry seq=%d not retained", seq)
+	}
+	entries, err := s.entriesInRange(ctx, current, seq, seq+1)
 	if err != nil {
-		return 0, false
+		return nil, err
 	}
-	return seq, true
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("manifest entry seq=%d not found", seq)
+	}
+	return entries[0], nil
 }
 
 func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) {
@@ -959,9 +919,7 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		nextSeq = current.NextSeq
 	}
 
-	// m.LogSeq is the highest applied sequence; next sequence should be LogSeq+1.
 	manifestNextSeq := m.LogSeq + 1
-	// we will preserve zero for a truly empty manifest state.
 	if m.LogSeq == 0 &&
 		len(m.L0SSTs) == 0 &&
 		len(m.SortedRuns) == 0 &&
@@ -994,6 +952,11 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if current == nil {
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
+	normalizeCurrent(current)
+	oldLogSeqStart := current.LogSeqStart
+	if current.ChangeFeedLogStart == oldLogSeqStart {
+		current.ChangeFeedLogStart = nextSeq
+	}
 	if current.MaxCommittedLSN == nil {
 		s.applyCommittedLSNFromManifest(current, m)
 	}
@@ -1002,6 +965,8 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
+	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, current.ChangeFeedLogStart)
+	current.IndexFrontier = filterPageRefsAtOrAfter(current.IndexFrontier, current.ChangeFeedLogStart)
 	if current.NextEpoch < m.NextEpoch {
 		current.NextEpoch = m.NextEpoch
 	}
@@ -1018,14 +983,30 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	return path, nil
 }
 
-func currentLogs(current *Current, pathFn func(seq uint64) string) []string {
-	if current == nil {
-		return nil
+func filterEntriesAtOrAfter(entries []ManifestLogEntry, floor uint64) []ManifestLogEntry {
+	if floor == 0 || len(entries) == 0 {
+		return entries
 	}
-	if current.NextSeq <= current.LogSeqStart {
-		return []string{}
+	kept := entries[:0]
+	for _, entry := range entries {
+		if entry.Seq >= floor {
+			kept = append(kept, entry)
+		}
 	}
-	return current.LogPaths(pathFn)
+	return kept
+}
+
+func filterPageRefsAtOrAfter(refs []PageRef, floor uint64) []PageRef {
+	if floor == 0 || len(refs) == 0 {
+		return refs
+	}
+	kept := refs[:0]
+	for _, ref := range refs {
+		if ref.SeqHi >= floor {
+			kept = append(kept, ref)
+		}
+	}
+	return kept
 }
 
 func currentLogStart(current *Current) uint64 {
@@ -1045,9 +1026,6 @@ func currentNextSeq(current *Current) uint64 {
 func (s *Store) entriesInRange(ctx context.Context, current *Current, start, end uint64) ([]*ManifestLogEntry, error) {
 	if current == nil || end <= start {
 		return nil, nil
-	}
-	if len(current.IndexFrontier) == 0 && len(current.ActiveEntries) == 0 && current.NextSeq > current.LogSeqStart {
-		return s.entriesFromLegacyLogs(ctx, start, end)
 	}
 	var entries []*ManifestLogEntry
 	for _, ref := range current.IndexFrontier {
@@ -1070,24 +1048,31 @@ func (s *Store) entriesInRange(ctx context.Context, current *Current, start, end
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Seq < entries[j].Seq
 	})
+	if err := validateEntryCoverage(entries, start, end); err != nil {
+		return nil, err
+	}
 	return entries, nil
 }
 
-func (s *Store) entriesFromLegacyLogs(ctx context.Context, start, end uint64) ([]*ManifestLogEntry, error) {
-	entries := make([]*ManifestLogEntry, 0, end-start)
-	for seq := start; seq < end; seq++ {
-		path := s.logPath(seq)
-		data, err := s.storage.ReadLog(ctx, path)
-		if err != nil {
-			return nil, err
-		}
-		entry, err := DecodeLogEntry(data)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
+func validateEntryCoverage(entries []*ManifestLogEntry, start, end uint64) error {
+	if end <= start {
+		return nil
 	}
-	return entries, nil
+	expectedCount := end - start
+	if uint64(len(entries)) != expectedCount {
+		return fmt.Errorf("manifest entry range incomplete: start=%d end=%d got=%d want=%d", start, end, len(entries), expectedCount)
+	}
+	expected := start
+	for _, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("manifest entry range contains nil entry at seq=%d", expected)
+		}
+		if entry.Seq != expected {
+			return fmt.Errorf("manifest entry sequence mismatch: got=%d want=%d range=[%d,%d)", entry.Seq, expected, start, end)
+		}
+		expected++
+	}
+	return nil
 }
 
 func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end uint64) ([]*ManifestLogEntry, error) {
@@ -1112,6 +1097,9 @@ func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end 
 	}
 	if page.Level != ref.Level || page.SeqLo != ref.SeqLo || page.SeqHi != ref.SeqHi {
 		return nil, fmt.Errorf("manifest page ref mismatch path=%q", ref.Path)
+	}
+	if err := validateCommitPage(page, ref.Path); err != nil {
+		return nil, err
 	}
 	if page.SeqHi < start || page.SeqLo >= end {
 		return nil, nil
@@ -1141,8 +1129,74 @@ func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end 
 	return entries, nil
 }
 
-func formatLogSeq(seq uint64) string {
-	return fmt.Sprintf("%020d", seq)
+func validateCommitPage(page *CommitPage, path string) error {
+	if page == nil {
+		return fmt.Errorf("manifest page is nil path=%q", path)
+	}
+	if page.SeqHi < page.SeqLo {
+		return fmt.Errorf("manifest page invalid range path=%q seq_lo=%d seq_hi=%d", path, page.SeqLo, page.SeqHi)
+	}
+	switch page.Level {
+	case 0:
+		if page.PageType != CommitPageTypeLeaf {
+			return fmt.Errorf("manifest leaf page type mismatch path=%q type=%q", path, page.PageType)
+		}
+		if page.Count != uint32(len(page.Entries)) {
+			return fmt.Errorf("manifest leaf page count mismatch path=%q count=%d entries=%d", path, page.Count, len(page.Entries))
+		}
+		if len(page.Children) != 0 {
+			return fmt.Errorf("manifest leaf page has children path=%q", path)
+		}
+		if len(page.Entries) == 0 {
+			return fmt.Errorf("manifest leaf page empty path=%q", path)
+		}
+		entries := make([]*ManifestLogEntry, 0, len(page.Entries))
+		for i := range page.Entries {
+			entry := page.Entries[i]
+			e := entry
+			entries = append(entries, &e)
+		}
+		if page.Entries[0].Seq != page.SeqLo || page.Entries[len(page.Entries)-1].Seq != page.SeqHi {
+			return fmt.Errorf("manifest leaf page range mismatch path=%q", path)
+		}
+		return validateEntryCoverage(entries, page.SeqLo, page.SeqHi+1)
+	default:
+		if page.PageType != CommitPageTypeIndex {
+			return fmt.Errorf("manifest index page type mismatch path=%q type=%q", path, page.PageType)
+		}
+		if page.Count != uint32(len(page.Children)) {
+			return fmt.Errorf("manifest index page count mismatch path=%q count=%d children=%d", path, page.Count, len(page.Children))
+		}
+		if len(page.Entries) != 0 {
+			return fmt.Errorf("manifest index page has entries path=%q", path)
+		}
+		if len(page.Children) == 0 {
+			return fmt.Errorf("manifest index page empty path=%q", path)
+		}
+		sort.Slice(page.Children, func(i, j int) bool {
+			return page.Children[i].SeqLo < page.Children[j].SeqLo
+		})
+		if page.Children[0].SeqLo != page.SeqLo || page.Children[len(page.Children)-1].SeqHi != page.SeqHi {
+			return fmt.Errorf("manifest index page range mismatch path=%q", path)
+		}
+		expected := page.SeqLo
+		for _, child := range page.Children {
+			if child.Level+1 != page.Level {
+				return fmt.Errorf("manifest index child level mismatch path=%q child_level=%d page_level=%d", path, child.Level, page.Level)
+			}
+			if child.SeqLo != expected {
+				return fmt.Errorf("manifest index child sequence gap path=%q got=%d want=%d", path, child.SeqLo, expected)
+			}
+			if child.SeqHi < child.SeqLo {
+				return fmt.Errorf("manifest index child invalid range path=%q seq_lo=%d seq_hi=%d", path, child.SeqLo, child.SeqHi)
+			}
+			expected = child.SeqHi + 1
+		}
+		if expected != page.SeqHi+1 {
+			return fmt.Errorf("manifest index page sequence gap path=%q got_end=%d want_end=%d", path, expected, page.SeqHi+1)
+		}
+		return nil
+	}
 }
 
 func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
@@ -1156,127 +1210,73 @@ func (s *Store) ReadCurrentData(ctx context.Context) (*Current, error) {
 }
 
 func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
-	if reader, ok := s.storage.(interface {
-		ReadCurrentData(ctx context.Context) ([]byte, error)
-	}); ok {
-		data, err := reader.ReadCurrentData(ctx)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		if len(data) == 0 {
+	data, _, err := s.storage.ReadCurrent(ctx)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			s.clearCurrentCache()
 			return nil, nil
 		}
-		var current Current
-		if err := json.Unmarshal(data, &current); err != nil {
-			return nil, err
-		}
-		normalizeCurrent(&current)
-		return &current, nil
+		return nil, err
 	}
-
-	return s.readCurrent(ctx)
+	if len(data) == 0 {
+		s.clearCurrentCache()
+		return nil, nil
+	}
+	current, err := DecodeCurrent(data)
+	if err != nil {
+		return nil, err
+	}
+	normalizeCurrent(current)
+	return current, nil
 }
 
 func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, error) {
 	data, etag, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			s.mu.Lock()
-			s.currentETag = ""
-			s.current = nil
-			s.mu.Unlock()
+			s.clearCurrentCache()
 			return nil, "", nil
 		}
 		return nil, "", err
 	}
-	var current Current
-	if err := json.Unmarshal(data, &current); err != nil {
+	if len(data) == 0 {
+		s.clearCurrentCache()
+		return nil, etag, nil
+	}
+	current, err := DecodeCurrent(data)
+	if err != nil {
 		return nil, "", err
 	}
-	normalizeCurrent(&current)
+	normalizeCurrent(current)
 	s.mu.Lock()
+	s.current = current.Clone()
 	s.currentETag = etag
-	s.current = &current
 	s.mu.Unlock()
-	return &current, etag, nil
+	return current, etag, nil
 }
 
-func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, expectedETag string) error {
+func (s *Store) clearCurrentCache() {
+	s.mu.Lock()
+	s.current = nil
+	s.currentETag = ""
+	s.mu.Unlock()
+}
+
+func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag string) error {
 	normalizeCurrent(current)
 	data, err := EncodeCurrent(current)
 	if err != nil {
 		return err
 	}
-	etag, err := s.storage.WriteCurrentCAS(ctx, data, expectedETag)
+	newETag, err := s.storage.WriteCurrentCAS(ctx, data, etag)
 	if err != nil {
 		return err
 	}
-	if current != nil {
-		s.mu.Lock()
-		s.current = current.Clone()
-		s.currentETag = etag
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	s.current = current.Clone()
+	s.currentETag = newETag
+	s.mu.Unlock()
 	return nil
-}
-
-func (s *Store) logPath(seq uint64) string {
-	return s.storage.LogPath(formatLogSeq(seq))
-}
-
-func (s *Store) appendCurrent(ctx context.Context, entry *ManifestLogEntry) error {
-	const maxRetries = 3
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		s.mu.Lock()
-		current := s.current
-		etag := s.currentETag
-		s.mu.Unlock()
-
-		if current == nil {
-			var err error
-			current, etag, err = s.readCurrentWithETag(ctx)
-			if err != nil {
-				return err
-			}
-			if current == nil {
-				current = &Current{NextEpoch: 1}
-			}
-		}
-
-		updated := *current
-		if updated.LogSeqStart == updated.NextSeq {
-			updated.LogSeqStart = entry.Seq
-		}
-		nextSeq := entry.Seq + 1
-		if updated.NextSeq > nextSeq {
-			nextSeq = updated.NextSeq
-		}
-		updated.NextSeq = nextSeq
-		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, entry)
-		s.applyCommittedLSNFromEntry(&updated, entry)
-		s.applyLowWatermarkLSNFromEntry(&updated, entry)
-
-		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
-			if errors.Is(err, ErrPreconditionFailed) {
-				current, _, readErr := s.readCurrentWithETag(ctx)
-				if readErr != nil {
-					return readErr
-				}
-				if fenceErr := s.checkFenceWithCurrent(entry.Role, current); fenceErr != nil {
-					return fenceErr
-				}
-				continue
-			}
-			return err
-		}
-		return nil
-	}
-
-	return ErrFenceConflict
 }
 
 func (s *Store) applyCommittedLSNFromEntry(current *Current, entry *ManifestLogEntry) {

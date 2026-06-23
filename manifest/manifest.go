@@ -126,18 +126,6 @@ type CommitPage struct {
 	CreatedAt     time.Time          `json:"created_at"`
 }
 
-func (c *Current) LogPaths(pathFn func(seq uint64) string) []string {
-	if c == nil || pathFn == nil || c.NextSeq <= c.LogSeqStart {
-		return nil
-	}
-
-	paths := make([]string, 0, c.NextSeq-c.LogSeqStart)
-	for seq := c.LogSeqStart; seq < c.NextSeq; seq++ {
-		paths = append(paths, pathFn(seq))
-	}
-	return paths
-}
-
 func EncodeSnapshot(m *Manifest) ([]byte, error) {
 	return json.Marshal(m)
 }

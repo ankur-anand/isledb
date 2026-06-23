@@ -29,14 +29,6 @@ func (b *BlobStoreBackend) ReadCurrent(ctx context.Context) ([]byte, string, err
 	return data, b.etagFromAttrs(attr), nil
 }
 
-func (b *BlobStoreBackend) ReadCurrentData(ctx context.Context) ([]byte, error) {
-	data, _, err := b.store.Read(ctx, b.store.ManifestPath())
-	if err != nil {
-		return nil, b.mapError(err)
-	}
-	return data, nil
-}
-
 func (b *BlobStoreBackend) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	attr, err := b.store.WriteIfMatch(ctx, b.store.ManifestPath(), data, expectedETag)
 	return b.etagFromAttrs(attr), b.mapError(err)

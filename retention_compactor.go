@@ -565,10 +565,9 @@ func (c *RetentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context
 func (c *RetentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, startSeq, endSeq uint64, now time.Time) (bool, error) {
 	changed := false
 	for seq := startSeq; seq < endSeq; seq++ {
-		logPath := c.manifestLog.Storage().LogPath(fmt.Sprintf("%020d", seq))
-		entry, err := c.manifestLog.Read(ctx, logPath)
+		entry, err := c.manifestLog.ReadEntry(ctx, seq)
 		if err != nil {
-			return false, fmt.Errorf("read manifest log seq=%d path=%q: %w", seq, logPath, err)
+			return false, fmt.Errorf("read manifest entry seq=%d: %w", seq, err)
 		}
 		changed = c.applyManifestLogEntryToDeleteMarksMap(marksByID, entry, now) || changed
 	}

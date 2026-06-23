@@ -218,7 +218,6 @@ func TestPathHelpers(t *testing.T) {
 			{"SSTPath", store.SSTPath("seg1.sst"), "sstable/9e6/seg1.sst"},
 			{"ChangeBatchPath", store.ChangeBatchPath("batch1.chg"), "changes/" + ChangeBatchBucket("batch1.chg") + "/batch1.chg"},
 			{"ManifestPath", store.ManifestPath(), "manifest/CURRENT"},
-			{"ManifestLogPath", store.ManifestLogPath("001"), "manifest/log/001.json"},
 			{"ManifestSnapshotPath", store.ManifestSnapshotPath("001"), "manifest/snapshots/001.manifest"},
 			{"ManifestPagePath", store.ManifestPagePath(0, "p001"), "manifest/pages/l00/p001.json"},
 		}
@@ -482,15 +481,15 @@ func TestListFunctions(t *testing.T) {
 		store := h.store
 
 		expected := map[string]int{
-			store.ManifestLogPath("001"): 2,
-			store.ManifestLogPath("002"): 3,
-			store.SSTPath("seg1.sst"):    4,
+			store.ManifestPagePath(0, "001"): 2,
+			store.ManifestPagePath(0, "002"): 3,
+			store.SSTPath("seg1.sst"):        4,
 		}
 
 		payloads := map[string][]byte{
-			store.ManifestLogPath("001"): []byte("m1"),
-			store.ManifestLogPath("002"): []byte("log"),
-			store.SSTPath("seg1.sst"):    []byte("data"),
+			store.ManifestPagePath(0, "001"): []byte("m1"),
+			store.ManifestPagePath(0, "002"): []byte("log"),
+			store.SSTPath("seg1.sst"):        []byte("data"),
 		}
 
 		for key, data := range payloads {
@@ -536,14 +535,6 @@ func TestListFunctions(t *testing.T) {
 		if len(sst) != 1 || sst[0].Key != store.SSTPath("seg1.sst") {
 			t.Errorf("ListSSTFiles = %#v", sst)
 		}
-
-		logs, err := store.ListManifestLogs(ctx)
-		if err != nil {
-			t.Fatalf("ListManifestLogs failed: %v", err)
-		}
-		if len(logs) != 2 {
-			t.Fatalf("ListManifestLogs count: got %d, want %d", len(logs), 2)
-		}
 	})
 }
 
@@ -552,7 +543,7 @@ func TestWriteIfNotExist_Success(t *testing.T) {
 		ctx := context.Background()
 		store := h.store
 
-		key := store.ManifestLogPath("00000000000000000001")
+		key := store.ManifestPagePath(0, "00000000000000000001")
 		data := []byte(`{"op": "add_sst", "id": "sst-1"}`)
 
 		_, err := store.WriteIfNotExist(ctx, key, data)
@@ -575,7 +566,7 @@ func TestWriteIfNotExist_AlreadyExists(t *testing.T) {
 		ctx := context.Background()
 		store := h.store
 
-		key := store.ManifestLogPath("00000000000000000001")
+		key := store.ManifestPagePath(0, "00000000000000000001")
 		data1 := []byte(`{"op": "add_sst", "id": "sst-1"}`)
 		data2 := []byte(`{"op": "add_sst", "id": "sst-2"}`)
 

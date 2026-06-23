@@ -145,7 +145,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | Close | `() error` | Close reader and caches |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
-| ManifestLogCacheStats | `() cachestore.ManifestLogCacheStats` | Manifest-log cache statistics |
+| ManifestPageCacheStats | `() cachestore.ManifestPageCacheStats` | Manifest commit-page cache statistics |
 
 ```go
 type ReaderOpenOptions struct {

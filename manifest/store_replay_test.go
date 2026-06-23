@@ -11,13 +11,17 @@ import (
 
 type countingStorage struct {
 	Storage
-	readLogCalls     atomic.Int64
+	readPageCalls    atomic.Int64
 	readCurrentCalls atomic.Int64
 }
 
-func (s *countingStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
-	s.readLogCalls.Add(1)
-	return s.Storage.ReadLog(ctx, path)
+func (s *countingStorage) ReadPage(ctx context.Context, path string) ([]byte, error) {
+	s.readPageCalls.Add(1)
+	pages, ok := s.Storage.(PageStorage)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return pages.ReadPage(ctx, path)
 }
 
 func (s *countingStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
@@ -72,7 +76,7 @@ func TestIncrementalReplay_NoNewEntries(t *testing.T) {
 		t.Fatalf("expected 5 L0 SSTs, got %d", len(m1.L0SSTs))
 	}
 
-	cs.readLogCalls.Store(0)
+	cs.readPageCalls.Store(0)
 
 	m2, err := ms.Replay(ctx)
 	if err != nil {
@@ -82,9 +86,9 @@ func TestIncrementalReplay_NoNewEntries(t *testing.T) {
 		t.Fatalf("expected 5 L0 SSTs, got %d", len(m2.L0SSTs))
 	}
 
-	logReads := cs.readLogCalls.Load()
-	if logReads != 0 {
-		t.Fatalf("expected 0 ReadLog calls for no-change replay, got %d", logReads)
+	pageReads := cs.readPageCalls.Load()
+	if pageReads != 0 {
+		t.Fatalf("expected 0 ReadPage calls for no-change replay, got %d", pageReads)
 	}
 }
 
@@ -115,7 +119,7 @@ func TestIncrementalReplay_DeltaEntries(t *testing.T) {
 		appendSSTEntry(t, ctx, ms, fmt.Sprintf("sst-%02d", i), 1)
 	}
 
-	cs.readLogCalls.Store(0)
+	cs.readPageCalls.Store(0)
 
 	m2, err := ms.Replay(ctx)
 	if err != nil {
@@ -125,9 +129,9 @@ func TestIncrementalReplay_DeltaEntries(t *testing.T) {
 		t.Fatalf("expected 13 L0 SSTs, got %d", len(m2.L0SSTs))
 	}
 
-	logReads := cs.readLogCalls.Load()
-	if logReads != 0 {
-		t.Fatalf("expected 0 ReadLog calls for delta replay from CURRENT, got %d", logReads)
+	pageReads := cs.readPageCalls.Load()
+	if pageReads != 0 {
+		t.Fatalf("expected 0 ReadPage calls for delta replay from CURRENT, got %d", pageReads)
 	}
 
 	for i := 0; i < 13; i++ {
@@ -165,7 +169,7 @@ func TestIncrementalReplay_FallsBackAfterSnapshot(t *testing.T) {
 		appendSSTEntry(t, ctx, ms, fmt.Sprintf("sst-%02d", i), 1)
 	}
 
-	cs.readLogCalls.Store(0)
+	cs.readPageCalls.Store(0)
 
 	m2, err := ms.Replay(ctx)
 	if err != nil {
@@ -175,9 +179,9 @@ func TestIncrementalReplay_FallsBackAfterSnapshot(t *testing.T) {
 		t.Fatalf("expected 7 L0 SSTs, got %d", len(m2.L0SSTs))
 	}
 
-	logReads := cs.readLogCalls.Load()
-	if logReads != 0 {
-		t.Fatalf("expected 0 ReadLog calls after snapshot from CURRENT, got %d", logReads)
+	pageReads := cs.readPageCalls.Load()
+	if pageReads != 0 {
+		t.Fatalf("expected 0 ReadPage calls after snapshot from CURRENT, got %d", pageReads)
 	}
 }
 
@@ -329,7 +333,7 @@ func TestIncrementalReplay_RepeatedCalls(t *testing.T) {
 			totalSSTs++
 		}
 
-		cs.readLogCalls.Store(0)
+		cs.readPageCalls.Store(0)
 
 		m, err := ms.Replay(ctx)
 		if err != nil {
@@ -339,9 +343,9 @@ func TestIncrementalReplay_RepeatedCalls(t *testing.T) {
 			t.Fatalf("round %d: expected %d L0 SSTs, got %d", round, totalSSTs, len(m.L0SSTs))
 		}
 
-		logReads := cs.readLogCalls.Load()
-		if logReads != 0 {
-			t.Fatalf("round %d: expected 0 ReadLog calls from CURRENT, got %d", round, logReads)
+		pageReads := cs.readPageCalls.Load()
+		if pageReads != 0 {
+			t.Fatalf("round %d: expected 0 ReadPage calls from CURRENT, got %d", round, pageReads)
 		}
 	}
 }

@@ -30,14 +30,14 @@ func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) ma
 
 func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.Storage, opts *ReaderOptions) manifest.Storage {
 	base := resolveManifestStorage(store, storage)
-	if opts != nil && opts.DisableManifestCache {
+	if opts != nil && opts.DisableManifestPageCache {
 		return base
 	}
 
 	cacheOpts := cachestore.CachingStorageOptions{}
 	if opts != nil {
-		cacheOpts.ManifestCache = opts.ManifestLogCache
-		cacheOpts.CacheSize = opts.ManifestLogCacheSize
+		cacheOpts.PageCache = opts.ManifestPageCache
+		cacheOpts.CacheSize = opts.ManifestPageCacheSize
 	}
 	return cachestore.NewCachingStorage(base, cacheOpts)
 }

@@ -9,13 +9,13 @@ import (
 )
 
 type mockStorage struct {
-	logs      map[string][]byte
+	pages     map[string][]byte
 	readCount atomic.Int64
 }
 
 func newMockStorage() *mockStorage {
 	return &mockStorage{
-		logs: make(map[string][]byte),
+		pages: make(map[string][]byte),
 	}
 }
 
@@ -35,42 +35,34 @@ func (m *mockStorage) WriteSnapshot(ctx context.Context, id string, data []byte)
 	return "snapshot/" + id, nil
 }
 
-func (m *mockStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
+func (m *mockStorage) ReadPage(ctx context.Context, path string) ([]byte, error) {
 	m.readCount.Add(1)
-	data, ok := m.logs[path]
+	data, ok := m.pages[path]
 	if !ok {
 		return nil, manifest.ErrNotFound
 	}
 	return data, nil
 }
 
-func (m *mockStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	path := "logs/" + name
-	m.logs[path] = data
+func (m *mockStorage) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
+	path := m.PagePath(level, id)
+	m.pages[path] = data
 	return path, nil
 }
 
-func (m *mockStorage) ListLogs(ctx context.Context) ([]string, error) {
-	paths := make([]string, 0, len(m.logs))
-	for path := range m.logs {
-		paths = append(paths, path)
-	}
-	return paths, nil
-}
-
-func (m *mockStorage) LogPath(name string) string {
-	return "logs/" + name
+func (m *mockStorage) PagePath(level uint8, id string) string {
+	return "pages/l00/" + id
 }
 
 func TestCachingStorage_CacheHit(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockStorage()
 
-	mock.logs["logs/entry1"] = []byte("data1")
+	mock.pages["pages/l00/entry1"] = []byte("data1")
 
 	cs := NewCachingStorage(mock, CachingStorageOptions{CacheSize: 10})
 
-	data, err := cs.ReadLog(ctx, "logs/entry1")
+	data, err := cs.ReadPage(ctx, "pages/l00/entry1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,7 +74,7 @@ func TestCachingStorage_CacheHit(t *testing.T) {
 		t.Errorf("expected 1 read, got %d", mock.readCount.Load())
 	}
 
-	data, err = cs.ReadLog(ctx, "logs/entry1")
+	data, err = cs.ReadPage(ctx, "pages/l00/entry1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -91,15 +83,15 @@ func TestCachingStorage_CacheHit(t *testing.T) {
 	}
 
 	if mock.readCount.Load() != 1 {
-		t.Errorf("expected still 1 read after manifestCache hit, got %d", mock.readCount.Load())
+		t.Errorf("expected still 1 read after pageCache hit, got %d", mock.readCount.Load())
 	}
 
 	stats := cs.CacheStats()
 	if stats.Hits != 1 {
-		t.Errorf("expected 1 manifestCache hit, got %d", stats.Hits)
+		t.Errorf("expected 1 pageCache hit, got %d", stats.Hits)
 	}
 	if stats.Misses != 1 {
-		t.Errorf("expected 1 manifestCache miss, got %d", stats.Misses)
+		t.Errorf("expected 1 pageCache miss, got %d", stats.Misses)
 	}
 }
 
@@ -109,12 +101,12 @@ func TestCachingStorage_WriteThroughCaching(t *testing.T) {
 
 	cs := NewCachingStorage(mock, CachingStorageOptions{CacheSize: 10})
 
-	path, err := cs.WriteLog(ctx, "entry1", []byte("data1"))
+	path, err := cs.WritePage(ctx, 0, "entry1", []byte("data1"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	data, err := cs.ReadLog(ctx, path)
+	data, err := cs.ReadPage(ctx, path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -123,39 +115,39 @@ func TestCachingStorage_WriteThroughCaching(t *testing.T) {
 	}
 
 	if mock.readCount.Load() != 0 {
-		t.Errorf("expected 0 reads (manifestCache hit from write), got %d", mock.readCount.Load())
+		t.Errorf("expected 0 reads (pageCache hit from write), got %d", mock.readCount.Load())
 	}
 
 	stats := cs.CacheStats()
 	if stats.Hits != 1 {
-		t.Errorf("expected 1 manifestCache hit, got %d", stats.Hits)
+		t.Errorf("expected 1 pageCache hit, got %d", stats.Hits)
 	}
 	if stats.Misses != 0 {
-		t.Errorf("expected 0 manifestCache misses, got %d", stats.Misses)
+		t.Errorf("expected 0 pageCache misses, got %d", stats.Misses)
 	}
 }
 
 func TestCachingStorage_ClearCache(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockStorage()
-	mock.logs["logs/entry1"] = []byte("data1")
+	mock.pages["pages/l00/entry1"] = []byte("data1")
 
 	cs := NewCachingStorage(mock, CachingStorageOptions{CacheSize: 10})
 
-	_, err := cs.ReadLog(ctx, "logs/entry1")
+	_, err := cs.ReadPage(ctx, "pages/l00/entry1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	cs.ClearCache()
 
-	_, err = cs.ReadLog(ctx, "logs/entry1")
+	_, err = cs.ReadPage(ctx, "pages/l00/entry1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if mock.readCount.Load() != 2 {
-		t.Errorf("expected 2 reads after manifestCache clear, got %d", mock.readCount.Load())
+		t.Errorf("expected 2 reads after pageCache clear, got %d", mock.readCount.Load())
 	}
 }
 
@@ -187,44 +179,36 @@ func TestCachingStorage_DelegateMethods(t *testing.T) {
 		t.Errorf("expected snapshot/snap1, got %s", path)
 	}
 
-	logPath := cs.LogPath("entry1")
-	if logPath != "logs/entry1" {
-		t.Errorf("expected logs/entry1, got %s", logPath)
+	pagePath := cs.PagePath(0, "entry1")
+	if pagePath != "pages/l00/entry1" {
+		t.Errorf("expected pages/l00/entry1, got %s", pagePath)
 	}
 
-	_, err = cs.WriteLog(ctx, "entry1", []byte("data1"))
+	_, err = cs.WritePage(ctx, 0, "entry1", []byte("data1"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-
-	logs, err := cs.ListLogs(ctx)
-	if err != nil {
-		t.Errorf("unexpected error from ListLogs: %v", err)
-	}
-	if len(logs) != 1 {
-		t.Errorf("expected 1 log, got %d", len(logs))
 	}
 }
 
 func TestCachingStorage_CustomCache(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockStorage()
-	mock.logs["logs/entry1"] = []byte("data1")
+	mock.pages["pages/l00/entry1"] = []byte("data1")
 
-	customCache := NewLRUManifestLogCache(5)
-	cs := NewCachingStorage(mock, CachingStorageOptions{ManifestCache: customCache})
+	customCache := NewLRUManifestPageCache(5)
+	cs := NewCachingStorage(mock, CachingStorageOptions{PageCache: customCache})
 
-	_, err := cs.ReadLog(ctx, "logs/entry1")
+	_, err := cs.ReadPage(ctx, "pages/l00/entry1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	stats := customCache.Stats()
 	if stats.MaxEntries != 5 {
-		t.Errorf("expected custom manifestCache with 5 max entries, got %d", stats.MaxEntries)
+		t.Errorf("expected custom pageCache with 5 max entries, got %d", stats.MaxEntries)
 	}
 	if stats.EntryCount != 1 {
-		t.Errorf("expected 1 entry in custom manifestCache, got %d", stats.EntryCount)
+		t.Errorf("expected 1 entry in custom pageCache, got %d", stats.EntryCount)
 	}
 }
 
@@ -233,7 +217,7 @@ func TestCachingStorage_DefaultCacheSize(t *testing.T) {
 	cs := NewCachingStorage(mock, CachingStorageOptions{})
 
 	stats := cs.CacheStats()
-	if stats.MaxEntries != DefaultManifestLogCacheSize {
-		t.Errorf("expected default manifestCache size %d, got %d", DefaultManifestLogCacheSize, stats.MaxEntries)
+	if stats.MaxEntries != DefaultManifestPageCacheSize {
+		t.Errorf("expected default pageCache size %d, got %d", DefaultManifestPageCacheSize, stats.MaxEntries)
 	}
 }

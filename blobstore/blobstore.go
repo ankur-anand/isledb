@@ -168,10 +168,6 @@ func (s *Store) ManifestPath() string {
 	return s.path("manifest", "CURRENT")
 }
 
-func (s *Store) ManifestLogPath(id string) string {
-	return s.path("manifest", "log", id+".json")
-}
-
 func (s *Store) ManifestSnapshotPath(id string) string {
 	return s.path("manifest", "snapshots", id+".manifest")
 }
@@ -524,14 +520,6 @@ func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error)
 
 func (s *Store) ListSSTFiles(ctx context.Context) ([]ObjectInfo, error) {
 	result, err := s.List(ctx, ListOptions{Prefix: "sstable/"})
-	if err != nil {
-		return nil, err
-	}
-	return result.Objects, nil
-}
-
-func (s *Store) ListManifestLogs(ctx context.Context) ([]ObjectInfo, error) {
-	result, err := s.List(ctx, ListOptions{Prefix: "manifest/log/"})
 	if err != nil {
 		return nil, err
 	}

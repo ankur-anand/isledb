@@ -49,7 +49,7 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 		t.Fatalf("manifest CURRENT missing: %v", err)
 	}
 
-	logs, err := manifestStore.List(ctx)
+	logs, err := manifestStore.ListEntries(ctx)
 	if err != nil {
 		t.Fatalf("manifest list: %v", err)
 	}
@@ -98,15 +98,15 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	logPaths, err := manifestStore.List(ctx)
+	entrySeqs, err := manifestStore.ListEntries(ctx)
 	if err != nil {
-		t.Fatalf("manifest log list: %v", err)
+		t.Fatalf("manifest entry list: %v", err)
 	}
 	var meta *manifest.ChangeBatchMeta
-	for _, logPath := range logPaths {
-		entry, err := manifestStore.Read(ctx, logPath)
+	for _, entrySeq := range entrySeqs {
+		entry, err := manifestStore.ReadEntry(ctx, entrySeq)
 		if err != nil {
-			t.Fatalf("read manifest log %s: %v", logPath, err)
+			t.Fatalf("read manifest entry seq=%d: %v", entrySeq, err)
 		}
 		if entry.Op == manifest.LogOpAddSSTable && entry.ChangeBatch != nil {
 			meta = entry.ChangeBatch
@@ -194,7 +194,7 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 		t.Fatalf("Flush2: %v", err)
 	}
 
-	logs, err := manifestStore.List(ctx)
+	logs, err := manifestStore.ListEntries(ctx)
 	if err != nil {
 		t.Fatalf("manifest list: %v", err)
 	}

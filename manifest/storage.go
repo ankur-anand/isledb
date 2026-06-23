@@ -16,7 +16,6 @@ type Storage interface {
 
 	ReadSnapshot(ctx context.Context, path string) ([]byte, error)
 	WriteSnapshot(ctx context.Context, id string, data []byte) (string, error)
-
 }
 
 type PageStorage interface {

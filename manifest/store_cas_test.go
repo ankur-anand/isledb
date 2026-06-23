@@ -60,22 +60,6 @@ func (s *casInjectStorage) WriteSnapshot(ctx context.Context, id string, data []
 	return s.base.WriteSnapshot(ctx, id, data)
 }
 
-func (s *casInjectStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
-	return s.base.ReadLog(ctx, path)
-}
-
-func (s *casInjectStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	return s.base.WriteLog(ctx, name, data)
-}
-
-func (s *casInjectStorage) ListLogs(ctx context.Context) ([]string, error) {
-	return s.base.ListLogs(ctx)
-}
-
-func (s *casInjectStorage) LogPath(name string) string {
-	return s.base.LogPath(name)
-}
-
 func (s *casInjectStorage) bumpWriterFenceEpoch(ctx context.Context) error {
 	data, etag, err := s.base.ReadCurrent(ctx)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -146,29 +130,13 @@ func (s *cancelCASStorage) WriteSnapshot(ctx context.Context, id string, data []
 	return s.base.WriteSnapshot(ctx, id, data)
 }
 
-func (s *cancelCASStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
-	return s.base.ReadLog(ctx, path)
-}
-
-func (s *cancelCASStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	return s.base.WriteLog(ctx, name, data)
-}
-
-func (s *cancelCASStorage) ListLogs(ctx context.Context) ([]string, error) {
-	return s.base.ListLogs(ctx)
-}
-
-func (s *cancelCASStorage) LogPath(name string) string {
-	return s.base.LogPath(name)
-}
-
 func (s *cancelCASStorage) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
 }
 
-func TestAppendCurrent_CASRetry_SucceedsWhenFenceValid(t *testing.T) {
+func TestAppendEntry_CASRetry_SucceedsWhenFenceValid(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("cas-retry")
 	defer store.Close()
@@ -193,7 +161,7 @@ func TestAppendCurrent_CASRetry_SucceedsWhenFenceValid(t *testing.T) {
 	}
 }
 
-func TestAppendCurrent_CASFencesWhenEpochAdvanced(t *testing.T) {
+func TestAppendEntry_CASFencesWhenEpochAdvanced(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("cas-fence")
 	defer store.Close()

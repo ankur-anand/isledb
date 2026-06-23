@@ -12,15 +12,12 @@ type etagStorage struct {
 	current     []byte
 	etagCounter int
 
-	logs        map[string][]byte
 	casExpected []string
 	readCount   int
 }
 
 func newETagStorage() *etagStorage {
-	return &etagStorage{
-		logs: make(map[string][]byte),
-	}
+	return &etagStorage{}
 }
 
 func (s *etagStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
@@ -62,40 +59,6 @@ func (s *etagStorage) WriteSnapshot(ctx context.Context, id string, data []byte)
 	return "snapshots/" + id, nil
 }
 
-func (s *etagStorage) ReadLog(ctx context.Context, path string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, ok := s.logs[path]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	return append([]byte(nil), data...), nil
-}
-
-func (s *etagStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.logs[name]; exists {
-		return "", ErrPreconditionFailed
-	}
-	s.logs[name] = append([]byte(nil), data...)
-	return name, nil
-}
-
-func (s *etagStorage) ListLogs(ctx context.Context) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	paths := make([]string, 0, len(s.logs))
-	for path := range s.logs {
-		paths = append(paths, path)
-	}
-	return paths, nil
-}
-
-func (s *etagStorage) LogPath(name string) string {
-	return name
-}
-
 func (s *etagStorage) resetCounts() {
 	s.mu.Lock()
 	s.readCount = 0
@@ -110,7 +73,7 @@ func (s *etagStorage) snapshotCounts() (int, []string) {
 	return s.readCount, cas
 }
 
-func TestAppendCurrent_UsesCachedETagAndSingleRead(t *testing.T) {
+func TestAppendEntry_UsesCachedETagAndSingleRead(t *testing.T) {
 	ctx := context.Background()
 	storage := newETagStorage()
 	ms := NewStoreWithStorage(storage)
@@ -141,7 +104,7 @@ func TestAppendCurrent_UsesCachedETagAndSingleRead(t *testing.T) {
 	}
 }
 
-func TestAppendCurrent_UsesUpdatedETagAcrossAppends(t *testing.T) {
+func TestAppendEntry_UsesUpdatedETagAcrossAppends(t *testing.T) {
 	ctx := context.Background()
 	storage := newETagStorage()
 	ms := NewStoreWithStorage(storage)
@@ -170,5 +133,38 @@ func TestAppendCurrent_UsesUpdatedETagAcrossAppends(t *testing.T) {
 	_, casExpected := storage.snapshotCounts()
 	if len(casExpected) != 2 || casExpected[0] != startETag || casExpected[1] != nextETag {
 		t.Fatalf("expected CAS [%s %s], got %v", startETag, nextETag, casExpected)
+	}
+}
+
+func TestReadCurrentWithETag_ClearsCacheOnNotFound(t *testing.T) {
+	ctx := context.Background()
+	storage := newETagStorage()
+	currentData, err := EncodeCurrent(&Current{NextEpoch: 1, NextSeq: 1})
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	storage.current = currentData
+
+	ms := NewStoreWithStorage(storage)
+	if current, _, err := ms.readCurrentWithETag(ctx); err != nil {
+		t.Fatalf("read current: %v", err)
+	} else if current == nil {
+		t.Fatal("expected current")
+	}
+	if ms.current == nil || ms.currentETag == "" {
+		t.Fatal("expected current cache to be populated")
+	}
+
+	storage.mu.Lock()
+	storage.current = nil
+	storage.mu.Unlock()
+
+	if current, etag, err := ms.readCurrentWithETag(ctx); err != nil {
+		t.Fatalf("read missing current: %v", err)
+	} else if current != nil || etag != "" {
+		t.Fatalf("expected missing current, got current=%v etag=%q", current, etag)
+	}
+	if ms.current != nil || ms.currentETag != "" {
+		t.Fatalf("expected current cache to be cleared, current=%v etag=%q", ms.current, ms.currentETag)
 	}
 }

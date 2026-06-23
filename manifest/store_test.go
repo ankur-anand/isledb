@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,20 +13,6 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/segmentio/ksuid"
 )
-
-type failNthWriteLogStorage struct {
-	Storage
-	failAt int
-	writes int
-}
-
-func (s *failNthWriteLogStorage) WriteLog(ctx context.Context, name string, data []byte) (string, error) {
-	s.writes++
-	if s.failAt > 0 && s.writes == s.failAt {
-		return "", fmt.Errorf("inject log write failure")
-	}
-	return s.Storage.WriteLog(ctx, name, data)
-}
 
 type blockingSnapshotStorage struct {
 	Storage
@@ -38,6 +25,72 @@ func (s *blockingSnapshotStorage) WriteSnapshot(ctx context.Context, id string, 
 	s.once.Do(func() { close(s.started) })
 	<-s.block
 	return s.Storage.WriteSnapshot(ctx, id, data)
+}
+
+func commitEntriesForTest(t *testing.T, ctx context.Context, backend *BlobStoreBackend, entries []*ManifestLogEntry) {
+	t.Helper()
+	data, etag, err := backend.ReadCurrent(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("read current: %v", err)
+	}
+	var current *Current
+	if len(data) > 0 {
+		current, err = DecodeCurrent(data)
+		if err != nil {
+			t.Fatalf("decode current: %v", err)
+		}
+	}
+	if current == nil {
+		current = &Current{NextEpoch: 1}
+	}
+	normalizeCurrent(current)
+	if len(entries) > 0 && current.NextSeq == 0 {
+		current.LogSeqStart = entries[0].Seq
+	}
+	for _, entry := range entries {
+		current.ActiveEntries = append(current.ActiveEntries, *entry)
+		if entry.Seq >= current.NextSeq {
+			current.NextSeq = entry.Seq + 1
+		}
+		current.NextEpoch = nextEpochFromEntry(current.NextEpoch, entry)
+	}
+	if current.ChangeFeedLogStart == 0 {
+		current.ChangeFeedLogStart = current.LogSeqStart
+	}
+	encoded, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, encoded, etag); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+}
+
+func writeCurrentForTest(t *testing.T, ctx context.Context, backend *BlobStoreBackend, current *Current) {
+	t.Helper()
+	normalizeCurrent(current)
+	encoded, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	_, etag, err := backend.ReadCurrent(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("read current etag: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, encoded, etag); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+}
+
+func testManifestEntry(seq uint64) ManifestLogEntry {
+	return ManifestLogEntry{
+		ID:      ksuid.New(),
+		Seq:     seq,
+		Role:    FenceRoleWriter,
+		Epoch:   1,
+		Op:      LogOpAddSSTable,
+		SSTable: &SSTMeta{ID: fmt.Sprintf("%d.sst", seq), Epoch: 1, Level: 0},
+	}
 }
 
 func TestAppendWithWriterFence_FencedOut(t *testing.T) {
@@ -67,33 +120,6 @@ func TestAppendWithWriterFence_FencedOut(t *testing.T) {
 	}
 	if _, err := ms2.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "b.sst", Epoch: 2, Level: 0}); err != nil {
 		t.Fatalf("append writer-2: %v", err)
-	}
-}
-
-func TestWriteLog_DoesNotOverwriteExistingEntry(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("test")
-	defer store.Close()
-
-	backend := NewBlobStoreBackend(store)
-	entry := &ManifestLogEntry{
-		ID:      ksuid.New(),
-		Seq:     0,
-		Role:    FenceRoleWriter,
-		Epoch:   1,
-		Op:      LogOpAddSSTable,
-		SSTable: &SSTMeta{ID: "a.sst", Epoch: 1, Level: 0},
-	}
-	data, err := EncodeLogEntry(entry)
-	if err != nil {
-		t.Fatalf("encode entry: %v", err)
-	}
-	logName := formatLogSeq(entry.Seq)
-	if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-		t.Fatalf("write log: %v", err)
-	}
-	if _, err := backend.WriteLog(ctx, logName, data); !errors.Is(err, ErrPreconditionFailed) {
-		t.Fatalf("expected ErrPreconditionFailed, got %v", err)
 	}
 }
 
@@ -168,7 +194,7 @@ func TestClaimWriter_WritesFenceClaimEntry(t *testing.T) {
 		t.Fatalf("claim writer: %v", err)
 	}
 
-	logs, err := ms.List(ctx)
+	logs, err := ms.ListEntries(ctx)
 	if err != nil {
 		t.Fatalf("list logs: %v", err)
 	}
@@ -177,7 +203,7 @@ func TestClaimWriter_WritesFenceClaimEntry(t *testing.T) {
 		t.Fatalf("expected 1 log entry, got %d", len(logs))
 	}
 
-	entry, err := ms.Read(ctx, logs[0])
+	entry, err := ms.ReadEntry(ctx, logs[0])
 	if err != nil {
 		t.Fatalf("read log entry: %v", err)
 	}
@@ -215,7 +241,7 @@ func TestClaimCompactor_WritesFenceClaimEntry(t *testing.T) {
 		t.Fatalf("claim compactor: %v", err)
 	}
 
-	logs, err := ms.List(ctx)
+	logs, err := ms.ListEntries(ctx)
 	if err != nil {
 		t.Fatalf("list logs: %v", err)
 	}
@@ -224,7 +250,7 @@ func TestClaimCompactor_WritesFenceClaimEntry(t *testing.T) {
 		t.Fatalf("expected 1 log entry, got %d", len(logs))
 	}
 
-	entry, err := ms.Read(ctx, logs[0])
+	entry, err := ms.ReadEntry(ctx, logs[0])
 	if err != nil {
 		t.Fatalf("read log entry: %v", err)
 	}
@@ -337,16 +363,7 @@ func TestReplay_FiltersStaleWriterEntries(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -460,16 +477,7 @@ func TestReplay_IndependentWriterCompactorFiltering(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -508,16 +516,7 @@ func TestReplay_BackwardsCompatibleWithEntriesWithoutRoleEpoch(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -580,16 +579,7 @@ func TestReplay_SeedsEpochFromCurrentAfterSnapshot(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -674,16 +664,7 @@ func TestReplay_IgnoresLowerEpochFenceClaim(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -752,16 +733,7 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 		},
 	}
 
-	for _, entry := range entries {
-		data, err := EncodeLogEntry(entry)
-		if err != nil {
-			t.Fatalf("encode entry: %v", err)
-		}
-		logName := formatLogSeq(entry.Seq)
-		if _, err := backend.WriteLog(ctx, logName, data); err != nil {
-			t.Fatalf("write log: %v", err)
-		}
-	}
+	commitEntriesForTest(t, ctx, backend, entries)
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
@@ -913,6 +885,124 @@ func TestWriteSnapshot_BackfillsCurrentCommittedLSNFromManifest(t *testing.T) {
 	}
 	if got := *current.MaxCommittedLSN; got != 77 {
 		t.Fatalf("unexpected max committed lsn: got=%d want=77", got)
+	}
+}
+
+func TestReadEntry_HonorsChangeFeedLogStart(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        10,
+		ChangeFeedLogStart: 10,
+		NextSeq:            12,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(9),
+			testManifestEntry(10),
+			testManifestEntry(11),
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	if _, err := ms.ReadEntry(ctx, 9); err == nil {
+		t.Fatal("expected seq below change-feed floor to be rejected")
+	}
+	entry, err := ms.ReadEntry(ctx, 10)
+	if err != nil {
+		t.Fatalf("read retained entry: %v", err)
+	}
+	if entry.Seq != 10 {
+		t.Fatalf("unexpected entry seq: got=%d want=10", entry.Seq)
+	}
+	seqs, err := ms.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("list entries: %v", err)
+	}
+	if got, want := fmt.Sprint(seqs), "[10 11]"; got != want {
+		t.Fatalf("unexpected listed entries: got=%s want=%s", got, want)
+	}
+}
+
+func TestWriteSnapshot_PrunesRefsBelowChangeFeedFloor(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        0,
+		ChangeFeedLogStart: 2,
+		NextSeq:            4,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(1),
+			testManifestEntry(2),
+			testManifestEntry(3),
+		},
+		IndexFrontier: []PageRef{
+			{Level: 0, SeqLo: 0, SeqHi: 1, Path: "pages/l00/old"},
+			{Level: 0, SeqLo: 2, SeqHi: 3, Path: "pages/l00/kept"},
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 3}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if current.ChangeFeedLogStart != 2 {
+		t.Fatalf("unexpected change-feed floor: got=%d want=2", current.ChangeFeedLogStart)
+	}
+	if got, want := len(current.ActiveEntries), 2; got != want {
+		t.Fatalf("unexpected active entry count: got=%d want=%d", got, want)
+	}
+	if current.ActiveEntries[0].Seq != 2 || current.ActiveEntries[1].Seq != 3 {
+		t.Fatalf("unexpected retained active entries: got=%d,%d want=2,3", current.ActiveEntries[0].Seq, current.ActiveEntries[1].Seq)
+	}
+	if got, want := len(current.IndexFrontier), 1; got != want {
+		t.Fatalf("unexpected index frontier count: got=%d want=%d", got, want)
+	}
+	if current.IndexFrontier[0].Path != "pages/l00/kept" {
+		t.Fatalf("unexpected retained page ref: got=%q", current.IndexFrontier[0].Path)
+	}
+}
+
+func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        0,
+		ChangeFeedLogStart: 0,
+		NextSeq:            2,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(0),
+			testManifestEntry(1),
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if current.ChangeFeedLogStart != 2 {
+		t.Fatalf("unexpected default change-feed floor: got=%d want=2", current.ChangeFeedLogStart)
+	}
+	if len(current.ActiveEntries) != 0 {
+		t.Fatalf("expected active entries below new floor to be pruned, got=%d", len(current.ActiveEntries))
 	}
 }
 
@@ -1202,5 +1292,129 @@ func TestReplay_DetectsCommittedPageChecksumMismatch(t *testing.T) {
 	_, err := NewStoreWithStorage(base).Replay(ctx)
 	if err == nil {
 		t.Fatalf("expected replay to fail on committed page checksum mismatch")
+	}
+}
+
+func TestReplay_DetectsActiveEntrySequenceGap(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	current := &Current{
+		LogSeqStart: 0,
+		NextSeq:     3,
+		NextEpoch:   2,
+		ActiveEntries: []ManifestLogEntry{
+			{ID: ksuid.New(), Seq: 0, Role: FenceRoleWriter, Epoch: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}},
+			{ID: ksuid.New(), Seq: 2, Role: FenceRoleWriter, Epoch: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "c.sst", Epoch: 1, Level: 0}},
+		},
+	}
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, data, ""); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	_, err = NewStoreWithStorage(backend).Replay(ctx)
+	if err == nil {
+		t.Fatalf("expected replay to fail on active entry sequence gap")
+	}
+}
+
+func TestReplay_DetectsActiveEntryDuplicateSequence(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	current := &Current{
+		LogSeqStart: 0,
+		NextSeq:     2,
+		NextEpoch:   2,
+		ActiveEntries: []ManifestLogEntry{
+			{ID: ksuid.New(), Seq: 0, Role: FenceRoleWriter, Epoch: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}},
+			{ID: ksuid.New(), Seq: 0, Role: FenceRoleWriter, Epoch: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "dup.sst", Epoch: 1, Level: 0}},
+		},
+	}
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, data, ""); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	_, err = NewStoreWithStorage(backend).Replay(ctx)
+	if err == nil {
+		t.Fatalf("expected replay to fail on duplicate active entry sequence")
+	}
+}
+
+func TestReplay_DetectsCommittedPageShapeMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	ms := NewStoreWithStorage(backend)
+	ms.activeEntryLimit = 2
+
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append a.sst: %v", err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "b.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append b.sst: %v", err)
+	}
+
+	current := ms.CurrentData()
+	if current == nil || len(current.IndexFrontier) == 0 {
+		t.Fatalf("expected committed page ref in CURRENT")
+	}
+	ref := current.IndexFrontier[0]
+	page := &CommitPage{
+		LayoutVersion: LayoutVersion,
+		PageType:      CommitPageTypeLeaf,
+		Level:         ref.Level,
+		SeqLo:         ref.SeqLo,
+		SeqHi:         ref.SeqHi,
+		Count:         ref.Count + 1,
+		Entries: []ManifestLogEntry{
+			{ID: ksuid.New(), Seq: ref.SeqLo, Role: FenceRoleWriter, Epoch: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}},
+		},
+		CreatedAt: ref.CreatedAt,
+	}
+	pageData, err := EncodeCommitPage(page)
+	if err != nil {
+		t.Fatalf("encode page: %v", err)
+	}
+	sum := sha256.Sum256(pageData)
+	current.IndexFrontier[0].Checksum = fmt.Sprintf("sha256:%x", sum[:])
+	currentData, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current: %v", err)
+	}
+	_, etag, err := backend.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if _, err := store.Write(ctx, ref.Path, pageData); err != nil {
+		t.Fatalf("overwrite page: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, currentData, etag); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	_, err = NewStoreWithStorage(backend).Replay(ctx)
+	if err == nil {
+		t.Fatalf("expected replay to fail on committed page shape mismatch")
 	}
 }
