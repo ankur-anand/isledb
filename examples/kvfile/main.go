@@ -46,9 +46,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
-	if err := writer.Put([]byte("hello"), []byte("world")); err != nil {
+	if err := writer.Put(ctx, []byte("hello"), []byte("world")); err != nil {
 		log.Fatal(err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -101,7 +101,7 @@ func main() {
 	for i := 0; i < 10; i++ {
 		key := []byte("key-" + strconv.Itoa(i))
 		value := []byte("value-" + strconv.Itoa(i))
-		if err := writer.Put(key, value); err != nil {
+		if err := writer.Put(ctx, key, value); err != nil {
 			log.Fatal(err)
 		}
 	}

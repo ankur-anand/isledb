@@ -263,16 +263,16 @@ func TestReaderSnapshotMaxCommittedLSN(t *testing.T) {
 	}
 	defer db.Close()
 
-	writer, err := db.OpenWriter(ctx, WriterOptions{FlushInterval: -1})
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	putLSN := func(lsn uint64, value string) {
 		key := make([]byte, 8)
 		binary.BigEndian.PutUint64(key, lsn)
-		if err := writer.Put(key, []byte(value)); err != nil {
+		if err := writer.Put(ctx, key, []byte(value)); err != nil {
 			t.Fatalf("Put(%d): %v", lsn, err)
 		}
 	}

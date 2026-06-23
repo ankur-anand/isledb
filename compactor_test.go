@@ -17,8 +17,8 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 1024
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 1024
 
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -29,7 +29,7 @@ func TestCompactor_L0Compaction(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			key := []byte{byte(batch), byte(i)}
 			value := []byte("value")
-			if err := writer.put(key, value); err != nil {
+			if err := writer.put(ctx, key, value); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -37,7 +37,7 @@ func TestCompactor_L0Compaction(t *testing.T) {
 			t.Fatalf("flush: %v", err)
 		}
 	}
-	writer.close()
+	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
@@ -93,8 +93,8 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 512
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 512
 
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -107,7 +107,7 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 			key := []byte{byte('a' + batch), byte('0' + i)}
 			value := []byte{byte('v'), byte(batch), byte(i)}
 			testData[string(key)] = string(value)
-			if err := writer.put(key, value); err != nil {
+			if err := writer.put(ctx, key, value); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -115,7 +115,7 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 			t.Fatalf("flush: %v", err)
 		}
 	}
-	writer.close()
+	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
@@ -158,8 +158,8 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 512
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 512
 
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			key := []byte{byte('k'), byte(batch), byte(i)}
 			value := []byte("value")
-			if err := writer.put(key, value); err != nil {
+			if err := writer.put(ctx, key, value); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -181,7 +181,7 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 
 		for i := 0; i < 3; i++ {
 			key := []byte{byte('k'), byte(batch), byte(i)}
-			if err := writer.delete(key); err != nil {
+			if err := writer.delete(ctx, key); err != nil {
 				t.Fatalf("delete: %v", err)
 			}
 		}
@@ -189,7 +189,7 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 			t.Fatalf("flush: %v", err)
 		}
 	}
-	writer.close()
+	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
@@ -283,13 +283,13 @@ func TestCompactor_Refresh(t *testing.T) {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := writer.put([]byte("key"), []byte("value")); err != nil {
+	if err := writer.put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	writer.close()
+	writer.close(ctx)
 
 	if err := compactor.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -311,8 +311,8 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 1024
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 1024
 
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -328,7 +328,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 			for j := range value {
 				value[j] = byte(batch ^ i ^ j)
 			}
-			if err := writer.put(key, value); err != nil {
+			if err := writer.put(ctx, key, value); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -336,7 +336,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 			t.Fatalf("flush: %v", err)
 		}
 	}
-	writer.close()
+	writer.close(ctx)
 
 	compactorOpts := DefaultCompactorOptions()
 	compactorOpts.L0CompactionThreshold = 4
@@ -394,8 +394,8 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	}
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 512
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 512
 
 	expectedData := make(map[string]string)
 
@@ -409,7 +409,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v1", i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -421,14 +421,14 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v1", i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
-		writer.close()
+		writer.close(ctx)
 
 		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
@@ -490,7 +490,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v2-UPDATED", i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -502,14 +502,14 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v3-LATEST", i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
-		writer.close()
+		writer.close(ctx)
 
 		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
@@ -559,7 +559,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 				key := fmt.Sprintf("batch%d-key-%03d", batch, i)
 				value := fmt.Sprintf("batch%d-value-%03d", batch, i)
 				expectedData[key] = value
-				if err := writer.put([]byte(key), []byte(value)); err != nil {
+				if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 					t.Fatalf("put: %v", err)
 				}
 			}
@@ -571,14 +571,14 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 				key := fmt.Sprintf("batch%d-key-%03d", batch, i)
 				value := fmt.Sprintf("batch%d-value-%03d", batch, i)
 				expectedData[key] = value
-				if err := writer.put([]byte(key), []byte(value)); err != nil {
+				if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 					t.Fatalf("put: %v", err)
 				}
 			}
 			if err := writer.flush(ctx); err != nil {
 				t.Fatalf("flush: %v", err)
 			}
-			writer.close()
+			writer.close(ctx)
 
 			compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 			if err != nil {
@@ -644,7 +644,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("key-%03d", i)
 			deletedKeys[key] = true
 			delete(expectedData, key)
-			if err := writer.delete([]byte(key)); err != nil {
+			if err := writer.delete(ctx, []byte(key)); err != nil {
 				t.Fatalf("delete: %v", err)
 			}
 		}
@@ -656,14 +656,14 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			key := fmt.Sprintf("padding-key-%03d", i)
 			value := fmt.Sprintf("padding-value-%03d", i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
-		writer.close()
+		writer.close(ctx)
 
 		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
@@ -758,20 +758,20 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	}
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 256
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 256
 
 	writer1, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := writer1.put([]byte("foo"), []byte("v1-old")); err != nil {
+	if err := writer1.put(ctx, []byte("foo"), []byte("v1-old")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("filler1-%03d", i)
-		if err := writer1.put([]byte(key), []byte("filler-value-1")); err != nil {
+		if err := writer1.put(ctx, []byte(key), []byte("filler-value-1")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
@@ -781,14 +781,14 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 
 	for i := 50; i < 100; i++ {
 		key := fmt.Sprintf("filler1-%03d", i)
-		if err := writer1.put([]byte(key), []byte("filler-value-1")); err != nil {
+		if err := writer1.put(ctx, []byte(key), []byte("filler-value-1")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
 	if err := writer1.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	writer1.close()
+	writer1.close(ctx)
 
 	compactor1, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
@@ -804,12 +804,12 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := writer2.put([]byte("foo"), []byte("v2-new")); err != nil {
+	if err := writer2.put(ctx, []byte("foo"), []byte("v2-new")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	for i := 0; i < 30; i++ {
 		key := fmt.Sprintf("filler2-%03d", i)
-		if err := writer2.put([]byte(key), []byte("short")); err != nil {
+		if err := writer2.put(ctx, []byte(key), []byte("short")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
@@ -819,14 +819,14 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 
 	for i := 30; i < 60; i++ {
 		key := fmt.Sprintf("filler2-%03d", i)
-		if err := writer2.put([]byte(key), []byte("short")); err != nil {
+		if err := writer2.put(ctx, []byte(key), []byte("short")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
 	if err := writer2.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	writer2.close()
+	writer2.close(ctx)
 
 	compactor2, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {
@@ -862,22 +862,22 @@ func TestCompactor_ValidateSSTChecksum(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := w.put([]byte("k1"), []byte("v1")); err != nil {
+	if err := w.put(ctx, []byte("k1"), []byte("v1")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := w.put([]byte("k2"), []byte("v2")); err != nil {
+	if err := w.put(ctx, []byte("k2"), []byte("v2")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	w.close()
+	w.close(ctx)
 
 	m, err := manifestStore.Replay(ctx)
 	if err != nil {
@@ -934,8 +934,8 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	}
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
-	writerOpts.MemtableSize = 4 * 1024
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 4 * 1024
 
 	expectedData := make(map[string]string)
 
@@ -949,14 +949,14 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 			key := fmt.Sprintf("batch%d-key-%05d", batch, i)
 			value := fmt.Sprintf("batch%d-value-%05d", batch, i)
 			expectedData[key] = value
-			if err := writer.put([]byte(key), []byte(value)); err != nil {
+			if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
-		writer.close()
+		writer.close(ctx)
 
 		compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 		if err != nil {
@@ -1028,16 +1028,16 @@ func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	writerOpts := DefaultWriterOptions()
-	writerOpts.FlushInterval = 0
+	writerOpts.Flush.Interval = 0
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	defer writer.close()
+	defer writer.close(ctx)
 
 	for i := 0; i < 6; i++ {
 		key := fmt.Sprintf("mark-key-%03d", i)
-		if err := writer.put([]byte(key), []byte("value")); err != nil {
+		if err := writer.put(ctx, []byte(key), []byte("value")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		if err := writer.flush(ctx); err != nil {

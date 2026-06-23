@@ -207,7 +207,7 @@ writer, err := db.OpenWriter(ctx, opts)
 if err != nil {
 	log.Fatal(err)
 }
-defer writer.Close()
+defer writer.Close(ctx)
 
 batch := []struct {
 	key   string
@@ -217,7 +217,7 @@ batch := []struct {
 	{key: "foo", value: "bar"},
 }
 for _, kv := range batch {
-	if err := writer.Put([]byte(kv.key), []byte(kv.value)); err != nil {
+	if err := writer.Put(ctx, []byte(kv.key), []byte(kv.value)); err != nil {
 		log.Fatal(err)
 	}
 }

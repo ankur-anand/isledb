@@ -15,17 +15,17 @@ func TestReader_RefreshAndPrefetch(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -47,7 +47,7 @@ func TestReader_RefreshAndPrefetch(t *testing.T) {
 	for i := 5; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -83,17 +83,17 @@ func TestReader_RefreshAndPrefetch_NoNewSSTs(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -149,12 +149,12 @@ func TestReader_RefreshAndPrefetch_MultipleFlushes(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	rOpts := DefaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
@@ -168,7 +168,7 @@ func TestReader_RefreshAndPrefetch_MultipleFlushes(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			key := fmt.Sprintf("batch%d:key:%03d", batch, i)
 			value := fmt.Sprintf("batch%d:value:%03d", batch, i)
-			if err := w.put([]byte(key), []byte(value)); err != nil {
+			if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put failed: %v", err)
 			}
 		}
@@ -209,17 +209,17 @@ func TestReader_RefreshAndPrefetch_ValidatesChecksum(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -244,7 +244,7 @@ func TestReader_RefreshAndPrefetch_ValidatesChecksum(t *testing.T) {
 	for i := 3; i < 6; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}

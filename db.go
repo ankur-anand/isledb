@@ -11,29 +11,30 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-// Writer provides write access to the database.
+// Writer provides write access to the database. It is not safe for concurrent
+// use; callers should serialize Put/Delete/Flush/Close for one writer.
 type Writer struct {
 	w *writer
 }
 
 // Put writes a key-value pair to the database.
-func (w *Writer) Put(key, value []byte) error {
-	return w.w.put(key, value)
+func (w *Writer) Put(ctx context.Context, key, value []byte) error {
+	return w.w.put(ctx, key, value)
 }
 
 // PutWithTTL writes a key-value pair with a time-to-live duration.
-func (w *Writer) PutWithTTL(key, value []byte, ttl time.Duration) error {
-	return w.w.putWithTTL(key, value, ttl)
+func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error {
+	return w.w.putWithTTL(ctx, key, value, ttl)
 }
 
 // Delete marks a key as deleted.
-func (w *Writer) Delete(key []byte) error {
-	return w.w.delete(key)
+func (w *Writer) Delete(ctx context.Context, key []byte) error {
+	return w.w.delete(ctx, key)
 }
 
 // DeleteWithTTL marks a key as deleted with a time-to-live duration.
-func (w *Writer) DeleteWithTTL(key []byte, ttl time.Duration) error {
-	return w.w.deleteWithTTL(key, ttl)
+func (w *Writer) DeleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
+	return w.w.deleteWithTTL(ctx, key, ttl)
 }
 
 // Flush forces a flush of the current memtable to a new SST file.
@@ -41,9 +42,13 @@ func (w *Writer) Flush(ctx context.Context) error {
 	return w.w.flush(ctx)
 }
 
-// Close closes the writer, flushing any pending writes.
-func (w *Writer) Close() error {
-	return w.w.close()
+// Close closes the writer, flushing any pending writes before returning.
+func (w *Writer) Close(ctx context.Context) error {
+	return w.w.close(ctx)
+}
+
+func (w *Writer) closeDB() error {
+	return w.w.closeWithTimeout(30 * time.Second)
 }
 
 // DB encapsulates manifest state for writers and compactors operating on a single bucket/prefix.
@@ -58,7 +63,7 @@ type DB struct {
 }
 
 type dbCloser interface {
-	Close() error
+	closeDB() error
 }
 
 // DBOptions configures a DB instance.
@@ -110,7 +115,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 
 	writer := &Writer{w: w}
 	if err := db.registerCloser(writer); err != nil {
-		_ = writer.Close()
+		_ = writer.Close(ctx)
 		return nil, err
 	}
 	return writer, nil
@@ -170,7 +175,7 @@ func (db *DB) Close() error {
 
 	var firstErr error
 	for _, c := range closers {
-		if err := c.Close(); err != nil && firstErr == nil {
+		if err := c.closeDB(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

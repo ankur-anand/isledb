@@ -177,16 +177,16 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	err = w.putWithTTL([]byte("key1"), []byte("value1"), time.Hour)
+	err = w.putWithTTL(ctx, []byte("key1"), []byte("value1"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -222,14 +222,14 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	w.mu.Lock()
 	w.seq++
@@ -238,7 +238,7 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("expired_key"), []byte("expired_value"), seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.putWithTTL([]byte("valid_key"), []byte("valid_value"), time.Hour)
+	err = w.putWithTTL(ctx, []byte("valid_key"), []byte("valid_value"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -282,14 +282,14 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	w.mu.Lock()
 	w.seq++
@@ -299,11 +299,11 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("ccc"), []byte("expired2"), w.seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.putWithTTL([]byte("bbb"), []byte("valid1"), time.Hour)
+	err = w.putWithTTL(ctx, []byte("bbb"), []byte("valid1"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
-	err = w.putWithTTL([]byte("ddd"), []byte("valid2"), time.Hour)
+	err = w.putWithTTL(ctx, []byte("ddd"), []byte("valid2"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -345,16 +345,16 @@ func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	opts := DefaultWriterOptions()
-	opts.MemtableSize = 1024 * 1024
-	opts.FlushInterval = 0
+	opts.Memtable.TargetBytes = 1024 * 1024
+	opts.Flush.Interval = 0
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
-	if err := w.put([]byte("key1"), []byte("old_value")); err != nil {
+	if err := w.put(ctx, []byte("key1"), []byte("old_value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 

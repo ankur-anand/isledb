@@ -111,15 +111,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer writer.Close()
+	defer writer.Close(ctx)
 
 	for i := 0; i < 10; i++ {
 		dataKey := fmt.Sprintf("data/%03d", i)
 		value := fmt.Sprintf("value-%03d", i)
-		if err := writer.Put([]byte(dataKey), []byte(value)); err != nil {
+		if err := writer.Put(ctx, []byte(dataKey), []byte(value)); err != nil {
 			log.Fatal(err)
 		}
-		if err := writeWALEvent(writer, walPrefix, &walSeq, "put", dataKey); err != nil {
+		if err := writeWALEvent(ctx, writer, walPrefix, &walSeq, "put", dataKey); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -173,10 +173,10 @@ func main() {
 		})
 	}()
 
-	if err := writer.Put([]byte("data/tail"), []byte("tail-value")); err != nil {
+	if err := writer.Put(ctx, []byte("data/tail"), []byte("tail-value")); err != nil {
 		log.Fatal(err)
 	}
-	if err := writeWALEvent(writer, walPrefix, &walSeq, "put", "data/tail"); err != nil {
+	if err := writeWALEvent(ctx, writer, walPrefix, &walSeq, "put", "data/tail"); err != nil {
 		log.Fatal(err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -189,10 +189,10 @@ func main() {
 		for i := 0; i < 5; i++ {
 			dataKey := fmt.Sprintf("data/burst-%03d-%03d", batch, i)
 			value := fmt.Sprintf("value-%03d-%03d", batch, i)
-			if err := writer.Put([]byte(dataKey), []byte(value)); err != nil {
+			if err := writer.Put(ctx, []byte(dataKey), []byte(value)); err != nil {
 				log.Fatal(err)
 			}
-			if err := writeWALEvent(writer, walPrefix, &walSeq, "put", dataKey); err != nil {
+			if err := writeWALEvent(ctx, writer, walPrefix, &walSeq, "put", dataKey); err != nil {
 				log.Fatal(err)
 			}
 		}
@@ -203,10 +203,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := writer.Delete([]byte("data/005")); err != nil {
+	if err := writer.Delete(ctx, []byte("data/005")); err != nil {
 		log.Fatal(err)
 	}
-	if err := writeWALEvent(writer, walPrefix, &walSeq, "delete", "data/005"); err != nil {
+	if err := writeWALEvent(ctx, writer, walPrefix, &walSeq, "delete", "data/005"); err != nil {
 		log.Fatal(err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -243,7 +243,7 @@ type walEvent struct {
 	Time string `json:"time"`
 }
 
-func writeWALEvent(writer *isledb.Writer, prefix string, seq *int, op, key string) error {
+func writeWALEvent(ctx context.Context, writer *isledb.Writer, prefix string, seq *int, op, key string) error {
 	*seq = *seq + 1
 	event := walEvent{
 		Key:  key,
@@ -255,7 +255,7 @@ func writeWALEvent(writer *isledb.Writer, prefix string, seq *int, op, key strin
 		return err
 	}
 	walKey := fmt.Sprintf("%s%s-%06d", prefix, time.Now().UTC().Format("20060102T150405.000000000Z"), *seq)
-	return writer.Put([]byte(walKey), data)
+	return writer.Put(ctx, []byte(walKey), data)
 }
 
 func prefixUpperBound(prefix string) []byte {

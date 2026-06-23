@@ -17,8 +17,8 @@ defer db.Close()
 
 // 3. Write data
 w, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
-defer w.Close()
-w.Put([]byte("key"), []byte("value"))
+defer w.Close(ctx)
+w.Put(ctx, []byte("key"), []byte("value"))
 w.Flush(ctx)
 
 // 4. Read data
@@ -67,24 +67,37 @@ Provides write access to the database. Buffers writes in a memtable and flushes 
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Put | `(key, value []byte) error` | Write a key-value pair |
-| PutWithTTL | `(key, value []byte, ttl time.Duration) error` | Write with time-to-live |
-| Delete | `(key []byte) error` | Mark a key as deleted |
-| DeleteWithTTL | `(key []byte, ttl time.Duration) error` | Delete with TTL |
+| Put | `(ctx context.Context, key, value []byte) error` | Write a key-value pair |
+| PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Write with time-to-live |
+| Delete | `(ctx context.Context, key []byte) error` | Mark a key as deleted |
+| DeleteWithTTL | `(ctx context.Context, key []byte, ttl time.Duration) error` | Delete with TTL |
 | Flush | `(ctx context.Context) error` | Force flush memtable to SST |
-| Close | `() error` | Close the writer |
+| Close | `(ctx context.Context) error` | Close the writer |
 
 ```go
 type WriterOptions struct {
-    MemtableSize           int64                    // Memtable size before flush
-    FlushInterval          time.Duration            // Auto-flush interval
-    BloomBitsPerKey        int                      // Bloom filter bits per key
-    BlockSize              int                      // SST block size
-    Compression            string                   // Compression algorithm
-    MaxImmutableMemtables  int                      // Max pending memtables before backpressure
-    OnFlushError           func(error)              // Flush error callback
-    ValueStorage           config.ValueStorageConfig // Value storage configuration
-    OwnerID                string                   // Writer owner identifier
+    OwnerID      string
+    Memtable    WriterMemtableOptions
+    Flush       WriterFlushOptions
+    SST         WriterSSTOptions
+    Values      config.ValueStorageConfig
+    OnFlushError func(error)
+    Metrics     *WriterMetrics
+}
+
+type WriterMemtableOptions struct {
+    TargetBytes int64 // Approximate active memtable size before rotation.
+    MaxFrozen   int   // Max full memtables waiting for flush. Zero means unbounded.
+}
+
+type WriterFlushOptions struct {
+    Interval time.Duration // Background flush cadence. Zero disables auto-flush.
+}
+
+type WriterSSTOptions struct {
+    BloomBitsPerKey int
+    BlockBytes      int
+    Compression     string
 }
 
 func DefaultWriterOptions() WriterOptions

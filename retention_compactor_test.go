@@ -18,7 +18,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
@@ -28,7 +28,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			key := fmt.Sprintf("wal:%d:%03d", batch, i)
 			value := fmt.Sprintf("entry:%d:%03d", batch, i)
-			if err := w.put([]byte(key), []byte(value)); err != nil {
+			if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put failed: %v", err)
 			}
 		}
@@ -36,7 +36,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.close()
+	w.close(ctx)
 
 	rOpts := DefaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
@@ -86,7 +86,7 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
@@ -96,7 +96,7 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			key := fmt.Sprintf("log:%d:%03d", batch, i)
 			value := fmt.Sprintf("data:%d:%03d", batch, i)
-			if err := w.put([]byte(key), []byte(value)); err != nil {
+			if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put failed: %v", err)
 			}
 		}
@@ -104,7 +104,7 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.close()
+	w.close(ctx)
 
 	cleanerOpts := RetentionCompactorOptions{
 		Mode:            CompactByTimeWindow,
@@ -140,7 +140,7 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
@@ -148,14 +148,14 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.put([]byte(key), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(key), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
-	w.close()
+	w.close(ctx)
 
 	cleanerOpts := RetentionCompactorOptions{
 		Mode:            CompactByAge,
@@ -191,21 +191,21 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 5; batch++ {
-		if err := w.put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
 			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.close()
+	w.close(ctx)
 
 	var callbackCalled atomic.Bool
 	var deletedCount int
@@ -246,21 +246,21 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 5; batch++ {
-		if err := w.put([]byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(fmt.Sprintf("key:%d", batch)), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
 			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	w.close()
+	w.close(ctx)
 
 	var cleanupCount atomic.Int32
 
@@ -318,21 +318,21 @@ func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
 
 	for batch := 0; batch < 6; batch++ {
-		if err := w.put([]byte(fmt.Sprintf("fence-key:%d", batch)), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(fmt.Sprintf("fence-key:%d", batch)), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
 			t.Fatalf("flush failed: %v", err)
 		}
 	}
-	if err := w.close(); err != nil {
+	if err := w.close(ctx); err != nil {
 		t.Fatalf("writer close failed: %v", err)
 	}
 
@@ -390,17 +390,17 @@ func TestRetentionCompactor_FIFO_EnqueuesDeleteMarks_NoPhysicalDelete(t *testing
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for batch := 0; batch < 5; batch++ {
 		key := fmt.Sprintf("fifo-mark:%03d", batch)
 		value := fmt.Sprintf("value:%03d", batch)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
@@ -457,17 +457,17 @@ func TestRetentionCompactor_Segmented_EnqueuesDeleteMarks_NoPhysicalDelete(t *te
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for batch := 0; batch < 4; batch++ {
 		key := fmt.Sprintf("seg-mark:%03d", batch)
 		value := fmt.Sprintf("value:%03d", batch)
-		if err := w.put([]byte(key), []byte(value)); err != nil {
+		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
@@ -525,16 +525,16 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 6; i++ {
 		key := fmt.Sprintf("catchup-key:%03d", i)
-		if err := w.put([]byte(key), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(key), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
@@ -664,16 +664,16 @@ func TestRetentionCompactor_LogCatchup_FastForwardsFromSnapshotBoundary(t *testi
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("snap-boundary-key:%03d", i)
-		if err := w.put([]byte(key), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(key), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
@@ -738,16 +738,16 @@ func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing
 	manifestStore := newManifestStore(store, nil)
 
 	wOpts := DefaultWriterOptions()
-	wOpts.FlushInterval = 0
+	wOpts.Flush.Interval = 0
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {
 		t.Fatalf("newWriter failed: %v", err)
 	}
-	defer w.close()
+	defer w.close(ctx)
 
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("orphan-scan-key:%03d", i)
-		if err := w.put([]byte(key), []byte("value")); err != nil {
+		if err := w.put(ctx, []byte(key), []byte("value")); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 		if err := w.flush(ctx); err != nil {
