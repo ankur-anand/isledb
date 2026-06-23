@@ -63,5 +63,5 @@ func newManifestStoreWithCache(store *blobstore.Store, opts *ReaderOptions) *man
 }
 
 func isFenceError(err error) bool {
-	return errors.Is(err, manifest.ErrFenced) || errors.Is(err, manifest.ErrFenceConflict)
+	return errors.Is(err, manifest.ErrFenced)
 }

@@ -287,31 +287,42 @@ Merges L0 SSTs into sorted runs and merges consecutive similar runs in the backg
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Start | `()` | Start background compaction loop |
-| Stop | `()` | Stop background compaction |
-| Close | `() error` | Close compactor |
+| Start | `(ctx context.Context) error` | Start background compaction loop |
+| Close | `(ctx context.Context) error` | Stop background compaction and close compactor |
 | Refresh | `(ctx context.Context) error` | Reload manifest |
-| RunCompaction | `(ctx context.Context) error` | Perform a compaction cycle |
+| RunOnce | `(ctx context.Context) error` | Perform one scheduler compaction pass |
 | IsFenced | `() bool` | Check if compactor is fenced |
 | FenceToken | `() *manifest.FenceToken` | Get fence token |
 
 ```go
 type CompactorOptions struct {
-    L0CompactionThreshold int                      // L0 SST count to trigger compaction
-    MinSources            int                      // Min sorted runs to merge
-    MaxSources            int                      // Max sorted runs to merge
-    SizeThreshold         int                      // Size similarity threshold
-    BloomBitsPerKey       int                      // Bloom filter bits per key
-    BlockSize             int                      // SST block size
-    Compression           string                   // Compression algorithm
-    TargetSSTSize         int64                    // Target SST file size
-    ValidateSSTChecksum   bool                     // Verify SST checksums
-    SSTHashVerifier       SSTHashVerifier          // SST signature verifier
-    CheckInterval         time.Duration            // Compaction check interval
+    OwnerID string
+    Trigger CompactionTriggerOptions
+    Output  CompactionOutputOptions
+    Safety  CompactionSafetyOptions
     OnCompactionStart     func(CompactionJob)      // Compaction start callback
     OnCompactionEnd       func(CompactionJob, error) // Compaction end callback
-    OwnerID               string                   // Compactor owner identifier
     GCMarkStorage         manifest.GCMarkStorage   // Optional custom GC mark storage backend
+}
+
+type CompactionTriggerOptions struct {
+    CheckInterval time.Duration // Background scheduler cadence used by Start.
+    L0SSTCount    int           // L0 SST count that triggers an L0 merge.
+    MinSources    int           // Minimum sorted runs to merge.
+    MaxSources    int           // Maximum sorted runs to merge.
+    SizeRatio     int           // Size similarity threshold.
+}
+
+type CompactionOutputOptions struct {
+    TargetSSTBytes int64
+    BloomBitsPerKey int
+    BlockBytes      int
+    Compression     string
+}
+
+type CompactionSafetyOptions struct {
+    ValidateSSTChecksum bool
+    SSTHashVerifier     SSTHashVerifier
 }
 
 func DefaultCompactorOptions() CompactorOptions
@@ -334,11 +345,10 @@ Deletes old SSTs based on a retention policy (age-based FIFO or time-window segm
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Start | `()` | Start background cleanup loop |
-| Stop | `()` | Stop background cleanup |
-| Close | `() error` | Close retention compactor |
+| Start | `(ctx context.Context) error` | Start background cleanup loop |
+| Close | `(ctx context.Context) error` | Stop background cleanup and close retention compactor |
 | Refresh | `(ctx context.Context) error` | Reload manifest |
-| RunCleanup | `(ctx context.Context) error` | Perform a cleanup cycle |
+| RunOnce | `(ctx context.Context) error` | Perform a cleanup cycle |
 | IsFenced | `() bool` | Check if fenced |
 | Stats | `() RetentionCompactorStats` | Get current statistics |
 

@@ -48,9 +48,10 @@ type Compactor struct {
 	mu       sync.Mutex
 	manifest *Manifest
 
-	ticker *time.Ticker
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	lifecycleMu sync.Mutex
+	ticker      *time.Ticker
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -60,19 +61,10 @@ type Compactor struct {
 }
 
 func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts CompactorOptions) (*Compactor, error) {
-	d := DefaultCompactorOptions()
-	opts.L0CompactionThreshold = cmp.Or(opts.L0CompactionThreshold, d.L0CompactionThreshold)
-	opts.MinSources = cmp.Or(opts.MinSources, d.MinSources)
-	opts.MaxSources = cmp.Or(opts.MaxSources, d.MaxSources)
-	opts.SizeThreshold = cmp.Or(opts.SizeThreshold, d.SizeThreshold)
-	opts.BloomBitsPerKey = cmp.Or(opts.BloomBitsPerKey, d.BloomBitsPerKey)
-	opts.BlockSize = cmp.Or(opts.BlockSize, d.BlockSize)
-	opts.Compression = cmp.Or(opts.Compression, d.Compression)
-	opts.CheckInterval = cmp.Or(opts.CheckInterval, d.CheckInterval)
-	opts.TargetSSTSize = cmp.Or(opts.TargetSSTSize, d.TargetSSTSize)
-	if opts.GCMarkStorage == nil {
-		opts.GCMarkStorage = newGCMarkStorage(store)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
 	}
+	opts = normalizeCompactorOptions(opts, store)
 
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
@@ -85,7 +77,6 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
-		stopCh:      make(chan struct{}),
 	}
 
 	ownerID := opts.OwnerID
@@ -101,39 +92,95 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 	return c, nil
 }
 
-func (c *Compactor) Start() {
+func normalizeCompactorOptions(opts CompactorOptions, store *blobstore.Store) CompactorOptions {
+	d := DefaultCompactorOptions()
+	if opts.Trigger.CheckInterval <= 0 {
+		opts.Trigger.CheckInterval = d.Trigger.CheckInterval
+	}
+	if opts.Trigger.L0SSTCount <= 0 {
+		opts.Trigger.L0SSTCount = d.Trigger.L0SSTCount
+	}
+	if opts.Trigger.MinSources <= 0 {
+		opts.Trigger.MinSources = d.Trigger.MinSources
+	}
+	if opts.Trigger.MaxSources <= 0 {
+		opts.Trigger.MaxSources = d.Trigger.MaxSources
+	}
+	if opts.Trigger.SizeRatio <= 0 {
+		opts.Trigger.SizeRatio = d.Trigger.SizeRatio
+	}
+	if opts.Output.BloomBitsPerKey == 0 {
+		opts.Output.BloomBitsPerKey = d.Output.BloomBitsPerKey
+	}
+	if opts.Output.BlockBytes == 0 {
+		opts.Output.BlockBytes = d.Output.BlockBytes
+	}
+	opts.Output.Compression = cmp.Or(opts.Output.Compression, d.Output.Compression)
+	if opts.Output.TargetSSTBytes <= 0 {
+		opts.Output.TargetSSTBytes = d.Output.TargetSSTBytes
+	}
+	if opts.GCMarkStorage == nil {
+		opts.GCMarkStorage = newGCMarkStorage(store)
+	}
+	return opts
+}
+
+func (c *Compactor) Start(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	if c.closed.Load() {
+		return errors.New("compactor closed")
+	}
 	if !c.running.CompareAndSwap(false, true) {
-		return
-	}
-	c.stopCh = make(chan struct{})
-	c.ticker = time.NewTicker(c.opts.CheckInterval)
-	c.wg.Add(1)
-	go c.compactionLoop()
-}
-
-func (c *Compactor) Stop() {
-	if !c.running.CompareAndSwap(true, false) {
-		return
-	}
-	if c.stopCh != nil {
-		close(c.stopCh)
-	}
-	if c.ticker != nil {
-		c.ticker.Stop()
-	}
-	c.wg.Wait()
-}
-
-func (c *Compactor) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	c.Stop()
+
+	loopCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
+	c.ticker = time.NewTicker(c.opts.Trigger.CheckInterval)
+	c.wg.Add(1)
+	go c.compactionLoop(loopCtx, c.ticker)
 	return nil
 }
 
+func (c *Compactor) stopLoop() {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	if c.ticker != nil {
+		c.ticker.Stop()
+		c.ticker = nil
+	}
+	c.running.Store(false)
+}
+
+func (c *Compactor) Close(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if c.closed.CompareAndSwap(false, true) {
+		c.stopLoop()
+	}
+	return waitGroupContext(ctx, &c.wg)
+}
+
 func (c *Compactor) closeDB() error {
-	return c.Close()
+	return c.closeWithTimeout(30 * time.Second)
+}
+
+func (c *Compactor) closeWithTimeout(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.Close(ctx)
 }
 
 func (c *Compactor) Refresh(ctx context.Context) error {
@@ -147,27 +194,46 @@ func (c *Compactor) Refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *Compactor) compactionLoop() {
+func (c *Compactor) compactionLoop(ctx context.Context, ticker *time.Ticker) {
 	defer c.wg.Done()
+	defer func() {
+		ticker.Stop()
+		c.lifecycleMu.Lock()
+		if c.ticker == ticker {
+			c.ticker = nil
+			c.cancel = nil
+		}
+		c.lifecycleMu.Unlock()
+		c.running.Store(false)
+	}()
 	for {
 		select {
-		case <-c.ticker.C:
-			if err := c.RunCompaction(context.Background()); err != nil {
-
+		case <-ticker.C:
+			if err := c.RunOnce(ctx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
 				if isFenceError(err) {
 					slog.Error("isledb: compactor fenced, stopping background compaction")
 					return
 				}
+				if errors.Is(err, manifest.ErrFenceConflict) {
+					slog.Debug("isledb: compaction skipped after concurrent manifest update")
+					continue
+				}
 				slog.Error("isledb: compaction error", "error", err)
 			}
-		case <-c.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// RunCompaction performs a compaction cycle and returns when no work remains.
-func (c *Compactor) RunCompaction(ctx context.Context) error {
+// RunOnce performs one scheduler compaction pass and returns when no work remains.
+func (c *Compactor) RunOnce(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
 
 	for i := 0; i < CompactionMaxIterations; i++ {
 		if err := ctx.Err(); err != nil {
@@ -185,7 +251,7 @@ func (c *Compactor) RunCompaction(ctx context.Context) error {
 		m := c.manifest.Clone()
 		c.mu.Unlock()
 
-		if m.L0SSTCount() >= c.opts.L0CompactionThreshold {
+		if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount {
 			if err := c.compactL0(ctx, m); err != nil {
 
 				if isFenceError(err) {
@@ -224,6 +290,9 @@ func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
 		return
 	}
 	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		slog.Warn("isledb: compactor sst sweep failed", "error", err)
 	}
 }
@@ -310,9 +379,9 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 
 func (c *Compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
 	runs := m.FindConsecutiveSimilarRuns(
-		c.opts.MinSources,
-		c.opts.MaxSources,
-		c.opts.SizeThreshold,
+		c.opts.Trigger.MinSources,
+		c.opts.Trigger.MaxSources,
+		c.opts.Trigger.SizeRatio,
 	)
 
 	if len(runs) == 0 {
@@ -511,7 +580,7 @@ func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Ite
 			cleanup()
 			return nil, nil, fmt.Errorf("read sst %s: %w", sst.ID, err)
 		}
-		if err := validateSSTDataForCompaction(sst, data, c.opts.ValidateSSTChecksum, c.opts.SSTHashVerifier); err != nil {
+		if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum, c.opts.Safety.SSTHashVerifier); err != nil {
 			cleanup()
 			return nil, nil, err
 		}
@@ -588,9 +657,9 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 	defer iter.close()
 
 	sstOpts := SSTWriterOptions{
-		BloomBitsPerKey: c.opts.BloomBitsPerKey,
-		BlockSize:       c.opts.BlockSize,
-		Compression:     c.opts.Compression,
+		BloomBitsPerKey: c.opts.Output.BloomBitsPerKey,
+		BlockSize:       c.opts.Output.BlockBytes,
+		Compression:     c.opts.Output.Compression,
 	}
 
 	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
@@ -601,7 +670,7 @@ func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 		return err
 	}
 
-	results, err := writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.TargetSSTSize, uploadFn)
+	results, err := writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.Output.TargetSSTBytes, uploadFn)
 	if err != nil {
 		if errors.Is(err, ErrEmptyIterator) {
 			return nil, nil

@@ -400,17 +400,17 @@ func BenchmarkDB_Get_AfterCompaction(b *testing.B) {
 	}
 
 	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.L0CompactionThreshold = 4
+	compactorOpts.Trigger.L0SSTCount = 4
 
 	compactor, err := db.OpenCompactor(ctx, compactorOpts)
 	if err != nil {
 		b.Fatalf("OpenCompactor: %v", err)
 	}
-	if err := compactor.RunCompaction(ctx); err != nil {
-		_ = compactor.Close()
-		b.Fatalf("RunCompaction: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		_ = compactor.Close(ctx)
+		b.Fatalf("RunOnce: %v", err)
 	}
-	if err := compactor.Close(); err != nil {
+	if err := compactor.Close(ctx); err != nil {
 		b.Fatalf("Compactor close: %v", err)
 	}
 
@@ -722,7 +722,7 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 		}
 
 		compactorOpts := DefaultCompactorOptions()
-		compactorOpts.L0CompactionThreshold = 4
+		compactorOpts.Trigger.L0SSTCount = 4
 
 		compactor, err := db.OpenCompactor(ctx, compactorOpts)
 		if err != nil {
@@ -732,16 +732,16 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 
 		b.StartTimer()
 
-		if err := compactor.RunCompaction(ctx); err != nil {
-			_ = compactor.Close()
+		if err := compactor.RunOnce(ctx); err != nil {
+			_ = compactor.Close(ctx)
 			_ = db.Close()
 			_ = store.Close()
-			b.Fatalf("RunCompaction: %v", err)
+			b.Fatalf("RunOnce: %v", err)
 		}
 
 		b.StopTimer()
 
-		if err := compactor.Close(); err != nil {
+		if err := compactor.Close(ctx); err != nil {
 			_ = db.Close()
 			_ = store.Close()
 			b.Fatalf("Compactor close: %v", err)

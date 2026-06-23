@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,79 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
 )
+
+func TestRetentionCompactor_RejectsNilContext(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("retention-nil-context")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	if _, err := newRetentionCompactor(nil, store, manifestStore, RetentionCompactorOptions{}); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("newRetentionCompactor(nil) error=%v, want %v", err, ErrNilContext)
+	}
+
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor: %v", err)
+	}
+	defer cleaner.Close(ctx)
+
+	if err := cleaner.Start(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("Start(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := cleaner.RunOnce(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("RunOnce(nil) error=%v, want %v", err, ErrNilContext)
+	}
+	if err := cleaner.Close(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("Close(nil) error=%v, want %v", err, ErrNilContext)
+	}
+}
+
+func TestRetentionCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("retention-close-retry")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+
+	opts := DefaultRetentionCompactorOptions()
+	opts.CheckInterval = 10 * time.Millisecond
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newRetentionCompactor: %v", err)
+	}
+
+	storage.block.Store(true)
+	if err := cleaner.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background retention compactor did not reach blocking CURRENT read")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = cleaner.Close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := cleaner.Close(retryCtx); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
 
 func TestRetentionCompactor_FIFO(t *testing.T) {
 	ctx := context.Background()
@@ -58,10 +132,10 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	rOpts2 := DefaultReaderOptions()
@@ -118,11 +192,11 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
 	statsBefore := cleaner.Stats()
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	statsAfter := cleaner.Stats()
@@ -168,12 +242,12 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
 	statsBefore := cleaner.Stats()
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	statsAfter := cleaner.Stats()
@@ -225,10 +299,10 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	if !callbackCalled.Load() {
@@ -279,11 +353,11 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
 
-	cleaner.Start()
+	cleaner.Start(ctx)
 
 	time.Sleep(150 * time.Millisecond)
 
-	cleaner.Close()
+	cleaner.Close(ctx)
 
 	if cleanupCount.Load() == 0 {
 		t.Error("Background cleanup should have run at least once")
@@ -351,7 +425,7 @@ func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
 	competingStore := newManifestStore(store, nil)
 	if _, err := competingStore.Replay(ctx); err != nil {
@@ -361,7 +435,7 @@ func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 		t.Fatalf("competing claim compactor failed: %v", err)
 	}
 
-	cleaner.Start()
+	cleaner.Start(ctx)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for cleanupErrCount.Load() == 0 && time.Now().Before(deadline) {
@@ -425,10 +499,10 @@ func TestRetentionCompactor_FIFO_EnqueuesDeleteMarks_NoPhysicalDelete(t *testing
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	sstAfter, err := store.ListSSTFiles(ctx)
@@ -494,10 +568,10 @@ func TestRetentionCompactor_Segmented_EnqueuesDeleteMarks_NoPhysicalDelete(t *te
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	sstAfter, err := store.ListSSTFiles(ctx)
@@ -552,16 +626,18 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 	targetSSTID := beforeCompaction.L0SSTs[0].ID
 
 	compactor, err := newCompactor(ctx, store, manifestStore, CompactorOptions{
-		L0CompactionThreshold: 2,
-		CheckInterval:         time.Hour,
+		Trigger: CompactionTriggerOptions{
+			L0SSTCount:    2,
+			CheckInterval: time.Hour,
+		},
 	})
 	if err != nil {
 		t.Fatalf("newCompactor failed: %v", err)
 	}
-	defer compactor.Close()
+	defer compactor.Close(ctx)
 
-	if err := compactor.RunCompaction(ctx); err != nil {
-		t.Fatalf("RunCompaction failed: %v", err)
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	found, err := hasPendingSSTDeleteMark(ctx, store, targetSSTID)
@@ -588,10 +664,10 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	found, err = hasPendingSSTDeleteMark(ctx, store, targetSSTID)
@@ -704,10 +780,10 @@ func TestRetentionCompactor_LogCatchup_FastForwardsFromSnapshotBoundary(t *testi
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	current, err := cleaner.readManifestCurrent(ctx)
@@ -783,10 +859,10 @@ func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
-	if err := cleaner.RunCleanup(ctx); err != nil {
-		t.Fatalf("RunCleanup failed: %v", err)
+	if err := cleaner.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
 	}
 
 	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)
@@ -798,7 +874,7 @@ func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing
 	}
 }
 
-func TestRetentionCompactor_RunCleanup_MissingManifestPageReturnsError(t *testing.T) {
+func TestRetentionCompactor_RunOnce_MissingManifestPageReturnsError(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 	defer store.Close()
@@ -832,7 +908,7 @@ func TestRetentionCompactor_RunCleanup_MissingManifestPageReturnsError(t *testin
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
 	}
-	defer cleaner.Close()
+	defer cleaner.Close(ctx)
 
 	current, err := cleaner.readManifestCurrent(ctx)
 	if err != nil {
@@ -851,8 +927,8 @@ func TestRetentionCompactor_RunCleanup_MissingManifestPageReturnsError(t *testin
 		t.Fatalf("write orphan sst: %v", err)
 	}
 
-	if err := cleaner.RunCleanup(ctx); err == nil {
-		t.Fatalf("expected RunCleanup to fail when a committed manifest page is missing")
+	if err := cleaner.RunOnce(ctx); err == nil {
+		t.Fatalf("expected RunOnce to fail when a committed manifest page is missing")
 	}
 
 	found, err := hasPendingSSTDeleteMark(ctx, store, orphanID)

@@ -293,9 +293,11 @@ compactor, err := db.OpenCompactor(ctx, isledb.DefaultCompactorOptions())
 if err != nil {
 	log.Fatal(err)
 }
-defer compactor.Close()
+defer compactor.Close(ctx)
 
-compactor.Start()
+if err := compactor.Start(ctx); err != nil {
+	log.Fatal(err)
+}
 ```
 
 #### Retention Compactor (by age / FIFO)
@@ -311,9 +313,11 @@ retention, err := db.OpenRetentionCompactor(ctx, isledb.RetentionCompactorOption
 if err != nil {
 	log.Fatal(err)
 }
-defer retention.Close()
+defer retention.Close(ctx)
 
-retention.Start()
+if err := retention.Start(ctx); err != nil {
+	log.Fatal(err)
+}
 ```
 
 #### Retention Compactor (by time window)
@@ -334,9 +338,11 @@ retention, err := db.OpenRetentionCompactor(ctx, isledb.RetentionCompactorOption
 if err != nil {
 	log.Fatal(err)
 }
-defer retention.Close()
+defer retention.Close(ctx)
 
-retention.Start()
+if err := retention.Start(ctx); err != nil {
+	log.Fatal(err)
+}
 ```
 
 ### Examples
