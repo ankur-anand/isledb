@@ -1422,6 +1422,52 @@ func (s *Store) UpdateCurrentLowWatermarkPosition(ctx context.Context, m *Manife
 	return ErrFenceConflict
 }
 
+// AdvanceChangeFeedLogStart advances CURRENT.change_feed_log_start and prunes
+// retained manifest entry refs below the new floor. The floor is clamped to
+// [current.change_feed_log_start, current.next_seq].
+func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*Current, error) {
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		current, etag, err := s.readCurrentWithETag(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if current == nil {
+			return nil, nil
+		}
+
+		updated := current.Clone()
+		if updated == nil {
+			return nil, nil
+		}
+		normalizeCurrent(updated)
+		if floor < updated.ChangeFeedLogStart {
+			floor = updated.ChangeFeedLogStart
+		}
+		if floor > updated.NextSeq {
+			floor = updated.NextSeq
+		}
+		if floor == updated.ChangeFeedLogStart {
+			return updated, nil
+		}
+
+		updated.ChangeFeedLogStart = floor
+		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, floor)
+		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, floor)
+
+		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
+			if errors.Is(err, ErrPreconditionFailed) {
+				continue
+			}
+			return nil, err
+		}
+		return updated, nil
+	}
+
+	return nil, ErrFenceConflict
+}
+
 func (s *Store) getKeyPositionExtractor() KeyPositionExtractor {
 	s.mu.Lock()
 	defer s.mu.Unlock()

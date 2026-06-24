@@ -111,7 +111,9 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	defer store.Close()
 
 	manifestStore := newManifestStore(store, nil)
-	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
+	opts := testWriterOptions(1<<20, 0)
+	opts.ChangeFeed.Enabled = true
+	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
@@ -177,6 +179,48 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	}
 	if batch.Changes[2].Seq != 3 || string(batch.Changes[2].Key) != "c" || string(batch.Changes[2].Value) != "vc" {
 		t.Fatalf("change[2] mismatch: %+v", batch.Changes[2])
+	}
+}
+
+func TestWriter_ChangeFeedDisabledByDefault(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-change-feed-disabled")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("a"), []byte("va")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	entrySeqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("manifest entry list: %v", err)
+	}
+	for _, entrySeq := range entrySeqs {
+		entry, err := manifestStore.ReadEntry(ctx, entrySeq)
+		if err != nil {
+			t.Fatalf("read manifest entry seq=%d: %v", entrySeq, err)
+		}
+		if entry.Op == manifest.LogOpAddSSTable && entry.ChangeBatch != nil {
+			t.Fatalf("change batch metadata present while change feed is disabled: %+v", entry.ChangeBatch)
+		}
+	}
+
+	result, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
+	if err != nil {
+		t.Fatalf("list changes: %v", err)
+	}
+	if len(result.Objects) != 0 {
+		t.Fatalf("expected no change batch objects when disabled, got %d", len(result.Objects))
 	}
 }
 

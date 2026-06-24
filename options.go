@@ -31,8 +31,18 @@ type WriterOptions struct {
 	// Values controls inline-vs-blob value storage and value/key limits.
 	Values config.ValueStorageConfig
 
+	// ChangeFeed controls whether flushes also publish seq-ordered mutation
+	// batches under changes/. Disabled by default for pure KV workloads.
+	ChangeFeed ChangeFeedOptions
+
 	OnFlushError func(error)
 	Metrics      *WriterMetrics
+}
+
+type ChangeFeedOptions struct {
+	// Enabled makes Writer.Flush publish one change batch per flushed memtable
+	// and attach its metadata to the committed manifest entry.
+	Enabled bool
 }
 
 type WriterMemtableOptions struct {
