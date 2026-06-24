@@ -22,6 +22,8 @@ var (
 	ErrNilContext   = errors.New("nil context")
 )
 
+const minMemtableArenaHeadroom = 1 << 20
+
 type writer struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
@@ -71,7 +73,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		valueConfig:             valueConfig,
 		ctx:                     writerCtx,
 		cancel:                  cancel,
-		memtable:                internal.NewMemtable(opts.Memtable.TargetBytes*2, memtableInlineThreshold),
+		memtable:                internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, valueConfig), memtableInlineThreshold),
 		memtableInlineThreshold: memtableInlineThreshold,
 		seq:                     m.MaxSeqNum(),
 		epoch:                   m.NextEpoch,
@@ -118,6 +120,32 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
 	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
 	return opts, valueConfig
+}
+
+func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorageConfig) int64 {
+	headroom := targetBytes / 4
+	if headroom < minMemtableArenaHeadroom {
+		headroom = minMemtableArenaHeadroom
+	}
+
+	maxInlineValue := int64(valueConfig.BlobThreshold - 1)
+	if maxInlineValue < 0 || maxInlineValue > valueConfig.MaxValueSize {
+		maxInlineValue = valueConfig.MaxValueSize
+	}
+	maxInlineEntry := int64(valueConfig.MaxKeySize) + maxInlineValue + 1024
+	if headroom < maxInlineEntry {
+		headroom = maxInlineEntry
+	}
+
+	if targetBytes > 0 && headroom > (1<<63-1)-targetBytes {
+		return 1<<63 - 1
+	}
+	return targetBytes + headroom
+}
+
+func (w *writer) newMemtable() *internal.Memtable {
+	arenaBytes := defaultMemtableArenaBytes(w.opts.Memtable.TargetBytes, w.valueConfig)
+	return internal.NewMemtable(arenaBytes, w.memtableInlineThreshold)
 }
 
 func (w *writer) ensureWritable() error {
@@ -259,7 +287,7 @@ func (w *writer) ensureCapacityLocked() error {
 	}
 	if w.memtable.ApproxSize() > 0 {
 		w.immQueue = append(w.immQueue, w.memtable)
-		w.memtable = internal.NewMemtable(w.opts.Memtable.TargetBytes*2, w.memtableInlineThreshold)
+		w.memtable = w.newMemtable()
 	}
 	return nil
 }
@@ -281,7 +309,7 @@ func (w *writer) flush(ctx context.Context) error {
 	w.immQueue = nil
 	if w.memtable.ApproxSize() > 0 {
 		toFlush = append(toFlush, w.memtable)
-		w.memtable = internal.NewMemtable(w.opts.Memtable.TargetBytes*2, w.memtableInlineThreshold)
+		w.memtable = w.newMemtable()
 	}
 	w.mu.Unlock()
 
