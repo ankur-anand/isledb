@@ -73,6 +73,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		valueConfig:             valueConfig,
 		ctx:                     writerCtx,
 		cancel:                  cancel,
+		memtable:                internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, valueConfig), memtableInlineThreshold),
 		memtableInlineThreshold: memtableInlineThreshold,
 		seq:                     m.MaxSeqNum(),
 		epoch:                   m.NextEpoch,
@@ -277,22 +278,17 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 }
 
 func (w *writer) ensureCapacityLocked() error {
-	if w.memtable == nil {
-		w.memtable = w.newMemtable()
-		return nil
-	}
 	if w.memtable.ApproxSize() < w.opts.Memtable.TargetBytes {
-		return nil
-	}
-	if w.memtable.Empty() {
 		return nil
 	}
 	if w.opts.Memtable.MaxFrozen > 0 && len(w.immQueue) >= w.opts.Memtable.MaxFrozen {
 		w.metrics.ObserveBackpressure()
 		return ErrBackpressure
 	}
-	w.immQueue = append(w.immQueue, w.memtable)
-	w.memtable = w.newMemtable()
+	if w.memtable.ApproxSize() > 0 {
+		w.immQueue = append(w.immQueue, w.memtable)
+		w.memtable = w.newMemtable()
+	}
 	return nil
 }
 
@@ -311,9 +307,9 @@ func (w *writer) flush(ctx context.Context) error {
 	w.mu.Lock()
 	toFlush := append([]*internal.Memtable(nil), w.immQueue...)
 	w.immQueue = nil
-	if w.memtable != nil && !w.memtable.Empty() {
+	if w.memtable.ApproxSize() > 0 {
 		toFlush = append(toFlush, w.memtable)
-		w.memtable = nil
+		w.memtable = w.newMemtable()
 	}
 	w.mu.Unlock()
 
