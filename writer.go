@@ -330,17 +330,21 @@ func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error
 		return fmt.Errorf("stream sst: %w", err)
 	}
 
-	changeBatch, err := buildChangeBatch(ctx, mt.Iterator(), epoch, seqLo, seqHi, result.Meta.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("build change batch: %w", err)
-	}
-	changeBatch.Meta.Path = w.store.ChangeBatchPath(changeBatch.Meta.ID)
-	if _, err := w.store.Write(ctx, changeBatch.Meta.Path, changeBatch.Data); err != nil {
-		return fmt.Errorf("write change batch: %w", err)
+	var changeBatchMeta *manifest.ChangeBatchMeta
+	if w.opts.ChangeFeed.Enabled {
+		changeBatch, err := buildChangeBatch(ctx, mt.Iterator(), epoch, seqLo, seqHi, result.Meta.CreatedAt)
+		if err != nil {
+			return fmt.Errorf("build change batch: %w", err)
+		}
+		changeBatch.Meta.Path = w.store.ChangeBatchPath(changeBatch.Meta.ID)
+		if _, err := w.store.Write(ctx, changeBatch.Meta.Path, changeBatch.Data); err != nil {
+			return fmt.Errorf("write change batch: %w", err)
+		}
+		changeBatchMeta = &changeBatch.Meta
 	}
 
 	var appendErr error
-	_, appendErr = w.manifestLog.AppendAddSSTableWithChangeBatchWithFence(ctx, result.Meta, &changeBatch.Meta)
+	_, appendErr = w.manifestLog.AppendAddSSTableWithChangeBatchWithFence(ctx, result.Meta, changeBatchMeta)
 
 	if appendErr != nil {
 		if isFenceError(appendErr) {

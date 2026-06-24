@@ -44,6 +44,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 | OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
 | OpenCompactor | `(ctx context.Context, opts CompactorOptions) (*Compactor, error)` |
 | OpenRetentionCompactor | `(ctx context.Context, opts RetentionCompactorOptions) (*RetentionCompactor, error)` |
+| OpenChangeFeedCleaner | `(ctx context.Context, opts ChangeFeedCleanerOptions) (*ChangeFeedCleaner, error)` |
 | Close | `() error` |
 
 ```go
@@ -81,8 +82,13 @@ type WriterOptions struct {
     Flush       WriterFlushOptions
     SST         WriterSSTOptions
     Values      config.ValueStorageConfig
+    ChangeFeed  ChangeFeedOptions
     OnFlushError func(error)
     Metrics     *WriterMetrics
+}
+
+type ChangeFeedOptions struct {
+    Enabled bool // Write seq-ordered mutation batches under changes/.
 }
 
 type WriterMemtableOptions struct {
@@ -311,6 +317,33 @@ type RetentionCompactorStats struct {
 
 ---
 
+### ChangeFeedCleaner
+
+Advances the retained change-feed floor and deletes old `changes/*.chg` objects
+after a grace period. This is only needed when writers enable change feed.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Start | `(ctx context.Context) error` | Start background cleanup loop |
+| Close | `(ctx context.Context) error` | Stop background cleanup and close cleaner |
+| RunOnce | `(ctx context.Context) error` | Perform one cleanup cycle |
+
+```go
+type ChangeFeedCleanerOptions struct {
+    RetentionPeriod  time.Duration
+    RetentionCount   uint64
+    CheckInterval    time.Duration
+    SweepBatchSize   int
+    SweepGracePeriod time.Duration
+    OnCleanup        func(ChangeFeedCleanupStats)
+    OnCleanupError   func(error)
+}
+
+func DefaultChangeFeedCleanerOptions() ChangeFeedCleanerOptions
+```
+
+---
+
 ## Manifest Types
 
 Re-exported from `manifest` package for convenience.
@@ -367,6 +400,10 @@ type SSTMeta = manifest.SSTMeta
 | HasBlobRefs | `bool` | Contains external blob references |
 
 ### ChangeBatchMeta
+
+Change batches are written only when `WriterOptions.ChangeFeed.Enabled` is true.
+Manifest entries are still the source of truth; readers should not discover
+change history by listing `changes/`.
 
 ```go
 type ChangeBatchMeta = manifest.ChangeBatchMeta

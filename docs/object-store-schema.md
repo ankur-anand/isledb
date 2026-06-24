@@ -34,6 +34,7 @@ demo/p000/
 
 - `manifest/CURRENT`, `manifest/snapshots/*.manifest`, `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
 - `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
+- `changes/*` objects are written only when `WriterOptions.ChangeFeed.Enabled` is true.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
 - Manifest log `role` is numeric:
   - `0` = writer
@@ -403,9 +404,9 @@ JSON-style descriptor:
 
 ## `changes/<bucket>/<change-batch-id>`
 
-Immutable, seq-ordered mutation batch written alongside a memtable flush. This
-object is binary, not JSON. It preserves puts, deletes, TTL metadata, inline
-values, and blob references in row-sequence order.
+Immutable, seq-ordered mutation batch written alongside a memtable flush when
+change feed is enabled. This object is binary, not JSON. It preserves puts,
+deletes, TTL metadata, inline values, and blob references in row-sequence order.
 
 The bucket is deterministically derived from the change-batch ID using
 `blobstore.ChangeBatchBucket`. Readers should not list `changes/` to discover

@@ -100,14 +100,14 @@ What each object family does:
 | `manifest/gc/pending-sst/pending.json` | JSON | compactor, retention compactor | compactor, retention compactor | Tracks SSTs that are no longer referenced and are waiting for physical deletion. |
 | `manifest/gc/checkpoint.json` | JSON | retention compactor | retention compactor | Stores GC replay progress over manifest history. |
 | `sstable/<bucket>/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. The bucket is deterministically derived from the SST ID. |
-| `changes/<bucket>/<change-batch-id>` | Binary | writer | future change-feed readers, maintenance processes | Immutable, seq-ordered committed mutation batch emitted with a memtable flush. Visibility still comes from the manifest, not raw object listing. |
+| `changes/<bucket>/<change-batch-id>` | Binary | writer when change feed is enabled | future change-feed readers, maintenance processes | Immutable, seq-ordered committed mutation batch emitted with a memtable flush. Visibility still comes from the manifest, not raw object listing. |
 | `blobs/<prefix>/<blob-id>.blob` | Binary | writer | reader | External value objects used when large values are stored out-of-line. |
 
 #### Write, Read, and Cleanup Lifecycle
 
 1. `Writer.Put` buffers keys in the active memtable. If a value crosses the blob threshold, the value bytes are uploaded to `blobs/` first and the memtable stores a blob reference.
-2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths. It also writes one seq-ordered change batch under `changes/` for each flushed memtable.
-3. After the SST and change-batch objects exist, the writer commits manifest state by CAS-updating `manifest/CURRENT`. Small recent entries stay in `CURRENT.active_entries`; older entries rotate into immutable `manifest/pages/` objects. This is the visibility boundary for readers and future change-feed consumers.
+2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths. If `WriterOptions.ChangeFeed.Enabled` is true, it also writes one seq-ordered change batch under `changes/` for each flushed memtable.
+3. After the SST and optional change-batch objects exist, the writer commits manifest state by CAS-updating `manifest/CURRENT`. Small recent entries stay in `CURRENT.active_entries`; older entries rotate into immutable `manifest/pages/` objects. This is the visibility boundary for readers and future change-feed consumers.
 4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/page files, then read the newly visible SSTs and blobs on demand.
 5. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.
 6. `RetentionCompactor` removes old SSTs from visible manifest state, advances low-watermark metadata when configured, records pending-delete marks in `manifest/gc/*`, and later deletes obsolete SST objects.

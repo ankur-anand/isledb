@@ -1006,6 +1006,50 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	}
 }
 
+func TestAdvanceChangeFeedLogStartPrunesRetainedRefs(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        0,
+		ChangeFeedLogStart: 1,
+		NextSeq:            4,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(1),
+			testManifestEntry(2),
+			testManifestEntry(3),
+		},
+		IndexFrontier: []PageRef{
+			{Level: 0, SeqLo: 0, SeqHi: 1, Path: "pages/l00/old"},
+			{Level: 0, SeqLo: 2, SeqHi: 3, Path: "pages/l00/kept"},
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	updated, err := ms.AdvanceChangeFeedLogStart(ctx, 2)
+	if err != nil {
+		t.Fatalf("advance change-feed floor: %v", err)
+	}
+	if updated.ChangeFeedLogStart != 2 {
+		t.Fatalf("unexpected change-feed floor: got=%d want=2", updated.ChangeFeedLogStart)
+	}
+	if got, want := len(updated.ActiveEntries), 2; got != want {
+		t.Fatalf("unexpected active entry count: got=%d want=%d", got, want)
+	}
+	if updated.ActiveEntries[0].Seq != 2 || updated.ActiveEntries[1].Seq != 3 {
+		t.Fatalf("unexpected active entries after prune: got=%d,%d want=2,3", updated.ActiveEntries[0].Seq, updated.ActiveEntries[1].Seq)
+	}
+	if got, want := len(updated.IndexFrontier), 1; got != want {
+		t.Fatalf("unexpected index frontier count: got=%d want=%d", got, want)
+	}
+	if updated.IndexFrontier[0].Path != "pages/l00/kept" {
+		t.Fatalf("unexpected retained page ref: got=%q", updated.IndexFrontier[0].Path)
+	}
+}
+
 func TestReplay_ErrsWhenCurrentSnapshotIsMissing(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")

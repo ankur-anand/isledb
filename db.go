@@ -161,6 +161,23 @@ func (db *DB) OpenRetentionCompactor(ctx context.Context, opts RetentionCompacto
 	return retentionCompactor, nil
 }
 
+// OpenChangeFeedCleaner opens a cleaner for retained change-feed history.
+func (db *DB) OpenChangeFeedCleaner(ctx context.Context, opts ChangeFeedCleanerOptions) (*ChangeFeedCleaner, error) {
+	if db.closed.Load() {
+		return nil, errors.New("db closed")
+	}
+
+	cleaner, err := newChangeFeedCleaner(ctx, db.store, db.manifestStore, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.registerCloser(cleaner); err != nil {
+		_ = cleaner.Close(ctx)
+		return nil, err
+	}
+	return cleaner, nil
+}
+
 // Close closes the DB and any writers/compactors opened from it.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
