@@ -198,6 +198,9 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	if err := reader.Refresh(ctx); err != ErrReaderClosed {
 		t.Fatalf("Refresh after Reader.Close error=%v, want %v", err, ErrReaderClosed)
 	}
+	if _, err := reader.Prefetch(ctx, PrefetchOptions{All: true}); err != ErrReaderClosed {
+		t.Fatalf("Prefetch after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
 	if got := reader.Manifest(); got != nil {
 		t.Fatalf("Manifest after Reader.Close = %#v, want nil", got)
 	}

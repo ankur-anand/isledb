@@ -258,6 +258,25 @@ if ok {
 }
 ```
 
+Use `Prefetch` when a reader knows a hot key range and should warm local SST
+cache before serving reads. `Prefetch` uses the current manifest view, so call
+`Refresh` first when you need the latest committed state.
+
+```go
+if err := reader.Refresh(ctx); err != nil {
+	log.Fatal(err)
+}
+
+_, err = reader.Prefetch(ctx, isledb.PrefetchOptions{
+	Range:       isledb.PrefixRange([]byte("user:")),
+	MaxBytes:    256 << 20,
+	Concurrency: 4,
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
 #### Snapshot
 
 Use a snapshot when multiple reads must observe the same loaded view. The parent reader can refresh later without changing the pinned snapshot.

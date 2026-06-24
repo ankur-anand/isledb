@@ -164,6 +164,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
 | Refresh | `(ctx context.Context) error` | Reload manifest and invalidate removed SSTs |
+| Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
 | Snapshot | `() *Snapshot` | Pin the current loaded state for consistent multi-operation reads |
 | Manifest | `() *Manifest` | Return cloned manifest snapshot |
 | Close | `() error` | Close reader and caches |
@@ -187,6 +188,34 @@ type ReaderOpenOptions struct {
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
+```
+
+`Refresh` and `Prefetch` are separate operations. `Refresh` discovers committed
+manifest state. `Prefetch` downloads SSTs from the currently loaded manifest
+into the local cache. `Prefetch` does not call `Refresh`.
+
+```go
+type KeyRange struct {
+    Min []byte // inclusive; nil means beginning
+    Max []byte // exclusive; nil means end
+}
+
+func PrefixRange(prefix []byte) KeyRange
+
+type PrefetchOptions struct {
+    Range       KeyRange // Select SSTs overlapping this half-open range.
+    All         bool     // Required for whole-database prefetch.
+    MaxSSTs     int      // 0 = no limit
+    MaxBytes    int64    // 0 = no limit
+    Concurrency int      // 0 = default
+}
+
+type PrefetchStats struct {
+    MatchedSSTs int
+    CachedSSTs  int
+    SkippedSSTs int
+    BytesRead   int64
+}
 ```
 
 #### KV
