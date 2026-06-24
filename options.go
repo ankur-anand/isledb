@@ -17,6 +17,7 @@ const (
 
 type WriterOptions struct {
 	// OwnerID is the stable writer identity stored in the writer fence.
+	// Empty means a process-local ID is generated.
 	OwnerID string
 
 	// Memtable controls in-memory write buffering before SST creation.
@@ -35,8 +36,12 @@ type WriterOptions struct {
 	// batches under changes/. Disabled by default for pure KV workloads.
 	ChangeFeed ChangeFeedOptions
 
+	// OnFlushError is called when the background flush loop observes an error.
+	// Explicit Flush and Close calls return their errors directly.
 	OnFlushError func(error)
-	Metrics      *WriterMetrics
+
+	// Metrics receives optional writer observations. Nil disables metrics.
+	Metrics *WriterMetrics
 }
 
 type ChangeFeedOptions struct {
@@ -47,15 +52,19 @@ type ChangeFeedOptions struct {
 
 type WriterMemtableOptions struct {
 	// TargetBytes is the approximate active memtable size that triggers rotation.
+	// Rotation does not publish data by itself; Flush, background flush, or Close
+	// publishes frozen memtables as SSTs.
 	TargetBytes int64
 
 	// MaxFrozen limits full memtables waiting for flush. When the limit is
-	// reached, writes return ErrBackpressure. Zero means unbounded.
+	// reached, writes return ErrBackpressure instead of buffering more data.
+	// Zero means unbounded.
 	MaxFrozen int
 }
 
 type WriterFlushOptions struct {
 	// Interval is the background flush cadence. Zero disables background flush.
+	// Background errors are delivered to WriterOptions.OnFlushError when set.
 	Interval time.Duration
 }
 

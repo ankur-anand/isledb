@@ -11,38 +11,71 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-// Writer provides write access to the database. It is not safe for concurrent
-// use; callers should serialize Put/Delete/Flush/Close for one writer.
+// Writer provides write access to the database.
+//
+// A Writer owns one fenced write session for a DB bucket/prefix. It buffers
+// writes in memory, flushes full memtables into immutable SST files, and then
+// commits those SSTs through the manifest. Only manifest-committed SSTs are
+// visible to readers.
+//
+// Writer uses internal locks to protect its memtable, sequence assignment, and
+// background flush loop. Those locks are an implementation guard, not a
+// concurrent API contract: concurrent public calls do not have documented
+// ordering or Close/Flush semantics. Callers should serialize Put, Delete,
+// Flush, and Close for one Writer.
+//
+// If WriterOptions.Flush.Interval is greater than zero, the Writer also runs a
+// background flush loop. Background flush errors are reported through
+// WriterOptions.OnFlushError when configured; they are not returned by later Put
+// calls. Call Flush or Close to synchronously observe flush errors.
 type Writer struct {
 	w *writer
 }
 
-// Put writes a key-value pair to the database.
+// Put writes a key-value pair to the active memtable.
+//
+// Put returns after the mutation is buffered locally. The mutation becomes
+// durable and visible to readers only after a successful Flush, background
+// flush, or Close.
 func (w *Writer) Put(ctx context.Context, key, value []byte) error {
 	return w.w.put(ctx, key, value)
 }
 
 // PutWithTTL writes a key-value pair with a time-to-live duration.
+//
+// ttl <= 0 means no expiration. Expired values are filtered by readers.
 func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error {
 	return w.w.putWithTTL(ctx, key, value, ttl)
 }
 
 // Delete marks a key as deleted.
+//
+// Like Put, the tombstone is buffered first and becomes durable and visible
+// after a successful Flush, background flush, or Close.
 func (w *Writer) Delete(ctx context.Context, key []byte) error {
 	return w.w.delete(ctx, key)
 }
 
 // DeleteWithTTL marks a key as deleted with a time-to-live duration.
+//
+// ttl <= 0 means the tombstone does not expire.
 func (w *Writer) DeleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
 	return w.w.deleteWithTTL(ctx, key, ttl)
 }
 
-// Flush forces a flush of the current memtable to a new SST file.
+// Flush synchronously publishes all currently buffered writes.
+//
+// Flush rotates the active memtable, writes all frozen memtables as SST files,
+// commits their manifest entries, and returns only after the flushed data is
+// visible to newly refreshed readers.
 func (w *Writer) Flush(ctx context.Context) error {
 	return w.w.flush(ctx)
 }
 
-// Close closes the writer, flushing any pending writes before returning.
+// Close stops background flushing and synchronously flushes pending writes.
+//
+// Close returns the first close or flush error it observes. After Close returns,
+// the Writer cannot be used again.
 func (w *Writer) Close(ctx context.Context) error {
 	return w.w.close(ctx)
 }
