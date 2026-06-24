@@ -56,6 +56,8 @@ type Compactor struct {
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
 
+	consecutiveL0Compactions int
+
 	running atomic.Bool
 	closed  atomic.Bool
 }
@@ -94,11 +96,17 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 
 func normalizeCompactorOptions(opts CompactorOptions, store *blobstore.Store) CompactorOptions {
 	d := DefaultCompactorOptions()
+	if opts.InputReadParallelism <= 0 {
+		opts.InputReadParallelism = d.InputReadParallelism
+	}
 	if opts.Trigger.CheckInterval <= 0 {
 		opts.Trigger.CheckInterval = d.Trigger.CheckInterval
 	}
 	if opts.Trigger.L0SSTCount <= 0 {
 		opts.Trigger.L0SSTCount = d.Trigger.L0SSTCount
+	}
+	if opts.Trigger.MaxConsecutiveL0Compactions <= 0 {
+		opts.Trigger.MaxConsecutiveL0Compactions = d.Trigger.MaxConsecutiveL0Compactions
 	}
 	if opts.Trigger.MinSources <= 0 {
 		opts.Trigger.MinSources = d.Trigger.MinSources
@@ -251,7 +259,23 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 		m := c.manifest.Clone()
 		c.mu.Unlock()
 
-		if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount {
+		l0Ready := m.L0SSTCount() >= c.opts.Trigger.L0SSTCount
+		runJob := c.findConsecutiveCompaction(m)
+
+		if runJob != nil && (!l0Ready || c.shouldRunSortedRunForFairness()) {
+			if err := c.compactRuns(ctx, m, runJob); err != nil {
+
+				if isFenceError(err) {
+					c.fenced.Store(true)
+					return err
+				}
+				return fmt.Errorf("consecutive compaction: %w", err)
+			}
+			c.consecutiveL0Compactions = 0
+			continue
+		}
+
+		if l0Ready {
 			if err := c.compactL0(ctx, m); err != nil {
 
 				if isFenceError(err) {
@@ -260,18 +284,7 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 				}
 				return fmt.Errorf("L0 compaction: %w", err)
 			}
-			continue
-		}
-
-		if job := c.findConsecutiveCompaction(m); job != nil {
-			if err := c.compactRuns(ctx, m, job); err != nil {
-
-				if isFenceError(err) {
-					c.fenced.Store(true)
-					return err
-				}
-				return fmt.Errorf("consecutive compaction: %w", err)
-			}
+			c.consecutiveL0Compactions++
 			continue
 		}
 
@@ -283,6 +296,10 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 		"CompactionMaxIterations", CompactionMaxIterations)
 	c.runSSTSweeperBestEffort(ctx)
 	return nil
+}
+
+func (c *Compactor) shouldRunSortedRunForFairness() bool {
+	return c.consecutiveL0Compactions >= c.opts.Trigger.MaxConsecutiveL0Compactions
 }
 
 func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
@@ -554,59 +571,132 @@ func (c *Compactor) FenceToken() *manifest.FenceToken {
 	return c.fenceToken
 }
 
+type openSSTResult struct {
+	iter   sstable.Iterator
+	reader *sstable.Reader
+	err    error
+}
+
 func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Iterator, []*sstable.Reader, error) {
+	if len(ssts) == 0 {
+		return nil, nil, nil
+	}
+
+	parallelism := c.opts.InputReadParallelism
+	if parallelism < 1 {
+		parallelism = 1
+	}
+	if parallelism > len(ssts) {
+		parallelism = len(ssts)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]openSSTResult, len(ssts))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < parallelism; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if err := ctx.Err(); err != nil {
+					results[i].err = err
+					continue
+				}
+				results[i] = c.openOneSST(ctx, ssts[i])
+				if results[i].err != nil {
+					cancel()
+				}
+			}
+		}()
+	}
+
+	var sendErr error
+sendJobs:
+	for i := range ssts {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			sendErr = ctx.Err()
+			break sendJobs
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
 	iters := make([]sstable.Iterator, 0, len(ssts))
 	readers := make([]*sstable.Reader, 0, len(ssts))
 
-	cleanup := func() {
-		for _, it := range iters {
-			_ = it.Close()
-		}
-		for _, r := range readers {
-			_ = r.Close()
+	for i := range results {
+		if results[i].err != nil {
+			cleanupOpenResults(results)
+			return nil, nil, results[i].err
 		}
 	}
+	if sendErr != nil {
+		cleanupOpenResults(results)
+		return nil, nil, sendErr
+	}
 
-	for _, sst := range ssts {
-		path := c.store.SSTPath(sst.ID)
-		var data []byte
-		var err error
-		if sst.Size > 0 {
-			data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
-		} else {
-			data, _, err = c.store.Read(ctx, path)
+	for i := range results {
+		if results[i].iter == nil || results[i].reader == nil {
+			cleanupOpenResults(results)
+			return nil, nil, fmt.Errorf("open sst %s: missing reader", ssts[i].ID)
 		}
-		if err != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("read sst %s: %w", sst.ID, err)
-		}
-		if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum, c.opts.Safety.SSTHashVerifier); err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-
-		data, err = trimSSTData(sst, data)
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-
-		reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		readers = append(readers, reader)
-
-		iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		iters = append(iters, iter)
+		iters = append(iters, results[i].iter)
+		readers = append(readers, results[i].reader)
 	}
 
 	return iters, readers, nil
+}
+
+func (c *Compactor) openOneSST(ctx context.Context, sst SSTMeta) openSSTResult {
+	path := c.store.SSTPath(sst.ID)
+	var data []byte
+	var err error
+	if sst.Size > 0 {
+		data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
+	} else {
+		data, _, err = c.store.Read(ctx, path)
+	}
+	if err != nil {
+		return openSSTResult{err: fmt.Errorf("read sst %s: %w", sst.ID, err)}
+	}
+	if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum, c.opts.Safety.SSTHashVerifier); err != nil {
+		return openSSTResult{err: err}
+	}
+
+	data, err = trimSSTData(sst, data)
+	if err != nil {
+		return openSSTResult{err: err}
+	}
+
+	reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
+	if err != nil {
+		return openSSTResult{err: err}
+	}
+
+	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+	if err != nil {
+		_ = reader.Close()
+		return openSSTResult{err: err}
+	}
+
+	return openSSTResult{iter: iter, reader: reader}
+}
+
+func cleanupOpenResults(results []openSSTResult) {
+	for _, result := range results {
+		if result.iter != nil {
+			_ = result.iter.Close()
+		}
+		if result.reader != nil {
+			_ = result.reader.Close()
+		}
+	}
 }
 
 func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifier SSTHashVerifier) error {

@@ -834,6 +834,114 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 }
 
+func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
+	store := blobstore.NewMemory("test")
+	ctx := context.Background()
+
+	manifestStore := newManifestStore(store, nil)
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.Flush.Interval = 0
+	writerOpts.Memtable.TargetBytes = 512
+
+	writeL0 := func(prefix string, batches int) {
+		t.Helper()
+
+		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
+		if err != nil {
+			t.Fatalf("newWriter: %v", err)
+		}
+		defer writer.close(ctx)
+
+		for batch := 0; batch < batches; batch++ {
+			for i := 0; i < 20; i++ {
+				key := fmt.Sprintf("%s-b%02d-k%03d", prefix, batch, i)
+				value := fmt.Sprintf("%s-value-%03d", prefix, i)
+				if err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
+					t.Fatalf("put: %v", err)
+				}
+			}
+			if err := writer.flush(ctx); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+		}
+	}
+
+	buildRunOpts := DefaultCompactorOptions()
+	buildRunOpts.Trigger.L0SSTCount = 2
+	buildRunOpts.Trigger.MinSources = 100
+	buildRunOpts.Trigger.MaxSources = 100
+	buildRunOpts.Trigger.CheckInterval = time.Hour
+	buildRunOpts.Output.Compression = "none"
+	buildRunOpts.Output.TargetSSTBytes = 64 * 1024
+
+	for run := 0; run < 2; run++ {
+		writeL0(fmt.Sprintf("run%d", run), 2)
+
+		compactor, err := newCompactor(ctx, store, manifestStore, buildRunOpts)
+		if err != nil {
+			t.Fatalf("newCompactor build run %d: %v", run, err)
+		}
+		if err := compactor.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce build run %d: %v", run, err)
+		}
+		if err := compactor.Close(ctx); err != nil {
+			t.Fatalf("close compactor build run %d: %v", run, err)
+		}
+	}
+
+	before, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay before fairness run: %v", err)
+	}
+	if before.SortedRunCount() != 2 || before.L0SSTCount() != 0 {
+		t.Fatalf("setup manifest l0=%d sorted_runs=%d, want l0=0 sorted_runs=2", before.L0SSTCount(), before.SortedRunCount())
+	}
+
+	writeL0("initial-l0", 2)
+
+	var order []CompactionJobType
+	injectedL0 := false
+	fairOpts := DefaultCompactorOptions()
+	fairOpts.Trigger.L0SSTCount = 2
+	fairOpts.Trigger.MinSources = 2
+	fairOpts.Trigger.MaxSources = 4
+	fairOpts.Trigger.MaxConsecutiveL0Compactions = 1
+	fairOpts.Trigger.CheckInterval = time.Hour
+	fairOpts.Output.Compression = "none"
+	fairOpts.Output.TargetSSTBytes = 64 * 1024
+	fairOpts.OnCompactionStart = func(job CompactionJob) {
+		order = append(order, job.Type)
+	}
+	fairOpts.OnCompactionEnd = func(job CompactionJob, err error) {
+		if err != nil || job.Type != CompactionL0Flush || injectedL0 {
+			return
+		}
+		injectedL0 = true
+		writeL0("injected-l0", 2)
+	}
+
+	compactor, err := newCompactor(ctx, store, manifestStore, fairOpts)
+	if err != nil {
+		t.Fatalf("newCompactor fairness: %v", err)
+	}
+	defer compactor.Close(ctx)
+
+	if err := compactor.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce fairness: %v", err)
+	}
+
+	if len(order) < 2 {
+		t.Fatalf("compaction order=%v, want at least L0 then sorted-run", order)
+	}
+	if order[0] != CompactionL0Flush {
+		t.Fatalf("first compaction=%v, want L0", order[0])
+	}
+	if order[1] != CompactionConsecutiveMerge {
+		t.Fatalf("second compaction=%v, want sorted-run merge after fairness budget", order[1])
+	}
+}
+
 func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()

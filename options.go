@@ -147,6 +147,10 @@ type CompactorOptions struct {
 	// OwnerID is the stable compactor identity stored in the compactor fence.
 	OwnerID string
 
+	// InputReadParallelism bounds concurrent source SST reads inside one
+	// compaction job. Values <= 0 use the default.
+	InputReadParallelism int
+
 	// Trigger controls when compaction work is selected.
 	Trigger CompactionTriggerOptions
 
@@ -169,6 +173,11 @@ type CompactionTriggerOptions struct {
 
 	// L0SSTCount is the number of L0 SSTs that triggers an L0 merge.
 	L0SSTCount int
+
+	// MaxConsecutiveL0Compactions is the fairness budget for L0 compaction.
+	// After this many L0 jobs, an eligible sorted-run merge gets one turn
+	// even if L0 is still over threshold. Values <= 0 use the default.
+	MaxConsecutiveL0Compactions int
 
 	// MinSources and MaxSources bound consecutive sorted-run merge candidates.
 	MinSources int
@@ -202,12 +211,14 @@ type CompactionSafetyOptions struct {
 
 func DefaultCompactorOptions() CompactorOptions {
 	return CompactorOptions{
+		InputReadParallelism: 4,
 		Trigger: CompactionTriggerOptions{
-			CheckInterval: 5 * time.Second,
-			L0SSTCount:    8,
-			MinSources:    4,
-			MaxSources:    8,
-			SizeRatio:     4,
+			CheckInterval:               5 * time.Second,
+			L0SSTCount:                  8,
+			MaxConsecutiveL0Compactions: 4,
+			MinSources:                  4,
+			MaxSources:                  8,
+			SizeRatio:                   4,
 		},
 		Output: CompactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,
