@@ -17,10 +17,6 @@ type SSTSignature = manifest.SSTSignature
 type SortedRun = manifest.SortedRun
 type CompactionLogPayload = manifest.CompactionLogPayload
 
-// KeyPositionExtractor extracts an application-defined monotonic position from
-// an SST boundary key.
-type KeyPositionExtractor = manifest.KeyPositionExtractor
-
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {
 		return storage
@@ -43,15 +39,7 @@ func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.St
 }
 
 func newManifestStore(store *blobstore.Store, storage manifest.Storage) *manifest.Store {
-	return newManifestStoreWithExtractor(store, storage, nil)
-}
-
-func newManifestStoreWithExtractor(store *blobstore.Store, storage manifest.Storage, extractor KeyPositionExtractor) *manifest.Store {
-	ms := manifest.NewStoreWithStorage(resolveManifestStorage(store, storage))
-	if extractor != nil {
-		ms.SetKeyPositionExtractor(extractor)
-	}
-	return ms
+	return manifest.NewStoreWithStorage(resolveManifestStorage(store, storage))
 }
 
 func newManifestStoreWithCache(store *blobstore.Store, opts *readerOptions) *manifest.Store {

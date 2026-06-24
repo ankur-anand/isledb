@@ -79,14 +79,6 @@ func (c *Current) Clone() *Current {
 		clone.IndexFrontier = make([]PageRef, len(c.IndexFrontier))
 		copy(clone.IndexFrontier, c.IndexFrontier)
 	}
-	if c.MaxCommittedPosition != nil {
-		position := *c.MaxCommittedPosition
-		clone.MaxCommittedPosition = &position
-	}
-	if c.LowWatermarkPosition != nil {
-		position := *c.LowWatermarkPosition
-		clone.LowWatermarkPosition = &position
-	}
 	return clone
 }
 

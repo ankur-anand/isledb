@@ -22,7 +22,7 @@ w.Put(ctx, []byte("key"), []byte("value"))
 w.Flush(ctx)
 
 // 4. Read data
-r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions())
+r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
 defer r.Close()
 val, found, err := r.Get(ctx, []byte("key"))
 ```
@@ -51,29 +51,38 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 type DBOptions struct {
     ManifestStorage manifest.Storage // Optional custom manifest storage backend
     GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
-    KeyPositionExtractor isledb.KeyPositionExtractor // Optional CURRENT position updater for monotonic keyspaces
 }
 ```
-
-`KeyPositionExtractor` is intended for monotonic keyspaces where the
-lexicographically largest key is also the latest logical position, such as
-8-byte big-endian sequence keys. If it is not configured,
-`Reader.MaxCommittedPosition` returns `found=false`.
 
 ---
 
 ### Writer
 
-Provides write access to the database. Buffers writes in a memtable and flushes to SSTs.
+Provides write access to the database. A writer buffers mutations in memory,
+flushes full memtables into immutable SST files, and commits those SSTs through
+the manifest.
+
+`Writer` uses internal locks to protect state and coordinate with background
+flushing. Those locks are not a concurrent API contract: concurrent public calls
+do not have documented ordering or Close/Flush semantics. Serialize `Put`,
+`Delete`, `Flush`, and `Close` for one writer.
+
+Visibility contract:
+
+- `Put` and `Delete` return after the mutation is buffered locally.
+- `Flush` is the synchronous publish boundary. It writes pending memtables as
+  SST files and commits manifest entries.
+- `Close` stops background flushing and flushes pending writes before returning.
+- Readers see newly flushed data after they open or call `Reader.Refresh`.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Put | `(ctx context.Context, key, value []byte) error` | Write a key-value pair |
-| PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Write with time-to-live |
-| Delete | `(ctx context.Context, key []byte) error` | Mark a key as deleted |
-| DeleteWithTTL | `(ctx context.Context, key []byte, ttl time.Duration) error` | Delete with TTL |
-| Flush | `(ctx context.Context) error` | Force flush memtable to SST |
-| Close | `(ctx context.Context) error` | Close the writer |
+| Put | `(ctx context.Context, key, value []byte) error` | Buffer a key-value mutation |
+| PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Buffer a key-value mutation with time-to-live |
+| Delete | `(ctx context.Context, key []byte) error` | Buffer a tombstone |
+| DeleteWithTTL | `(ctx context.Context, key []byte, ttl time.Duration) error` | Buffer a tombstone with TTL |
+| Flush | `(ctx context.Context) error` | Publish all currently buffered writes |
+| Close | `(ctx context.Context) error` | Stop background flushing and publish pending writes |
 
 ```go
 type WriterOptions struct {
@@ -110,7 +119,14 @@ func DefaultWriterOptions() WriterOptions
 ```
 
 **Errors:**
-- `ErrBackpressure` - Writer hit memtable queue limit, caller should retry after a delay.
+- `ErrBackpressure` - writer hit `Memtable.MaxFrozen`; caller should retry after a delay or flush.
+
+Background flush:
+
+- `Flush.Interval > 0` starts a background flush loop.
+- Background flush errors are delivered to `WriterOptions.OnFlushError` when it
+  is set. Otherwise they are logged.
+- Explicit `Flush` and `Close` return flush errors directly.
 
 ---
 
@@ -126,8 +142,6 @@ later.
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key from this fixed view |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create a bounded iterator over this fixed view |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Read up to limit records from this fixed view |
-| MaxCommittedPosition | `() (uint64, bool)` | Return the head/high-watermark captured with this view |
-| LowWatermarkPosition | `() (uint64, bool)` | Return the low watermark captured with this view |
 | Close | `() error` | Release the caller reference to the view |
 
 ```go
@@ -145,16 +159,13 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| RefreshAndPrefetchSSTs | `(ctx context.Context) error` | Reload manifest and proactively warm newly visible SSTs into cache |
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key |
-| MaxCommittedPosition | `(ctx context.Context) (uint64, bool, error)` | Read latest committed position from `CURRENT` for monotonic keyspaces |
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
 | Refresh | `(ctx context.Context) error` | Reload manifest and invalidate removed SSTs |
 | Snapshot | `() *Snapshot` | Pin the current loaded state for consistent multi-operation reads |
 | Manifest | `() *Manifest` | Return cloned manifest snapshot |
-| ManifestUnsafe | `() *Manifest` | Return manifest without copying |
 | Close | `() error` | Close reader and caches |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
@@ -162,7 +173,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 
 ```go
 type ReaderOpenOptions struct {
-    CacheDir                 string               // Required: directory for disk caches
+    CacheDir                 string               // Required disk cache directory.
     SSTCacheSize             int64                // Default: 1GB
     BlobCacheSize            int64                // Default: 1GB
     BlobCacheMaxItemSize     int64                // Max size per cached blob (0 = no limit)
@@ -175,12 +186,8 @@ type ReaderOpenOptions struct {
     ManifestStorage          manifest.Storage     // Optional custom manifest storage
 }
 
-func DefaultReaderOpenOptions() ReaderOpenOptions
+func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 ```
-
-`MaxCommittedPosition` is a fast path backed by `CURRENT`. Use it only for workloads
-where max key equals latest logical position. It is not a general-purpose
-replacement for manifest replay or arbitrary KV ordering.
 
 #### KV
 

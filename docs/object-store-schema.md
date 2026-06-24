@@ -90,7 +90,7 @@ This is a representative JSON-style view of the object families under one prefix
 
 ## `manifest/CURRENT`
 
-Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs. It can also carry fast-path metadata such as `max_committed_position` and `low_watermark_position`.
+Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs.
 
 Path:
 
@@ -130,8 +130,6 @@ Example:
       "op": "add_sstable"
     }
   ],
-  "max_committed_position": 381,
-  "low_watermark_position": 240,
   "writer_fence": {
     "epoch": 18,
     "owner": "writer-p000",

@@ -53,11 +53,6 @@ type replayCache struct {
 	compactorFenceEpoch uint64
 }
 
-// KeyPositionExtractor extracts an application-defined monotonic position from
-// an SST boundary key. The store uses it for CURRENT.MaxCommittedPosition from
-// MaxKey and CURRENT.LowWatermarkPosition from MinKey.
-type KeyPositionExtractor func(boundaryKey []byte) (uint64, bool)
-
 type Store struct {
 	storage Storage
 	mu      sync.Mutex
@@ -69,8 +64,7 @@ type Store struct {
 	writerFence    *FenceToken
 	compactorFence *FenceToken
 
-	rcache               *replayCache
-	keyPositionExtractor KeyPositionExtractor
+	rcache *replayCache
 
 	activeEntryLimit int
 	pageFanout       int
@@ -98,14 +92,6 @@ func (s *Store) CurrentData() *Current {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.current.Clone()
-}
-
-// SetKeyPositionExtractor configures how CURRENT position metadata is derived
-// from monotonic SST boundary keys.
-func (s *Store) SetKeyPositionExtractor(extractor KeyPositionExtractor) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.keyPositionExtractor = extractor
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
@@ -404,8 +390,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
 		updated.NextSeq = nextEntry.Seq + 1
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
-		s.applyMaxPositionFromEntry(updated, &nextEntry)
-		s.applyLowWatermarkPositionFromEntry(updated, &nextEntry)
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -957,12 +941,6 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if current.ChangeFeedLogStart == oldLogSeqStart {
 		current.ChangeFeedLogStart = nextSeq
 	}
-	if current.MaxCommittedPosition == nil {
-		s.applyMaxPositionFromManifest(current, m)
-	}
-	if current.LowWatermarkPosition == nil {
-		s.applyLowWatermarkPositionFromManifest(current, m)
-	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
 	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, current.ChangeFeedLogStart)
@@ -1279,149 +1257,6 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 	return nil
 }
 
-func (s *Store) applyMaxPositionFromEntry(current *Current, entry *ManifestLogEntry) {
-	if current == nil || entry == nil || entry.Op != LogOpAddSSTable || entry.SSTable == nil {
-		return
-	}
-
-	extractor := s.getKeyPositionExtractor()
-	if extractor == nil {
-		return
-	}
-
-	maxKey := append([]byte(nil), entry.SSTable.MaxKey...)
-	position, ok := extractor(maxKey)
-	if !ok {
-		return
-	}
-
-	if current.MaxCommittedPosition == nil || position > *current.MaxCommittedPosition {
-		current.MaxCommittedPosition = &position
-	}
-}
-
-func (s *Store) applyLowWatermarkPositionFromEntry(current *Current, entry *ManifestLogEntry) {
-	if current == nil || entry == nil {
-		return
-	}
-
-	extractor := s.getKeyPositionExtractor()
-	if extractor == nil {
-		return
-	}
-
-	applyMinKey := func(minKey []byte) {
-		position, ok := extractor(append([]byte(nil), minKey...))
-		if !ok {
-			return
-		}
-		if current.LowWatermarkPosition == nil || position < *current.LowWatermarkPosition {
-			current.LowWatermarkPosition = &position
-		}
-	}
-
-	switch entry.Op {
-	case LogOpAddSSTable:
-		if entry.SSTable != nil {
-			applyMinKey(entry.SSTable.MinKey)
-		}
-	case LogOpCompaction:
-		if entry.Compaction == nil {
-			return
-		}
-		for _, sst := range entry.Compaction.AddSSTables {
-			applyMinKey(sst.MinKey)
-		}
-		if entry.Compaction.AddSortedRun != nil {
-			for _, sst := range entry.Compaction.AddSortedRun.SSTs {
-				applyMinKey(sst.MinKey)
-			}
-		}
-	}
-}
-
-func (s *Store) applyMaxPositionFromManifest(current *Current, m *Manifest) {
-	if current == nil || m == nil {
-		return
-	}
-
-	extractor := s.getKeyPositionExtractor()
-	if extractor == nil {
-		return
-	}
-
-	maxKey := m.MaxKey()
-	if len(maxKey) == 0 {
-		return
-	}
-
-	position, ok := extractor(maxKey)
-	if !ok {
-		return
-	}
-
-	if current.MaxCommittedPosition == nil || position > *current.MaxCommittedPosition {
-		current.MaxCommittedPosition = &position
-	}
-}
-
-func (s *Store) applyLowWatermarkPositionFromManifest(current *Current, m *Manifest) {
-	if current == nil || m == nil {
-		return
-	}
-
-	extractor := s.getKeyPositionExtractor()
-	if extractor == nil {
-		return
-	}
-
-	minKey := m.MinKey()
-	if len(minKey) == 0 {
-		current.LowWatermarkPosition = nil
-		return
-	}
-
-	position, ok := extractor(minKey)
-	if !ok {
-		return
-	}
-
-	current.LowWatermarkPosition = &position
-}
-
-// UpdateCurrentLowWatermarkPosition recomputes CURRENT.LowWatermarkPosition from the
-// provided manifest. Callers should pass the manifest state that is already
-// visible after their metadata update.
-func (s *Store) UpdateCurrentLowWatermarkPosition(ctx context.Context, m *Manifest) error {
-	const maxRetries = 3
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		current, etag, err := s.readCurrentWithETag(ctx)
-		if err != nil {
-			return err
-		}
-		if current == nil {
-			current = &Current{NextEpoch: 1}
-		}
-
-		updated := *current
-		if m != nil && updated.NextEpoch < m.NextEpoch {
-			updated.NextEpoch = m.NextEpoch
-		}
-		s.applyLowWatermarkPositionFromManifest(&updated, m)
-
-		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
-			if errors.Is(err, ErrPreconditionFailed) {
-				continue
-			}
-			return err
-		}
-		return nil
-	}
-
-	return ErrFenceConflict
-}
-
 // AdvanceChangeFeedLogStart advances CURRENT.change_feed_log_start and prunes
 // retained manifest entry refs below the new floor. The floor is clamped to
 // [current.change_feed_log_start, current.next_seq].
@@ -1466,12 +1301,6 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*C
 	}
 
 	return nil, ErrFenceConflict
-}
-
-func (s *Store) getKeyPositionExtractor() KeyPositionExtractor {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.keyPositionExtractor
 }
 
 func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {

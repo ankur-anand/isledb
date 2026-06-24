@@ -10,7 +10,7 @@ import (
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
-	// CacheDir is the directory for disk caches (required).
+	// CacheDir is the directory for disk caches. It must be non-empty.
 	CacheDir string
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
@@ -48,10 +48,12 @@ type ReaderOpenOptions struct {
 	ManifestStorage manifest.Storage
 }
 
-// DefaultReaderOpenOptions returns sane defaults for ReaderOpenOptions.
-func DefaultReaderOpenOptions() ReaderOpenOptions {
+// DefaultReaderOpenOptions returns default reader options using cacheDir for
+// disk caches.
+func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
+		CacheDir:        cacheDir,
 		SSTCacheSize:    defaults.SSTCacheSize,
 		BlobCacheSize:   defaults.BlobCacheSize,
 		BlobReadOptions: config.DefaultBlobReadOptions(),
