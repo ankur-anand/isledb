@@ -73,7 +73,7 @@ type WriterSSTOptions struct {
 func DefaultWriterOptions() WriterOptions {
 	return WriterOptions{
 		Memtable: WriterMemtableOptions{
-			TargetBytes: 4 * 1024 * 1024,
+			TargetBytes: 16 * 1024 * 1024,
 		},
 		Flush: WriterFlushOptions{
 			Interval: time.Second,

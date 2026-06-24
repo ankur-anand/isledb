@@ -49,6 +49,12 @@ func (m *Memtable) SeqHi() uint64 {
 	return m.seqHi
 }
 
+func (m *Memtable) Empty() bool {
+	m.seqMu.Lock()
+	defer m.seqMu.Unlock()
+	return m.seqLo == ^uint64(0)
+}
+
 func (m *Memtable) updateSeqBounds(seq uint64) {
 	m.seqMu.Lock()
 	defer m.seqMu.Unlock()
