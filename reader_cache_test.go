@@ -24,7 +24,7 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 	}
 	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
-	opts := DefaultReaderOptions()
+	opts := defaultReaderOptions()
 	opts.CacheDir = t.TempDir()
 	opts.ValidateSSTChecksum = validate
 

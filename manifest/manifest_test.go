@@ -77,15 +77,15 @@ func TestSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCurrentRoundTrip(t *testing.T) {
-	maxCommittedLSN := uint64(42)
-	lowWatermarkLSN := uint64(7)
+	maxCommittedPosition := uint64(42)
+	lowWatermarkPosition := uint64(7)
 	c := &Current{
-		Snapshot:        "snapshots/000000001.manifest",
-		LogSeqStart:     7,
-		NextSeq:         12,
-		NextEpoch:       5,
-		MaxCommittedLSN: &maxCommittedLSN,
-		LowWatermarkLSN: &lowWatermarkLSN,
+		Snapshot:             "snapshots/000000001.manifest",
+		LogSeqStart:          7,
+		NextSeq:              12,
+		NextEpoch:            5,
+		MaxCommittedPosition: &maxCommittedPosition,
+		LowWatermarkPosition: &lowWatermarkPosition,
 	}
 
 	data, err := EncodeCurrent(c)
@@ -99,10 +99,10 @@ func TestCurrentRoundTrip(t *testing.T) {
 	if got.Snapshot != c.Snapshot || got.LogSeqStart != c.LogSeqStart || got.NextSeq != c.NextSeq || got.NextEpoch != c.NextEpoch {
 		t.Fatalf("current mismatch")
 	}
-	if got.MaxCommittedLSN == nil || *got.MaxCommittedLSN != *c.MaxCommittedLSN {
+	if got.MaxCommittedPosition == nil || *got.MaxCommittedPosition != *c.MaxCommittedPosition {
 		t.Fatalf("current mismatch")
 	}
-	if got.LowWatermarkLSN == nil || *got.LowWatermarkLSN != *c.LowWatermarkLSN {
+	if got.LowWatermarkPosition == nil || *got.LowWatermarkPosition != *c.LowWatermarkPosition {
 		t.Fatalf("current mismatch")
 	}
 }

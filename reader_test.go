@@ -64,7 +64,7 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		store.Close()
 		t.Fatalf("newReader: %v", err)
@@ -158,7 +158,7 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, newEntries, 0, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestReader_Refresh_PicksUpNewSSTs(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestReader_Get_L0PrefersNewerSeq(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, newer, 0, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, second, 1, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestReader_Get_TombstoneShadowsLowerLevel(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 2)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: cacheDir})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestReader_VerifierRequiresSignature(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:        cacheDir,
 		SSTHashVerifier: noopSSTVerifier{},
 	})
@@ -436,7 +436,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:            cacheDir,
 		ValidateSSTChecksum: true,
 	})
@@ -466,7 +466,7 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 	}
 	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
-	reader, err := newReader(ctx, store, ReaderOptions{CacheDir: t.TempDir()})
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
 	if err != nil {
 		store.Close()
 		t.Fatalf("newReader: %v", err)
@@ -524,7 +524,7 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
 	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(),
 		Metrics:  metrics,
 	})
@@ -639,7 +639,7 @@ func TestReader_MetricsBlobFetch(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(),
 		Metrics:  metrics,
 	})
@@ -693,7 +693,7 @@ func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 	_ = writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
 	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(),
 		Metrics:  metrics,
 	})
@@ -741,7 +741,7 @@ func TestReader_MetricsSSTDownloadError(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, ReaderOptions{
+	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(),
 		Metrics:  metrics,
 	})

@@ -60,7 +60,7 @@ type KV struct {
 	Value []byte
 }
 
-func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) (*Reader, error) {
+func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) (*Reader, error) {
 	ms := newManifestStoreWithCache(store, &opts)
 	m, err := ms.Replay(ctx)
 	if err != nil {
@@ -129,7 +129,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts ReaderOptions) 
 	return reader, nil
 }
 
-func initSSTCache(opts ReaderOptions) (diskcache.RefCountedCache, bool, error) {
+func initSSTCache(opts readerOptions) (diskcache.RefCountedCache, bool, error) {
 	if opts.SSTCache != nil {
 		return opts.SSTCache, false, nil
 	}
@@ -154,7 +154,7 @@ func initSSTCache(opts ReaderOptions) (diskcache.RefCountedCache, bool, error) {
 	return cache, true, nil
 }
 
-func initBlobCache(opts ReaderOptions) (diskcache.Cache, bool, error) {
+func initBlobCache(opts readerOptions) (diskcache.Cache, bool, error) {
 	if opts.BlobCache != nil {
 		return opts.BlobCache, false, nil
 	}
@@ -285,13 +285,13 @@ func (r *Reader) Snapshot() *Snapshot {
 	return newSnapshot(r, m, r.manifestStore.CurrentData())
 }
 
-// MaxCommittedLSN returns the latest committed application LSN recorded in CURRENT.
+// MaxCommittedPosition returns the latest committed application position recorded in CURRENT.
 //
 // This fast path is available only when writers were opened with
-// DBOptions.CommittedLSNExtractor and the workload uses a monotonic key
+// DBOptions.KeyPositionExtractor and the workload uses a monotonic key
 // encoding where max key == latest logical position. It returns found=false
 // when the value is not present.
-func (r *Reader) MaxCommittedLSN(ctx context.Context) (uint64, bool, error) {
+func (r *Reader) MaxCommittedPosition(ctx context.Context) (uint64, bool, error) {
 	current, err := r.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
 		if errors.Is(err, manifest.ErrNotFound) {
@@ -299,20 +299,20 @@ func (r *Reader) MaxCommittedLSN(ctx context.Context) (uint64, bool, error) {
 		}
 		return 0, false, err
 	}
-	if current == nil || current.MaxCommittedLSN == nil {
+	if current == nil || current.MaxCommittedPosition == nil {
 		return 0, false, nil
 	}
-	return *current.MaxCommittedLSN, true, nil
+	return *current.MaxCommittedPosition, true, nil
 }
 
-// LowWatermarkLSN returns the earliest still-visible application LSN recorded
+// LowWatermarkPosition returns the earliest still-visible application position recorded
 // in CURRENT.
 //
 // This fast path is available only when writers were opened with
-// DBOptions.CommittedLSNExtractor and the workload uses a monotonic key
+// DBOptions.KeyPositionExtractor and the workload uses a monotonic key
 // encoding where min key == earliest logical position. It returns found=false
 // when the value is not present.
-func (r *Reader) LowWatermarkLSN(ctx context.Context) (uint64, bool, error) {
+func (r *Reader) LowWatermarkPosition(ctx context.Context) (uint64, bool, error) {
 	current, err := r.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
 		if errors.Is(err, manifest.ErrNotFound) {
@@ -320,10 +320,10 @@ func (r *Reader) LowWatermarkLSN(ctx context.Context) (uint64, bool, error) {
 		}
 		return 0, false, err
 	}
-	if current == nil || current.LowWatermarkLSN == nil {
+	if current == nil || current.LowWatermarkPosition == nil {
 		return 0, false, nil
 	}
-	return *current.LowWatermarkLSN, true, nil
+	return *current.LowWatermarkPosition, true, nil
 }
 
 // Get returns the value for key if present and not deleted/expired.

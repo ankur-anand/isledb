@@ -495,7 +495,7 @@ func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.Compa
 		return err
 	}
 	if updatedManifest != nil {
-		if err := c.manifestLog.UpdateCurrentLowWatermarkLSN(ctx, updatedManifest); err != nil {
+		if err := c.manifestLog.UpdateCurrentLowWatermarkPosition(ctx, updatedManifest); err != nil {
 			return err
 		}
 	}

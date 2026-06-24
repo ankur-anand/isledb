@@ -76,7 +76,15 @@ func readObjectWithCAS(ctx context.Context, store *blobstore.Store, key string) 
 		}
 		return nil, "", false, err
 	}
-	return data, matchTokenFromAttrs(attrs), true, nil
+	matchToken := matchTokenFromAttrs(attrs)
+	if matchToken == "" {
+		attrs, err = store.Attributes(ctx, key)
+		if err != nil {
+			return nil, "", false, err
+		}
+		matchToken = matchTokenFromAttrs(attrs)
+	}
+	return data, matchToken, true, nil
 }
 
 func (s gcMarkStorageAdapter) LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error) {
@@ -347,8 +355,7 @@ func matchTokenFromAttrs(attr blobstore.Attributes) string {
 
 func writeObjectCAS(ctx context.Context, store *blobstore.Store, key string, payload []byte, matchToken string, exists bool) error {
 	if exists && matchToken == "" {
-		_, err := store.Write(ctx, key, payload)
-		return err
+		return fmt.Errorf("%w: missing object version token for %s", blobstore.ErrPreconditionFailed, key)
 	}
 	_, err := store.WriteIfMatch(ctx, key, payload, matchToken)
 	return err

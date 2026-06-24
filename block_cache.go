@@ -9,7 +9,7 @@ import (
 
 const defaultBlockSize = 4 << 10
 
-func initBlockCache(opts ReaderOptions) (*ristretto.Cache[string, []byte], bool, error) {
+func initBlockCache(opts readerOptions) (*ristretto.Cache[string, []byte], bool, error) {
 	if opts.BlockCacheSize <= 0 {
 		return nil, false, nil
 	}

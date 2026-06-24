@@ -50,7 +50,7 @@ type ReaderOpenOptions struct {
 
 // DefaultReaderOpenOptions returns sane defaults for ReaderOpenOptions.
 func DefaultReaderOpenOptions() ReaderOpenOptions {
-	defaults := DefaultReaderOptions()
+	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
 		SSTCacheSize:    defaults.SSTCacheSize,
 		BlobCacheSize:   defaults.BlobCacheSize,
@@ -65,7 +65,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		blobReadOpts = config.DefaultBlobReadOptions()
 	}
 
-	ropts := ReaderOptions{
+	ropts := readerOptions{
 		CacheDir:                 opts.CacheDir,
 		SSTCacheSize:             opts.SSTCacheSize,
 		BlobCacheSize:            opts.BlobCacheSize,

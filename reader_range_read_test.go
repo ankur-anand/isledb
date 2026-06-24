@@ -40,7 +40,7 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 		t.Fatalf("expected large SST, got size %d", res.Meta.Size)
 	}
 
-	opts := ReaderOptions{
+	opts := readerOptions{
 		CacheDir:                 t.TempDir(),
 		BlockCacheSize:           1 << 20,
 		RangeReadMinSSTSize:      32 << 10,
@@ -126,7 +126,7 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	opts := ReaderOptions{
+	opts := readerOptions{
 		CacheDir:                 t.TempDir(),
 		Metrics:                  metrics,
 		BlockCacheSize:           1 << 20,

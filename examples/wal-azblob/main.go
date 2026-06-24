@@ -143,35 +143,10 @@ func main() {
 		log.Printf("read: data/000=%s", value)
 	}
 
-	tr, err := isledb.OpenTailingReader(ctx, store, isledb.TailingReaderOpenOptions{
-		RefreshInterval: 200 * time.Millisecond,
-		ReaderOptions: isledb.ReaderOpenOptions{
-			CacheDir: cacheDir,
-		},
-	})
+	lastKey, err = consumeWAL(ctx, reader, walPrefix, walMax, lastKey, checkpointPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer tr.Close()
-
-	if err := tr.Start(); err != nil {
-		log.Fatal(err)
-	}
-	tailCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- tr.Tail(tailCtx, isledb.TailOptions{
-			MinKey:        []byte(walPrefix),
-			MaxKey:        walMax,
-			StartAfterKey: lastKey,
-			PollInterval:  200 * time.Millisecond,
-		}, func(kv isledb.KV) error {
-			log.Printf("tail: %s=%s", kv.Key, kv.Value)
-			return saveLastKey(checkpointPath, kv.Key)
-		})
-	}()
 
 	if err := writer.Put(ctx, []byte("data/tail"), []byte("tail-value")); err != nil {
 		log.Fatal(err)
@@ -213,7 +188,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := <-done; err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	if err := reader.Refresh(ctx); err != nil {
+		log.Fatal(err)
+	}
+	lastKey, err = consumeWAL(ctx, reader, walPrefix, walMax, lastKey, checkpointPath)
+	if err != nil {
 		log.Fatal(err)
 	}
 
@@ -256,6 +235,36 @@ func writeWALEvent(ctx context.Context, writer *isledb.Writer, prefix string, se
 	}
 	walKey := fmt.Sprintf("%s%s-%06d", prefix, time.Now().UTC().Format("20060102T150405.000000000Z"), *seq)
 	return writer.Put(ctx, []byte(walKey), data)
+}
+
+func consumeWAL(ctx context.Context, reader *isledb.Reader, walPrefix string, walMax []byte, lastKey []byte, checkpointPath string) ([]byte, error) {
+	minKey := []byte(walPrefix)
+	if len(lastKey) > 0 {
+		minKey = nextKey(lastKey)
+	}
+	rows, err := reader.ScanLimit(ctx, minKey, walMax, 0)
+	if err != nil {
+		return lastKey, err
+	}
+	for _, kv := range rows {
+		log.Printf("wal: %s=%s", kv.Key, kv.Value)
+		lastKey = append(lastKey[:0], kv.Key...)
+		if err := saveLastKey(checkpointPath, lastKey); err != nil {
+			return lastKey, err
+		}
+	}
+	return lastKey, nil
+}
+
+func nextKey(key []byte) []byte {
+	out := append([]byte(nil), key...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] < 0xFF {
+			out[i]++
+			return out[:i+1]
+		}
+	}
+	return append(out, 0x00)
 }
 
 func prefixUpperBound(prefix string) []byte {
