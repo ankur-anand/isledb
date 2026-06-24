@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -49,10 +50,13 @@ type Reader struct {
 	ownsSSTCache   bool
 	ownsBlockCache bool
 	ownsBlobCache  bool
+	cacheDir       string
 
-	mu       sync.RWMutex
-	manifest *Manifest
-	metrics  *ReaderMetrics
+	lifecycleMu sync.RWMutex
+	mu          sync.RWMutex
+	manifest    *Manifest
+	metrics     *ReaderMetrics
+	closed      atomic.Bool
 }
 
 type KV struct {
@@ -121,6 +125,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		ownsSSTCache:             ownsSSTCache,
 		ownsBlockCache:           ownsBlockCache,
 		ownsBlobCache:            ownsBlobCache,
+		cacheDir:                 opts.CacheDir,
 		metrics:                  opts.Metrics,
 	}
 	cleanupSSTCache = false
@@ -135,7 +140,7 @@ func initSSTCache(opts readerOptions) (diskcache.RefCountedCache, bool, error) {
 	}
 
 	if opts.CacheDir == "" {
-		return nil, false, errors.New("CacheDir is required")
+		return nil, false, errors.New("cache dir is required")
 	}
 
 	maxSize := opts.SSTCacheSize
@@ -183,6 +188,12 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
+	done, err := r.beginRead()
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	var m *Manifest
 	m, err = r.manifestStore.Replay(ctx)
 	if err != nil {
@@ -223,6 +234,16 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
 }
 
 func (r *Reader) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	var firstErr error
 
 	if r.sstCache != nil && r.ownsSSTCache {
@@ -240,23 +261,34 @@ func (r *Reader) Close() error {
 			firstErr = err
 		}
 	}
-
 	return firstErr
 }
 
+func (r *Reader) beginRead() (func(), error) {
+	if r == nil {
+		return nil, ErrReaderClosed
+	}
+	r.lifecycleMu.RLock()
+	if r.closed.Load() {
+		r.lifecycleMu.RUnlock()
+		return nil, ErrReaderClosed
+	}
+	return r.lifecycleMu.RUnlock, nil
+}
+
 func (r *Reader) Manifest() *Manifest {
+	done, err := r.beginRead()
+	if err != nil {
+		return nil
+	}
+	defer done()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.manifest == nil {
 		return nil
 	}
 	return r.manifest.Clone()
-}
-
-func (r *Reader) ManifestUnsafe() *Manifest {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.manifest
 }
 
 // currentManifest returns the currently published manifest pointer.
@@ -275,55 +307,17 @@ func (r *Reader) currentManifest() *Manifest {
 // manifest state. The returned snapshot does not refresh, even if the Reader is
 // refreshed later.
 func (r *Reader) Snapshot() *Snapshot {
-	if r == nil {
+	done, err := r.beginRead()
+	if err != nil {
 		return nil
 	}
+	defer done()
+
 	m := r.currentManifest()
 	if m == nil {
 		return nil
 	}
 	return newSnapshot(r, m, r.manifestStore.CurrentData())
-}
-
-// MaxCommittedPosition returns the latest committed application position recorded in CURRENT.
-//
-// This fast path is available only when writers were opened with
-// DBOptions.KeyPositionExtractor and the workload uses a monotonic key
-// encoding where max key == latest logical position. It returns found=false
-// when the value is not present.
-func (r *Reader) MaxCommittedPosition(ctx context.Context) (uint64, bool, error) {
-	current, err := r.manifestStore.ReadCurrentData(ctx)
-	if err != nil {
-		if errors.Is(err, manifest.ErrNotFound) {
-			return 0, false, nil
-		}
-		return 0, false, err
-	}
-	if current == nil || current.MaxCommittedPosition == nil {
-		return 0, false, nil
-	}
-	return *current.MaxCommittedPosition, true, nil
-}
-
-// LowWatermarkPosition returns the earliest still-visible application position recorded
-// in CURRENT.
-//
-// This fast path is available only when writers were opened with
-// DBOptions.KeyPositionExtractor and the workload uses a monotonic key
-// encoding where min key == earliest logical position. It returns found=false
-// when the value is not present.
-func (r *Reader) LowWatermarkPosition(ctx context.Context) (uint64, bool, error) {
-	current, err := r.manifestStore.ReadCurrentData(ctx)
-	if err != nil {
-		if errors.Is(err, manifest.ErrNotFound) {
-			return 0, false, nil
-		}
-		return 0, false, err
-	}
-	if current == nil || current.LowWatermarkPosition == nil {
-		return 0, false, nil
-	}
-	return *current.LowWatermarkPosition, true, nil
 }
 
 // Get returns the value for key if present and not deleted/expired.
@@ -332,6 +326,12 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 	defer func() {
 		r.metrics.ObserveGet(time.Since(start), found, err)
 	}()
+
+	done, err := r.beginRead()
+	if err != nil {
+		return nil, false, err
+	}
+	defer done()
 
 	if len(key) == 0 {
 		return nil, false, errors.New("empty key")
@@ -390,6 +390,12 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		r.metrics.ObserveScan(time.Since(start), len(out), err)
 	}()
 
+	done, err := r.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, 0)
 }
 
@@ -398,6 +404,12 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	defer func() {
 		r.metrics.ObserveScanLimit(time.Since(start), len(out), err)
 	}()
+
+	done, err := r.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 
 	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, limit)
 }
@@ -1084,7 +1096,17 @@ type iterEntry struct {
 }
 
 func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
-	return r.newIteratorWithManifest(ctx, r.currentManifest(), opts)
+	done, err := r.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	it, err := r.newIteratorWithManifest(ctx, r.currentManifest(), opts)
+	if err != nil {
+		return nil, err
+	}
+	return it, nil
 }
 
 func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts IteratorOptions) (*Iterator, error) {
@@ -1123,6 +1145,10 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts 
 
 func (it *Iterator) Next() bool {
 	if it.closed || it.err != nil {
+		return false
+	}
+	if it.reader != nil && it.reader.closed.Load() {
+		it.err = ErrReaderClosed
 		return false
 	}
 	if it.mergeIter == nil {

@@ -2,7 +2,6 @@ package isledb
 
 import (
 	"bytes"
-	"encoding/binary"
 	"testing"
 )
 
@@ -37,22 +36,5 @@ func TestIncrementKey(t *testing.T) {
 		if !bytes.Equal(got, tt.want) {
 			t.Fatalf("incrementKey(%q): got=%q want=%q", tt.input, got, tt.want)
 		}
-	}
-}
-
-func TestBigEndianUint64KeyPositionExtractor(t *testing.T) {
-	key := make([]byte, 8)
-	binary.BigEndian.PutUint64(key, 42)
-
-	position, ok := BigEndianUint64KeyPositionExtractor(key)
-	if !ok {
-		t.Fatal("expected extractor to accept 8-byte key")
-	}
-	if position != 42 {
-		t.Fatalf("unexpected position: got=%d want=42", position)
-	}
-
-	if _, ok := BigEndianUint64KeyPositionExtractor([]byte("short")); ok {
-		t.Fatal("expected extractor to reject non-8-byte key")
 	}
 }

@@ -3,7 +3,6 @@ package isledb
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -161,70 +160,91 @@ func TestReaderSnapshotCloseIsIdempotentAndRejectsFurtherUse(t *testing.T) {
 	}
 }
 
-func TestReaderSnapshotMaxCommittedPosition(t *testing.T) {
+func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("reader-snapshot-max-position")
+	store := blobstore.NewMemory("reader-close")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{
-		KeyPositionExtractor: BigEndianUint64KeyPositionExtractor,
-	})
-	if err != nil {
-		t.Fatalf("OpenDB: %v", err)
-	}
-	defer db.Close()
-
-	writer, err := db.OpenWriter(ctx, WriterOptions{})
-	if err != nil {
-		t.Fatalf("OpenWriter: %v", err)
-	}
-	defer writer.Close(ctx)
-
-	putPosition := func(position uint64, value string) {
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, position)
-		if err := writer.Put(ctx, key, []byte(value)); err != nil {
-			t.Fatalf("Put(%d): %v", position, err)
-		}
-	}
-
-	putPosition(7, "v7")
-	putPosition(42, "v42")
-	if err := writer.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
-	defer reader.Close()
-
 	snap := reader.Snapshot()
 	if snap == nil {
 		t.Fatal("Snapshot() = nil")
 	}
-	defer snap.Close()
 
-	position, found := snap.MaxCommittedPosition()
-	if !found {
-		t.Fatal("expected max committed position to be found")
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
-	if position != 42 {
-		t.Fatalf("unexpected max committed position: got=%d want=42", position)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 
-	low, found := snap.LowWatermarkPosition()
-	if !found {
-		t.Fatal("expected low watermark position to be found")
+	if _, _, err := reader.Get(ctx, []byte("a")); err != ErrReaderClosed {
+		t.Fatalf("Get after Reader.Close error=%v, want %v", err, ErrReaderClosed)
 	}
-	if low != 7 {
-		t.Fatalf("unexpected low watermark position: got=%d want=7", low)
+	if _, err := reader.Scan(ctx, nil, nil); err != ErrReaderClosed {
+		t.Fatalf("Scan after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if _, err := reader.ScanLimit(ctx, nil, nil, 1); err != ErrReaderClosed {
+		t.Fatalf("ScanLimit after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if _, err := reader.NewIterator(ctx, IteratorOptions{}); err != ErrReaderClosed {
+		t.Fatalf("NewIterator after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if err := reader.Refresh(ctx); err != ErrReaderClosed {
+		t.Fatalf("Refresh after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if _, err := reader.Prefetch(ctx, PrefetchOptions{All: true}); err != ErrReaderClosed {
+		t.Fatalf("Prefetch after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if got := reader.Manifest(); got != nil {
+		t.Fatalf("Manifest after Reader.Close = %#v, want nil", got)
+	}
+	if got := reader.Snapshot(); got != nil {
+		t.Fatalf("Snapshot after Reader.Close = %#v, want nil", got)
+	}
+	if _, _, err := snap.Get(ctx, []byte("a")); err != ErrReaderClosed {
+		t.Fatalf("Snapshot.Get after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+}
+
+func TestOpenReaderDefaultOptionsAreOpenable(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-default-options")
+	defer store.Close()
+
+	cacheDir := t.TempDir()
+	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(cacheDir))
+	if err != nil {
+		t.Fatalf("OpenReader with default options: %v", err)
+	}
+	if reader.cacheDir != cacheDir {
+		t.Fatalf("reader cacheDir=%q, want %q", reader.cacheDir, cacheDir)
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestOpenReaderRequiresExplicitCacheDir(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-cache-dir-required")
+	defer store.Close()
+
+	if _, err := OpenReader(ctx, store, DefaultReaderOpenOptions("")); err == nil {
+		t.Fatal("OpenReader with empty cache dir succeeded, want error")
 	}
 }
 
 func openTestReader(t *testing.T, ctx context.Context, store *blobstore.Store) *Reader {
 	t.Helper()
 
-	opts := DefaultReaderOpenOptions()
-	opts.CacheDir = t.TempDir()
+	opts := DefaultReaderOpenOptions(t.TempDir())
 	reader, err := OpenReader(ctx, store, opts)
 	if err != nil {
 		t.Fatalf("OpenReader: %v", err)

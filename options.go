@@ -33,7 +33,7 @@ type WriterOptions struct {
 	Values config.ValueStorageConfig
 
 	// ChangeFeed controls whether flushes also publish seq-ordered mutation
-	// batches under changes/. Disabled by default for pure KV workloads.
+	// batches under changes/. Disabled by default.
 	ChangeFeed ChangeFeedOptions
 
 	// OnFlushError is called when the background flush loop observes an error.

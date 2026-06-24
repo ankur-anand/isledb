@@ -52,8 +52,8 @@ For the exact per-file object-store schema and JSON examples, see [Object Store 
 | `DB` | Shared control plane for a single prefix. Opens writers and maintenance processes against the same manifest state. |
 | `Writer` | Buffers writes in memory, spills them into immutable SSTs, uploads those SSTs, and publishes manifest changes. Large values can be written as separate blob objects. |
 | `Manifest store` | Tracks the durable visible state of the database. `manifest/CURRENT` is the hot pointer; snapshots, bounded active entries, and immutable commit pages define the full topology. |
-| `Reader` | Replays manifest state, fetches SSTs and blobs on demand, and uses local caches to avoid repeated downloads. |
-| `TailingReader` | Polls for manifest changes and emits new keys in order for log/event-style consumption. |
+| `Reader` | Refreshes manifest state, fetches SSTs and blobs on demand, and uses local caches to avoid repeated downloads. |
+| `Snapshot` | Pins one loaded reader view so multiple reads see a consistent manifest version. |
 | `Compactor` | Rewrites L0 SSTs and sorted runs into a more efficient layout, then publishes the new topology through the manifest. |
 | `RetentionCompactor` | Applies FIFO or time-window retention, advances low-watermark metadata, and coordinates physical deletion of obsolete SSTs. |
 | `GC mark storage` | Stores pending-delete marks and replay checkpoints so cleanup can proceed safely across restarts. |
@@ -82,7 +82,7 @@ demo/p000/
   sstable/
     <bucket>/
       <sst-id>
-  changes/
+  changes/                 # optional experimental change-batch objects
     <bucket>/
       <change-batch-id>
   blobs/
@@ -94,33 +94,31 @@ What each object family does:
 
 | Path | Format | Written by | Read by | Purpose |
 | --- | --- | --- | --- | --- |
-| `manifest/CURRENT` | JSON | writer, compactor, retention compactor | reader, tailing reader, maintenance processes | Hot control record and visibility boundary. Holds fences, replay bounds, bounded active entries, immutable page refs, and optional `max_committed_lsn` / `low_watermark_lsn`. |
+| `manifest/CURRENT` | JSON | writer, compactor, retention compactor | reader, maintenance processes | Hot control record and visibility boundary. Holds fences, replay bounds, bounded active entries, and immutable page refs. |
 | `manifest/snapshots/<id>.manifest` | JSON | snapshot publication path via `manifest.Store.WriteSnapshot` | reader, compactor, retention compactor | Optional full manifest snapshot describing the complete visible SST topology at a point in time. |
 | `manifest/pages/lNN/<page-id>.json` | JSON | writer, compactor, retention compactor | reader, compactor, retention compactor | Immutable committed manifest pages. Level 0 pages hold entries; higher levels hold page refs. Only pages referenced by `CURRENT` are visible. |
 | `manifest/gc/pending-sst/pending.json` | JSON | compactor, retention compactor | compactor, retention compactor | Tracks SSTs that are no longer referenced and are waiting for physical deletion. |
 | `manifest/gc/checkpoint.json` | JSON | retention compactor | retention compactor | Stores GC replay progress over manifest history. |
 | `sstable/<bucket>/<sst-id>` | Binary | writer, compactor | reader, compactor, retention compactor | Immutable SST bytes containing committed key/value data. The bucket is deterministically derived from the SST ID. |
-| `changes/<bucket>/<change-batch-id>` | Binary | writer when change feed is enabled | future change-feed readers, maintenance processes | Immutable, seq-ordered committed mutation batch emitted with a memtable flush. Visibility still comes from the manifest, not raw object listing. |
+| `changes/<bucket>/<change-batch-id>` | Binary | writer when experimental change feed is enabled | maintenance processes | Optional committed mutation batch emitted with a memtable flush. This is not part of the stable core KV read path. |
 | `blobs/<prefix>/<blob-id>.blob` | Binary | writer | reader | External value objects used when large values are stored out-of-line. |
 
 #### Write, Read, and Cleanup Lifecycle
 
 1. `Writer.Put` buffers keys in the active memtable. If a value crosses the blob threshold, the value bytes are uploaded to `blobs/` first and the memtable stores a blob reference.
-2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths. If `WriterOptions.ChangeFeed.Enabled` is true, it also writes one seq-ordered change batch under `changes/` for each flushed memtable.
-3. After the SST and optional change-batch objects exist, the writer commits manifest state by CAS-updating `manifest/CURRENT`. Small recent entries stay in `CURRENT.active_entries`; older entries rotate into immutable `manifest/pages/` objects. This is the visibility boundary for readers and future change-feed consumers.
-4. `Reader.Refresh` or `TailingReader` replay from `manifest/CURRENT` plus any needed snapshot/page files, then read the newly visible SSTs and blobs on demand.
-5. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.
-6. `RetentionCompactor` removes old SSTs from visible manifest state, advances low-watermark metadata when configured, records pending-delete marks in `manifest/gc/*`, and later deletes obsolete SST objects.
-
-For append-only monotonic keyspaces, `DBOptions.CommittedLSNExtractor` lets IsleDB publish `max_committed_lsn` and `low_watermark_lsn` into `manifest/CURRENT`. That gives readers a cheap way to discover the committed head and retention floor without replaying the full manifest.
+2. `Writer.Flush` seals one or more memtables into immutable SSTs and uploads those files to bucketed `sstable/` paths.
+3. After the SST objects exist, the writer commits manifest state by CAS-updating `manifest/CURRENT`. Small recent entries stay in `CURRENT.active_entries`; older entries rotate into immutable `manifest/pages/` objects. This is the visibility boundary for readers.
+4. `Reader.Refresh` reloads `manifest/CURRENT` plus any needed snapshot/page files. Point reads, scans, and iterators then read newly visible SSTs and blobs on demand.
+5. `Reader.Snapshot` pins the current loaded state so a caller can run multiple reads against one consistent view while the parent reader refreshes independently.
+6. `Compactor` rewrites SST layout for lower read amplification and publishes the replacement topology through new manifest entries.
+7. `RetentionCompactor` removes old SSTs from visible manifest state, records pending-delete marks in `manifest/gc/*`, and later deletes obsolete SST objects.
 
 ### Use Cases
 
-One library, many workloads. The same storage and replay model can power event ingestion, state materialization, key-value APIs, and object-storage-first data pipelines.
+One library, many workloads. The same storage model can power key-value APIs, state materialization, snapshot reads, and object-storage-first data pipelines.
 
-- **Event Hub** — Ingest app events and fan out with tailing readers. *Common alternative: managed brokers + sinks.*
+- **Object-store KV** — Serve Get/Scan workloads with object-store durability. *Common alternative: managed key-value services.*
 - **Event Store** — Append ordered events and build projections from replay. *Common alternative: dedicated event databases.*
-- **KV API Backing Store** — Serve Get/Scan workloads with object-store durability. *Common alternative: managed key-value services.*
 - **CDC Pipeline Buffer** — Stage changes in object storage before indexing and analytics.
 
 ### When not to use IsleDB
@@ -201,6 +199,11 @@ defer db.Close()
 IsleDB uses a **write-ahead memtable** architecture where writes are first buffered in memory before being flushed to 
 persistent SST files. Large values are stored separately in blob storage to keep SSTs compact.
 
+`Put` and `Delete` buffer mutations in the active memtable. A mutation becomes durable and visible to newly refreshed
+readers after `Flush`, a background flush, or `Close` commits the SST metadata to the manifest. `Writer` uses internal
+locks to coordinate with background flushing, but concurrent public calls do not have documented ordering or Close/Flush
+semantics. Serialize calls for one writer.
+
 ```go
 opts := isledb.DefaultWriterOptions()
 writer, err := db.OpenWriter(ctx, opts)
@@ -226,6 +229,13 @@ if err := writer.Flush(ctx); err != nil {
 }
 ```
 
+Writer behavior:
+
+- `Flush` is the synchronous publish boundary. It writes pending memtables as SSTs and commits the manifest entries.
+- `Close` stops background flushing and flushes pending writes before returning.
+- `Flush.Interval` enables background flush. Background errors are reported through `OnFlushError`; explicit `Flush` and `Close` return errors directly.
+- `Memtable.MaxFrozen` bounds buffered full memtables. When the queue is full, writes return `ErrBackpressure`.
+
 #### Reader
 Readers open against the same bucket/prefix and fetch SSTs and blobs on demand. Configure local caches
 to reduce repeated downloads, and scale readers horizontally as needed.
@@ -248,35 +258,38 @@ if ok {
 }
 ```
 
-#### Tailing Reader
-
-Continuously streams new KV writes by polling for new SSTs and emitting entries in order.
-Good for event/log style consumption when you want a live feed over object storage.
+Use `Prefetch` when a reader knows a hot key range and should warm local SST
+cache before serving reads. `Prefetch` uses the current manifest view, so call
+`Refresh` first when you need the latest committed state.
 
 ```go
-tr, err := isledb.OpenTailingReader(ctx, store, isledb.TailingReaderOpenOptions{
-	RefreshInterval: time.Second,
-	ReaderOptions: isledb.ReaderOpenOptions{
-		CacheDir: "./cache",
-	},
-})
-if err != nil {
+if err := reader.Refresh(ctx); err != nil {
 	log.Fatal(err)
 }
-defer tr.Close()
 
-if err := tr.Start(); err != nil {
-	log.Fatal(err)
-}
-err = tr.Tail(ctx, isledb.TailOptions{
-	PollInterval: time.Second,
-}, func(kv isledb.KV) error {
-	log.Printf("%s=%s", kv.Key, kv.Value)
-	return nil
+_, err = reader.Prefetch(ctx, isledb.PrefetchOptions{
+	Range:       isledb.PrefixRange([]byte("user:")),
+	MaxBytes:    256 << 20,
+	Concurrency: 4,
 })
 if err != nil {
 	log.Fatal(err)
 }
+```
+
+#### Snapshot
+
+Use a snapshot when multiple reads must observe the same loaded view. The parent reader can refresh later without changing the pinned snapshot.
+
+```go
+snap := reader.Snapshot()
+defer snap.Close()
+
+items, err := snap.ScanLimit(ctx, []byte("user:"), []byte("user;"), 100)
+if err != nil {
+	log.Fatal(err)
+}
+log.Printf("items=%d version=%v", len(items), snap.Version())
 ```
 
 #### Compaction

@@ -384,9 +384,6 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	updated := m.Clone()
 	updated.RemoveL0SSTs(toDelete)
 	updated.RemoveSSTsFromSortedRuns(toDelete)
-	if err := c.manifestLog.UpdateCurrentLowWatermarkPosition(ctx, updated); err != nil {
-		return 0, 0, fmt.Errorf("update current low watermark: %w", err)
-	}
 	c.setManifest(updated)
 
 	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_fifo", entry.Seq); err != nil {
@@ -480,9 +477,6 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 	updated := m.Clone()
 	updated.RemoveL0SSTs(toDelete)
 	updated.RemoveSSTsFromSortedRuns(toDelete)
-	if err := c.manifestLog.UpdateCurrentLowWatermarkPosition(ctx, updated); err != nil {
-		return 0, 0, fmt.Errorf("update current low watermark: %w", err)
-	}
 	c.setManifest(updated)
 
 	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_segmented", entry.Seq); err != nil {
