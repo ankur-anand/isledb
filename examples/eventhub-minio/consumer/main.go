@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,8 +24,7 @@ func main() {
 		topic          = flag.String("topic", getenvDefault("ISLEDB_TOPIC", "orders"), "Event topic")
 		cacheDir       = flag.String("cache-dir", filepath.Join(os.TempDir(), "isledb-eventhub-cache"), "Reader cache directory")
 		checkpointPath = flag.String("checkpoint", filepath.Join(os.TempDir(), "isledb-eventhub", "consumer.checkpoint"), "Checkpoint file path")
-		pollInterval   = flag.Duration("poll-interval", 500*time.Millisecond, "Tail poll interval")
-		refreshEvery   = flag.Duration("refresh-interval", 500*time.Millisecond, "Tailing reader refresh interval")
+		pollInterval   = flag.Duration("poll-interval", 500*time.Millisecond, "Reader refresh poll interval")
 		ensureBucket   = flag.Bool("ensure-bucket", true, "Create MinIO bucket if missing")
 	)
 	flag.Parse()
@@ -56,43 +54,54 @@ func main() {
 	}
 	defer store.Close()
 
-	tr, err := isledb.OpenTailingReader(ctx, store, isledb.TailingReaderOpenOptions{
-		RefreshInterval: *refreshEvery,
-		ReaderOptions: isledb.ReaderOpenOptions{
-			CacheDir: *cacheDir,
-		},
+	reader, err := isledb.OpenReader(ctx, store, isledb.ReaderOpenOptions{
+		CacheDir: *cacheDir,
 	})
 	if err != nil {
-		log.Fatalf("open tailing reader: %v", err)
+		log.Fatalf("open reader: %v", err)
 	}
-	defer tr.Close()
-
-	if err := tr.Start(); err != nil {
-		log.Fatalf("start tailing reader: %v", err)
-	}
+	defer reader.Close()
 
 	eventPrefix := fmt.Sprintf("events/%s/", *topic)
 	log.Printf("consumer started bucket_url=%s prefix=%s topic=%s start_after=%q", *bucketURL, *prefix, *topic, string(lastKey))
 
-	err = tr.Tail(ctx, isledb.TailOptions{
-		MinKey:        []byte(eventPrefix),
-		MaxKey:        shared.PrefixUpperBound(eventPrefix),
-		StartAfterKey: lastKey,
-		PollInterval:  *pollInterval,
-	}, func(kv isledb.KV) error {
-		var ev shared.Event
-		if err := json.Unmarshal(kv.Value, &ev); err != nil {
-			log.Printf("consume key=%s raw=%s", kv.Key, kv.Value)
-		} else {
-			log.Printf("consume seq=%d id=%s topic=%s producer=%s payload=%s at=%s key=%s",
-				ev.Seq, ev.ID, ev.Topic, ev.Producer, ev.Payload, ev.At.Format(time.RFC3339Nano), kv.Key)
+	ticker := time.NewTicker(*pollInterval)
+	defer ticker.Stop()
+
+	for {
+		if err := reader.Refresh(ctx); err != nil {
+			log.Fatalf("refresh reader: %v", err)
 		}
-		return shared.SaveLastKey(*checkpointPath, kv.Key)
-	})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("tail failed: %v", err)
+
+		minKey := []byte(eventPrefix)
+		if len(lastKey) > 0 {
+			minKey = nextKey(lastKey)
+		}
+		rows, err := reader.ScanLimit(ctx, minKey, shared.PrefixUpperBound(eventPrefix), 0)
+		if err != nil {
+			log.Fatalf("scan events: %v", err)
+		}
+		for _, kv := range rows {
+			var ev shared.Event
+			if err := json.Unmarshal(kv.Value, &ev); err != nil {
+				log.Printf("consume key=%s raw=%s", kv.Key, kv.Value)
+			} else {
+				log.Printf("consume seq=%d id=%s topic=%s producer=%s payload=%s at=%s key=%s",
+					ev.Seq, ev.ID, ev.Topic, ev.Producer, ev.Payload, ev.At.Format(time.RFC3339Nano), kv.Key)
+			}
+			lastKey = append(lastKey[:0], kv.Key...)
+			if err := shared.SaveLastKey(*checkpointPath, lastKey); err != nil {
+				log.Fatalf("save checkpoint: %v", err)
+			}
+		}
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			log.Printf("consumer stopped")
+			return
+		}
 	}
-	log.Printf("consumer stopped")
 }
 
 func getenvDefault(key, fallback string) string {
@@ -100,4 +109,15 @@ func getenvDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func nextKey(key []byte) []byte {
+	out := append([]byte(nil), key...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] < 0xFF {
+			out[i]++
+			return out[:i+1]
+		}
+	}
+	return append(out, 0x00)
 }

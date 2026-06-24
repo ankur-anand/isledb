@@ -123,13 +123,13 @@ func TestAppendWithWriterFence_FencedOut(t *testing.T) {
 	}
 }
 
-func TestAppendAddSSTableWithFence_UpdatesCurrentCommittedLSN(t *testing.T) {
+func TestAppendAddSSTableWithFence_UpdatesCurrentMaxPosition(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
 
 	ms := NewStore(store)
-	ms.SetCommittedLSNExtractor(func(maxKey []byte) (uint64, bool) {
+	ms.SetKeyPositionExtractor(func(maxKey []byte) (uint64, bool) {
 		if len(maxKey) != 8 {
 			return 0, false
 		}
@@ -170,11 +170,11 @@ func TestAppendAddSSTableWithFence_UpdatesCurrentCommittedLSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read current: %v", err)
 	}
-	if current == nil || current.MaxCommittedLSN == nil {
-		t.Fatal("expected current max committed lsn to be set")
+	if current == nil || current.MaxCommittedPosition == nil {
+		t.Fatal("expected current max committed position to be set")
 	}
-	if got := *current.MaxCommittedLSN; got != 99 {
-		t.Fatalf("unexpected max committed lsn: got=%d want=99", got)
+	if got := *current.MaxCommittedPosition; got != 99 {
+		t.Fatalf("unexpected max committed position: got=%d want=99", got)
 	}
 }
 
@@ -848,13 +848,13 @@ func TestWriteSnapshot_DoesNotRegressCurrentNextSeqOnFreshStore(t *testing.T) {
 	}
 }
 
-func TestWriteSnapshot_BackfillsCurrentCommittedLSNFromManifest(t *testing.T) {
+func TestWriteSnapshot_BackfillsCurrentMaxPositionFromManifest(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
 
 	ms := NewStore(store)
-	ms.SetCommittedLSNExtractor(func(maxKey []byte) (uint64, bool) {
+	ms.SetKeyPositionExtractor(func(maxKey []byte) (uint64, bool) {
 		if len(maxKey) != 8 {
 			return 0, false
 		}
@@ -880,11 +880,11 @@ func TestWriteSnapshot_BackfillsCurrentCommittedLSNFromManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read current: %v", err)
 	}
-	if current == nil || current.MaxCommittedLSN == nil {
-		t.Fatal("expected current max committed lsn to be backfilled")
+	if current == nil || current.MaxCommittedPosition == nil {
+		t.Fatal("expected current max committed position to be backfilled")
 	}
-	if got := *current.MaxCommittedLSN; got != 77 {
-		t.Fatalf("unexpected max committed lsn: got=%d want=77", got)
+	if got := *current.MaxCommittedPosition; got != 77 {
+		t.Fatalf("unexpected max committed position: got=%d want=77", got)
 	}
 }
 

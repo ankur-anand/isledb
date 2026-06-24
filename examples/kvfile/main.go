@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
 
 	"github.com/ankur-anand/isledb"
 	"github.com/ankur-anand/isledb/blobstore"
@@ -71,33 +69,6 @@ func main() {
 		log.Printf("read: hello=%s", value)
 	}
 
-	tr, err := isledb.OpenTailingReader(ctx, store, isledb.TailingReaderOpenOptions{
-		RefreshInterval: 200 * time.Millisecond,
-		ReaderOptions: isledb.ReaderOpenOptions{
-			CacheDir: cacheDir,
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer tr.Close()
-
-	if err := tr.Start(); err != nil {
-		log.Fatal(err)
-	}
-	tailCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- tr.Tail(tailCtx, isledb.TailOptions{
-			PollInterval: 200 * time.Millisecond,
-		}, func(kv isledb.KV) error {
-			log.Printf("tail: %s=%s", kv.Key, kv.Value)
-			return nil
-		})
-	}()
-
 	for i := 0; i < 10; i++ {
 		key := []byte("key-" + strconv.Itoa(i))
 		value := []byte("value-" + strconv.Itoa(i))
@@ -109,7 +80,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := <-done; err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	if err := reader.Refresh(ctx); err != nil {
 		log.Fatal(err)
+	}
+	rows, err := reader.ScanLimit(ctx, []byte("key-"), []byte("key."), 20)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, kv := range rows {
+		log.Printf("scan: %s=%s", kv.Key, kv.Value)
 	}
 }

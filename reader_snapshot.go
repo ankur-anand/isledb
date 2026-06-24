@@ -32,23 +32,23 @@ type Snapshot struct {
 	reader          *Reader
 	manifest        *Manifest
 	version         Version
-	maxCommittedLSN uint64
-	hasCommittedLSN bool
-	lowWatermarkLSN uint64
+	maxPosition     uint64
+	hasMaxPosition  bool
+	lowPosition     uint64
 	hasLowWatermark bool
 	closed          atomic.Bool
 }
 
 func newSnapshot(reader *Reader, m *Manifest, current *manifest.Current) *Snapshot {
-	maxCommittedLSN, hasCommittedLSN := currentCommittedLSN(current)
-	lowWatermarkLSN, hasLowWatermark := currentLowWatermarkLSN(current)
+	maxPosition, hasMaxPosition := currentMaxPosition(current)
+	lowPosition, hasLowWatermark := currentLowWatermarkPosition(current)
 	return &Snapshot{
 		reader:          reader,
 		manifest:        m,
 		version:         versionFromCurrent(current),
-		maxCommittedLSN: maxCommittedLSN,
-		hasCommittedLSN: hasCommittedLSN,
-		lowWatermarkLSN: lowWatermarkLSN,
+		maxPosition:     maxPosition,
+		hasMaxPosition:  hasMaxPosition,
+		lowPosition:     lowPosition,
 		hasLowWatermark: hasLowWatermark,
 	}
 }
@@ -60,18 +60,18 @@ func (s *Snapshot) Version() Version {
 	return s.version
 }
 
-func (s *Snapshot) MaxCommittedLSN() (uint64, bool) {
+func (s *Snapshot) MaxCommittedPosition() (uint64, bool) {
 	if s == nil {
 		return 0, false
 	}
-	return s.maxCommittedLSN, s.hasCommittedLSN
+	return s.maxPosition, s.hasMaxPosition
 }
 
-func (s *Snapshot) LowWatermarkLSN() (uint64, bool) {
+func (s *Snapshot) LowWatermarkPosition() (uint64, bool) {
 	if s == nil {
 		return 0, false
 	}
-	return s.lowWatermarkLSN, s.hasLowWatermark
+	return s.lowPosition, s.hasLowWatermark
 }
 
 func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
@@ -95,13 +95,6 @@ func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit i
 	return s.reader.scanInternalWithManifest(ctx, s.manifest, minKey, maxKey, limit)
 }
 
-func (s *Snapshot) CatchUp(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
-	if err := s.ensureOpen(); err != nil {
-		return CatchUpResult{}, err
-	}
-	return catchUpWithManifest(ctx, s.reader, s.manifest, opts, handler)
-}
-
 func (s *Snapshot) Close() error {
 	if s == nil {
 		return nil
@@ -120,18 +113,18 @@ func (s *Snapshot) ensureOpen() error {
 	return nil
 }
 
-func currentCommittedLSN(current *manifest.Current) (uint64, bool) {
-	if current == nil || current.MaxCommittedLSN == nil {
+func currentMaxPosition(current *manifest.Current) (uint64, bool) {
+	if current == nil || current.MaxCommittedPosition == nil {
 		return 0, false
 	}
-	return *current.MaxCommittedLSN, true
+	return *current.MaxCommittedPosition, true
 }
 
-func currentLowWatermarkLSN(current *manifest.Current) (uint64, bool) {
-	if current == nil || current.LowWatermarkLSN == nil {
+func currentLowWatermarkPosition(current *manifest.Current) (uint64, bool) {
+	if current == nil || current.LowWatermarkPosition == nil {
 		return 0, false
 	}
-	return *current.LowWatermarkLSN, true
+	return *current.LowWatermarkPosition, true
 }
 
 func versionFromCurrent(current *manifest.Current) Version {
@@ -139,55 +132,17 @@ func versionFromCurrent(current *manifest.Current) Version {
 		return Version{}
 	}
 
-	maxCommittedLSN, hasCommittedLSN := currentCommittedLSN(current)
-	lowWatermarkLSN, hasLowWatermark := currentLowWatermarkLSN(current)
+	maxPosition, hasMaxPosition := currentMaxPosition(current)
+	lowPosition, hasLowWatermark := currentLowWatermarkPosition(current)
 	return Version{
 		value: fmt.Sprintf("%s:%d:%d:%t:%d:%t:%d",
 			current.Snapshot,
 			current.LogSeqStart,
 			current.NextSeq,
-			hasCommittedLSN,
-			maxCommittedLSN,
+			hasMaxPosition,
+			maxPosition,
 			hasLowWatermark,
-			lowWatermarkLSN,
+			lowPosition,
 		),
 	}
-}
-
-func catchUpWithManifest(ctx context.Context, reader *Reader, m *Manifest, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error) {
-	iter, err := reader.newIteratorWithManifest(ctx, m, IteratorOptions{
-		MinKey: catchUpMinKey(opts.MinKey, opts.StartAfterKey),
-		MaxKey: opts.MaxKey,
-	})
-	if err != nil {
-		return CatchUpResult{}, err
-	}
-	defer iter.Close()
-
-	var result CatchUpResult
-
-	for iter.Next() {
-		kv := KV{
-			Key:   iter.Key(),
-			Value: iter.Value(),
-		}
-
-		if err := handler(kv); err != nil {
-			return result, err
-		}
-
-		result.LastKey = append(result.LastKey[:0], kv.Key...)
-		result.Count++
-
-		if opts.Limit > 0 && result.Count >= opts.Limit {
-			result.Truncated = true
-			return result, nil
-		}
-	}
-
-	if err := iter.Err(); err != nil {
-		return result, err
-	}
-
-	return result, nil
 }

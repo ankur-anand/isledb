@@ -17,9 +17,9 @@ type SSTSignature = manifest.SSTSignature
 type SortedRun = manifest.SortedRun
 type CompactionLogPayload = manifest.CompactionLogPayload
 
-// CommittedLSNExtractor extracts an application-defined LSN from a monotonic
-// SST boundary key.
-type CommittedLSNExtractor = manifest.CommittedLSNExtractor
+// KeyPositionExtractor extracts an application-defined monotonic position from
+// an SST boundary key.
+type KeyPositionExtractor = manifest.KeyPositionExtractor
 
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {
@@ -28,7 +28,7 @@ func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) ma
 	return manifest.NewBlobStoreBackend(store)
 }
 
-func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.Storage, opts *ReaderOptions) manifest.Storage {
+func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.Storage, opts *readerOptions) manifest.Storage {
 	base := resolveManifestStorage(store, storage)
 	if opts != nil && opts.DisableManifestPageCache {
 		return base
@@ -46,15 +46,15 @@ func newManifestStore(store *blobstore.Store, storage manifest.Storage) *manifes
 	return newManifestStoreWithExtractor(store, storage, nil)
 }
 
-func newManifestStoreWithExtractor(store *blobstore.Store, storage manifest.Storage, extractor CommittedLSNExtractor) *manifest.Store {
+func newManifestStoreWithExtractor(store *blobstore.Store, storage manifest.Storage, extractor KeyPositionExtractor) *manifest.Store {
 	ms := manifest.NewStoreWithStorage(resolveManifestStorage(store, storage))
 	if extractor != nil {
-		ms.SetCommittedLSNExtractor(extractor)
+		ms.SetKeyPositionExtractor(extractor)
 	}
 	return ms
 }
 
-func newManifestStoreWithCache(store *blobstore.Store, opts *ReaderOptions) *manifest.Store {
+func newManifestStoreWithCache(store *blobstore.Store, opts *readerOptions) *manifest.Store {
 	var storage manifest.Storage
 	if opts != nil {
 		storage = opts.ManifestStorage

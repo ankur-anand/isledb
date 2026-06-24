@@ -33,7 +33,7 @@ func TestReader_RefreshAndPrefetch(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -101,7 +101,7 @@ func TestReader_RefreshAndPrefetch_NoNewSSTs(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -129,7 +129,7 @@ func TestReader_RefreshAndPrefetch_EmptyManifest(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -156,7 +156,7 @@ func TestReader_RefreshAndPrefetch_MultipleFlushes(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -227,7 +227,7 @@ func TestReader_RefreshAndPrefetch_ValidatesChecksum(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	rOpts.ValidateSSTChecksum = true
 	r, err := newReader(ctx, store, rOpts)

@@ -50,14 +50,14 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 type DBOptions struct {
     ManifestStorage manifest.Storage // Optional custom manifest storage backend
     GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
-    CommittedLSNExtractor isledb.CommittedLSNExtractor // Optional CURRENT max_lsn updater for append-only monotonic keyspaces
+    KeyPositionExtractor isledb.KeyPositionExtractor // Optional CURRENT position updater for monotonic keyspaces
 }
 ```
 
-`CommittedLSNExtractor` is intended for append-only, monotonic keyspaces where the
+`KeyPositionExtractor` is intended for monotonic keyspaces where the
 lexicographically largest key is also the latest logical position, such as
-8-byte big-endian WAL/LSN keys. If it is not configured, `Reader.MaxCommittedLSN`
-and `TailingReader.MaxCommittedLSN` return `found=false`.
+8-byte big-endian sequence keys. If it is not configured,
+`Reader.MaxCommittedPosition` returns `found=false`.
 
 ---
 
@@ -120,20 +120,14 @@ later.
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key from this fixed view |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create a bounded iterator over this fixed view |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Read up to limit records from this fixed view |
-| MaxCommittedLSN | `() (uint64, bool)` | Return the head/high-watermark captured with this view |
-| LowWatermarkLSN | `() (uint64, bool)` | Return the low watermark captured with this view |
-| CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Emit visible records after the requested checkpoint from this fixed view |
+| MaxCommittedPosition | `() (uint64, bool)` | Return the head/high-watermark captured with this view |
+| LowWatermarkPosition | `() (uint64, bool)` | Return the low watermark captured with this view |
 | Close | `() error` | Release the caller reference to the view |
 
 ```go
 type Version struct { ... }
 type Snapshot struct { ... }
 ```
-
-`CatchUp` on a `Snapshot` runs against one fixed visible manifest state. It does
-not refresh while scanning.
-
----
 
 ### Reader
 
@@ -147,7 +141,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 |--------|-----------|-------------|
 | RefreshAndPrefetchSSTs | `(ctx context.Context) error` | Reload manifest and proactively warm newly visible SSTs into cache |
 | Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key |
-| MaxCommittedLSN | `(ctx context.Context) (uint64, bool, error)` | Read latest committed LSN from `CURRENT` for append-only monotonic keyspaces |
+| MaxCommittedPosition | `(ctx context.Context) (uint64, bool, error)` | Read latest committed position from `CURRENT` for monotonic keyspaces |
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
@@ -178,7 +172,7 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions() ReaderOpenOptions
 ```
 
-`MaxCommittedLSN` is a fast path backed by `CURRENT`. Use it only for workloads
+`MaxCommittedPosition` is a fast path backed by `CURRENT`. Use it only for workloads
 where max key equals latest logical position. It is not a general-purpose
 replacement for manifest replay or arbitrary KV ordering.
 
@@ -211,75 +205,6 @@ type IteratorOptions struct {
     MaxKey []byte // Inclusive upper bound
 }
 ```
-
----
-
-### TailingReader
-
-Reader with periodic background manifest refresh and the ability to tail for new keys.
-
-```go
-func OpenTailingReader(ctx context.Context, store *blobstore.Store, opts TailingReaderOpenOptions) (*TailingReader, error)
-```
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Start | `() error` | Start background refresh loop |
-| Stop | `()` | Stop background refresh |
-| Close | `() error` | Stop and close underlying reader |
-| Refresh | `(ctx context.Context) error` | Manually refresh manifest |
-| LastRefresh | `() time.Time` | Time of last refresh |
-| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value |
-| MaxCommittedLSN | `(ctx context.Context) (uint64, bool, error)` | Read latest committed LSN from `CURRENT` for append-only monotonic keyspaces |
-| Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan key range |
-| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with limit |
-| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create iterator |
-| Manifest | `() *Manifest` | Get manifest snapshot |
-| Reader | `() *Reader` | Access underlying Reader |
-| CatchUp | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Refresh once and emit currently visible records |
-| CatchUpCurrent | `(ctx context.Context, opts CatchUpOptions, handler func(KV) error) (CatchUpResult, error)` | Emit records from the current manifest snapshot without refreshing |
-| Tail | `(ctx context.Context, opts TailOptions, handler func(KV) error) error` | Continuously scan for new keys |
-| TailChannel | `(ctx context.Context, opts TailOptions) (<-chan KV, <-chan error)` | Tail as channels |
-
-```go
-type TailingReaderOpenOptions struct {
-    RefreshInterval time.Duration
-    OnRefresh       func()
-    OnRefreshError  func(error)
-    ReaderOptions   ReaderOpenOptions
-}
-
-func DefaultTailingReaderOpenOptions() TailingReaderOpenOptions
-```
-
-```go
-type CatchUpOptions struct {
-    MinKey        []byte // Inclusive lower bound
-    MaxKey        []byte // Inclusive upper bound
-    StartAfterKey []byte // Resume from next key after this value
-    Limit         int    // 0 means unlimited
-}
-
-type CatchUpResult struct {
-    LastKey   []byte // Last key successfully delivered to the handler
-    Count     int    // Number of delivered records
-    Truncated bool   // True when the call stopped because Limit was reached
-}
-```
-
-```go
-type TailOptions struct {
-    MinKey        []byte        // Inclusive lower bound
-    MaxKey        []byte        // Inclusive upper bound
-    StartAfterKey []byte        // Resume from next key after this value
-    PollInterval  time.Duration // Check frequency for new keys
-}
-```
-
-**Errors:**
-- `ErrTailingReaderStopped` - Tailing reader has been stopped.
-
----
 
 ### Compactor
 

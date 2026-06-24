@@ -201,13 +201,13 @@ func TestOpenDBCompactorOptionsOverrideGCMarkStorage(t *testing.T) {
 	}
 }
 
-func TestReaderMaxCommittedLSN(t *testing.T) {
+func TestReaderMaxCommittedPosition(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("db-max-committed-lsn")
+	store := blobstore.NewMemory("db-max-committed-position")
 	defer store.Close()
 
 	db, err := OpenDB(ctx, store, DBOptions{
-		CommittedLSNExtractor: BigEndianUint64LSNExtractor,
+		KeyPositionExtractor: BigEndianUint64KeyPositionExtractor,
 	})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
@@ -220,16 +220,16 @@ func TestReaderMaxCommittedLSN(t *testing.T) {
 	}
 	defer writer.Close(ctx)
 
-	putLSN := func(lsn uint64, value string) {
+	putPosition := func(position uint64, value string) {
 		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, lsn)
+		binary.BigEndian.PutUint64(key, position)
 		if err := writer.Put(ctx, key, []byte(value)); err != nil {
-			t.Fatalf("Put(%d): %v", lsn, err)
+			t.Fatalf("Put(%d): %v", position, err)
 		}
 	}
 
-	putLSN(7, "v7")
-	putLSN(42, "v42")
+	putPosition(7, "v7")
+	putPosition(42, "v42")
 	if err := writer.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
@@ -240,36 +240,36 @@ func TestReaderMaxCommittedLSN(t *testing.T) {
 	}
 	defer reader.Close()
 
-	lsn, found, err := reader.MaxCommittedLSN(ctx)
+	position, found, err := reader.MaxCommittedPosition(ctx)
 	if err != nil {
-		t.Fatalf("MaxCommittedLSN: %v", err)
+		t.Fatalf("MaxCommittedPosition: %v", err)
 	}
 	if !found {
-		t.Fatal("expected max committed lsn to be found")
+		t.Fatal("expected max committed position to be found")
 	}
-	if lsn != 42 {
-		t.Fatalf("unexpected max committed lsn: got=%d want=42", lsn)
+	if position != 42 {
+		t.Fatalf("unexpected max committed position: got=%d want=42", position)
 	}
 
-	low, found, err := reader.LowWatermarkLSN(ctx)
+	low, found, err := reader.LowWatermarkPosition(ctx)
 	if err != nil {
-		t.Fatalf("LowWatermarkLSN: %v", err)
+		t.Fatalf("LowWatermarkPosition: %v", err)
 	}
 	if !found {
-		t.Fatal("expected low watermark lsn to be found")
+		t.Fatal("expected low watermark position to be found")
 	}
 	if low != 7 {
-		t.Fatalf("unexpected low watermark lsn: got=%d want=7", low)
+		t.Fatalf("unexpected low watermark position: got=%d want=7", low)
 	}
 }
 
-func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
+func TestRetentionCompactorUpdatesLowWatermarkPosition(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-low-watermark-retention")
 	defer store.Close()
 
 	db, err := OpenDB(ctx, store, DBOptions{
-		CommittedLSNExtractor: BigEndianUint64LSNExtractor,
+		KeyPositionExtractor: BigEndianUint64KeyPositionExtractor,
 	})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
@@ -282,11 +282,11 @@ func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
 	}
 	defer writer.Close(ctx)
 
-	put := func(lsn uint64, value string) {
+	put := func(position uint64, value string) {
 		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(key, lsn)
+		binary.BigEndian.PutUint64(key, position)
 		if err := writer.Put(ctx, key, []byte(value)); err != nil {
-			t.Fatalf("Put(%d): %v", lsn, err)
+			t.Fatalf("Put(%d): %v", position, err)
 		}
 	}
 
@@ -329,25 +329,25 @@ func TestRetentionCompactorUpdatesLowWatermarkLSN(t *testing.T) {
 	}
 	defer reader.Close()
 
-	low, found, err := reader.LowWatermarkLSN(ctx)
+	low, found, err := reader.LowWatermarkPosition(ctx)
 	if err != nil {
-		t.Fatalf("LowWatermarkLSN: %v", err)
+		t.Fatalf("LowWatermarkPosition: %v", err)
 	}
 	if !found {
-		t.Fatal("expected low watermark lsn to be found")
+		t.Fatal("expected low watermark position to be found")
 	}
 	if low != 20 {
-		t.Fatalf("unexpected low watermark lsn after cleanup: got=%d want=20", low)
+		t.Fatalf("unexpected low watermark position after cleanup: got=%d want=20", low)
 	}
 
-	max, found, err := reader.MaxCommittedLSN(ctx)
+	max, found, err := reader.MaxCommittedPosition(ctx)
 	if err != nil {
-		t.Fatalf("MaxCommittedLSN: %v", err)
+		t.Fatalf("MaxCommittedPosition: %v", err)
 	}
 	if !found {
-		t.Fatal("expected max committed lsn to be found")
+		t.Fatal("expected max committed position to be found")
 	}
 	if max != 31 {
-		t.Fatalf("unexpected max committed lsn after cleanup: got=%d want=31", max)
+		t.Fatalf("unexpected max committed position after cleanup: got=%d want=31", max)
 	}
 }

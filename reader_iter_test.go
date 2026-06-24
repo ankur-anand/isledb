@@ -36,7 +36,7 @@ func TestReader_ScanLimit(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -114,7 +114,7 @@ func TestReader_Iterator(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -188,7 +188,7 @@ func TestReader_Iterator_Empty(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -247,7 +247,7 @@ func TestReader_Iterator_SeekGE(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -337,7 +337,7 @@ func TestReader_Iterator_WithDeletes(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -398,7 +398,7 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -447,7 +447,7 @@ func TestReader_Iterator_SeekGE_RepositionAfterMiss(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {
@@ -507,7 +507,7 @@ func TestReader_Iterator_SeekGE_AfterExhaustion(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	r, err := newReader(ctx, store, rOpts)
 	if err != nil {

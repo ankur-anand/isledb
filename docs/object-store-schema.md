@@ -89,7 +89,7 @@ This is a representative JSON-style view of the object families under one prefix
 
 ## `manifest/CURRENT`
 
-Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs. It can also carry fast-path metadata such as `max_committed_lsn` and `low_watermark_lsn`.
+Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs. It can also carry fast-path metadata such as `max_committed_position` and `low_watermark_position`.
 
 Path:
 
@@ -129,8 +129,8 @@ Example:
       "op": "add_sstable"
     }
   ],
-  "max_committed_lsn": 381,
-  "low_watermark_lsn": 240,
+  "max_committed_position": 381,
+  "low_watermark_position": 240,
   "writer_fence": {
     "epoch": 18,
     "owner": "writer-p000",
@@ -233,7 +233,7 @@ Example:
 Notes:
 
 - `MinKey` and `MaxKey` are raw key bytes encoded as base64 in JSON.
-- If your workload uses monotonic 8-byte big-endian keys, those bytes can be decoded into numeric LSNs or offsets.
+- If your workload uses monotonic 8-byte big-endian keys, those bytes can be decoded into numeric positions or offsets.
 
 ## `manifest/pages/l<level>/<id>.json`
 

@@ -42,6 +42,21 @@ func TestStoreGCMarkCheckpoint_MonotonicProgress(t *testing.T) {
 	}
 }
 
+func TestWriteObjectCASRejectsExistingObjectWithoutToken(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+
+	key := "manifest/gc/test.json"
+	err := writeObjectCAS(ctx, store, key, []byte(`{"version":1}`), "", true)
+	if !errors.Is(err, blobstore.ErrPreconditionFailed) {
+		t.Fatalf("writeObjectCAS error=%v, want %v", err, blobstore.ErrPreconditionFailed)
+	}
+	if _, _, err := store.Read(ctx, key); !errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("object was written without a CAS token, read error=%v", err)
+	}
+}
+
 type fakeGCMarkStorage struct {
 	pendingData []byte
 	pendingETag string

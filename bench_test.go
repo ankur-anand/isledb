@@ -29,7 +29,7 @@ func openBenchWriter(b *testing.B, ctx context.Context, store *blobstore.Store, 
 func openBenchReader(b *testing.B, ctx context.Context, store *blobstore.Store) *Reader {
 	b.Helper()
 
-	opts := DefaultReaderOptions()
+	opts := defaultReaderOptions()
 	opts.CacheDir = b.TempDir()
 
 	reader, err := newReader(ctx, store, opts)

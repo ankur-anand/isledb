@@ -53,10 +53,10 @@ type replayCache struct {
 	compactorFenceEpoch uint64
 }
 
-// CommittedLSNExtractor extracts an application-defined LSN from an SST
-// boundary key. The store uses it for CURRENT.MaxCommittedLSN from MaxKey and
-// CURRENT.LowWatermarkLSN from MinKey.
-type CommittedLSNExtractor func(boundaryKey []byte) (uint64, bool)
+// KeyPositionExtractor extracts an application-defined monotonic position from
+// an SST boundary key. The store uses it for CURRENT.MaxCommittedPosition from
+// MaxKey and CURRENT.LowWatermarkPosition from MinKey.
+type KeyPositionExtractor func(boundaryKey []byte) (uint64, bool)
 
 type Store struct {
 	storage Storage
@@ -69,8 +69,8 @@ type Store struct {
 	writerFence    *FenceToken
 	compactorFence *FenceToken
 
-	rcache                *replayCache
-	committedLSNExtractor CommittedLSNExtractor
+	rcache               *replayCache
+	keyPositionExtractor KeyPositionExtractor
 
 	activeEntryLimit int
 	pageFanout       int
@@ -100,12 +100,12 @@ func (s *Store) CurrentData() *Current {
 	return s.current.Clone()
 }
 
-// SetCommittedLSNExtractor configures how CURRENT LSN metadata is derived from
-// monotonic SST boundary keys.
-func (s *Store) SetCommittedLSNExtractor(extractor CommittedLSNExtractor) {
+// SetKeyPositionExtractor configures how CURRENT position metadata is derived
+// from monotonic SST boundary keys.
+func (s *Store) SetKeyPositionExtractor(extractor KeyPositionExtractor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.committedLSNExtractor = extractor
+	s.keyPositionExtractor = extractor
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
@@ -404,8 +404,8 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
 		updated.NextSeq = nextEntry.Seq + 1
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
-		s.applyCommittedLSNFromEntry(updated, &nextEntry)
-		s.applyLowWatermarkLSNFromEntry(updated, &nextEntry)
+		s.applyMaxPositionFromEntry(updated, &nextEntry)
+		s.applyLowWatermarkPositionFromEntry(updated, &nextEntry)
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -957,11 +957,11 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if current.ChangeFeedLogStart == oldLogSeqStart {
 		current.ChangeFeedLogStart = nextSeq
 	}
-	if current.MaxCommittedLSN == nil {
-		s.applyCommittedLSNFromManifest(current, m)
+	if current.MaxCommittedPosition == nil {
+		s.applyMaxPositionFromManifest(current, m)
 	}
-	if current.LowWatermarkLSN == nil {
-		s.applyLowWatermarkLSNFromManifest(current, m)
+	if current.LowWatermarkPosition == nil {
+		s.applyLowWatermarkPositionFromManifest(current, m)
 	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
@@ -1279,44 +1279,44 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 	return nil
 }
 
-func (s *Store) applyCommittedLSNFromEntry(current *Current, entry *ManifestLogEntry) {
+func (s *Store) applyMaxPositionFromEntry(current *Current, entry *ManifestLogEntry) {
 	if current == nil || entry == nil || entry.Op != LogOpAddSSTable || entry.SSTable == nil {
 		return
 	}
 
-	extractor := s.getCommittedLSNExtractor()
+	extractor := s.getKeyPositionExtractor()
 	if extractor == nil {
 		return
 	}
 
 	maxKey := append([]byte(nil), entry.SSTable.MaxKey...)
-	lsn, ok := extractor(maxKey)
+	position, ok := extractor(maxKey)
 	if !ok {
 		return
 	}
 
-	if current.MaxCommittedLSN == nil || lsn > *current.MaxCommittedLSN {
-		current.MaxCommittedLSN = &lsn
+	if current.MaxCommittedPosition == nil || position > *current.MaxCommittedPosition {
+		current.MaxCommittedPosition = &position
 	}
 }
 
-func (s *Store) applyLowWatermarkLSNFromEntry(current *Current, entry *ManifestLogEntry) {
+func (s *Store) applyLowWatermarkPositionFromEntry(current *Current, entry *ManifestLogEntry) {
 	if current == nil || entry == nil {
 		return
 	}
 
-	extractor := s.getCommittedLSNExtractor()
+	extractor := s.getKeyPositionExtractor()
 	if extractor == nil {
 		return
 	}
 
 	applyMinKey := func(minKey []byte) {
-		lsn, ok := extractor(append([]byte(nil), minKey...))
+		position, ok := extractor(append([]byte(nil), minKey...))
 		if !ok {
 			return
 		}
-		if current.LowWatermarkLSN == nil || lsn < *current.LowWatermarkLSN {
-			current.LowWatermarkLSN = &lsn
+		if current.LowWatermarkPosition == nil || position < *current.LowWatermarkPosition {
+			current.LowWatermarkPosition = &position
 		}
 	}
 
@@ -1340,12 +1340,12 @@ func (s *Store) applyLowWatermarkLSNFromEntry(current *Current, entry *ManifestL
 	}
 }
 
-func (s *Store) applyCommittedLSNFromManifest(current *Current, m *Manifest) {
+func (s *Store) applyMaxPositionFromManifest(current *Current, m *Manifest) {
 	if current == nil || m == nil {
 		return
 	}
 
-	extractor := s.getCommittedLSNExtractor()
+	extractor := s.getKeyPositionExtractor()
 	if extractor == nil {
 		return
 	}
@@ -1355,44 +1355,44 @@ func (s *Store) applyCommittedLSNFromManifest(current *Current, m *Manifest) {
 		return
 	}
 
-	lsn, ok := extractor(maxKey)
+	position, ok := extractor(maxKey)
 	if !ok {
 		return
 	}
 
-	if current.MaxCommittedLSN == nil || lsn > *current.MaxCommittedLSN {
-		current.MaxCommittedLSN = &lsn
+	if current.MaxCommittedPosition == nil || position > *current.MaxCommittedPosition {
+		current.MaxCommittedPosition = &position
 	}
 }
 
-func (s *Store) applyLowWatermarkLSNFromManifest(current *Current, m *Manifest) {
+func (s *Store) applyLowWatermarkPositionFromManifest(current *Current, m *Manifest) {
 	if current == nil || m == nil {
 		return
 	}
 
-	extractor := s.getCommittedLSNExtractor()
+	extractor := s.getKeyPositionExtractor()
 	if extractor == nil {
 		return
 	}
 
 	minKey := m.MinKey()
 	if len(minKey) == 0 {
-		current.LowWatermarkLSN = nil
+		current.LowWatermarkPosition = nil
 		return
 	}
 
-	lsn, ok := extractor(minKey)
+	position, ok := extractor(minKey)
 	if !ok {
 		return
 	}
 
-	current.LowWatermarkLSN = &lsn
+	current.LowWatermarkPosition = &position
 }
 
-// UpdateCurrentLowWatermarkLSN recomputes CURRENT.LowWatermarkLSN from the
+// UpdateCurrentLowWatermarkPosition recomputes CURRENT.LowWatermarkPosition from the
 // provided manifest. Callers should pass the manifest state that is already
 // visible after their metadata update.
-func (s *Store) UpdateCurrentLowWatermarkLSN(ctx context.Context, m *Manifest) error {
+func (s *Store) UpdateCurrentLowWatermarkPosition(ctx context.Context, m *Manifest) error {
 	const maxRetries = 3
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -1408,7 +1408,7 @@ func (s *Store) UpdateCurrentLowWatermarkLSN(ctx context.Context, m *Manifest) e
 		if m != nil && updated.NextEpoch < m.NextEpoch {
 			updated.NextEpoch = m.NextEpoch
 		}
-		s.applyLowWatermarkLSNFromManifest(&updated, m)
+		s.applyLowWatermarkPositionFromManifest(&updated, m)
 
 		if err := s.writeCurrentWithCAS(ctx, &updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -1422,10 +1422,10 @@ func (s *Store) UpdateCurrentLowWatermarkLSN(ctx context.Context, m *Manifest) e
 	return ErrFenceConflict
 }
 
-func (s *Store) getCommittedLSNExtractor() CommittedLSNExtractor {
+func (s *Store) getKeyPositionExtractor() KeyPositionExtractor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.committedLSNExtractor
+	return s.keyPositionExtractor
 }
 
 func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {

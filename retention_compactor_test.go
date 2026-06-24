@@ -112,7 +112,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	}
 	w.close(ctx)
 
-	rOpts := DefaultReaderOptions()
+	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	reader, _ := newReader(ctx, store, rOpts)
 	m := reader.Manifest()
@@ -137,8 +137,12 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	if err := cleaner.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce failed: %v", err)
 	}
+	stats := cleaner.Stats()
+	if stats.L0SSTCount != 2 {
+		t.Fatalf("retention stats L0SSTCount=%d, want 2 after cleanup", stats.L0SSTCount)
+	}
 
-	rOpts2 := DefaultReaderOptions()
+	rOpts2 := defaultReaderOptions()
 	rOpts2.CacheDir = t.TempDir()
 	reader2, _ := newReader(ctx, store, rOpts2)
 	m2 := reader2.Manifest()

@@ -97,8 +97,8 @@ type Current struct {
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
 
-	MaxCommittedLSN *uint64 `json:"max_committed_lsn,omitempty"`
-	LowWatermarkLSN *uint64 `json:"low_watermark_lsn,omitempty"`
+	MaxCommittedPosition *uint64 `json:"max_committed_position,omitempty"`
+	LowWatermarkPosition *uint64 `json:"low_watermark_position,omitempty"`
 
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
