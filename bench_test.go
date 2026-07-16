@@ -399,19 +399,19 @@ func BenchmarkDB_Get_AfterCompaction(b *testing.B) {
 		b.Fatalf("Flush: %v", err)
 	}
 
-	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.Trigger.L0SSTCount = 4
+	maintenanceOpts := DefaultMaintenanceOptions()
+	maintenanceOpts.Compaction.L0SSTCount = 4
 
-	compactor, err := db.OpenCompactor(ctx, compactorOpts)
+	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
-		b.Fatalf("OpenCompactor: %v", err)
+		b.Fatalf("OpenMaintenance: %v", err)
 	}
-	if err := compactor.RunOnce(ctx); err != nil {
-		_ = compactor.Close(ctx)
+	if _, err := maintenance.RunOnce(ctx); err != nil {
+		_ = maintenance.Close(ctx)
 		b.Fatalf("RunOnce: %v", err)
 	}
-	if err := compactor.Close(ctx); err != nil {
-		b.Fatalf("Compactor close: %v", err)
+	if err := maintenance.Close(ctx); err != nil {
+		b.Fatalf("Maintenance close: %v", err)
 	}
 
 	reader := openBenchReader(b, ctx, store)
@@ -721,19 +721,19 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 			b.Fatalf("Writer close: %v", err)
 		}
 
-		compactorOpts := DefaultCompactorOptions()
-		compactorOpts.Trigger.L0SSTCount = 4
+		maintenanceOpts := DefaultMaintenanceOptions()
+		maintenanceOpts.Compaction.L0SSTCount = 4
 
-		compactor, err := db.OpenCompactor(ctx, compactorOpts)
+		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {
 			_ = db.Close()
-			b.Fatalf("OpenCompactor: %v", err)
+			b.Fatalf("OpenMaintenance: %v", err)
 		}
 
 		b.StartTimer()
 
-		if err := compactor.RunOnce(ctx); err != nil {
-			_ = compactor.Close(ctx)
+		if _, err := maintenance.RunOnce(ctx); err != nil {
+			_ = maintenance.Close(ctx)
 			_ = db.Close()
 			_ = store.Close()
 			b.Fatalf("RunOnce: %v", err)
@@ -741,10 +741,10 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 
 		b.StopTimer()
 
-		if err := compactor.Close(ctx); err != nil {
+		if err := maintenance.Close(ctx); err != nil {
 			_ = db.Close()
 			_ = store.Close()
-			b.Fatalf("Compactor close: %v", err)
+			b.Fatalf("Maintenance close: %v", err)
 		}
 		if err := db.Close(); err != nil {
 			_ = store.Close()

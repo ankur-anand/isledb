@@ -35,10 +35,10 @@ func TestChangeFeedCleanerRetiresOldBatches(t *testing.T) {
 		t.Fatalf("append recent sst: %v", err)
 	}
 
-	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, ChangeFeedCleanerOptions{
-		RetentionPeriod:  time.Hour,
-		RetentionCount:   1,
-		SweepGracePeriod: -1,
+	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, changeFeedCleanerOptions{
+		RetentionPeriod:            time.Hour,
+		KeepAtLeastManifestEntries: 1,
+		SweepGracePeriod:           -1,
 	})
 	if err != nil {
 		t.Fatalf("new change feed cleaner: %v", err)
@@ -72,6 +72,17 @@ func TestChangeFeedCleanerRetiresOldBatches(t *testing.T) {
 	}
 	if len(marks) != 0 {
 		t.Fatalf("expected pending change marks to be cleared after sweep, got=%+v", marks)
+	}
+
+	// Change-feed retention must not remove manifest entries still required to
+	// rebuild current KV state after a restart.
+	freshManifestStore := manifest.NewStore(store)
+	replayed, err := freshManifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh replay after change-feed cleanup: %v", err)
+	}
+	if replayed.LookupSST("old.sst") == nil || replayed.LookupSST("recent.sst") == nil {
+		t.Fatalf("change-feed cleanup changed visible SST state: %+v", replayed.AllSSTIDs())
 	}
 }
 
@@ -108,7 +119,11 @@ func TestPendingChangeBatchSweeperDoesNotDeleteRetainedBatch(t *testing.T) {
 		t.Fatalf("retained change batch should not be deleted: %v", err)
 	}
 
-	if _, err := manifestStore.AdvanceChangeFeedLogStart(ctx, entry.Seq+1); err != nil {
+	compactorToken, err := manifestStore.ClaimCompactor(ctx, "change-feed-test")
+	if err != nil {
+		t.Fatalf("claim compactor: %v", err)
+	}
+	if _, err := manifestStore.AdvanceChangeFeedLogStart(ctx, entry.Seq+1, compactorToken); err != nil {
 		t.Fatalf("advance change-feed floor: %v", err)
 	}
 	stats, err = runPendingChangeBatchSweeper(ctx, store, manifestStore, 10, -1)

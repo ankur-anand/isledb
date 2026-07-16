@@ -15,22 +15,24 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-type RetentionCompactorMode int
+type retentionCompactorMode int
 
 const (
-	CompactByAge RetentionCompactorMode = iota
+	compactByAge retentionCompactorMode = iota
 
-	CompactByTimeWindow
+	compactByTimeWindow
 )
 
-var ErrRetentionCompactorClosed = errors.New("retention compactor closed")
+var errRetentionCompactorClosed = errors.New("retention compactor closed")
 
-type RetentionCompactorOptions struct {
-	Mode RetentionCompactorMode
+type retentionCompactorOptions struct {
+	Mode retentionCompactorMode
 
 	RetentionPeriod time.Duration
 
-	RetentionCount int
+	KeepAtLeastSSTs int
+
+	KeepAtLeastWindows int
 
 	CheckInterval time.Duration
 
@@ -50,21 +52,22 @@ type CleanupStats struct {
 	Duration       time.Duration
 }
 
-func DefaultRetentionCompactorOptions() RetentionCompactorOptions {
-	return RetentionCompactorOptions{
-		Mode:            CompactByAge,
-		RetentionPeriod: 7 * 24 * time.Hour,
-		RetentionCount:  10,
-		CheckInterval:   time.Minute,
-		SegmentDuration: time.Hour,
+func defaultRetentionCompactorOptions() retentionCompactorOptions {
+	return retentionCompactorOptions{
+		Mode:               compactByAge,
+		RetentionPeriod:    7 * 24 * time.Hour,
+		KeepAtLeastSSTs:    10,
+		KeepAtLeastWindows: 1,
+		CheckInterval:      time.Minute,
+		SegmentDuration:    time.Hour,
 	}
 }
 
-type RetentionCompactor struct {
+type retentionCompactor struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
 	gcMarkStore manifest.GCMarkStorage
-	opts        RetentionCompactorOptions
+	opts        retentionCompactorOptions
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -76,22 +79,30 @@ type RetentionCompactor struct {
 	activeRuns sync.WaitGroup
 	runGate    chan struct{}
 
-	fenced  atomic.Bool
-	running atomic.Bool
-	closed  atomic.Bool
+	fenced     atomic.Bool
+	fenceToken *manifest.FenceToken
+	running    atomic.Bool
+	closed     atomic.Bool
 }
 
-func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
+func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts retentionCompactorOptions) (*retentionCompactor, error) {
+	return newRetentionCompactorWithFence(ctx, store, manifestLog, opts, nil)
+}
+
+func newRetentionCompactorWithFence(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts retentionCompactorOptions, fence *manifest.FenceToken) (*retentionCompactor, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
 
-	defaults := DefaultRetentionCompactorOptions()
+	defaults := defaultRetentionCompactorOptions()
 	if opts.RetentionPeriod <= 0 {
 		opts.RetentionPeriod = defaults.RetentionPeriod
 	}
-	if opts.RetentionCount == 0 {
-		opts.RetentionCount = defaults.RetentionCount
+	if opts.KeepAtLeastSSTs == 0 {
+		opts.KeepAtLeastSSTs = defaults.KeepAtLeastSSTs
+	}
+	if opts.KeepAtLeastWindows == 0 {
+		opts.KeepAtLeastWindows = defaults.KeepAtLeastWindows
 	}
 	if opts.CheckInterval <= 0 {
 		opts.CheckInterval = defaults.CheckInterval
@@ -108,22 +119,28 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
 
-	ownerID := fmt.Sprintf("retention-compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
-	if _, err := manifestLog.ClaimCompactor(ctx, ownerID); err != nil {
-		return nil, fmt.Errorf("claim compactor fence: %w", err)
+	if fence == nil {
+		ownerID := fmt.Sprintf("retention-compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+		token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim compactor fence: %w", err)
+		}
+		fence = token
 	}
+	token := *fence
 
-	return &RetentionCompactor{
+	return &retentionCompactor{
 		store:       store,
 		manifestLog: manifestLog,
 		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
 		runGate:     make(chan struct{}, 1),
+		fenceToken:  &token,
 	}, nil
 }
 
-func (c *RetentionCompactor) Start(ctx context.Context) error {
+func (c *retentionCompactor) Start(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -132,7 +149,7 @@ func (c *RetentionCompactor) Start(ctx context.Context) error {
 	defer c.lifecycleMu.Unlock()
 
 	if c.closed.Load() {
-		return ErrRetentionCompactorClosed
+		return errRetentionCompactorClosed
 	}
 	if !c.running.CompareAndSwap(false, true) {
 		return nil
@@ -146,7 +163,7 @@ func (c *RetentionCompactor) Start(ctx context.Context) error {
 	return nil
 }
 
-func (c *RetentionCompactor) stopLoop() {
+func (c *retentionCompactor) stopLoop() {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -161,7 +178,7 @@ func (c *RetentionCompactor) stopLoop() {
 	c.running.Store(false)
 }
 
-func (c *RetentionCompactor) Close(ctx context.Context) error {
+func (c *retentionCompactor) Close(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -174,17 +191,17 @@ func (c *RetentionCompactor) Close(ctx context.Context) error {
 	return waitGroupContext(ctx, &c.activeRuns)
 }
 
-func (c *RetentionCompactor) closeDB() error {
+func (c *retentionCompactor) closeDB() error {
 	return c.closeWithTimeout(30 * time.Second)
 }
 
-func (c *RetentionCompactor) closeWithTimeout(timeout time.Duration) error {
+func (c *retentionCompactor) closeWithTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return c.Close(ctx)
 }
 
-func (c *RetentionCompactor) refresh(ctx context.Context) error {
+func (c *retentionCompactor) refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
 		return err
@@ -193,7 +210,7 @@ func (c *RetentionCompactor) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *RetentionCompactor) setManifest(m *Manifest) {
+func (c *retentionCompactor) setManifest(m *Manifest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if m == nil {
@@ -203,7 +220,7 @@ func (c *RetentionCompactor) setManifest(m *Manifest) {
 	c.manifest = m.Clone()
 }
 
-func (c *RetentionCompactor) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
+func (c *retentionCompactor) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
 	defer c.wg.Done()
 	defer func() {
 		ticker.Stop()
@@ -247,7 +264,7 @@ func (c *RetentionCompactor) cleanupLoop(ctx context.Context, ticker *time.Ticke
 	}
 }
 
-func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
+func (c *retentionCompactor) RunOnce(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -282,7 +299,7 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 	var stats CleanupStats
 
 	switch c.opts.Mode {
-	case CompactByAge:
+	case compactByAge:
 		deleted, bytes, err := c.cleanupFIFO(ctx, m)
 		if err != nil {
 			if isFenceError(err) {
@@ -293,7 +310,7 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 		stats.SSTsDeleted = deleted
 		stats.BytesReclaimed = bytes
 
-	case CompactByTimeWindow:
+	case compactByTimeWindow:
 		deleted, bytes, err := c.cleanupSegmented(ctx, m)
 		if err != nil {
 			if isFenceError(err) {
@@ -316,9 +333,9 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-func (c *RetentionCompactor) beginRun(ctx context.Context) error {
+func (c *retentionCompactor) beginRun(ctx context.Context) error {
 	if c.closed.Load() {
-		return ErrRetentionCompactorClosed
+		return errRetentionCompactorClosed
 	}
 	if err := c.acquireRun(ctx); err != nil {
 		return err
@@ -328,19 +345,19 @@ func (c *RetentionCompactor) beginRun(ctx context.Context) error {
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
 		c.releaseRun()
-		return ErrRetentionCompactorClosed
+		return errRetentionCompactorClosed
 	}
 	c.activeRuns.Add(1)
 	c.lifecycleMu.Unlock()
 	return nil
 }
 
-func (c *RetentionCompactor) finishRun() {
+func (c *retentionCompactor) finishRun() {
 	c.activeRuns.Done()
 	c.releaseRun()
 }
 
-func (c *RetentionCompactor) acquireRun(ctx context.Context) error {
+func (c *retentionCompactor) acquireRun(ctx context.Context) error {
 	select {
 	case c.runGate <- struct{}{}:
 		return nil
@@ -349,14 +366,14 @@ func (c *RetentionCompactor) acquireRun(ctx context.Context) error {
 	}
 }
 
-func (c *RetentionCompactor) releaseRun() {
+func (c *retentionCompactor) releaseRun() {
 	select {
 	case <-c.runGate:
 	default:
 	}
 }
 
-func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
+func (c *retentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
@@ -368,7 +385,7 @@ func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 	}
 }
 
-func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int, int64, error) {
+func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int, int64, error) {
 	cutoff := time.Now().Add(-c.opts.RetentionPeriod)
 
 	type sstAge struct {
@@ -405,8 +422,8 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	})
 
 	keepCount := len(allSSTs)
-	if keepCount > c.opts.RetentionCount {
-		keepCount = c.opts.RetentionCount
+	if keepCount > c.opts.KeepAtLeastSSTs {
+		keepCount = c.opts.KeepAtLeastSSTs
 	}
 
 	var toDelete []string
@@ -445,7 +462,7 @@ func (c *RetentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	return len(toDelete), bytesReclaimed, nil
 }
 
-func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) (int, int64, error) {
+func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) (int, int64, error) {
 	cutoff := time.Now().Add(-c.opts.RetentionPeriod)
 
 	type segment struct {
@@ -492,10 +509,7 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 		return sortedSegments[i].start.Before(sortedSegments[j].start)
 	})
 
-	minSegments := c.opts.RetentionCount / 10
-	if minSegments < 1 {
-		minSegments = 1
-	}
+	minSegments := c.opts.KeepAtLeastWindows
 
 	var toDelete []string
 	var bytesReclaimed int64
@@ -538,7 +552,7 @@ func (c *RetentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 	return len(toDelete), bytesReclaimed, nil
 }
 
-func (c *RetentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Context, batchSize uint64) error {
+func (c *retentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Context, batchSize uint64) error {
 	if batchSize == 0 {
 		return nil
 	}
@@ -611,7 +625,7 @@ func computeGCMarkCatchupWindow(checkpoint *gcMarkCheckpoint, current *manifest.
 	return window
 }
 
-func (c *RetentionCompactor) catchupPendingSSTDeleteMarksAttempt(ctx context.Context, current *manifest.Current, checkpoint *gcMarkCheckpoint, window gcMarkCatchupWindow) (bool, error) {
+func (c *retentionCompactor) catchupPendingSSTDeleteMarksAttempt(ctx context.Context, current *manifest.Current, checkpoint *gcMarkCheckpoint, window gcMarkCatchupWindow) (bool, error) {
 	pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore)
 	if err != nil {
 		return false, err
@@ -640,7 +654,7 @@ func (c *RetentionCompactor) catchupPendingSSTDeleteMarksAttempt(ctx context.Con
 	return false, storeGCMarkCheckpointWithStorage(ctx, c.gcMarkStore, checkpoint)
 }
 
-func (c *RetentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, window gcMarkCatchupWindow, seq uint64, now time.Time) (bool, error) {
+func (c *retentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, window gcMarkCatchupWindow, seq uint64, now time.Time) (bool, error) {
 	marksChanged := false
 
 	if window.fullReplay {
@@ -659,7 +673,7 @@ func (c *RetentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context
 	return marksChanged, nil
 }
 
-func (c *RetentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, startSeq, endSeq uint64, now time.Time) (bool, error) {
+func (c *retentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, startSeq, endSeq uint64, now time.Time) (bool, error) {
 	changed := false
 	for seq := startSeq; seq < endSeq; seq++ {
 		entry, err := c.manifestLog.ReadEntry(ctx, seq)
@@ -671,7 +685,7 @@ func (c *RetentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.C
 	return changed, nil
 }
 
-func (c *RetentionCompactor) applyOrphanSSTMarkScanToMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, seq uint64, now time.Time) (bool, error) {
+func (c *retentionCompactor) applyOrphanSSTMarkScanToMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, seq uint64, now time.Time) (bool, error) {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
 		c.mu.Lock()
@@ -737,7 +751,7 @@ func (c *RetentionCompactor) applyOrphanSSTMarkScanToMap(ctx context.Context, ma
 	return changed, nil
 }
 
-func (c *RetentionCompactor) readManifestCurrent(ctx context.Context) (*manifest.Current, error) {
+func (c *retentionCompactor) readManifestCurrent(ctx context.Context) (*manifest.Current, error) {
 	data, _, err := c.manifestLog.Storage().ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, manifest.ErrNotFound) {
@@ -751,7 +765,7 @@ func (c *RetentionCompactor) readManifestCurrent(ctx context.Context) (*manifest
 	return manifest.DecodeCurrent(data)
 }
 
-func (c *RetentionCompactor) applyManifestLogEntryToDeleteMarksMap(marksByID map[string]pendingSSTDeleteMark, entry *manifest.ManifestLogEntry, now time.Time) bool {
+func (c *retentionCompactor) applyManifestLogEntryToDeleteMarksMap(marksByID map[string]pendingSSTDeleteMark, entry *manifest.ManifestLogEntry, now time.Time) bool {
 	if entry == nil {
 		return false
 	}
@@ -886,11 +900,11 @@ func applyPendingSSTDeleteMarkClears(byID map[string]pendingSSTDeleteMark, sstID
 	return changed
 }
 
-func (c *RetentionCompactor) Stats() RetentionCompactorStats {
+func (c *retentionCompactor) Stats() retentionCompactorStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	stats := RetentionCompactorStats{
+	stats := retentionCompactorStats{
 		Mode:            c.opts.Mode,
 		RetentionPeriod: c.opts.RetentionPeriod,
 	}
@@ -932,12 +946,12 @@ func (c *RetentionCompactor) Stats() RetentionCompactorStats {
 	return stats
 }
 
-func (c *RetentionCompactor) IsFenced() bool {
+func (c *retentionCompactor) IsFenced() bool {
 	return c.fenced.Load()
 }
 
-type RetentionCompactorStats struct {
-	Mode            RetentionCompactorMode
+type retentionCompactorStats struct {
+	Mode            retentionCompactorMode
 	RetentionPeriod time.Duration
 	L0SSTCount      int
 	SortedRunCount  int

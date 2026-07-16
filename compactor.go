@@ -31,7 +31,7 @@ const (
 
 const CompactionMaxIterations = 100
 
-var ErrCompactorClosed = errors.New("compactor closed")
+var errCompactorClosed = errors.New("compactor closed")
 
 type CompactionJob struct {
 	Type      CompactionJobType
@@ -40,12 +40,12 @@ type CompactionJob struct {
 	OutputRun *SortedRun
 }
 
-// Compactor merges SSTs into sorted runs in the background.
-type Compactor struct {
+// compactor merges SSTs into sorted runs in the background.
+type compactor struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
 	gcMarkStore manifest.GCMarkStorage
-	opts        CompactorOptions
+	opts        compactorOptions
 
 	mu       sync.Mutex
 	manifest *Manifest
@@ -66,7 +66,11 @@ type Compactor struct {
 	closed  atomic.Bool
 }
 
-func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts CompactorOptions) (*Compactor, error) {
+func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts compactorOptions) (*compactor, error) {
+	return newCompactorWithFence(ctx, store, manifestLog, opts, nil)
+}
+
+func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts compactorOptions, fence *manifest.FenceToken) (*compactor, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -77,7 +81,7 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
 
-	c := &Compactor{
+	c := &compactor{
 		store:       store,
 		manifestLog: manifestLog,
 		gcMarkStore: opts.GCMarkStorage,
@@ -86,21 +90,25 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 		runGate:     make(chan struct{}, 1),
 	}
 
-	ownerID := opts.OwnerID
-	if ownerID == "" {
-		ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+	if fence == nil {
+		ownerID := opts.OwnerID
+		if ownerID == "" {
+			ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
+		}
+		token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim compactor fence: %w", err)
+		}
+		fence = token
 	}
-	token, err := manifestLog.ClaimCompactor(ctx, ownerID)
-	if err != nil {
-		return nil, fmt.Errorf("claim compactor fence: %w", err)
-	}
-	c.fenceToken = token
+	token := *fence
+	c.fenceToken = &token
 
 	return c, nil
 }
 
-func normalizeCompactorOptions(opts CompactorOptions, store *blobstore.Store) CompactorOptions {
-	d := DefaultCompactorOptions()
+func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) compactorOptions {
+	d := defaultCompactorOptions()
 	if opts.InputReadParallelism <= 0 {
 		opts.InputReadParallelism = d.InputReadParallelism
 	}
@@ -138,7 +146,7 @@ func normalizeCompactorOptions(opts CompactorOptions, store *blobstore.Store) Co
 	return opts
 }
 
-func (c *Compactor) Start(ctx context.Context) error {
+func (c *compactor) Start(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -147,7 +155,7 @@ func (c *Compactor) Start(ctx context.Context) error {
 	defer c.lifecycleMu.Unlock()
 
 	if c.closed.Load() {
-		return ErrCompactorClosed
+		return errCompactorClosed
 	}
 	if !c.running.CompareAndSwap(false, true) {
 		return nil
@@ -161,7 +169,7 @@ func (c *Compactor) Start(ctx context.Context) error {
 	return nil
 }
 
-func (c *Compactor) stopLoop() {
+func (c *compactor) stopLoop() {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -176,7 +184,7 @@ func (c *Compactor) stopLoop() {
 	c.running.Store(false)
 }
 
-func (c *Compactor) Close(ctx context.Context) error {
+func (c *compactor) Close(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -189,17 +197,17 @@ func (c *Compactor) Close(ctx context.Context) error {
 	return waitGroupContext(ctx, &c.activeRuns)
 }
 
-func (c *Compactor) closeDB() error {
+func (c *compactor) closeDB() error {
 	return c.closeWithTimeout(30 * time.Second)
 }
 
-func (c *Compactor) closeWithTimeout(timeout time.Duration) error {
+func (c *compactor) closeWithTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return c.Close(ctx)
 }
 
-func (c *Compactor) refresh(ctx context.Context) error {
+func (c *compactor) refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
 		return err
@@ -210,7 +218,7 @@ func (c *Compactor) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *Compactor) compactionLoop(ctx context.Context, ticker *time.Ticker) {
+func (c *compactor) compactionLoop(ctx context.Context, ticker *time.Ticker) {
 	defer c.wg.Done()
 	defer func() {
 		ticker.Stop()
@@ -246,7 +254,7 @@ func (c *Compactor) compactionLoop(ctx context.Context, ticker *time.Ticker) {
 }
 
 // RunOnce performs one scheduler compaction pass and returns when no work remains.
-func (c *Compactor) RunOnce(ctx context.Context) error {
+func (c *compactor) RunOnce(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -310,9 +318,9 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-func (c *Compactor) beginRun(ctx context.Context) error {
+func (c *compactor) beginRun(ctx context.Context) error {
 	if c.closed.Load() {
-		return ErrCompactorClosed
+		return errCompactorClosed
 	}
 	if err := c.acquireRun(ctx); err != nil {
 		return err
@@ -322,19 +330,19 @@ func (c *Compactor) beginRun(ctx context.Context) error {
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
 		c.releaseRun()
-		return ErrCompactorClosed
+		return errCompactorClosed
 	}
 	c.activeRuns.Add(1)
 	c.lifecycleMu.Unlock()
 	return nil
 }
 
-func (c *Compactor) finishRun() {
+func (c *compactor) finishRun() {
 	c.activeRuns.Done()
 	c.releaseRun()
 }
 
-func (c *Compactor) acquireRun(ctx context.Context) error {
+func (c *compactor) acquireRun(ctx context.Context) error {
 	select {
 	case c.runGate <- struct{}{}:
 		return nil
@@ -343,18 +351,18 @@ func (c *Compactor) acquireRun(ctx context.Context) error {
 	}
 }
 
-func (c *Compactor) releaseRun() {
+func (c *compactor) releaseRun() {
 	select {
 	case <-c.runGate:
 	default:
 	}
 }
 
-func (c *Compactor) shouldRunSortedRunForFairness() bool {
+func (c *compactor) shouldRunSortedRunForFairness() bool {
 	return c.consecutiveL0Compactions >= c.opts.Trigger.MaxConsecutiveL0Compactions
 }
 
-func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
+func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
@@ -366,7 +374,7 @@ func (c *Compactor) runSSTSweeperBestEffort(ctx context.Context) {
 	}
 }
 
-func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
+func (c *compactor) compactL0(ctx context.Context, m *Manifest) error {
 	if len(m.L0SSTs) == 0 {
 		return nil
 	}
@@ -446,7 +454,7 @@ func (c *Compactor) compactL0(ctx context.Context, m *Manifest) error {
 	return nil
 }
 
-func (c *Compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
+func (c *compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
 	runs := m.FindConsecutiveSimilarRuns(
 		c.opts.Trigger.MinSources,
 		c.opts.Trigger.MaxSources,
@@ -473,7 +481,7 @@ func (c *Compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
 	return job
 }
 
-func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *CompactionJob) error {
+func (c *compactor) compactRuns(ctx context.Context, m *Manifest, job *CompactionJob) error {
 	if c.opts.OnCompactionStart != nil {
 		c.opts.OnCompactionStart(*job)
 	}
@@ -555,7 +563,7 @@ func (c *Compactor) compactRuns(ctx context.Context, m *Manifest, job *Compactio
 	return nil
 }
 
-func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
+func (c *compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
 	entry, err := c.manifestLog.AppendCompactionWithFence(ctx, payload)
 	if err != nil && isFenceError(err) {
 		c.fenced.Store(true)
@@ -588,11 +596,11 @@ func (c *Compactor) appendCompaction(ctx context.Context, payload manifest.Compa
 	return nil
 }
 
-func (c *Compactor) IsFenced() bool {
+func (c *compactor) IsFenced() bool {
 	return c.fenced.Load()
 }
 
-func (c *Compactor) FenceToken() *manifest.FenceToken {
+func (c *compactor) FenceToken() *manifest.FenceToken {
 	return c.fenceToken
 }
 
@@ -602,7 +610,7 @@ type openSSTResult struct {
 	err    error
 }
 
-func (c *Compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Iterator, []*sstable.Reader, error) {
+func (c *compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Iterator, []*sstable.Reader, error) {
 	if len(ssts) == 0 {
 		return nil, nil, nil
 	}
@@ -678,7 +686,7 @@ sendJobs:
 	return iters, readers, nil
 }
 
-func (c *Compactor) openOneSST(ctx context.Context, sst SSTMeta) openSSTResult {
+func (c *compactor) openOneSST(ctx context.Context, sst SSTMeta) openSSTResult {
 	path := c.store.SSTPath(sst.ID)
 	var data []byte
 	var err error
@@ -768,7 +776,7 @@ func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifi
 	return nil
 }
 
-func (c *Compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
+func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
 	defer iter.close()
 
 	sstOpts := SSTWriterOptions{

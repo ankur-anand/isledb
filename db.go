@@ -104,16 +104,17 @@ func (w *Writer) releaseWriter() {
 	w.releaseOnce.Do(w.release)
 }
 
-// DB encapsulates manifest state for writers and compactors operating on a single bucket/prefix.
-// Use OpenDB once, then call db.OpenWriter and/or db.OpenCompactor.
+// DB encapsulates manifest state for one bucket/prefix. It permits one active
+// Writer and one active Maintenance handle.
 type DB struct {
-	store         *blobstore.Store
-	manifestStore *manifest.Store
-	gcMarkStorage manifest.GCMarkStorage
-	mu            sync.Mutex
-	closers       []dbCloser
-	writerOpen    bool
-	closed        atomic.Bool
+	store           *blobstore.Store
+	manifestStore   *manifest.Store
+	gcMarkStorage   manifest.GCMarkStorage
+	mu              sync.Mutex
+	closers         []dbCloser
+	writerOpen      bool
+	maintenanceOpen bool
+	closed          atomic.Bool
 }
 
 type dbCloser interface {
@@ -191,64 +192,47 @@ func (db *DB) releaseWriter() {
 	db.mu.Unlock()
 }
 
-// OpenCompactor opens a compactor instance from the DB.
-func (db *DB) OpenCompactor(ctx context.Context, opts CompactorOptions) (*Compactor, error) {
-	if db.closed.Load() {
-		return nil, errors.New("db closed")
-	}
-	if opts.GCMarkStorage == nil {
-		opts.GCMarkStorage = db.gcMarkStorage
+// OpenMaintenance opens the DB's single fenced maintenance owner.
+func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error) {
+	if err := db.reserveMaintenance(); err != nil {
+		return nil, err
 	}
 
-	compactor, err := newCompactor(ctx, db.store, db.manifestStore, opts)
+	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcMarkStorage, opts)
 	if err != nil {
+		db.releaseMaintenance()
 		return nil, err
 	}
-	if err := db.registerCloser(compactor); err != nil {
-		_ = compactor.Close(ctx)
+	maintenance.release = db.releaseMaintenance
+	if err := db.registerCloser(maintenance); err != nil {
+		_ = maintenance.Close(ctx)
+		db.releaseMaintenance()
 		return nil, err
 	}
-	return compactor, nil
+	return maintenance, nil
 }
 
-// OpenRetentionCompactor opens a retention compactor for this DB.
-func (db *DB) OpenRetentionCompactor(ctx context.Context, opts RetentionCompactorOptions) (*RetentionCompactor, error) {
-	if db.closed.Load() {
-		return nil, errors.New("db closed")
-	}
-	if opts.GCMarkStorage == nil {
-		opts.GCMarkStorage = db.gcMarkStorage
-	}
+func (db *DB) reserveMaintenance() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-	retentionCompactor, err := newRetentionCompactor(ctx, db.store, db.manifestStore, opts)
-	if err != nil {
-		return nil, err
+	if db.closed.Load() {
+		return errors.New("db closed")
 	}
-	if err := db.registerCloser(retentionCompactor); err != nil {
-		_ = retentionCompactor.Close(ctx)
-		return nil, err
+	if db.maintenanceOpen {
+		return ErrMaintenanceAlreadyOpen
 	}
-	return retentionCompactor, nil
+	db.maintenanceOpen = true
+	return nil
 }
 
-// OpenChangeFeedCleaner opens a cleaner for retained change-feed history.
-func (db *DB) OpenChangeFeedCleaner(ctx context.Context, opts ChangeFeedCleanerOptions) (*ChangeFeedCleaner, error) {
-	if db.closed.Load() {
-		return nil, errors.New("db closed")
-	}
-
-	cleaner, err := newChangeFeedCleaner(ctx, db.store, db.manifestStore, opts)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.registerCloser(cleaner); err != nil {
-		_ = cleaner.Close(ctx)
-		return nil, err
-	}
-	return cleaner, nil
+func (db *DB) releaseMaintenance() {
+	db.mu.Lock()
+	db.maintenanceOpen = false
+	db.mu.Unlock()
 }
 
-// Close closes the DB and any writers/compactors opened from it.
+// Close closes the DB and any writer or maintenance handle opened from it.
 func (db *DB) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil

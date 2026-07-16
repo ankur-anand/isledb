@@ -195,26 +195,21 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	}
 	defer writer.Close(ctx)
 
-	compactor, err := db.OpenCompactor(ctx, CompactorOptions{})
+	retention := DefaultRetentionPolicy()
+	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
 	if err != nil {
-		t.Fatalf("OpenCompactor: %v", err)
+		t.Fatalf("OpenMaintenance: %v", err)
 	}
-	defer compactor.Close(ctx)
-
-	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{})
-	if err != nil {
-		t.Fatalf("OpenRetentionCompactor: %v", err)
-	}
-	defer retentionCompactor.Close(ctx)
+	defer maintenance.Close(ctx)
 
 	if writer.w.manifestLog != db.manifestStore {
 		t.Fatal("writer does not share manifest store with db")
 	}
-	if compactor.manifestLog != db.manifestStore {
-		t.Fatal("compactor does not share manifest store with db")
+	if maintenance.manifestLog != db.manifestStore {
+		t.Fatal("maintenance does not share manifest store with db")
 	}
-	if retentionCompactor.manifestLog != db.manifestStore {
-		t.Fatal("retention compactor does not share manifest store with db")
+	if maintenance.compactor.manifestLog != db.manifestStore || maintenance.retention.manifestLog != db.manifestStore {
+		t.Fatal("maintenance stages do not share manifest store with db")
 	}
 }
 
@@ -234,11 +229,8 @@ func TestOpenDBClosed(t *testing.T) {
 	if _, err := db.OpenWriter(ctx, WriterOptions{}); err == nil {
 		t.Fatal("expected OpenWriter to fail after DB is closed")
 	}
-	if _, err := db.OpenCompactor(ctx, CompactorOptions{}); err == nil {
-		t.Fatal("expected OpenCompactor to fail after DB is closed")
-	}
-	if _, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{}); err == nil {
-		t.Fatal("expected OpenRetentionCompactor to fail after DB is closed")
+	if _, err := db.OpenMaintenance(ctx, MaintenanceOptions{}); err == nil {
+		t.Fatal("expected OpenMaintenance to fail after DB is closed")
 	}
 }
 
@@ -257,14 +249,10 @@ func TestDBCloseClosesHandles(t *testing.T) {
 		t.Fatalf("OpenWriter: %v", err)
 	}
 
-	compactor, err := db.OpenCompactor(ctx, CompactorOptions{})
+	retention := DefaultRetentionPolicy()
+	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
 	if err != nil {
-		t.Fatalf("OpenCompactor: %v", err)
-	}
-
-	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{})
-	if err != nil {
-		t.Fatalf("OpenRetentionCompactor: %v", err)
+		t.Fatalf("OpenMaintenance: %v", err)
 	}
 
 	if err := db.Close(); err != nil {
@@ -274,15 +262,15 @@ func TestDBCloseClosesHandles(t *testing.T) {
 	if !writer.w.closed.Load() {
 		t.Fatal("expected writer to be closed by DB.Close")
 	}
-	if !compactor.closed.Load() {
-		t.Fatal("expected compactor to be closed by DB.Close")
+	if !maintenance.closed.Load() {
+		t.Fatal("expected maintenance to be closed by DB.Close")
 	}
-	if !retentionCompactor.closed.Load() {
-		t.Fatal("expected retention compactor to be closed by DB.Close")
+	if !maintenance.compactor.closed.Load() || !maintenance.retention.closed.Load() {
+		t.Fatal("expected maintenance stages to be closed by DB.Close")
 	}
 }
 
-func TestOpenDBPropagatesGCMarkStorageToCompactors(t *testing.T) {
+func TestOpenDBPropagatesGCMarkStorageToMaintenance(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-gc-mark-storage")
 	defer store.Close()
@@ -294,57 +282,17 @@ func TestOpenDBPropagatesGCMarkStorageToCompactors(t *testing.T) {
 	}
 	defer db.Close()
 
-	compactor, err := db.OpenCompactor(ctx, CompactorOptions{})
+	retention := DefaultRetentionPolicy()
+	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
 	if err != nil {
-		t.Fatalf("OpenCompactor: %v", err)
+		t.Fatalf("OpenMaintenance: %v", err)
 	}
-	defer compactor.Close(ctx)
+	defer maintenance.Close(ctx)
 
-	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{})
-	if err != nil {
-		t.Fatalf("OpenRetentionCompactor: %v", err)
-	}
-	defer retentionCompactor.Close(ctx)
-
-	if compactor.gcMarkStore != custom {
+	if maintenance.compactor.gcMarkStore != custom {
 		t.Fatal("compactor did not inherit db gc mark storage")
 	}
-	if retentionCompactor.gcMarkStore != custom {
+	if maintenance.retention.gcMarkStore != custom {
 		t.Fatal("retention compactor did not inherit db gc mark storage")
-	}
-}
-
-func TestOpenDBCompactorOptionsOverrideGCMarkStorage(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("db-gc-mark-storage-override")
-	defer store.Close()
-
-	dbStorage := &testGCMarkStorage{}
-	compactorStorage := &testGCMarkStorage{}
-	retentionStorage := &testGCMarkStorage{}
-
-	db, err := OpenDB(ctx, store, DBOptions{GCMarkStorage: dbStorage})
-	if err != nil {
-		t.Fatalf("OpenDB: %v", err)
-	}
-	defer db.Close()
-
-	compactor, err := db.OpenCompactor(ctx, CompactorOptions{GCMarkStorage: compactorStorage})
-	if err != nil {
-		t.Fatalf("OpenCompactor: %v", err)
-	}
-	defer compactor.Close(ctx)
-
-	retentionCompactor, err := db.OpenRetentionCompactor(ctx, RetentionCompactorOptions{GCMarkStorage: retentionStorage})
-	if err != nil {
-		t.Fatalf("OpenRetentionCompactor: %v", err)
-	}
-	defer retentionCompactor.Close(ctx)
-
-	if compactor.gcMarkStore != compactorStorage {
-		t.Fatal("compactor gc mark storage override not applied")
-	}
-	if retentionCompactor.gcMarkStore != retentionStorage {
-		t.Fatal("retention compactor gc mark storage override not applied")
 	}
 }

@@ -4,27 +4,61 @@
 
 ```go
 import (
+    "context"
+    "log"
+    "time"
+
     "github.com/ankur-anand/isledb"
     "github.com/ankur-anand/isledb/blobstore"
 )
 
+ctx := context.Background()
+
 // 1. Open blob storage
 store, err := blobstore.Open(ctx, "s3://my-bucket?region=us-east-1", "mydb")
+if err != nil {
+    log.Fatal(err)
+}
+defer store.Close()
 
 // 2. Open database
 db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
+if err != nil {
+    log.Fatal(err)
+}
 defer db.Close()
 
-// 3. Write data
+// 3. Write data. Flush is the synchronous visibility boundary.
 w, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
+if err != nil {
+    log.Fatal(err)
+}
 defer w.Close(ctx)
-w.Put(ctx, []byte("key"), []byte("value"))
-w.Flush(ctx)
 
-// 4. Read data
+if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
+    log.Fatal(err)
+}
+if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), time.Hour); err != nil {
+    log.Fatal(err)
+}
+if err := w.Flush(ctx); err != nil {
+    log.Fatal(err)
+}
+
+// 4. Read data. Refresh discovers newly committed SSTs.
 r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+if err != nil {
+    log.Fatal(err)
+}
 defer r.Close()
-val, found, err := r.Get(ctx, []byte("key"))
+
+if err := r.Refresh(ctx); err != nil {
+    log.Fatal(err)
+}
+val, found, err := r.Get(ctx, []byte("user:1"))
+_ = val
+_ = found
+_ = err
 ```
 
 ---
@@ -33,7 +67,8 @@ val, found, err := r.Get(ctx, []byte("key"))
 
 ### DB
 
-Entry point for database operations. Manages writers, compactors, and manifest state.
+Entry point for database operations. Manages one writer, one maintenance owner,
+and shared manifest state.
 
 ```go
 func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error)
@@ -42,9 +77,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 | Method | Signature |
 |--------|-----------|
 | OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
-| OpenCompactor | `(ctx context.Context, opts CompactorOptions) (*Compactor, error)` |
-| OpenRetentionCompactor | `(ctx context.Context, opts RetentionCompactorOptions) (*RetentionCompactor, error)` |
-| OpenChangeFeedCleaner | `(ctx context.Context, opts ChangeFeedCleanerOptions) (*ChangeFeedCleaner, error)` |
+| OpenMaintenance | `(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)` |
 | Close | `() error` |
 
 ```go
@@ -70,6 +103,8 @@ do not have documented ordering or Close/Flush semantics. Serialize `Put`,
 Visibility contract:
 
 - `Put` and `Delete` return after the mutation is buffered locally.
+- `PutWithTTL` stores an expiry with the value. `ttl <= 0` means no expiration.
+- `DeleteWithTTL` stores an expiring tombstone. `ttl <= 0` means the tombstone does not expire.
 - `Flush` is the synchronous publish boundary. It writes pending memtables as
   SST files and commits manifest entries.
 - `Close` stops background flushing and flushes pending writes before returning.
@@ -128,6 +163,32 @@ Background flush:
   is set. Otherwise they are logged.
 - Explicit `Flush` and `Close` return flush errors directly.
 
+Example:
+
+```go
+opts := isledb.DefaultWriterOptions()
+opts.Flush.Interval = time.Second
+opts.Memtable.TargetBytes = 16 << 20
+opts.Memtable.MaxFrozen = 4
+
+w, err := db.OpenWriter(ctx, opts)
+if err != nil {
+    return err
+}
+defer w.Close(ctx)
+
+if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
+    return err
+}
+if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), 30*time.Minute); err != nil {
+    return err
+}
+if err := w.DeleteWithTTL(ctx, []byte("lock:1"), 5*time.Second); err != nil {
+    return err
+}
+return w.Flush(ctx)
+```
+
 ---
 
 ### Snapshot
@@ -157,17 +218,21 @@ Read-only handle for database access. Supports point lookups, range scans, and i
 func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error)
 ```
 
+Reader state is explicit. Opening a reader loads a view. `Refresh` reloads the
+manifest so the reader can see newly flushed data. Reads use the currently
+loaded view.
+
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key |
-| Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range |
-| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan with result limit |
-| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create bounded iterator |
 | Refresh | `(ctx context.Context) error` | Reload manifest and invalidate removed SSTs |
-| Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
+| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve one key from the current view |
+| Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range into memory |
+| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan a bounded number of records |
+| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Stream a bounded key range |
 | Snapshot | `() *Snapshot` | Pin the current loaded state for consistent multi-operation reads |
+| Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
 | Manifest | `() *Manifest` | Return cloned manifest snapshot |
-| Close | `() error` | Close reader and caches |
+| Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
 | ManifestPageCacheStats | `() cachestore.ManifestPageCacheStats` | Manifest commit-page cache statistics |
@@ -194,6 +259,33 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 manifest state. `Prefetch` downloads SSTs from the currently loaded manifest
 into the local cache. `Prefetch` does not call `Refresh`.
 
+Example:
+
+```go
+r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+if err != nil {
+    return err
+}
+defer r.Close()
+
+if err := r.Refresh(ctx); err != nil {
+    return err
+}
+
+value, ok, err := r.Get(ctx, []byte("user:1"))
+if err != nil {
+    return err
+}
+_ = value
+_ = ok
+
+items, err := r.ScanLimit(ctx, []byte("user:"), []byte("user;"), 100)
+if err != nil {
+    return err
+}
+_ = items
+```
+
 ```go
 type KeyRange struct {
     Min []byte // inclusive; nil means beginning
@@ -216,6 +308,24 @@ type PrefetchStats struct {
     SkippedSSTs int
     BytesRead   int64
 }
+```
+
+Prefetch example:
+
+```go
+if err := r.Refresh(ctx); err != nil {
+    return err
+}
+
+stats, err := r.Prefetch(ctx, isledb.PrefetchOptions{
+    Range:       isledb.PrefixRange([]byte("user:")),
+    MaxBytes:    256 << 20,
+    Concurrency: 4,
+})
+if err != nil {
+    return err
+}
+_ = stats
 ```
 
 #### KV
@@ -248,134 +358,103 @@ type IteratorOptions struct {
 }
 ```
 
-### Compactor
+### Maintenance
 
-Merges L0 SSTs into sorted runs and merges consecutive similar runs in the background.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Start | `(ctx context.Context) error` | Start background compaction loop |
-| Close | `(ctx context.Context) error` | Stop background compaction and close compactor |
-| Refresh | `(ctx context.Context) error` | Reload manifest |
-| RunOnce | `(ctx context.Context) error` | Perform one scheduler compaction pass |
-| IsFenced | `() bool` | Check if compactor is fenced |
-| FenceToken | `() *manifest.FenceToken` | Get fence token |
-
-```go
-type CompactorOptions struct {
-    OwnerID string
-    Trigger CompactionTriggerOptions
-    Output  CompactionOutputOptions
-    Safety  CompactionSafetyOptions
-    OnCompactionStart     func(CompactionJob)      // Compaction start callback
-    OnCompactionEnd       func(CompactionJob, error) // Compaction end callback
-    GCMarkStorage         manifest.GCMarkStorage   // Optional custom GC mark storage backend
-}
-
-type CompactionTriggerOptions struct {
-    CheckInterval time.Duration // Background scheduler cadence used by Start.
-    L0SSTCount    int           // L0 SST count that triggers an L0 merge.
-    MinSources    int           // Minimum sorted runs to merge.
-    MaxSources    int           // Maximum sorted runs to merge.
-    SizeRatio     int           // Size similarity threshold.
-}
-
-type CompactionOutputOptions struct {
-    TargetSSTBytes int64
-    BloomBitsPerKey int
-    BlockBytes      int
-    Compression     string
-}
-
-type CompactionSafetyOptions struct {
-    ValidateSSTChecksum bool
-    SSTHashVerifier     SSTHashVerifier
-}
-
-func DefaultCompactorOptions() CompactorOptions
-```
-
-```go
-type CompactionJob struct {
-    Type      CompactionJobType // CompactionL0Flush or CompactionConsecutiveMerge
-    InputSSTs []string
-    InputRuns []uint32
-    OutputRun *SortedRun
-}
-```
-
----
-
-### RetentionCompactor
-
-Deletes old SSTs based on a retention policy (age-based FIFO or time-window segmented).
+Owns one fenced maintenance session for a database prefix. It runs compaction,
+optional SST retention, optional change-feed retention, and garbage collection
+in a fixed serialized order. `DB.OpenMaintenance` rejects a second active
+maintenance handle opened from the same `DB`.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| Start | `(ctx context.Context) error` | Start background cleanup loop |
-| Close | `(ctx context.Context) error` | Stop background cleanup and close retention compactor |
-| Refresh | `(ctx context.Context) error` | Reload manifest |
-| RunOnce | `(ctx context.Context) error` | Perform a cleanup cycle |
-| IsFenced | `() bool` | Check if fenced |
-| Stats | `() RetentionCompactorStats` | Get current statistics |
+| Run | `(ctx context.Context) error` | Run cycles until cancellation, fencing, or `Close` |
+| RunOnce | `(ctx context.Context) (MaintenanceStats, error)` | Perform one serialized cycle |
+| Close | `(ctx context.Context) error` | Stop scheduling, wait for active work, and release ownership |
 
 ```go
-type RetentionCompactorOptions struct {
-    Mode            RetentionCompactorMode // CompactByAge or CompactByTimeWindow
-    RetentionPeriod time.Duration          // How long to keep data (default: 7 days)
-    RetentionCount  int                    // Minimum SSTs to keep (default: 10)
-    CheckInterval   time.Duration          // Cleanup check interval (default: 1 min)
-    SegmentDuration time.Duration          // Time window segment size (default: 1 hour)
-    OnCleanup       func(CleanupStats)     // Cleanup complete callback
-    OnCleanupError  func(error)            // Cleanup error callback
-    GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
+type MaintenanceOptions struct {
+    OwnerID            string
+    Every              time.Duration
+    Compaction         CompactionPolicy
+    Retention          *RetentionPolicy
+    ChangeFeedRetention *ChangeFeedRetentionPolicy
+    OnCycle            func(MaintenanceStats)
+    OnError            func(error)
 }
 
-func DefaultRetentionCompactorOptions() RetentionCompactorOptions
+type CompactionPolicy struct {
+    InputReadParallelism         int
+    L0SSTCount                   int
+    MaxConsecutiveL0Compactions int
+    MinSortedRunSources          int
+    MaxSortedRunSources          int
+    SortedRunSizeRatio           int
+    TargetSSTBytes               int64
+    BloomBitsPerKey              int
+    BlockBytes                   int
+    Compression                  string
+    ValidateSSTChecksum          bool
+    SSTHashVerifier              SSTHashVerifier
+    OnCompactionStart            func(CompactionJob)
+    OnCompactionEnd              func(CompactionJob, error)
+}
+
+type RetentionPolicy struct {
+    Mode               RetentionMode
+    KeepFor            time.Duration
+    KeepAtLeastSSTs    int
+    KeepAtLeastWindows int
+    Window             time.Duration
+    OnCleanup          func(CleanupStats)
+}
+
+type ChangeFeedRetentionPolicy struct {
+    KeepFor                    time.Duration
+    KeepAtLeastManifestEntries uint64
+    DeleteBatchSize            int
+    DeleteGracePeriod          time.Duration
+    OnCleanup                  func(ChangeFeedCleanupStats)
+}
 ```
 
-```go
-type CleanupStats struct {
-    SSTsDeleted    int
-    BytesReclaimed int64
-    Duration       time.Duration
-}
+`DefaultMaintenanceOptions` enables compaction and leaves both retention
+policies nil. Use `DefaultRetentionPolicy` or
+`DefaultChangeFeedRetentionPolicy` before enabling destructive cleanup.
 
-type RetentionCompactorStats struct {
-    Mode            RetentionCompactorMode
-    RetentionPeriod time.Duration
-    L0SSTCount      int
-    SortedRunCount  int
-    TotalSize       int64
-    OldestSST       time.Time
+In `RetentionByAge` mode, `KeepAtLeastSSTs` protects the newest SSTs. In
+`RetentionByTimeWindow` mode, `Window` defines the grouping interval and
+`KeepAtLeastWindows` protects the newest groups. The two limits are independent;
+there is no conversion between SST counts and window counts.
+
+`KeepAtLeastManifestEntries` protects the newest manifest entries from
+change-feed retirement. This includes entries without a change batch because
+the retention floor advances through the ordered manifest log.
+
+```go
+opts := isledb.DefaultMaintenanceOptions()
+opts.Every = 5 * time.Second
+opts.Compaction.L0SSTCount = 8
+opts.Compaction.InputReadParallelism = 4
+opts.Compaction.TargetSSTBytes = 64 << 20
+
+retention := isledb.DefaultRetentionPolicy()
+retention.KeepFor = 7 * 24 * time.Hour
+retention.KeepAtLeastSSTs = 10
+opts.Retention = &retention
+
+m, err := db.OpenMaintenance(ctx, opts)
+if err != nil {
+    return err
 }
+defer m.Close(ctx)
+
+return m.Run(ctx)
 ```
 
----
-
-### ChangeFeedCleaner
-
-Advances the retained change-feed floor and deletes old `changes/*.chg` objects
-after a grace period. This is only needed when writers enable change feed.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Start | `(ctx context.Context) error` | Start background cleanup loop |
-| Close | `(ctx context.Context) error` | Stop background cleanup and close cleaner |
-| RunOnce | `(ctx context.Context) error` | Perform one cleanup cycle |
+For a scheduled job:
 
 ```go
-type ChangeFeedCleanerOptions struct {
-    RetentionPeriod  time.Duration
-    RetentionCount   uint64
-    CheckInterval    time.Duration
-    SweepBatchSize   int
-    SweepGracePeriod time.Duration
-    OnCleanup        func(ChangeFeedCleanupStats)
-    OnCleanupError   func(error)
-}
-
-func DefaultChangeFeedCleanerOptions() ChangeFeedCleanerOptions
+stats, err := m.RunOnce(ctx)
 ```
 
 ---
