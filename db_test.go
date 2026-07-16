@@ -2,11 +2,161 @@ package isledb
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
 )
+
+func TestDBOpenWriterRejectsSecondActiveWriter(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-single-writer")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	first, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter(first): %v", err)
+	}
+
+	if _, err := db.OpenWriter(ctx, WriterOptions{}); !errors.Is(err, ErrWriterAlreadyOpen) {
+		t.Fatalf("OpenWriter(second) error=%v, want %v", err, ErrWriterAlreadyOpen)
+	}
+
+	if err := first.Close(ctx); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	second, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter(after close): %v", err)
+	}
+	if err := second.Close(ctx); err != nil {
+		t.Fatalf("Close(second): %v", err)
+	}
+}
+
+func TestDBOpenWriterConcurrentCallsAllowOneWriter(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-concurrent-single-writer")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	const callers = 16
+	type result struct {
+		writer *Writer
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			writer, err := db.OpenWriter(ctx, WriterOptions{})
+			results <- result{writer: writer, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var opened *Writer
+	for result := range results {
+		switch {
+		case result.err == nil:
+			if opened != nil {
+				t.Fatal("more than one concurrent OpenWriter call succeeded")
+			}
+			opened = result.writer
+		case !errors.Is(result.err, ErrWriterAlreadyOpen):
+			t.Fatalf("OpenWriter error=%v, want %v", result.err, ErrWriterAlreadyOpen)
+		}
+	}
+	if opened == nil {
+		t.Fatal("no concurrent OpenWriter call succeeded")
+	}
+	if err := opened.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDBOpenWriterReleasesReservationAfterConstructionFailure(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-writer-construction-failure")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := db.OpenWriter(canceled, WriterOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("OpenWriter(canceled) error=%v, want %v", err, context.Canceled)
+	}
+
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter(after failure): %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-writer-close-error")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := writer.Close(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close(canceled) error=%v, want %v", err, context.Canceled)
+	}
+	if _, err := db.OpenWriter(ctx, WriterOptions{}); !errors.Is(err, ErrWriterAlreadyOpen) {
+		t.Fatalf("OpenWriter(after failed close) error=%v, want %v", err, ErrWriterAlreadyOpen)
+	}
+
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Close(retry): %v", err)
+	}
+	reopened, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter(after successful close): %v", err)
+	}
+	if err := reopened.Close(ctx); err != nil {
+		t.Fatalf("Close(reopened): %v", err)
+	}
+}
 
 type testGCMarkStorage struct{}
 
