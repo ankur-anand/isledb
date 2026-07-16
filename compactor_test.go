@@ -55,6 +55,24 @@ func TestCompactor_RejectsNilContext(t *testing.T) {
 	}
 }
 
+func TestCompactor_RunOnceAfterCloseReturnsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-closed")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	c, err := newCompactor(ctx, store, manifestStore, CompactorOptions{})
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := c.RunOnce(ctx); !errors.Is(err, ErrCompactorClosed) {
+		t.Fatalf("RunOnce after Close error=%v, want %v", err, ErrCompactorClosed)
+	}
+}
+
 func TestCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("compactor-close-retry")
@@ -98,6 +116,105 @@ func TestCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
 	defer cancel()
 	if err := c.Close(retryCtx); err != nil {
 		t.Fatalf("retry close: %v", err)
+	}
+}
+
+func TestCompactor_CloseWaitsForManualRunOnce(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-close-manual-runonce")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	c, err := newCompactor(ctx, store, manifestStore, CompactorOptions{})
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+
+	storage.block.Store(true)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- c.RunOnce(ctx)
+	}()
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual RunOnce did not reach blocking CURRENT read")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = c.Close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("manual RunOnce error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual RunOnce did not finish after release")
+	}
+
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := c.Close(retryCtx); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
+
+func TestCompactor_RunOnceSerializesConcurrentCalls(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("compactor-runonce-serial")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	c, err := newCompactor(ctx, store, manifestStore, CompactorOptions{})
+	if err != nil {
+		t.Fatalf("newCompactor: %v", err)
+	}
+	defer c.Close(ctx)
+
+	storage.block.Store(true)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- c.RunOnce(ctx)
+	}()
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first RunOnce did not reach blocking CURRENT read")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = c.RunOnce(waitCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second RunOnce error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first RunOnce error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first RunOnce did not finish after release")
 	}
 }
 
@@ -159,8 +276,8 @@ func TestCompactor_L0Compaction(t *testing.T) {
 		t.Errorf("compaction callbacks not called: started=%v ended=%v", compactionStarted, compactionEnded)
 	}
 
-	if err := compactor.Refresh(ctx); err != nil {
-		t.Fatalf("Refresh: %v", err)
+	if err := compactor.refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
 	}
 
 	compactor.mu.Lock()
@@ -357,7 +474,7 @@ func TestCompactor_BackgroundLoop(t *testing.T) {
 	}
 }
 
-func TestCompactor_Refresh(t *testing.T) {
+func TestCompactorRefreshesManifestState(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
@@ -382,7 +499,7 @@ func TestCompactor_Refresh(t *testing.T) {
 	}
 	writer.close(ctx)
 
-	if err := compactor.Refresh(ctx); err != nil {
+	if err := compactor.refresh(ctx); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 
@@ -444,7 +561,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
-	if err := compactor.Refresh(ctx); err != nil {
+	if err := compactor.refresh(ctx); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 
@@ -534,7 +651,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("RunOnce: %v", err)
 		}
 
-		if err := compactor.Refresh(ctx); err != nil {
+		if err := compactor.refresh(ctx); err != nil {
 			t.Fatalf("Refresh: %v", err)
 		}
 
@@ -615,7 +732,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			t.Fatalf("RunOnce: %v", err)
 		}
 
-		if err := compactor.Refresh(ctx); err != nil {
+		if err := compactor.refresh(ctx); err != nil {
 			t.Fatalf("Refresh: %v", err)
 		}
 
