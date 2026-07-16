@@ -21,15 +21,15 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	writerOpts.Flush.Interval = 0
 	writerOpts.Memtable.TargetBytes = 512
 
-	compactorOpts := CompactorOptions{
-		Trigger: CompactionTriggerOptions{
+	compactorOpts := compactorOptions{
+		Trigger: compactionTriggerOptions{
 			L0SSTCount:    1,
 			MinSources:    1,
 			MaxSources:    4,
 			SizeRatio:     1,
 			CheckInterval: time.Hour,
 		},
-		Output: CompactionOutputOptions{
+		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
 			BlockBytes:      1024,
 			Compression:     "snappy",

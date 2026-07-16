@@ -1,0 +1,561 @@
+package isledb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/manifest"
+)
+
+var (
+	ErrMaintenanceAlreadyOpen    = errors.New("maintenance already open")
+	ErrMaintenanceClosed         = errors.New("maintenance closed")
+	ErrMaintenanceRunning        = errors.New("maintenance already running")
+	ErrInvalidMaintenanceOptions = errors.New("invalid maintenance options")
+)
+
+// RetentionMode selects how maintenance groups data for retention.
+type RetentionMode uint8
+
+const (
+	RetentionByAge RetentionMode = iota
+	RetentionByTimeWindow
+)
+
+// MaintenanceOptions configures one fenced maintenance owner for a DB.
+type MaintenanceOptions struct {
+	// OwnerID is stored in the maintenance fence. Empty generates a process-local ID.
+	OwnerID string
+
+	// Every is the delay between completed cycles when Run is used.
+	Every time.Duration
+
+	Compaction CompactionPolicy
+
+	// Retention is nil by default because enabling it removes historical data.
+	Retention *RetentionPolicy
+
+	// ChangeFeedRetention is nil by default because enabling it retires change history.
+	ChangeFeedRetention *ChangeFeedRetentionPolicy
+
+	OnCycle func(MaintenanceStats)
+	OnError func(error)
+}
+
+// CompactionPolicy controls L0 and sorted-run compaction.
+type CompactionPolicy struct {
+	InputReadParallelism        int
+	L0SSTCount                  int
+	MaxConsecutiveL0Compactions int
+	MinSortedRunSources         int
+	MaxSortedRunSources         int
+	SortedRunSizeRatio          int
+	TargetSSTBytes              int64
+	BloomBitsPerKey             int
+	BlockBytes                  int
+	Compression                 string
+	ValidateSSTChecksum         bool
+	SSTHashVerifier             SSTHashVerifier
+	OnCompactionStart           func(CompactionJob)
+	OnCompactionEnd             func(CompactionJob, error)
+}
+
+// RetentionPolicy controls removal of old SSTs. It is enabled only when the
+// containing MaintenanceOptions.Retention pointer is non-nil.
+type RetentionPolicy struct {
+	Mode RetentionMode
+
+	KeepFor time.Duration
+
+	// KeepAtLeastSSTs is the minimum number of newest SSTs retained in
+	// RetentionByAge mode.
+	KeepAtLeastSSTs int
+
+	// KeepAtLeastWindows is the minimum number of newest windows retained in
+	// RetentionByTimeWindow mode.
+	KeepAtLeastWindows int
+
+	Window    time.Duration
+	OnCleanup func(CleanupStats)
+}
+
+// ChangeFeedRetentionPolicy controls logical retirement and physical deletion
+// of change batches.
+type ChangeFeedRetentionPolicy struct {
+	KeepFor time.Duration
+
+	// KeepAtLeastManifestEntries is the minimum number of newest manifest
+	// entries retained, including entries that do not contain a change batch.
+	KeepAtLeastManifestEntries uint64
+
+	DeleteBatchSize   int
+	DeleteGracePeriod time.Duration
+	OnCleanup         func(ChangeFeedCleanupStats)
+}
+
+// MaintenanceStats describes work committed by one RunOnce cycle.
+type MaintenanceStats struct {
+	CompactionJobs        int
+	CompactionInputSSTs   int
+	CompactionOutputSSTs  int
+	CompactionOutputBytes int64
+	Retention             CleanupStats
+	ChangeFeed            ChangeFeedCleanupStats
+	Duration              time.Duration
+}
+
+// DefaultMaintenanceOptions returns safe defaults. Compaction and SST sweeping
+// are enabled; data and change-feed retention remain disabled.
+func DefaultMaintenanceOptions() MaintenanceOptions {
+	compaction := defaultCompactorOptions()
+	return MaintenanceOptions{
+		Every: compaction.Trigger.CheckInterval,
+		Compaction: CompactionPolicy{
+			InputReadParallelism:        compaction.InputReadParallelism,
+			L0SSTCount:                  compaction.Trigger.L0SSTCount,
+			MaxConsecutiveL0Compactions: compaction.Trigger.MaxConsecutiveL0Compactions,
+			MinSortedRunSources:         compaction.Trigger.MinSources,
+			MaxSortedRunSources:         compaction.Trigger.MaxSources,
+			SortedRunSizeRatio:          compaction.Trigger.SizeRatio,
+			TargetSSTBytes:              compaction.Output.TargetSSTBytes,
+			BloomBitsPerKey:             compaction.Output.BloomBitsPerKey,
+			BlockBytes:                  compaction.Output.BlockBytes,
+			Compression:                 compaction.Output.Compression,
+		},
+	}
+}
+
+func DefaultRetentionPolicy() RetentionPolicy {
+	opts := defaultRetentionCompactorOptions()
+	return RetentionPolicy{
+		Mode:               RetentionByAge,
+		KeepFor:            opts.RetentionPeriod,
+		KeepAtLeastSSTs:    opts.KeepAtLeastSSTs,
+		KeepAtLeastWindows: opts.KeepAtLeastWindows,
+		Window:             opts.SegmentDuration,
+	}
+}
+
+func DefaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
+	opts := defaultChangeFeedCleanerOptions()
+	return ChangeFeedRetentionPolicy{
+		KeepFor:                    opts.RetentionPeriod,
+		KeepAtLeastManifestEntries: opts.KeepAtLeastManifestEntries,
+		DeleteBatchSize:            opts.SweepBatchSize,
+		DeleteGracePeriod:          opts.SweepGracePeriod,
+	}
+}
+
+// Maintenance owns compaction, retention, and garbage collection for one DB.
+// It is safe to call Close concurrently with Run or RunOnce.
+type Maintenance struct {
+	manifestLog *manifest.Store
+	opts        MaintenanceOptions
+	compactor   *compactor
+	retention   *retentionCompactor
+	changeFeed  *changeFeedCleaner
+	fenceToken  *manifest.FenceToken
+
+	lifecycleMu   sync.Mutex
+	closeMu       sync.Mutex
+	runCancel     context.CancelFunc
+	loopWG        sync.WaitGroup
+	activeRuns    sync.WaitGroup
+	runGate       chan struct{}
+	enginesClosed bool
+
+	statsMu      sync.Mutex
+	currentStats *MaintenanceStats
+
+	running atomic.Bool
+	closed  atomic.Bool
+
+	releaseOnce sync.Once
+	release     func()
+}
+
+func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcMarks manifest.GCMarkStorage, opts MaintenanceOptions) (*Maintenance, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	var err error
+	opts, err = normalizeMaintenanceOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := manifestLog.Replay(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("replay manifest: %w", err)
+	}
+	ownerID := opts.OwnerID
+	if ownerID == "" {
+		ownerID = fmt.Sprintf("maintenance-%d-%d", time.Now().UnixNano(), state.NextEpoch)
+	}
+	token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("claim maintenance fence: %w", err)
+	}
+
+	m := &Maintenance{
+		manifestLog: manifestLog,
+		opts:        opts,
+		fenceToken:  token,
+		runGate:     make(chan struct{}, 1),
+	}
+
+	compactorOpts := m.compactorOptions(gcMarks)
+	m.compactor, err = newCompactorWithFence(ctx, store, manifestLog, compactorOpts, token)
+	if err != nil {
+		return nil, fmt.Errorf("open compaction stage: %w", err)
+	}
+
+	if opts.Retention != nil {
+		retentionOpts := m.retentionOptions(gcMarks)
+		m.retention, err = newRetentionCompactorWithFence(ctx, store, manifestLog, retentionOpts, token)
+		if err != nil {
+			_ = m.compactor.Close(ctx)
+			return nil, fmt.Errorf("open retention stage: %w", err)
+		}
+	}
+
+	if opts.ChangeFeedRetention != nil {
+		changeFeedOpts := m.changeFeedOptions()
+		m.changeFeed, err = newChangeFeedCleanerWithFence(ctx, store, manifestLog, changeFeedOpts, token)
+		if err != nil {
+			if m.retention != nil {
+				_ = m.retention.Close(ctx)
+			}
+			_ = m.compactor.Close(ctx)
+			return nil, fmt.Errorf("open change-feed retention stage: %w", err)
+		}
+	}
+
+	return m, nil
+}
+
+func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, error) {
+	defaults := DefaultMaintenanceOptions()
+	if opts.Every <= 0 {
+		opts.Every = defaults.Every
+	}
+	if opts.Retention != nil && opts.Retention.Mode != RetentionByAge && opts.Retention.Mode != RetentionByTimeWindow {
+		return MaintenanceOptions{}, fmt.Errorf("%w: retention mode=%d", ErrInvalidMaintenanceOptions, opts.Retention.Mode)
+	}
+	return opts, nil
+}
+
+func (m *Maintenance) compactorOptions(gcMarks manifest.GCMarkStorage) compactorOptions {
+	p := m.opts.Compaction
+	return compactorOptions{
+		OwnerID:              m.opts.OwnerID,
+		InputReadParallelism: p.InputReadParallelism,
+		Trigger: compactionTriggerOptions{
+			CheckInterval:               m.opts.Every,
+			L0SSTCount:                  p.L0SSTCount,
+			MaxConsecutiveL0Compactions: p.MaxConsecutiveL0Compactions,
+			MinSources:                  p.MinSortedRunSources,
+			MaxSources:                  p.MaxSortedRunSources,
+			SizeRatio:                   p.SortedRunSizeRatio,
+		},
+		Output: compactionOutputOptions{
+			TargetSSTBytes:  p.TargetSSTBytes,
+			BloomBitsPerKey: p.BloomBitsPerKey,
+			BlockBytes:      p.BlockBytes,
+			Compression:     p.Compression,
+		},
+		Safety: compactionSafetyOptions{
+			ValidateSSTChecksum: p.ValidateSSTChecksum,
+			SSTHashVerifier:     p.SSTHashVerifier,
+		},
+		OnCompactionStart: p.OnCompactionStart,
+		OnCompactionEnd:   m.recordCompaction,
+		GCMarkStorage:     gcMarks,
+	}
+}
+
+func (m *Maintenance) retentionOptions(gcMarks manifest.GCMarkStorage) retentionCompactorOptions {
+	p := m.opts.Retention
+	mode := compactByAge
+	if p.Mode == RetentionByTimeWindow {
+		mode = compactByTimeWindow
+	}
+	return retentionCompactorOptions{
+		Mode:               mode,
+		RetentionPeriod:    p.KeepFor,
+		KeepAtLeastSSTs:    p.KeepAtLeastSSTs,
+		KeepAtLeastWindows: p.KeepAtLeastWindows,
+		CheckInterval:      m.opts.Every,
+		SegmentDuration:    p.Window,
+		OnCleanup:          m.recordRetention,
+		GCMarkStorage:      gcMarks,
+	}
+}
+
+func (m *Maintenance) changeFeedOptions() changeFeedCleanerOptions {
+	p := m.opts.ChangeFeedRetention
+	return changeFeedCleanerOptions{
+		RetentionPeriod:            p.KeepFor,
+		KeepAtLeastManifestEntries: p.KeepAtLeastManifestEntries,
+		CheckInterval:              m.opts.Every,
+		SweepBatchSize:             p.DeleteBatchSize,
+		SweepGracePeriod:           p.DeleteGracePeriod,
+		OnCleanup:                  m.recordChangeFeed,
+	}
+}
+
+// Run executes maintenance cycles until ctx is canceled, Close is called, or
+// the maintenance fence is lost.
+func (m *Maintenance) Run(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
+	m.lifecycleMu.Lock()
+	if m.closed.Load() {
+		m.lifecycleMu.Unlock()
+		return ErrMaintenanceClosed
+	}
+	if !m.running.CompareAndSwap(false, true) {
+		m.lifecycleMu.Unlock()
+		return ErrMaintenanceRunning
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	m.runCancel = cancel
+	m.loopWG.Add(1)
+	m.lifecycleMu.Unlock()
+
+	defer func() {
+		cancel()
+		m.lifecycleMu.Lock()
+		m.runCancel = nil
+		m.running.Store(false)
+		m.lifecycleMu.Unlock()
+		m.loopWG.Done()
+	}()
+
+	for {
+		stats, err := m.RunOnce(runCtx)
+		if err != nil {
+			if m.closed.Load() && (errors.Is(err, context.Canceled) || errors.Is(err, ErrMaintenanceClosed)) {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if isFenceError(err) {
+				return err
+			}
+			if errors.Is(err, manifest.ErrFenceConflict) {
+				slog.Debug("isledb: maintenance cycle skipped after concurrent manifest update")
+			} else if m.opts.OnError != nil {
+				m.opts.OnError(err)
+			} else {
+				slog.Error("isledb: maintenance cycle failed", "error", err)
+			}
+		} else if m.opts.OnCycle != nil {
+			m.opts.OnCycle(stats)
+		}
+
+		timer := time.NewTimer(m.opts.Every)
+		select {
+		case <-timer.C:
+		case <-runCtx.Done():
+			stopMaintenanceTimer(timer)
+			if m.closed.Load() {
+				return nil
+			}
+			return runCtx.Err()
+		}
+	}
+}
+
+// RunOnce performs one serialized maintenance cycle.
+func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
+	if err := checkContext(ctx); err != nil {
+		return MaintenanceStats{}, err
+	}
+	if err := m.beginCycle(ctx); err != nil {
+		return MaintenanceStats{}, err
+	}
+
+	stats := MaintenanceStats{}
+	start := time.Now()
+	m.statsMu.Lock()
+	m.currentStats = &stats
+	m.statsMu.Unlock()
+	defer func() {
+		m.statsMu.Lock()
+		m.currentStats = nil
+		m.statsMu.Unlock()
+		m.finishCycle()
+	}()
+
+	if err := m.compactor.RunOnce(ctx); err != nil {
+		return m.completeCycleStats(start), fmt.Errorf("compaction: %w", err)
+	}
+	if m.retention != nil {
+		if err := m.retention.RunOnce(ctx); err != nil {
+			return m.completeCycleStats(start), fmt.Errorf("retention: %w", err)
+		}
+	}
+	if m.changeFeed != nil {
+		if err := m.changeFeed.RunOnce(ctx); err != nil {
+			return m.completeCycleStats(start), fmt.Errorf("change-feed retention: %w", err)
+		}
+	}
+
+	return m.completeCycleStats(start), nil
+}
+
+func (m *Maintenance) completeCycleStats(start time.Time) MaintenanceStats {
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.Duration = time.Since(start)
+	}
+	result := *m.currentStats
+	m.statsMu.Unlock()
+	return result
+}
+
+func (m *Maintenance) beginCycle(ctx context.Context) error {
+	if m.closed.Load() {
+		return ErrMaintenanceClosed
+	}
+	select {
+	case m.runGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	m.lifecycleMu.Lock()
+	if m.closed.Load() {
+		m.lifecycleMu.Unlock()
+		<-m.runGate
+		return ErrMaintenanceClosed
+	}
+	m.activeRuns.Add(1)
+	m.lifecycleMu.Unlock()
+	return nil
+}
+
+func (m *Maintenance) finishCycle() {
+	m.activeRuns.Done()
+	<-m.runGate
+}
+
+// Close stops scheduled maintenance, waits for active work, and releases the
+// DB maintenance slot after all stages close successfully.
+func (m *Maintenance) Close(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
+	if m.closed.CompareAndSwap(false, true) {
+		m.lifecycleMu.Lock()
+		if m.runCancel != nil {
+			m.runCancel()
+		}
+		m.lifecycleMu.Unlock()
+	}
+	if err := waitGroupContext(ctx, &m.loopWG); err != nil {
+		return err
+	}
+	if err := waitGroupContext(ctx, &m.activeRuns); err != nil {
+		return err
+	}
+
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.enginesClosed {
+		m.releaseMaintenance()
+		return nil
+	}
+	if m.changeFeed != nil {
+		if err := m.changeFeed.Close(ctx); err != nil {
+			return err
+		}
+	}
+	if m.retention != nil {
+		if err := m.retention.Close(ctx); err != nil {
+			return err
+		}
+	}
+	if err := m.compactor.Close(ctx); err != nil {
+		return err
+	}
+	m.enginesClosed = true
+	m.releaseMaintenance()
+	return nil
+}
+
+func (m *Maintenance) closeDB() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.Close(ctx)
+}
+
+func (m *Maintenance) releaseMaintenance() {
+	if m == nil || m.release == nil {
+		return
+	}
+	m.releaseOnce.Do(m.release)
+}
+
+func stopMaintenanceTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
+	if err == nil {
+		m.statsMu.Lock()
+		if m.currentStats != nil {
+			m.currentStats.CompactionJobs++
+			m.currentStats.CompactionInputSSTs += len(job.InputSSTs)
+			if job.OutputRun != nil {
+				m.currentStats.CompactionOutputSSTs += len(job.OutputRun.SSTs)
+				for _, sst := range job.OutputRun.SSTs {
+					m.currentStats.CompactionOutputBytes += sst.Size
+				}
+			}
+		}
+		m.statsMu.Unlock()
+	}
+	if callback := m.opts.Compaction.OnCompactionEnd; callback != nil {
+		callback(job, err)
+	}
+}
+
+func (m *Maintenance) recordRetention(stats CleanupStats) {
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.Retention = stats
+	}
+	m.statsMu.Unlock()
+	if callback := m.opts.Retention.OnCleanup; callback != nil {
+		callback(stats)
+	}
+}
+
+func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.ChangeFeed = stats
+	}
+	m.statsMu.Unlock()
+	if callback := m.opts.ChangeFeedRetention.OnCleanup; callback != nil {
+		callback(stats)
+	}
+}

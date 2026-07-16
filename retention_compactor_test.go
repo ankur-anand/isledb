@@ -18,11 +18,11 @@ func TestRetentionCompactor_RejectsNilContext(t *testing.T) {
 	defer store.Close()
 
 	manifestStore := newManifestStore(store, nil)
-	if _, err := newRetentionCompactor(nil, store, manifestStore, RetentionCompactorOptions{}); !errors.Is(err, ErrNilContext) {
+	if _, err := newRetentionCompactor(nil, store, manifestStore, retentionCompactorOptions{}); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("newRetentionCompactor(nil) error=%v, want %v", err, ErrNilContext)
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("newRetentionCompactor: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestRetentionCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
 
-	opts := DefaultRetentionCompactorOptions()
+	opts := defaultRetentionCompactorOptions()
 	opts.CheckInterval = 10 * time.Millisecond
 	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, opts)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestRetentionCompactor_CloseWaitsForManualRunOnce(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("newRetentionCompactor: %v", err)
 	}
@@ -143,15 +143,15 @@ func TestRetentionCompactor_RunOnceAfterCloseReturnsClosed(t *testing.T) {
 	defer store.Close()
 
 	manifestStore := newManifestStore(store, nil)
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("newRetentionCompactor: %v", err)
 	}
 	if err := cleaner.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := cleaner.RunOnce(ctx); !errors.Is(err, ErrRetentionCompactorClosed) {
-		t.Fatalf("RunOnce after Close error=%v, want %v", err, ErrRetentionCompactorClosed)
+	if err := cleaner.RunOnce(ctx); !errors.Is(err, errRetentionCompactorClosed) {
+		t.Fatalf("RunOnce after Close error=%v, want %v", err, errRetentionCompactorClosed)
 	}
 }
 
@@ -166,7 +166,7 @@ func TestRetentionCompactor_RunOnceSerializesConcurrentCalls(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{})
 	if err != nil {
 		t.Fatalf("newRetentionCompactor: %v", err)
 	}
@@ -238,10 +238,10 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	}
 	reader.Close()
 
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  2,
+		KeepAtLeastSSTs: 2,
 		CheckInterval:   time.Hour,
 	}
 
@@ -301,12 +301,12 @@ func TestRetentionCompactor_Segmented(t *testing.T) {
 	}
 	w.close(ctx)
 
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByTimeWindow,
-		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  1,
-		SegmentDuration: time.Hour,
-		CheckInterval:   time.Hour,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:               compactByTimeWindow,
+		RetentionPeriod:    time.Nanosecond,
+		KeepAtLeastWindows: 1,
+		SegmentDuration:    time.Hour,
+		CheckInterval:      time.Hour,
 	}
 
 	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, cleanerOpts)
@@ -352,10 +352,10 @@ func TestRetentionCompactor_NoDeleteWhenFresh(t *testing.T) {
 	}
 	w.close(ctx)
 
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: 7 * 24 * time.Hour,
-		RetentionCount:  1,
+		KeepAtLeastSSTs: 1,
 		CheckInterval:   time.Hour,
 	}
 
@@ -405,10 +405,10 @@ func TestRetentionCompactor_Callback(t *testing.T) {
 	var callbackCalled atomic.Bool
 	var deletedCount int
 
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  2,
+		KeepAtLeastSSTs: 2,
 		CheckInterval:   time.Hour,
 		OnCleanup: func(stats CleanupStats) {
 			callbackCalled.Store(true)
@@ -459,10 +459,10 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 
 	var cleanupCount atomic.Int32
 
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  1,
+		KeepAtLeastSSTs: 1,
 		CheckInterval:   50 * time.Millisecond,
 		OnCleanup: func(stats CleanupStats) {
 			cleanupCount.Add(1)
@@ -486,16 +486,19 @@ func TestRetentionCompactor_BackgroundLoop(t *testing.T) {
 }
 
 func TestDefaultRetentionCompactorOptions(t *testing.T) {
-	opts := DefaultRetentionCompactorOptions()
+	opts := defaultRetentionCompactorOptions()
 
-	if opts.Mode != CompactByAge {
+	if opts.Mode != compactByAge {
 		t.Errorf("Default mode should be FIFO")
 	}
 	if opts.RetentionPeriod != 7*24*time.Hour {
 		t.Errorf("Default retention should be 7 days")
 	}
-	if opts.RetentionCount != 10 {
-		t.Errorf("Default retention count should be 10")
+	if opts.KeepAtLeastSSTs != 10 {
+		t.Errorf("default minimum SST count = %d, want 10", opts.KeepAtLeastSSTs)
+	}
+	if opts.KeepAtLeastWindows != 1 {
+		t.Errorf("default minimum window count = %d, want 1", opts.KeepAtLeastWindows)
 	}
 	if opts.CheckInterval != time.Minute {
 		t.Errorf("Default check interval should be 1 minute")
@@ -532,10 +535,10 @@ func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 	}
 
 	var cleanupErrCount atomic.Int32
-	cleanerOpts := RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleanerOpts := retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  1,
+		KeepAtLeastSSTs: 1,
 		CheckInterval:   20 * time.Millisecond,
 		OnCleanupError: func(err error) {
 			cleanupErrCount.Add(1)
@@ -611,10 +614,10 @@ func TestRetentionCompactor_FIFO_EnqueuesDeleteMarks_NoPhysicalDelete(t *testing
 		t.Fatalf("expected 5 SST files before cleanup, got %d", len(sstBefore))
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  2,
+		KeepAtLeastSSTs: 2,
 		CheckInterval:   time.Hour,
 	})
 	if err != nil {
@@ -679,12 +682,12 @@ func TestRetentionCompactor_Segmented_EnqueuesDeleteMarks_NoPhysicalDelete(t *te
 		t.Fatalf("expected 4 SST files before cleanup, got %d", len(sstBefore))
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByTimeWindow,
-		RetentionPeriod: time.Nanosecond,
-		RetentionCount:  1,
-		SegmentDuration: time.Second,
-		CheckInterval:   time.Hour,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:               compactByTimeWindow,
+		RetentionPeriod:    time.Nanosecond,
+		KeepAtLeastWindows: 2,
+		SegmentDuration:    time.Second,
+		CheckInterval:      time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("newRetentionCompactor failed: %v", err)
@@ -702,13 +705,20 @@ func TestRetentionCompactor_Segmented_EnqueuesDeleteMarks_NoPhysicalDelete(t *te
 	if len(sstAfter) != len(sstBefore) {
 		t.Fatalf("expected no physical SST deletion in phase-1, before=%d after=%d", len(sstBefore), len(sstAfter))
 	}
+	manifestAfter, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay manifest after cleanup: %v", err)
+	}
+	if got := manifestAfter.L0SSTCount(); got != 2 {
+		t.Fatalf("retained L0 windows=%d, want 2", got)
+	}
 
 	marks, err := loadPendingSSTDeleteMarks(ctx, store)
 	if err != nil {
 		t.Fatalf("load pending delete marks: %v", err)
 	}
-	if len(marks) == 0 {
-		t.Fatalf("expected pending delete marks to be enqueued")
+	if len(marks) != 2 {
+		t.Fatalf("pending delete marks=%d, want 2", len(marks))
 	}
 }
 
@@ -746,8 +756,8 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 	}
 	targetSSTID := beforeCompaction.L0SSTs[0].ID
 
-	compactor, err := newCompactor(ctx, store, manifestStore, CompactorOptions{
-		Trigger: CompactionTriggerOptions{
+	compactor, err := newCompactor(ctx, store, manifestStore, compactorOptions{
+		Trigger: compactionTriggerOptions{
 			L0SSTCount:    2,
 			CheckInterval: time.Hour,
 		},
@@ -776,10 +786,10 @@ func TestRetentionCompactor_LogCatchup_RebuildsMissingMarkFromCompactionLog(t *t
 		t.Fatalf("delete gc checkpoint: %v", err)
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: 365 * 24 * time.Hour,
-		RetentionCount:  1000,
+		KeepAtLeastSSTs: 1000,
 		CheckInterval:   time.Hour,
 	})
 	if err != nil {
@@ -892,10 +902,10 @@ func TestRetentionCompactor_LogCatchup_FastForwardsFromSnapshotBoundary(t *testi
 		t.Fatalf("write stale checkpoint: %v", err)
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: 365 * 24 * time.Hour,
-		RetentionCount:  1000,
+		KeepAtLeastSSTs: 1000,
 		CheckInterval:   time.Hour,
 	})
 	if err != nil {
@@ -971,10 +981,10 @@ func TestRetentionCompactor_LogCatchup_SnapshotBoundaryRunsOrphanScan(t *testing
 		t.Fatalf("write stale checkpoint: %v", err)
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: 365 * 24 * time.Hour,
-		RetentionCount:  1000,
+		KeepAtLeastSSTs: 1000,
 		CheckInterval:   time.Hour,
 	})
 	if err != nil {
@@ -1020,10 +1030,10 @@ func TestRetentionCompactor_RunOnce_MissingManifestPageReturnsError(t *testing.T
 		}
 	}
 
-	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{
-		Mode:            CompactByAge,
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, retentionCompactorOptions{
+		Mode:            compactByAge,
 		RetentionPeriod: 365 * 24 * time.Hour,
-		RetentionCount:  1000,
+		KeepAtLeastSSTs: 1000,
 		CheckInterval:   time.Hour,
 	})
 	if err != nil {

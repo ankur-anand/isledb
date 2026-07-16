@@ -3,6 +3,7 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"testing"
@@ -86,23 +87,22 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("open writer: %v", err)
 	}
 
-	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.OwnerID = "s3-e2e-compactor"
-	compactorOpts.Trigger.CheckInterval = 10 * time.Millisecond
-	compactorOpts.Trigger.L0SSTCount = 4
-	compactorOpts.Trigger.MinSources = 1 << 20
-	compactorOpts.Trigger.MaxSources = 1 << 20
-	compactorOpts.Output.TargetSSTBytes = 2 * 1024
-	compactorOpts.Output.BlockBytes = 1024
-	compactorOpts.Output.Compression = "none"
+	maintenanceOpts := DefaultMaintenanceOptions()
+	maintenanceOpts.OwnerID = "s3-e2e-maintenance"
+	maintenanceOpts.Every = 10 * time.Millisecond
+	maintenanceOpts.Compaction.L0SSTCount = 4
+	maintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.TargetSSTBytes = 2 * 1024
+	maintenanceOpts.Compaction.BlockBytes = 1024
+	maintenanceOpts.Compaction.Compression = "none"
 
-	compactor, err := db.OpenCompactor(ctx, compactorOpts)
+	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
-		t.Fatalf("open compactor: %v", err)
+		t.Fatalf("open maintenance: %v", err)
 	}
-	if err := compactor.Start(ctx); err != nil {
-		t.Fatalf("start compactor: %v", err)
-	}
+	maintenanceDone := make(chan error, 1)
+	go func() { maintenanceDone <- maintenance.Run(ctx) }()
 
 	const (
 		batches         = 24
@@ -131,13 +131,16 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("close writer: %v", err)
 	}
 
-	// Make the compaction boundary deterministic. The background compactor is
+	// Make the compaction boundary deterministic. Background maintenance is
 	// already running while writes happen; RunOnce drains any remaining L0 work.
-	if err := compactor.RunOnce(ctx); err != nil {
-		t.Fatalf("compactor run once: %v", err)
+	if _, err := maintenance.RunOnce(ctx); err != nil {
+		t.Fatalf("maintenance run once: %v", err)
 	}
-	if err := compactor.Close(ctx); err != nil {
-		t.Fatalf("close compactor: %v", err)
+	if err := maintenance.Close(ctx); err != nil {
+		t.Fatalf("close maintenance: %v", err)
+	}
+	if err := <-maintenanceDone; err != nil {
+		t.Fatalf("maintenance run: %v", err)
 	}
 
 	compacted := replayManifestForTest(t, ctx, store)
@@ -189,24 +192,28 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 
 	time.Sleep(2 * time.Millisecond)
 	var cleanup CleanupStats
-	retentionOpts := DefaultRetentionCompactorOptions()
-	retentionOpts.Mode = CompactByAge
-	retentionOpts.RetentionPeriod = time.Nanosecond
-	retentionOpts.RetentionCount = 1
-	retentionOpts.CheckInterval = time.Hour
-	retentionOpts.OnCleanup = func(stats CleanupStats) {
+	retentionPolicy := DefaultRetentionPolicy()
+	retentionPolicy.Mode = RetentionByAge
+	retentionPolicy.KeepFor = time.Nanosecond
+	retentionPolicy.KeepAtLeastSSTs = 1
+	retentionPolicy.OnCleanup = func(stats CleanupStats) {
 		cleanup = stats
 	}
+	retentionMaintenanceOpts := DefaultMaintenanceOptions()
+	retentionMaintenanceOpts.Compaction.L0SSTCount = 1 << 20
+	retentionMaintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
+	retentionMaintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	retentionMaintenanceOpts.Retention = &retentionPolicy
 
-	retention, err := db.OpenRetentionCompactor(ctx, retentionOpts)
+	retentionMaintenance, err := db.OpenMaintenance(ctx, retentionMaintenanceOpts)
 	if err != nil {
-		t.Fatalf("open retention compactor: %v", err)
+		t.Fatalf("open retention maintenance: %v", err)
 	}
-	if err := retention.RunOnce(ctx); err != nil {
-		t.Fatalf("retention run once: %v", err)
+	if _, err := retentionMaintenance.RunOnce(ctx); err != nil {
+		t.Fatalf("retention maintenance run once: %v", err)
 	}
-	if err := retention.Close(ctx); err != nil {
-		t.Fatalf("close retention compactor: %v", err)
+	if err := retentionMaintenance.Close(ctx); err != nil {
+		t.Fatalf("close retention maintenance: %v", err)
 	}
 	if cleanup.SSTsDeleted == 0 {
 		t.Fatalf("retention deleted no SSTs; live before=%d", len(liveSSTsBeforeRetention))
@@ -263,6 +270,320 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		len(expected), batches, len(liveSSTsBeforeRetention), len(liveSSTsAfterRetention), len(objects), time.Since(start))
 }
 
+func TestS3E2E_ChangeFeedRetentionPreservesKVState(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("change-feed-e2e-%d", time.Now().UnixNano()))
+	defer store.Close()
+	runChangeFeedRetentionE2E(t, ctx, store)
+}
+
+func TestS3E2E_KVLifecycle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("kv-lifecycle-e2e-%d", time.Now().UnixNano()))
+	defer store.Close()
+	runKVLifecycleE2E(t, ctx, store)
+}
+
+func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
+	t.Helper()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	reader, err := OpenReader(ctx, store, ReaderOpenOptions{
+		CacheDir:            t.TempDir(),
+		BlockCacheSize:      64 << 10,
+		ValidateSSTChecksum: true,
+	})
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.OwnerID = "kv-lifecycle-writer"
+	writerOpts.Flush.Interval = 0
+	writerOpts.SST.BlockBytes = 1024
+	writerOpts.SST.Compression = "none"
+
+	writer, err := db.OpenWriter(ctx, writerOpts)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+
+	for key, value := range map[string]string{
+		"stable":  "stable-value",
+		"updated": "version-1",
+		"deleted": "delete-me",
+	} {
+		if err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+	if err := writer.PutWithTTL(ctx, []byte("ttl-expired"), []byte("expires"), 100*time.Millisecond); err != nil {
+		t.Fatalf("put ttl-expired: %v", err)
+	}
+	if err := writer.PutWithTTL(ctx, []byte("ttl-live"), []byte("still-live"), time.Hour); err != nil {
+		t.Fatalf("put ttl-live: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush initial state: %v", err)
+	}
+
+	assertReaderValue(t, ctx, reader, "updated", "", false)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("refresh initial state: %v", err)
+	}
+	assertReaderValue(t, ctx, reader, "stable", "stable-value", true)
+	assertReaderValue(t, ctx, reader, "updated", "version-1", true)
+	assertReaderValue(t, ctx, reader, "deleted", "delete-me", true)
+
+	if err := writer.Put(ctx, []byte("updated"), []byte("version-2")); err != nil {
+		t.Fatalf("update key: %v", err)
+	}
+	if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+		t.Fatalf("delete key: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("new"), []byte("new-value")); err != nil {
+		t.Fatalf("put new key: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush updated state: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	// Reader views are explicit snapshots of manifest state until Refresh.
+	assertReaderValue(t, ctx, reader, "updated", "version-1", true)
+	assertReaderValue(t, ctx, reader, "deleted", "delete-me", true)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("refresh updated state: %v", err)
+	}
+	assertReaderValue(t, ctx, reader, "updated", "version-2", true)
+	assertReaderValue(t, ctx, reader, "deleted", "", false)
+	assertReaderValue(t, ctx, reader, "new", "new-value", true)
+
+	time.Sleep(150 * time.Millisecond)
+	assertReaderValue(t, ctx, reader, "ttl-expired", "", false)
+	assertReaderValue(t, ctx, reader, "ttl-live", "still-live", true)
+
+	before := replayManifestForTest(t, ctx, store)
+	if before.L0SSTCount() != 2 {
+		t.Fatalf("L0 SST count before compaction=%d, want 2", before.L0SSTCount())
+	}
+	oldSSTs := make(map[string]struct{}, len(before.L0SSTs))
+	for _, sst := range before.L0SSTs {
+		oldSSTs[sst.ID] = struct{}{}
+	}
+
+	opts := DefaultMaintenanceOptions()
+	opts.OwnerID = "kv-lifecycle-maintenance"
+	opts.Compaction.L0SSTCount = 2
+	opts.Compaction.MinSortedRunSources = 1 << 20
+	opts.Compaction.MaxSortedRunSources = 1 << 20
+	opts.Compaction.TargetSSTBytes = 1 << 20
+	opts.Compaction.BlockBytes = 1024
+	opts.Compaction.Compression = "none"
+	maintenance, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("open maintenance: %v", err)
+	}
+	stats, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("maintenance run once: %v", err)
+	}
+	if stats.CompactionJobs == 0 {
+		t.Fatalf("compaction did not run: %+v", stats)
+	}
+	if err := maintenance.Close(ctx); err != nil {
+		t.Fatalf("close maintenance: %v", err)
+	}
+
+	// The pre-compaction reader view remains valid during the GC grace period.
+	assertCurrentKVState(t, ctx, reader)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("refresh compacted state: %v", err)
+	}
+	assertCurrentKVState(t, ctx, reader)
+
+	compacted := replayManifestForTest(t, ctx, store)
+	if compacted.L0SSTCount() != 0 || compacted.SortedRunCount() == 0 {
+		t.Fatalf("unexpected compacted manifest: l0=%d sorted_runs=%d", compacted.L0SSTCount(), compacted.SortedRunCount())
+	}
+	for _, id := range compacted.AllSSTIDs() {
+		if _, stale := oldSSTs[id]; stale {
+			t.Fatalf("old L0 SST %q remained visible after compaction", id)
+		}
+	}
+
+	sweep, err := runPendingSSTSweeperWithStorage(
+		ctx,
+		store,
+		db.manifestStore,
+		db.gcMarkStorage,
+		len(oldSSTs),
+		-1,
+	)
+	if err != nil {
+		t.Fatalf("sweep compacted L0 SSTs: %v", err)
+	}
+	if sweep.Deleted != len(oldSSTs) || sweep.Failed != 0 {
+		t.Fatalf("unexpected SST sweep stats: %+v want_deleted=%d", sweep, len(oldSSTs))
+	}
+	for id := range oldSSTs {
+		if _, _, err := store.Read(ctx, store.SSTPath(id)); !errors.Is(err, blobstore.ErrNotFound) {
+			t.Fatalf("old SST %q read error=%v, want %v", id, err, blobstore.ErrNotFound)
+		}
+	}
+	assertCurrentKVState(t, ctx, reader)
+
+	freshReader, err := OpenReader(ctx, store, ReaderOpenOptions{
+		CacheDir:            t.TempDir(),
+		ValidateSSTChecksum: true,
+	})
+	if err != nil {
+		t.Fatalf("open fresh reader: %v", err)
+	}
+	defer freshReader.Close()
+	assertCurrentKVState(t, ctx, freshReader)
+
+	rows, err := freshReader.Scan(ctx, []byte(""), []byte("zzzz"))
+	if err != nil {
+		t.Fatalf("scan compacted state: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("compacted scan count=%d, want 4", len(rows))
+	}
+}
+
+func assertCurrentKVState(t testing.TB, ctx context.Context, reader *Reader) {
+	t.Helper()
+	assertReaderValue(t, ctx, reader, "stable", "stable-value", true)
+	assertReaderValue(t, ctx, reader, "updated", "version-2", true)
+	assertReaderValue(t, ctx, reader, "deleted", "", false)
+	assertReaderValue(t, ctx, reader, "new", "new-value", true)
+	assertReaderValue(t, ctx, reader, "ttl-expired", "", false)
+	assertReaderValue(t, ctx, reader, "ttl-live", "still-live", true)
+}
+
+func assertReaderValue(t testing.TB, ctx context.Context, reader *Reader, key, want string, wantFound bool) {
+	t.Helper()
+	got, found, err := reader.Get(ctx, []byte(key))
+	if err != nil {
+		t.Fatalf("get %s: %v", key, err)
+	}
+	if found != wantFound || (found && string(got) != want) {
+		t.Fatalf("get %s=%q found=%v, want %q found=%v", key, got, found, want, wantFound)
+	}
+}
+
+func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
+	t.Helper()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.OwnerID = "change-feed-e2e-writer"
+	writerOpts.Flush.Interval = 0
+	writerOpts.ChangeFeed.Enabled = true
+	writerOpts.SST.Compression = "none"
+
+	writer, err := db.OpenWriter(ctx, writerOpts)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("key:1"), []byte("value:1")); err != nil {
+		t.Fatalf("put key:1: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush key:1: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := writer.Put(ctx, []byte("key:2"), []byte("value:2")); err != nil {
+		t.Fatalf("put key:2: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush key:2: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	before, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
+	if err != nil {
+		t.Fatalf("list change batches before cleanup: %v", err)
+	}
+	if len(before.Objects) != 2 {
+		t.Fatalf("change batches before cleanup=%d, want 2", len(before.Objects))
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	changeFeed := DefaultChangeFeedRetentionPolicy()
+	changeFeed.KeepFor = time.Millisecond
+	// The newest retained entries are the maintenance fence claim and the
+	// newest add-SST entry, so the newest change batch remains available.
+	changeFeed.KeepAtLeastManifestEntries = 2
+	changeFeed.DeleteGracePeriod = -1
+	opts := DefaultMaintenanceOptions()
+	opts.OwnerID = "change-feed-e2e-maintenance"
+	opts.ChangeFeedRetention = &changeFeed
+
+	maintenance, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("open maintenance: %v", err)
+	}
+	stats, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("maintenance run once: %v", err)
+	}
+	if err := maintenance.Close(ctx); err != nil {
+		t.Fatalf("close maintenance: %v", err)
+	}
+	if stats.ChangeFeed.EntriesRetired == 0 || stats.ChangeFeed.BatchesMarked != 1 || stats.ChangeFeed.BatchesDeleted != 1 {
+		t.Fatalf("unexpected change-feed cleanup stats: %+v", stats.ChangeFeed)
+	}
+
+	after, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
+	if err != nil {
+		t.Fatalf("list change batches after cleanup: %v", err)
+	}
+	if len(after.Objects) != 1 {
+		t.Fatalf("change batches after cleanup=%d, want 1", len(after.Objects))
+	}
+
+	replayed := replayManifestForTest(t, ctx, store)
+	if replayed.L0SSTCount() != 2 {
+		t.Fatalf("replayed L0 SST count=%d, want 2", replayed.L0SSTCount())
+	}
+
+	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+	for key, want := range map[string]string{"key:1": "value:1", "key:2": "value:2"} {
+		got, found, err := reader.Get(ctx, []byte(key))
+		if err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+		if !found || string(got) != want {
+			t.Fatalf("get %s=%q found=%v, want %q true", key, got, found, want)
+		}
+	}
+}
+
 func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -288,26 +609,26 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 		b.Fatalf("open writer: %v", err)
 	}
 
-	compactorOpts := DefaultCompactorOptions()
-	compactorOpts.OwnerID = "s3-bench-compactor"
-	compactorOpts.Trigger.CheckInterval = 25 * time.Millisecond
-	compactorOpts.Trigger.L0SSTCount = 8
-	compactorOpts.Trigger.MinSources = 1 << 20
-	compactorOpts.Trigger.MaxSources = 1 << 20
-	compactorOpts.Output.TargetSSTBytes = 64 << 10
-	compactorOpts.Output.Compression = "none"
+	maintenanceOpts := DefaultMaintenanceOptions()
+	maintenanceOpts.OwnerID = "s3-bench-maintenance"
+	maintenanceOpts.Every = 25 * time.Millisecond
+	maintenanceOpts.Compaction.L0SSTCount = 8
+	maintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.TargetSSTBytes = 64 << 10
+	maintenanceOpts.Compaction.Compression = "none"
 
-	compactor, err := db.OpenCompactor(ctx, compactorOpts)
+	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
-		b.Fatalf("open compactor: %v", err)
+		b.Fatalf("open maintenance: %v", err)
 	}
-	if err := compactor.Start(ctx); err != nil {
-		b.Fatalf("start compactor: %v", err)
-	}
+	maintenanceDone := make(chan error, 1)
+	go func() { maintenanceDone <- maintenance.Run(ctx) }()
 	defer func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer closeCancel()
-		_ = compactor.Close(closeCtx)
+		_ = maintenance.Close(closeCtx)
+		<-maintenanceDone
 	}()
 
 	b.ResetTimer()
@@ -326,8 +647,8 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	if err := writer.Close(ctx); err != nil {
 		b.Fatalf("close writer: %v", err)
 	}
-	if err := compactor.RunOnce(ctx); err != nil {
-		b.Fatalf("compactor run once: %v", err)
+	if _, err := maintenance.RunOnce(ctx); err != nil {
+		b.Fatalf("maintenance run once: %v", err)
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "records/s")

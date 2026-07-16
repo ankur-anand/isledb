@@ -230,6 +230,19 @@ func (s *Store) CheckCompactorFence(ctx context.Context) error {
 	return s.checkFence(ctx, FenceRoleCompactor)
 }
 
+// CheckCompactorFenceToken verifies that token is still the current compactor
+// fence without relying on mutable process-local Store state.
+func (s *Store) CheckCompactorFenceToken(ctx context.Context, token *FenceToken) error {
+	current, _, err := s.readCurrentWithETag(ctx)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return ErrFenced
+	}
+	return checkFenceToken(token, current.CompactorFence)
+}
+
 func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
 	s.mu.Lock()
 	var localFence *FenceToken
@@ -261,15 +274,7 @@ func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
 		remoteFence = current.CompactorFence
 	}
 
-	if remoteFence == nil {
-		return ErrFenced
-	}
-
-	if remoteFence.Epoch > localFence.Epoch {
-		return ErrFenced
-	}
-
-	return nil
+	return checkFenceToken(localFence, remoteFence)
 }
 
 func (s *Store) WriterEpoch() uint64 {
@@ -943,8 +948,9 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	}
 	current.Snapshot = path
 	current.LogSeqStart = nextSeq
-	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, current.ChangeFeedLogStart)
-	current.IndexFrontier = filterPageRefsAtOrAfter(current.IndexFrontier, current.ChangeFeedLogStart)
+	retainedFrom := retainedEntryFloor(current)
+	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, retainedFrom)
+	current.IndexFrontier = filterPageRefsAtOrAfter(current.IndexFrontier, retainedFrom)
 	if current.NextEpoch < m.NextEpoch {
 		current.NextEpoch = m.NextEpoch
 	}
@@ -990,6 +996,16 @@ func filterPageRefsAtOrAfter(refs []PageRef, floor uint64) []PageRef {
 func currentLogStart(current *Current) uint64 {
 	if current == nil {
 		return 0
+	}
+	return current.LogSeqStart
+}
+
+func retainedEntryFloor(current *Current) uint64 {
+	if current == nil {
+		return 0
+	}
+	if current.ChangeFeedLogStart < current.LogSeqStart {
+		return current.ChangeFeedLogStart
 	}
 	return current.LogSeqStart
 }
@@ -1260,7 +1276,7 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 // AdvanceChangeFeedLogStart advances CURRENT.change_feed_log_start and prunes
 // retained manifest entry refs below the new floor. The floor is clamped to
 // [current.change_feed_log_start, current.next_seq].
-func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*Current, error) {
+func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
 	const maxRetries = 3
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -1270,6 +1286,9 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*C
 		}
 		if current == nil {
 			return nil, nil
+		}
+		if err := checkFenceToken(token, current.CompactorFence); err != nil {
+			return nil, err
 		}
 
 		updated := current.Clone()
@@ -1288,8 +1307,9 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*C
 		}
 
 		updated.ChangeFeedLogStart = floor
-		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, floor)
-		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, floor)
+		retainedFrom := retainedEntryFloor(updated)
+		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, retainedFrom)
+		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, retainedFrom)
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -1301,6 +1321,16 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64) (*C
 	}
 
 	return nil, ErrFenceConflict
+}
+
+func checkFenceToken(local, remote *FenceToken) error {
+	if local == nil || remote == nil {
+		return ErrFenced
+	}
+	if local.Epoch != remote.Epoch || local.Owner != remote.Owner {
+		return ErrFenced
+	}
+	return nil
 }
 
 func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {
@@ -1329,13 +1359,7 @@ func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {
 		remoteFence = current.CompactorFence
 	}
 
-	if remoteFence == nil {
-		return ErrFenced
-	}
-	if remoteFence.Epoch > localFence.Epoch {
-		return ErrFenced
-	}
-	return nil
+	return checkFenceToken(localFence, remoteFence)
 }
 
 func nextEpochFromEntry(current uint64, entry *ManifestLogEntry) uint64 {

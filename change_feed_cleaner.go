@@ -13,15 +13,15 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-type ChangeFeedCleanerOptions struct {
+type changeFeedCleanerOptions struct {
 	// RetentionPeriod is the minimum age retained for change-feed entries.
 	// Entries with change batches older than this can be retired, subject to
-	// RetentionCount. Zero uses the default.
+	// KeepAtLeastManifestEntries. Zero uses the default.
 	RetentionPeriod time.Duration
 
-	// RetentionCount is the minimum number of newest manifest entries retained
-	// for change-feed readers. Zero uses the default.
-	RetentionCount uint64
+	// KeepAtLeastManifestEntries is the minimum number of newest manifest
+	// entries retained for change-feed readers. Zero uses the default.
+	KeepAtLeastManifestEntries uint64
 
 	// CheckInterval is the background cleaner cadence used by Start.
 	CheckInterval time.Duration
@@ -47,20 +47,21 @@ type ChangeFeedCleanupStats struct {
 	Duration        time.Duration
 }
 
-func DefaultChangeFeedCleanerOptions() ChangeFeedCleanerOptions {
-	return ChangeFeedCleanerOptions{
-		RetentionPeriod:  7 * 24 * time.Hour,
-		RetentionCount:   1024,
-		CheckInterval:    time.Minute,
-		SweepBatchSize:   defaultChangeFeedSweepBatchSize,
-		SweepGracePeriod: defaultChangeFeedSweepGracePeriod,
+func defaultChangeFeedCleanerOptions() changeFeedCleanerOptions {
+	return changeFeedCleanerOptions{
+		RetentionPeriod:            7 * 24 * time.Hour,
+		KeepAtLeastManifestEntries: 1024,
+		CheckInterval:              time.Minute,
+		SweepBatchSize:             defaultChangeFeedSweepBatchSize,
+		SweepGracePeriod:           defaultChangeFeedSweepGracePeriod,
 	}
 }
 
-type ChangeFeedCleaner struct {
+type changeFeedCleaner struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
-	opts        ChangeFeedCleanerOptions
+	opts        changeFeedCleanerOptions
+	fenceToken  *manifest.FenceToken
 
 	lifecycleMu sync.Mutex
 	ticker      *time.Ticker
@@ -71,16 +72,20 @@ type ChangeFeedCleaner struct {
 	closed  atomic.Bool
 }
 
-func newChangeFeedCleaner(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts ChangeFeedCleanerOptions) (*ChangeFeedCleaner, error) {
+func newChangeFeedCleaner(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts changeFeedCleanerOptions) (*changeFeedCleaner, error) {
+	return newChangeFeedCleanerWithFence(ctx, store, manifestLog, opts, nil)
+}
+
+func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts changeFeedCleanerOptions, fence *manifest.FenceToken) (*changeFeedCleaner, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	defaults := DefaultChangeFeedCleanerOptions()
+	defaults := defaultChangeFeedCleanerOptions()
 	if opts.RetentionPeriod <= 0 {
 		opts.RetentionPeriod = defaults.RetentionPeriod
 	}
-	if opts.RetentionCount == 0 {
-		opts.RetentionCount = defaults.RetentionCount
+	if opts.KeepAtLeastManifestEntries == 0 {
+		opts.KeepAtLeastManifestEntries = defaults.KeepAtLeastManifestEntries
 	}
 	if opts.CheckInterval <= 0 {
 		opts.CheckInterval = defaults.CheckInterval
@@ -91,10 +96,19 @@ func newChangeFeedCleaner(ctx context.Context, store *blobstore.Store, manifestL
 	if opts.SweepGracePeriod == 0 {
 		opts.SweepGracePeriod = defaults.SweepGracePeriod
 	}
-	return &ChangeFeedCleaner{store: store, manifestLog: manifestLog, opts: opts}, nil
+	if fence == nil {
+		ownerID := fmt.Sprintf("change-feed-cleaner-%d", time.Now().UnixNano())
+		token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim compactor fence: %w", err)
+		}
+		fence = token
+	}
+	token := *fence
+	return &changeFeedCleaner{store: store, manifestLog: manifestLog, opts: opts, fenceToken: &token}, nil
 }
 
-func (c *ChangeFeedCleaner) Start(ctx context.Context) error {
+func (c *changeFeedCleaner) Start(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -117,7 +131,7 @@ func (c *ChangeFeedCleaner) Start(ctx context.Context) error {
 	return nil
 }
 
-func (c *ChangeFeedCleaner) stopLoop() {
+func (c *changeFeedCleaner) stopLoop() {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -132,7 +146,7 @@ func (c *ChangeFeedCleaner) stopLoop() {
 	c.running.Store(false)
 }
 
-func (c *ChangeFeedCleaner) Close(ctx context.Context) error {
+func (c *changeFeedCleaner) Close(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -142,13 +156,13 @@ func (c *ChangeFeedCleaner) Close(ctx context.Context) error {
 	return waitGroupContext(ctx, &c.wg)
 }
 
-func (c *ChangeFeedCleaner) closeDB() error {
+func (c *changeFeedCleaner) closeDB() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return c.Close(ctx)
 }
 
-func (c *ChangeFeedCleaner) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
+func (c *changeFeedCleaner) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
 	defer c.wg.Done()
 	defer func() {
 		ticker.Stop()
@@ -184,8 +198,14 @@ func (c *ChangeFeedCleaner) cleanupLoop(ctx context.Context, ticker *time.Ticker
 	}
 }
 
-func (c *ChangeFeedCleaner) RunOnce(ctx context.Context) error {
+func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if c.closed.Load() {
+		return errors.New("change feed cleaner closed")
+	}
+	if err := c.manifestLog.CheckCompactorFenceToken(ctx, c.fenceToken); err != nil {
 		return err
 	}
 	start := time.Now()
@@ -219,7 +239,7 @@ func (c *ChangeFeedCleaner) RunOnce(ctx context.Context) error {
 
 	var entriesRetired int
 	if floor > current.ChangeFeedLogStart {
-		if _, err := c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor); err != nil {
+		if _, err := c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken); err != nil {
 			return fmt.Errorf("advance change-feed floor: %w", err)
 		}
 		entriesRetired = int(floor - current.ChangeFeedLogStart)
@@ -244,7 +264,7 @@ func (c *ChangeFeedCleaner) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-func (c *ChangeFeedCleaner) planRetentionFloor(ctx context.Context, current *manifest.Current, now time.Time) (uint64, []changeBatchDeleteCandidate, error) {
+func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, current *manifest.Current, now time.Time) (uint64, []changeBatchDeleteCandidate, error) {
 	if current == nil || current.NextSeq <= current.ChangeFeedLogStart {
 		return currentNextSeqForCleaner(current), nil, nil
 	}
@@ -252,9 +272,9 @@ func (c *ChangeFeedCleaner) planRetentionFloor(ctx context.Context, current *man
 	start := current.ChangeFeedLogStart
 	end := current.NextSeq
 	maxFloor := end
-	if c.opts.RetentionCount > 0 && end-start > c.opts.RetentionCount {
-		maxFloor = end - c.opts.RetentionCount
-	} else if c.opts.RetentionCount > 0 {
+	if c.opts.KeepAtLeastManifestEntries > 0 && end-start > c.opts.KeepAtLeastManifestEntries {
+		maxFloor = end - c.opts.KeepAtLeastManifestEntries
+	} else if c.opts.KeepAtLeastManifestEntries > 0 {
 		maxFloor = start
 	}
 

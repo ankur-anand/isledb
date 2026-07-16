@@ -152,7 +152,7 @@ func defaultReaderOptions() readerOptions {
 	}
 }
 
-type CompactorOptions struct {
+type compactorOptions struct {
 	// OwnerID is the stable compactor identity stored in the compactor fence.
 	OwnerID string
 
@@ -161,13 +161,13 @@ type CompactorOptions struct {
 	InputReadParallelism int
 
 	// Trigger controls when compaction work is selected.
-	Trigger CompactionTriggerOptions
+	Trigger compactionTriggerOptions
 
 	// Output controls compacted SST file encoding and sizing.
-	Output CompactionOutputOptions
+	Output compactionOutputOptions
 
 	// Safety controls source SST validation before compaction.
-	Safety CompactionSafetyOptions
+	Safety compactionSafetyOptions
 
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
@@ -176,7 +176,7 @@ type CompactorOptions struct {
 	GCMarkStorage manifest.GCMarkStorage
 }
 
-type CompactionTriggerOptions struct {
+type compactionTriggerOptions struct {
 	// CheckInterval is the background scheduler cadence used by Start.
 	CheckInterval time.Duration
 
@@ -196,7 +196,7 @@ type CompactionTriggerOptions struct {
 	SizeRatio int
 }
 
-type CompactionOutputOptions struct {
+type compactionOutputOptions struct {
 	// TargetSSTBytes is the target size for compacted SST outputs.
 	TargetSSTBytes int64
 
@@ -210,7 +210,7 @@ type CompactionOutputOptions struct {
 	Compression string
 }
 
-type CompactionSafetyOptions struct {
+type compactionSafetyOptions struct {
 	// ValidateSSTChecksum verifies SST checksums before compaction.
 	ValidateSSTChecksum bool
 
@@ -218,10 +218,10 @@ type CompactionSafetyOptions struct {
 	SSTHashVerifier SSTHashVerifier
 }
 
-func DefaultCompactorOptions() CompactorOptions {
-	return CompactorOptions{
+func defaultCompactorOptions() compactorOptions {
+	return compactorOptions{
 		InputReadParallelism: 4,
-		Trigger: CompactionTriggerOptions{
+		Trigger: compactionTriggerOptions{
 			CheckInterval:               5 * time.Second,
 			L0SSTCount:                  8,
 			MaxConsecutiveL0Compactions: 4,
@@ -229,7 +229,7 @@ func DefaultCompactorOptions() CompactorOptions {
 			MaxSources:                  8,
 			SizeRatio:                   4,
 		},
-		Output: CompactionOutputOptions{
+		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,
 			BloomBitsPerKey: 10,
 			BlockBytes:      4096,

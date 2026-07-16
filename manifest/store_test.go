@@ -910,14 +910,16 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	}
 }
 
-func TestAdvanceChangeFeedLogStartPrunesRetainedRefs(t *testing.T) {
+func TestAdvanceChangeFeedLogStartKeepsRefsNeededForStateReplay(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
 
 	backend := NewBlobStoreBackend(store)
+	token := &FenceToken{Epoch: 7, Owner: "maintenance-1", ClaimedAt: time.Now().UTC()}
 	writeCurrentForTest(t, ctx, backend, &Current{
 		NextEpoch:          1,
+		CompactorFence:     token,
 		LogSeqStart:        0,
 		ChangeFeedLogStart: 1,
 		NextSeq:            4,
@@ -933,24 +935,51 @@ func TestAdvanceChangeFeedLogStartPrunesRetainedRefs(t *testing.T) {
 	})
 
 	ms := NewStoreWithStorage(backend)
-	updated, err := ms.AdvanceChangeFeedLogStart(ctx, 2)
+	updated, err := ms.AdvanceChangeFeedLogStart(ctx, 2, token)
 	if err != nil {
 		t.Fatalf("advance change-feed floor: %v", err)
 	}
 	if updated.ChangeFeedLogStart != 2 {
 		t.Fatalf("unexpected change-feed floor: got=%d want=2", updated.ChangeFeedLogStart)
 	}
-	if got, want := len(updated.ActiveEntries), 2; got != want {
+	if got, want := len(updated.ActiveEntries), 3; got != want {
 		t.Fatalf("unexpected active entry count: got=%d want=%d", got, want)
 	}
-	if updated.ActiveEntries[0].Seq != 2 || updated.ActiveEntries[1].Seq != 3 {
-		t.Fatalf("unexpected active entries after prune: got=%d,%d want=2,3", updated.ActiveEntries[0].Seq, updated.ActiveEntries[1].Seq)
+	if updated.ActiveEntries[0].Seq != 1 || updated.ActiveEntries[1].Seq != 2 || updated.ActiveEntries[2].Seq != 3 {
+		t.Fatalf("unexpected retained active entries: got=%d,%d,%d want=1,2,3", updated.ActiveEntries[0].Seq, updated.ActiveEntries[1].Seq, updated.ActiveEntries[2].Seq)
 	}
-	if got, want := len(updated.IndexFrontier), 1; got != want {
+	if got, want := len(updated.IndexFrontier), 2; got != want {
 		t.Fatalf("unexpected index frontier count: got=%d want=%d", got, want)
 	}
-	if updated.IndexFrontier[0].Path != "pages/l00/kept" {
-		t.Fatalf("unexpected retained page ref: got=%q", updated.IndexFrontier[0].Path)
+	if updated.IndexFrontier[0].Path != "pages/l00/old" || updated.IndexFrontier[1].Path != "pages/l00/kept" {
+		t.Fatalf("unexpected retained page refs: got=%q,%q", updated.IndexFrontier[0].Path, updated.IndexFrontier[1].Path)
+	}
+}
+
+func TestCheckFenceTokenRequiresExactIdentity(t *testing.T) {
+	token := &FenceToken{Epoch: 7, Owner: "maintenance-1"}
+	tests := []struct {
+		name   string
+		remote *FenceToken
+		valid  bool
+	}{
+		{name: "same token", remote: &FenceToken{Epoch: 7, Owner: "maintenance-1"}, valid: true},
+		{name: "newer epoch", remote: &FenceToken{Epoch: 8, Owner: "maintenance-2"}},
+		{name: "older epoch", remote: &FenceToken{Epoch: 6, Owner: "maintenance-0"}},
+		{name: "different owner", remote: &FenceToken{Epoch: 7, Owner: "maintenance-2"}},
+		{name: "missing remote"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkFenceToken(token, tt.remote)
+			if tt.valid && err != nil {
+				t.Fatalf("checkFenceToken error=%v", err)
+			}
+			if !tt.valid && !errors.Is(err, ErrFenced) {
+				t.Fatalf("checkFenceToken error=%v, want %v", err, ErrFenced)
+			}
+		})
 	}
 }
 
