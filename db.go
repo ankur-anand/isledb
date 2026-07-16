@@ -11,6 +11,9 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
+// ErrWriterAlreadyOpen is returned when a DB already owns an active writer.
+var ErrWriterAlreadyOpen = errors.New("writer already open")
+
 // Writer provides write access to the database.
 //
 // A Writer owns one fenced write session for a DB bucket/prefix. It buffers
@@ -29,7 +32,9 @@ import (
 // WriterOptions.OnFlushError when configured; they are not returned by later Put
 // calls. Call Flush or Close to synchronously observe flush errors.
 type Writer struct {
-	w *writer
+	w           *writer
+	releaseOnce sync.Once
+	release     func()
 }
 
 // Put writes a key-value pair to the active memtable.
@@ -77,11 +82,26 @@ func (w *Writer) Flush(ctx context.Context) error {
 // Close returns the first close or flush error it observes. After Close returns,
 // the Writer cannot be used again.
 func (w *Writer) Close(ctx context.Context) error {
-	return w.w.close(ctx)
+	err := w.w.close(ctx)
+	if err == nil || errors.Is(err, manifest.ErrFenced) {
+		w.releaseWriter()
+	}
+	return err
 }
 
 func (w *Writer) closeDB() error {
-	return w.w.closeWithTimeout(30 * time.Second)
+	err := w.w.closeWithTimeout(30 * time.Second)
+	if err == nil || errors.Is(err, manifest.ErrFenced) {
+		w.releaseWriter()
+	}
+	return err
+}
+
+func (w *Writer) releaseWriter() {
+	if w == nil || w.release == nil {
+		return
+	}
+	w.releaseOnce.Do(w.release)
 }
 
 // DB encapsulates manifest state for writers and compactors operating on a single bucket/prefix.
@@ -92,6 +112,7 @@ type DB struct {
 	gcMarkStorage manifest.GCMarkStorage
 	mu            sync.Mutex
 	closers       []dbCloser
+	writerOpen    bool
 	closed        atomic.Bool
 }
 
@@ -128,23 +149,46 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 	}, nil
 }
 
-// OpenWriter opens a writer instance from the DB.
+// OpenWriter opens the DB's single active writer. A new writer can be opened
+// after the previous writer closes successfully or becomes fenced.
 func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, error) {
-	if db.closed.Load() {
-		return nil, errors.New("db closed")
+	if err := db.reserveWriter(); err != nil {
+		return nil, err
 	}
 
 	w, err := newWriter(ctx, db.store, db.manifestStore, opts)
 	if err != nil {
+		db.releaseWriter()
 		return nil, err
 	}
 
-	writer := &Writer{w: w}
+	writer := &Writer{w: w, release: db.releaseWriter}
 	if err := db.registerCloser(writer); err != nil {
 		_ = writer.Close(ctx)
+		db.releaseWriter()
 		return nil, err
 	}
 	return writer, nil
+}
+
+func (db *DB) reserveWriter() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed.Load() {
+		return errors.New("db closed")
+	}
+	if db.writerOpen {
+		return ErrWriterAlreadyOpen
+	}
+	db.writerOpen = true
+	return nil
+}
+
+func (db *DB) releaseWriter() {
+	db.mu.Lock()
+	db.writerOpen = false
+	db.mu.Unlock()
 }
 
 // OpenCompactor opens a compactor instance from the DB.
