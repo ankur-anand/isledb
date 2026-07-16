@@ -23,6 +23,8 @@ const (
 	CompactByTimeWindow
 )
 
+var ErrRetentionCompactorClosed = errors.New("retention compactor closed")
+
 type RetentionCompactorOptions struct {
 	Mode RetentionCompactorMode
 
@@ -68,9 +70,11 @@ type RetentionCompactor struct {
 	mu          sync.Mutex
 	manifest    *Manifest
 
-	ticker *time.Ticker
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ticker     *time.Ticker
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	activeRuns sync.WaitGroup
+	runGate    chan struct{}
 
 	fenced  atomic.Bool
 	running atomic.Bool
@@ -115,6 +119,7 @@ func newRetentionCompactor(ctx context.Context, store *blobstore.Store, manifest
 		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
+		runGate:     make(chan struct{}, 1),
 	}, nil
 }
 
@@ -127,7 +132,7 @@ func (c *RetentionCompactor) Start(ctx context.Context) error {
 	defer c.lifecycleMu.Unlock()
 
 	if c.closed.Load() {
-		return errors.New("retention compactor closed")
+		return ErrRetentionCompactorClosed
 	}
 	if !c.running.CompareAndSwap(false, true) {
 		return nil
@@ -163,7 +168,10 @@ func (c *RetentionCompactor) Close(ctx context.Context) error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.stopLoop()
 	}
-	return waitGroupContext(ctx, &c.wg)
+	if err := waitGroupContext(ctx, &c.wg); err != nil {
+		return err
+	}
+	return waitGroupContext(ctx, &c.activeRuns)
 }
 
 func (c *RetentionCompactor) closeDB() error {
@@ -176,7 +184,7 @@ func (c *RetentionCompactor) closeWithTimeout(timeout time.Duration) error {
 	return c.Close(ctx)
 }
 
-func (c *RetentionCompactor) Refresh(ctx context.Context) error {
+func (c *RetentionCompactor) refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
 		return err
@@ -243,6 +251,10 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
+	if err := c.beginRun(ctx); err != nil {
+		return err
+	}
+	defer c.finishRun()
 
 	start := time.Now()
 	if c.fenced.Load() {
@@ -259,7 +271,7 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("mark catchup from manifest log: %w", err)
 	}
 
-	if err := c.Refresh(ctx); err != nil {
+	if err := c.refresh(ctx); err != nil {
 		return fmt.Errorf("refresh manifest: %w", err)
 	}
 
@@ -302,6 +314,46 @@ func (c *RetentionCompactor) RunOnce(ctx context.Context) error {
 	c.runSSTSweeperBestEffort(ctx)
 
 	return nil
+}
+
+func (c *RetentionCompactor) beginRun(ctx context.Context) error {
+	if c.closed.Load() {
+		return ErrRetentionCompactorClosed
+	}
+	if err := c.acquireRun(ctx); err != nil {
+		return err
+	}
+
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		c.releaseRun()
+		return ErrRetentionCompactorClosed
+	}
+	c.activeRuns.Add(1)
+	c.lifecycleMu.Unlock()
+	return nil
+}
+
+func (c *RetentionCompactor) finishRun() {
+	c.activeRuns.Done()
+	c.releaseRun()
+}
+
+func (c *RetentionCompactor) acquireRun(ctx context.Context) error {
+	select {
+	case c.runGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *RetentionCompactor) releaseRun() {
+	select {
+	case <-c.runGate:
+	default:
+	}
 }
 
 func (c *RetentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {

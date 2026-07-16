@@ -85,6 +85,123 @@ func TestRetentionCompactor_CloseTimeoutCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestRetentionCompactor_CloseWaitsForManualRunOnce(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("retention-close-manual-runonce")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor: %v", err)
+	}
+
+	storage.block.Store(true)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- cleaner.RunOnce(ctx)
+	}()
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual RunOnce did not reach blocking CURRENT read")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = cleaner.Close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("manual RunOnce error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual RunOnce did not finish after release")
+	}
+
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := cleaner.Close(retryCtx); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+}
+
+func TestRetentionCompactor_RunOnceAfterCloseReturnsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("retention-closed")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor: %v", err)
+	}
+	if err := cleaner.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := cleaner.RunOnce(ctx); !errors.Is(err, ErrRetentionCompactorClosed) {
+		t.Fatalf("RunOnce after Close error=%v, want %v", err, ErrRetentionCompactorClosed)
+	}
+}
+
+func TestRetentionCompactor_RunOnceSerializesConcurrentCalls(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("retention-runonce-serial")
+	defer store.Close()
+
+	storage := &blockingReadCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	cleaner, err := newRetentionCompactor(ctx, store, manifestStore, RetentionCompactorOptions{})
+	if err != nil {
+		t.Fatalf("newRetentionCompactor: %v", err)
+	}
+	defer cleaner.Close(ctx)
+
+	storage.block.Store(true)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- cleaner.RunOnce(ctx)
+	}()
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first RunOnce did not reach blocking CURRENT read")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	err = cleaner.RunOnce(waitCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second RunOnce error=%v, want %v", err, context.DeadlineExceeded)
+	}
+
+	close(storage.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first RunOnce error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first RunOnce did not finish after release")
+	}
+}
+
 func TestRetentionCompactor_FIFO(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")

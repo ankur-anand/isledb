@@ -31,6 +31,8 @@ const (
 
 const CompactionMaxIterations = 100
 
+var ErrCompactorClosed = errors.New("compactor closed")
+
 type CompactionJob struct {
 	Type      CompactionJobType
 	InputSSTs []string
@@ -52,6 +54,8 @@ type Compactor struct {
 	ticker      *time.Ticker
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+	activeRuns  sync.WaitGroup
+	runGate     chan struct{}
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -79,6 +83,7 @@ func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *mani
 		gcMarkStore: opts.GCMarkStorage,
 		opts:        opts,
 		manifest:    m,
+		runGate:     make(chan struct{}, 1),
 	}
 
 	ownerID := opts.OwnerID
@@ -142,7 +147,7 @@ func (c *Compactor) Start(ctx context.Context) error {
 	defer c.lifecycleMu.Unlock()
 
 	if c.closed.Load() {
-		return errors.New("compactor closed")
+		return ErrCompactorClosed
 	}
 	if !c.running.CompareAndSwap(false, true) {
 		return nil
@@ -178,7 +183,10 @@ func (c *Compactor) Close(ctx context.Context) error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.stopLoop()
 	}
-	return waitGroupContext(ctx, &c.wg)
+	if err := waitGroupContext(ctx, &c.wg); err != nil {
+		return err
+	}
+	return waitGroupContext(ctx, &c.activeRuns)
 }
 
 func (c *Compactor) closeDB() error {
@@ -191,7 +199,7 @@ func (c *Compactor) closeWithTimeout(timeout time.Duration) error {
 	return c.Close(ctx)
 }
 
-func (c *Compactor) Refresh(ctx context.Context) error {
+func (c *Compactor) refresh(ctx context.Context) error {
 	m, err := c.manifestLog.Replay(ctx)
 	if err != nil {
 		return err
@@ -242,6 +250,10 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
+	if err := c.beginRun(ctx); err != nil {
+		return err
+	}
+	defer c.finishRun()
 
 	for i := 0; i < CompactionMaxIterations; i++ {
 		if err := ctx.Err(); err != nil {
@@ -251,7 +263,7 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 			return manifest.ErrFenced
 		}
 
-		if err := c.Refresh(ctx); err != nil {
+		if err := c.refresh(ctx); err != nil {
 			return fmt.Errorf("refresh manifest: %w", err)
 		}
 
@@ -296,6 +308,46 @@ func (c *Compactor) RunOnce(ctx context.Context) error {
 		"CompactionMaxIterations", CompactionMaxIterations)
 	c.runSSTSweeperBestEffort(ctx)
 	return nil
+}
+
+func (c *Compactor) beginRun(ctx context.Context) error {
+	if c.closed.Load() {
+		return ErrCompactorClosed
+	}
+	if err := c.acquireRun(ctx); err != nil {
+		return err
+	}
+
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		c.releaseRun()
+		return ErrCompactorClosed
+	}
+	c.activeRuns.Add(1)
+	c.lifecycleMu.Unlock()
+	return nil
+}
+
+func (c *Compactor) finishRun() {
+	c.activeRuns.Done()
+	c.releaseRun()
+}
+
+func (c *Compactor) acquireRun(ctx context.Context) error {
+	select {
+	case c.runGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Compactor) releaseRun() {
+	select {
+	case <-c.runGate:
+	default:
+	}
 }
 
 func (c *Compactor) shouldRunSortedRunForFairness() bool {
