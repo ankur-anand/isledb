@@ -28,9 +28,9 @@ var ErrWriterAlreadyOpen = errors.New("writer already open")
 // Flush, and Close for one Writer.
 //
 // If WriterOptions.Flush.Interval is greater than zero, the Writer also runs a
-// background flush loop. Background flush errors are reported through
-// WriterOptions.OnFlushError when configured; they are not returned by later Put
-// calls. Call Flush or Close to synchronously observe flush errors.
+// background flush loop. An unobserved background flush failure makes the
+// Writer terminal. The callback, later mutations, Flush, and Close all observe
+// the same ErrWriterFailed value wrapping the original cause.
 type Writer struct {
 	w           *writer
 	releaseOnce sync.Once
@@ -83,7 +83,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 // the Writer cannot be used again.
 func (w *Writer) Close(ctx context.Context) error {
 	err := w.w.close(ctx)
-	if err == nil || errors.Is(err, manifest.ErrFenced) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
 		w.releaseWriter()
 	}
 	return err
@@ -91,7 +91,7 @@ func (w *Writer) Close(ctx context.Context) error {
 
 func (w *Writer) closeDB() error {
 	err := w.w.closeWithTimeout(30 * time.Second)
-	if err == nil || errors.Is(err, manifest.ErrFenced) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
 		w.releaseWriter()
 	}
 	return err

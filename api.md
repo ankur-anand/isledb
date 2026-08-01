@@ -156,13 +156,18 @@ func DefaultWriterOptions() WriterOptions
 **Errors:**
 - `ErrBackpressure` - writer hit `Memtable.MaxPendingMemtables`; caller should retry after a delay or flush.
 - `ErrInvalidWriterOptions` - writer configuration contains an invalid value.
+- `ErrWriterFailed` - background flushing failed. The writer is terminal and the error wraps the original cause.
 
 Background flush:
 
 - `Flush.Interval > 0` starts a background flush loop.
-- Background flush errors are delivered to `WriterOptions.OnFlushError` when it
-  is set. Otherwise they are logged.
+- The first background flush error makes the writer terminal. It is delivered
+  once to `WriterOptions.OnFlushError` when set, otherwise it is logged.
+- Later mutations, `Flush`, and `Close` return the stored `ErrWriterFailed`
+  value wrapping the original failure.
 - Explicit `Flush` and `Close` return flush errors directly.
+- An explicit `Flush` failure remains retryable because the caller observes it
+  synchronously.
 
 Example:
 

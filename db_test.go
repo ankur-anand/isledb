@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
@@ -155,6 +156,57 @@ func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	}
 	if err := reopened.Close(ctx); err != nil {
 		t.Fatalf("Close(reopened): %v", err)
+	}
+}
+
+func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-writer-terminal-failure")
+	defer store.Close()
+
+	rootCause := errors.New("injected background publish failure")
+	storage := &failOnceStorage{
+		Storage:     manifest.NewBlobStoreBackend(store),
+		failOnWrite: 3,
+		failErr:     rootCause,
+	}
+	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	callback := make(chan error, 1)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = time.Millisecond
+	opts.OnFlushError = func(err error) {
+		callback <- err
+	}
+	writer, err := db.OpenWriter(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	select {
+	case err := <-callback:
+		if !errors.Is(err, ErrWriterFailed) || !errors.Is(err, rootCause) {
+			t.Fatalf("callback error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("background flush failure was not reported")
+	}
+
+	if err := writer.Close(ctx); !errors.Is(err, ErrWriterFailed) {
+		t.Fatalf("Close error=%v, want %v", err, ErrWriterFailed)
+	}
+	reopened, err := db.OpenWriter(ctx, DefaultWriterOptions())
+	if err != nil {
+		t.Fatalf("OpenWriter after terminal close: %v", err)
+	}
+	if err := reopened.Close(ctx); err != nil {
+		t.Fatalf("Close reopened writer: %v", err)
 	}
 }
 

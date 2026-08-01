@@ -21,6 +21,7 @@ var (
 	ErrBackpressure         = errors.New("writer backpressure")
 	ErrNilContext           = errors.New("nil context")
 	ErrInvalidWriterOptions = errors.New("invalid writer options")
+	ErrWriterFailed         = errors.New("writer failed")
 )
 
 const minMemtableArenaHeadroom = 1 << 20
@@ -50,8 +51,13 @@ type writer struct {
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
 
-	closed  atomic.Bool
-	metrics *WriterMetrics
+	closed            atomic.Bool
+	backgroundFailure atomic.Pointer[writerFailure]
+	metrics           *WriterMetrics
+}
+
+type writerFailure struct {
+	err error
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
@@ -161,6 +167,9 @@ func (w *writer) newMemtable() *internal.Memtable {
 }
 
 func (w *writer) ensureWritable() error {
+	if err := w.backgroundError(); err != nil {
+		return err
+	}
 	if w.closed.Load() {
 		return errors.New("writer closed")
 	}
@@ -290,6 +299,9 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 }
 
 func (w *writer) ensureCapacityLocked() error {
+	if err := w.ensureWritable(); err != nil {
+		return err
+	}
 	if w.memtable.ApproxSize() < w.opts.Memtable.TargetBytes {
 		return nil
 	}
@@ -306,6 +318,14 @@ func (w *writer) ensureCapacityLocked() error {
 }
 
 func (w *writer) flush(ctx context.Context) error {
+	return w.flushInternal(ctx, false)
+}
+
+func (w *writer) flushBackground(ctx context.Context) error {
+	return w.flushInternal(ctx, true)
+}
+
+func (w *writer) flushInternal(ctx context.Context, terminalOnError bool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -313,6 +333,9 @@ func (w *writer) flush(ctx context.Context) error {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
+	if err := w.backgroundError(); err != nil {
+		return err
+	}
 	if w.fenced.Load() {
 		return manifest.ErrFenced
 	}
@@ -336,6 +359,9 @@ func (w *writer) flush(ctx context.Context) error {
 			if err != nil && !errors.Is(err, ErrEmptyIterator) {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
+				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
+					err = w.recordBackgroundFailureLocked(err)
+				}
 				w.mu.Unlock()
 				return err
 			}
@@ -344,6 +370,30 @@ func (w *writer) flush(ctx context.Context) error {
 			w.mu.Unlock()
 		}
 	}
+}
+
+func (w *writer) backgroundError() error {
+	failure := w.backgroundFailure.Load()
+	if failure == nil {
+		return nil
+	}
+	return failure.err
+}
+
+// recordBackgroundFailureLocked stores the first unobserved flush failure.
+// The caller holds w.mu so mutation acceptance and terminal failure recording
+// have one ordering point.
+func (w *writer) recordBackgroundFailureLocked(cause error) error {
+	if err := w.backgroundError(); err != nil {
+		return err
+	}
+	failure := &writerFailure{
+		err: fmt.Errorf("%w: background flush: %w", ErrWriterFailed, cause),
+	}
+	if w.backgroundFailure.CompareAndSwap(nil, failure) {
+		return failure.err
+	}
+	return w.backgroundError()
 }
 
 // takeFlushBatchLocked returns pending work that may contain mutations at or
@@ -425,7 +475,7 @@ func (w *writer) flushLoop() {
 	for {
 		select {
 		case <-w.flushTicker.C:
-			if err := w.flush(w.ctx); err != nil {
+			if err := w.flushBackground(w.ctx); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
@@ -440,6 +490,7 @@ func (w *writer) flushLoop() {
 					slog.Error("isledb: background flush failed",
 						"component", "writer", "error", err)
 				}
+				return
 			}
 		case <-w.stopCh:
 			return
