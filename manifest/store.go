@@ -14,13 +14,15 @@ import (
 )
 
 var (
-	ErrFenced        = errors.New("fenced: epoch superseded by newer owner")
-	ErrFenceConflict = errors.New("fence conflict: concurrent claim detected")
+	ErrFenced          = errors.New("fenced: epoch superseded by newer owner")
+	ErrFenceConflict   = errors.New("fence conflict: concurrent claim detected")
+	ErrCurrentTooLarge = errors.New("manifest CURRENT exceeds size limit")
 )
 
 const (
-	defaultActiveEntryLimit = 1024
-	defaultPageFanout       = 1024
+	defaultActiveEntryLimit = 64
+	defaultPageFanout       = 32
+	defaultMaxCurrentBytes  = 64 << 10
 )
 
 type FenceRole int
@@ -68,6 +70,7 @@ type Store struct {
 
 	activeEntryLimit int
 	pageFanout       int
+	maxCurrentBytes  int
 }
 
 func NewStore(store *blobstore.Store) *Store {
@@ -79,6 +82,7 @@ func NewStoreWithStorage(storage Storage) *Store {
 		storage:          storage,
 		activeEntryLimit: defaultActiveEntryLimit,
 		pageFanout:       defaultPageFanout,
+		maxCurrentBytes:  defaultMaxCurrentBytes,
 	}
 }
 
@@ -395,6 +399,9 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
 		updated.NextSeq = nextEntry.Seq + 1
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
+		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
+			return err
+		}
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
@@ -463,6 +470,56 @@ func (s *Store) frontierFanout() int {
 		return defaultPageFanout
 	}
 	return s.pageFanout
+}
+
+func (s *Store) currentByteLimit() int {
+	if s.maxCurrentBytes <= 0 {
+		return defaultMaxCurrentBytes
+	}
+	return s.maxCurrentBytes
+}
+
+// rotateActiveEntriesForCurrentSize keeps the newest entry in CURRENT and
+// moves its predecessors into the immutable page tree when CURRENT crosses
+// the byte limit. Entry count remains the normal rollover trigger; this is the
+// guard for variable-sized manifest entries.
+func (s *Store) rotateActiveEntriesForCurrentSize(ctx context.Context, current *Current) error {
+	if current == nil {
+		return nil
+	}
+	size, err := encodedCurrentSize(current)
+	if err != nil {
+		return err
+	}
+	limit := s.currentByteLimit()
+	if size <= limit {
+		return nil
+	}
+
+	if len(current.ActiveEntries) > 1 {
+		newest := current.ActiveEntries[len(current.ActiveEntries)-1]
+		current.ActiveEntries = current.ActiveEntries[:len(current.ActiveEntries)-1]
+		if err := s.rotateActiveEntries(ctx, current); err != nil {
+			return err
+		}
+		current.ActiveEntries = append(current.ActiveEntries, newest)
+		size, err = encodedCurrentSize(current)
+		if err != nil {
+			return err
+		}
+	}
+	if size > limit {
+		return fmt.Errorf("%w: size=%d limit=%d", ErrCurrentTooLarge, size, limit)
+	}
+	return nil
+}
+
+func encodedCurrentSize(current *Current) (int, error) {
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 func (s *Store) rotateActiveEntries(ctx context.Context, current *Current) error {
@@ -1261,6 +1318,9 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 	data, err := EncodeCurrent(current)
 	if err != nil {
 		return err
+	}
+	if limit := s.currentByteLimit(); len(data) > limit {
+		return fmt.Errorf("%w: size=%d limit=%d", ErrCurrentTooLarge, len(data), limit)
 	}
 	newETag, err := s.storage.WriteCurrentCAS(ctx, data, etag)
 	if err != nil {

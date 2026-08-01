@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1393,5 +1394,158 @@ func TestReplay_DetectsCommittedPageShapeMismatch(t *testing.T) {
 	_, err = NewStoreWithStorage(backend).Replay(ctx)
 	if err == nil {
 		t.Fatalf("expected replay to fail on committed page shape mismatch")
+	}
+}
+
+func TestStoreDefaultPagePolicyRotatesAndPromotes(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("default-page-policy")
+	defer store.Close()
+
+	ms := NewStore(store)
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	// The fence claim is itself the first manifest entry. Sixty-three SST
+	// entries therefore fill the default 64-entry active window.
+	for i := 0; i < defaultActiveEntryLimit-1; i++ {
+		id := fmt.Sprintf("sst-%04d", i)
+		if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Epoch: 1, Level: 0}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+	current := ms.CurrentData()
+	if got := len(current.ActiveEntries); got != defaultActiveEntryLimit {
+		t.Fatalf("active entries=%d, want=%d", got, defaultActiveEntryLimit)
+	}
+	if got := len(current.IndexFrontier); got != 0 {
+		t.Fatalf("frontier refs=%d before rollover, want=0", got)
+	}
+
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "sst-0063", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append rollover entry: %v", err)
+	}
+	current = ms.CurrentData()
+	if got := len(current.ActiveEntries); got != 1 {
+		t.Fatalf("active entries after rollover=%d, want=1", got)
+	}
+	if got := len(current.IndexFrontier); got != 1 {
+		t.Fatalf("frontier refs after rollover=%d, want=1", got)
+	}
+	if ref := current.IndexFrontier[0]; ref.Level != 0 || ref.Count != defaultActiveEntryLimit {
+		t.Fatalf("leaf ref=(level=%d count=%d), want=(0,%d)", ref.Level, ref.Count, defaultActiveEntryLimit)
+	}
+
+	// Complete 32 leaf rotations. The frontier must collapse those leaves into
+	// one level-1 index page rather than growing CURRENT with 32 leaf refs.
+	for i := defaultActiveEntryLimit; i < defaultActiveEntryLimit*defaultPageFanout; i++ {
+		id := fmt.Sprintf("sst-%04d", i)
+		if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Epoch: 1, Level: 0}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+	current = ms.CurrentData()
+	if got := len(current.IndexFrontier); got != 1 {
+		t.Fatalf("frontier refs after promotion=%d, want=1", got)
+	}
+	if ref := current.IndexFrontier[0]; ref.Level != 1 || ref.Count != defaultPageFanout {
+		t.Fatalf("index ref=(level=%d count=%d), want=(1,%d)", ref.Level, ref.Count, defaultPageFanout)
+	}
+
+	replayed, err := NewStore(store).Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh replay: %v", err)
+	}
+	if got, want := len(replayed.L0SSTs), defaultActiveEntryLimit*defaultPageFanout; got != want {
+		t.Fatalf("replayed L0 SSTs=%d, want=%d", got, want)
+	}
+}
+
+func TestStoreCurrentByteLimitRotatesBeforeEntryLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("current-byte-rollover")
+	defer store.Close()
+
+	ms := NewStore(store)
+	ms.maxCurrentBytes = 2 << 10
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	var appended int
+	for ; appended < defaultActiveEntryLimit; appended++ {
+		id := fmt.Sprintf("sst-%02d-%s", appended, strings.Repeat("x", 320))
+		if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Epoch: 1, Level: 0}); err != nil {
+			t.Fatalf("append %d: %v", appended, err)
+		}
+		current := ms.CurrentData()
+		data, err := EncodeCurrent(current)
+		if err != nil {
+			t.Fatalf("encode CURRENT: %v", err)
+		}
+		if len(data) > ms.currentByteLimit() {
+			t.Fatalf("CURRENT bytes=%d exceed limit=%d", len(data), ms.currentByteLimit())
+		}
+		if len(current.IndexFrontier) > 0 {
+			if len(current.ActiveEntries) >= defaultActiveEntryLimit {
+				t.Fatalf("byte rollover waited for entry limit: active=%d", len(current.ActiveEntries))
+			}
+			appended++
+			break
+		}
+	}
+	if appended >= defaultActiveEntryLimit {
+		t.Fatal("expected byte-based rollover before active-entry limit")
+	}
+
+	replayed, err := NewStore(store).Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh replay: %v", err)
+	}
+	if got := len(replayed.L0SSTs); got != appended {
+		t.Fatalf("replayed L0 SSTs=%d, want=%d", got, appended)
+	}
+}
+
+func TestStoreRejectsSingleEntryLargerThanCurrentLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("oversized-current-entry")
+	defer store.Close()
+
+	ms := NewStore(store)
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	before := ms.CurrentData()
+	beforeData, err := EncodeCurrent(before)
+	if err != nil {
+		t.Fatalf("encode CURRENT before append: %v", err)
+	}
+	ms.maxCurrentBytes = len(beforeData) + 512
+
+	_, err = ms.AppendAddSSTableWithFence(ctx, SSTMeta{
+		ID:    "oversized-" + strings.Repeat("x", ms.maxCurrentBytes),
+		Epoch: 1,
+		Level: 0,
+	})
+	if !errors.Is(err, ErrCurrentTooLarge) {
+		t.Fatalf("append error=%v, want %v", err, ErrCurrentTooLarge)
+	}
+	after := ms.CurrentData()
+	if after.NextSeq != before.NextSeq {
+		t.Fatalf("CURRENT next_seq=%d after rejected append, want=%d", after.NextSeq, before.NextSeq)
+	}
+	if len(after.ActiveEntries) != len(before.ActiveEntries) {
+		t.Fatalf("CURRENT active entries=%d after rejected append, want=%d", len(after.ActiveEntries), len(before.ActiveEntries))
 	}
 }
