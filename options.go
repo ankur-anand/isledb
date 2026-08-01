@@ -56,10 +56,10 @@ type WriterMemtableOptions struct {
 	// publishes frozen memtables as SSTs.
 	TargetBytes int64
 
-	// MaxFrozen limits full memtables waiting for flush. When the limit is
-	// reached, writes return ErrBackpressure instead of buffering more data.
-	// Zero means unbounded.
-	MaxFrozen int
+	// MaxPendingMemtables limits frozen memtables that are queued or currently
+	// flushing. When the limit is reached, writes return ErrBackpressure before
+	// accepting another mutation. Zero selects the default.
+	MaxPendingMemtables int
 }
 
 type WriterFlushOptions struct {
@@ -82,7 +82,8 @@ type WriterSSTOptions struct {
 func DefaultWriterOptions() WriterOptions {
 	return WriterOptions{
 		Memtable: WriterMemtableOptions{
-			TargetBytes: 16 * 1024 * 1024,
+			TargetBytes:         16 * 1024 * 1024,
+			MaxPendingMemtables: 4,
 		},
 		Flush: WriterFlushOptions{
 			Interval: time.Second,

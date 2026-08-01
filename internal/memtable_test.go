@@ -177,6 +177,17 @@ func TestMemtable_ApproxSize(t *testing.T) {
 	}
 }
 
+func TestMemtable_Empty(t *testing.T) {
+	mt := NewMemtable(1<<20, 0)
+	if !mt.Empty() {
+		t.Fatal("new memtable should be empty")
+	}
+	mt.Put([]byte("key"), []byte("value"), 1)
+	if mt.Empty() {
+		t.Fatal("memtable with one entry should not be empty")
+	}
+}
+
 func TestMemtable_TotalSize(t *testing.T) {
 	mt := NewMemtable(1<<20, 0)
 

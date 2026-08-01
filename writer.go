@@ -18,8 +18,9 @@ import (
 )
 
 var (
-	ErrBackpressure = errors.New("writer backpressure")
-	ErrNilContext   = errors.New("nil context")
+	ErrBackpressure         = errors.New("writer backpressure")
+	ErrNilContext           = errors.New("nil context")
+	ErrInvalidWriterOptions = errors.New("invalid writer options")
 )
 
 const minMemtableArenaHeadroom = 1 << 20
@@ -35,6 +36,7 @@ type writer struct {
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
 	immQueue                []*internal.Memtable
+	pendingMemtables        int
 	memtableInlineThreshold int
 	seq                     uint64
 	epoch                   uint64
@@ -56,7 +58,10 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	opts, valueConfig := normalizeWriterOptions(opts)
+	opts, valueConfig, err := normalizeWriterOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
@@ -101,10 +106,17 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 	return w, nil
 }
 
-func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStorageConfig) {
+func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStorageConfig, error) {
 	d := DefaultWriterOptions()
 	if opts.Memtable.TargetBytes <= 0 {
 		opts.Memtable.TargetBytes = d.Memtable.TargetBytes
+	}
+	if opts.Memtable.MaxPendingMemtables < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: max_pending_memtables=%d", ErrInvalidWriterOptions, opts.Memtable.MaxPendingMemtables)
+	}
+	if opts.Memtable.MaxPendingMemtables == 0 {
+		opts.Memtable.MaxPendingMemtables = d.Memtable.MaxPendingMemtables
 	}
 	if opts.SST.BloomBitsPerKey == 0 {
 		opts.SST.BloomBitsPerKey = d.SST.BloomBitsPerKey
@@ -119,7 +131,7 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
 	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
 	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
-	return opts, valueConfig
+	return opts, valueConfig, nil
 }
 
 func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorageConfig) int64 {
@@ -281,12 +293,13 @@ func (w *writer) ensureCapacityLocked() error {
 	if w.memtable.ApproxSize() < w.opts.Memtable.TargetBytes {
 		return nil
 	}
-	if w.opts.Memtable.MaxFrozen > 0 && len(w.immQueue) >= w.opts.Memtable.MaxFrozen {
+	if w.pendingMemtables >= w.opts.Memtable.MaxPendingMemtables {
 		w.metrics.ObserveBackpressure()
 		return ErrBackpressure
 	}
-	if w.memtable.ApproxSize() > 0 {
+	if !w.memtable.Empty() {
 		w.immQueue = append(w.immQueue, w.memtable)
+		w.pendingMemtables++
 		w.memtable = w.newMemtable()
 	}
 	return nil
@@ -305,33 +318,53 @@ func (w *writer) flush(ctx context.Context) error {
 	}
 
 	w.mu.Lock()
-	toFlush := append([]*internal.Memtable(nil), w.immQueue...)
-	w.immQueue = nil
-	if w.memtable.ApproxSize() > 0 {
-		toFlush = append(toFlush, w.memtable)
-		w.memtable = w.newMemtable()
-	}
+	throughSeq := w.seq
 	w.mu.Unlock()
 
-	for i, mt := range toFlush {
-		start := time.Now()
-		err := w.flushMemtable(ctx, mt)
-		w.metrics.ObserveFlush(time.Since(start), err)
-		if err != nil {
-			if errors.Is(err, ErrEmptyIterator) {
-				continue
+	for {
+		w.mu.Lock()
+		toFlush := w.takeFlushBatchLocked(throughSeq)
+		w.mu.Unlock()
+		if len(toFlush) == 0 {
+			return nil
+		}
+
+		for i, mt := range toFlush {
+			start := time.Now()
+			err := w.flushMemtable(ctx, mt)
+			w.metrics.ObserveFlush(time.Since(start), err)
+			if err != nil && !errors.Is(err, ErrEmptyIterator) {
+				w.mu.Lock()
+				w.immQueue = append(toFlush[i:], w.immQueue...)
+				w.mu.Unlock()
+				return err
 			}
 			w.mu.Lock()
-			remaining := toFlush[i:]
-			if len(remaining) > 0 {
-				w.immQueue = append(remaining, w.immQueue...)
-			}
+			w.pendingMemtables--
 			w.mu.Unlock()
-			return err
 		}
 	}
+}
 
-	return nil
+// takeFlushBatchLocked returns pending work that may contain mutations at or
+// below throughSeq. Work already in immQueue remains counted while it is in
+// flight. The active memtable is rotated only when a pending slot is available.
+func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*internal.Memtable {
+	cut := 0
+	for cut < len(w.immQueue) && w.immQueue[cut].SeqLo() <= throughSeq {
+		cut++
+	}
+	toFlush := append([]*internal.Memtable(nil), w.immQueue[:cut]...)
+	clear(w.immQueue[:cut])
+	w.immQueue = w.immQueue[cut:]
+
+	if !w.memtable.Empty() && w.memtable.SeqLo() <= throughSeq &&
+		w.pendingMemtables < w.opts.Memtable.MaxPendingMemtables {
+		toFlush = append(toFlush, w.memtable)
+		w.pendingMemtables++
+		w.memtable = w.newMemtable()
+	}
+	return toFlush
 }
 
 func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error {

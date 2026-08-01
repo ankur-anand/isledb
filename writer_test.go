@@ -14,11 +14,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func testWriterOptions(memtableBytes int64, maxFrozen int) WriterOptions {
+func testWriterOptions(memtableBytes int64, maxPendingMemtables int) WriterOptions {
 	return WriterOptions{
 		Memtable: WriterMemtableOptions{
-			TargetBytes: memtableBytes,
-			MaxFrozen:   maxFrozen,
+			TargetBytes:         memtableBytes,
+			MaxPendingMemtables: maxPendingMemtables,
 		},
 		SST: WriterSSTOptions{
 			BlockBytes:  4096,
@@ -325,6 +325,12 @@ func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("background flush did not reach blocking CURRENT write")
 	}
+	w.mu.Lock()
+	pending := w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending memtables during background flush=%d, want=1", pending)
+	}
 
 	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	err = w.close(closeCtx)
@@ -339,6 +345,12 @@ func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
 	defer cancel()
 	if err := w.close(retryCtx); err != nil {
 		t.Fatalf("retry close: %v", err)
+	}
+	w.mu.Lock()
+	pending = w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending memtables after close=%d, want=0", pending)
 	}
 }
 
@@ -373,13 +385,23 @@ func TestWriter_Backpressure(t *testing.T) {
 
 	w.mu.Lock()
 	queueLen := len(w.immQueue)
+	pending := w.pendingMemtables
 	w.mu.Unlock()
 	if queueLen != 1 {
 		t.Fatalf("expected immQueue length 1, got %d", queueLen)
 	}
+	if pending != 1 {
+		t.Fatalf("pending memtables=%d, want=1", pending)
+	}
 
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
+	}
+	w.mu.Lock()
+	pending = w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending memtables after flush=%d, want=0", pending)
 	}
 	if err := w.put(ctx, []byte("post"), []byte("v")); err != nil {
 		t.Fatalf("put after flush: %v", err)
@@ -413,13 +435,135 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 
 	w.mu.Lock()
 	queueLen := len(w.immQueue)
+	pending := w.pendingMemtables
 	w.mu.Unlock()
 	if queueLen == 0 {
 		t.Fatalf("expected immQueue to be requeued after failure")
 	}
+	if pending != 1 {
+		t.Fatalf("pending memtables after failed flush=%d, want=1", pending)
+	}
 
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush retry: %v", err)
+	}
+	w.mu.Lock()
+	pending = w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending memtables after retry=%d, want=0", pending)
+	}
+}
+
+func TestWriter_InFlightMemtableCountsTowardBackpressure(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-inflight-backpressure")
+	defer store.Close()
+
+	storage := &blockingCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	opts := testWriterOptions(512, 1)
+	opts.Flush.Interval = 0
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("initial"), []byte("value")); err != nil {
+		t.Fatalf("put initial: %v", err)
+	}
+	storage.block.Store(true)
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- w.flush(ctx)
+	}()
+
+	select {
+	case <-storage.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush did not reach blocking CURRENT write")
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(storage.release)
+		}
+	}()
+
+	w.mu.Lock()
+	if got := w.pendingMemtables; got != 1 {
+		w.mu.Unlock()
+		t.Fatalf("pending memtables during upload=%d, want=1", got)
+	}
+	if got := len(w.immQueue); got != 0 {
+		w.mu.Unlock()
+		t.Fatalf("queued memtables during upload=%d, want=0", got)
+	}
+	w.mu.Unlock()
+
+	value := bytes.Repeat([]byte("v"), 128)
+	var backpressureSeq uint64
+	for i := 0; i < 10_000; i++ {
+		w.mu.Lock()
+		seqBefore := w.seq
+		w.mu.Unlock()
+		err := w.put(ctx, []byte(fmt.Sprintf("queued-%06d", i)), value)
+		if errors.Is(err, ErrBackpressure) {
+			w.mu.Lock()
+			backpressureSeq = w.seq
+			w.mu.Unlock()
+			if backpressureSeq != seqBefore {
+				t.Fatalf("backpressure advanced seq: before=%d after=%d", seqBefore, backpressureSeq)
+			}
+			break
+		}
+		if err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if backpressureSeq == 0 {
+		t.Fatal("expected backpressure while the only pending slot was in flight")
+	}
+
+	close(storage.release)
+	released = true
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush did not finish after release")
+	}
+	w.mu.Lock()
+	pending := w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending memtables after upload=%d, want=0", pending)
+	}
+	if err := w.put(ctx, []byte("after-flush"), []byte("value")); err != nil {
+		t.Fatalf("put after capacity release: %v", err)
+	}
+}
+
+func TestWriterOptions_DefaultAndInvalidPendingMemtables(t *testing.T) {
+	if got, want := DefaultWriterOptions().Memtable.MaxPendingMemtables, 4; got != want {
+		t.Fatalf("default max pending memtables=%d, want=%d", got, want)
+	}
+
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-invalid-pending")
+	defer store.Close()
+	opts := DefaultWriterOptions()
+	opts.Memtable.MaxPendingMemtables = -1
+	_, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
+	if !errors.Is(err, ErrInvalidWriterOptions) {
+		t.Fatalf("newWriter error=%v, want %v", err, ErrInvalidWriterOptions)
 	}
 }
 
@@ -521,7 +665,7 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 512
-	opts.Memtable.MaxFrozen = 1
+	opts.Memtable.MaxPendingMemtables = 1
 	opts.Metrics = &WriterMetrics{}
 
 	w, err := newWriter(ctx, store, manifestStore, opts)

@@ -521,6 +521,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	writerOpts := DefaultWriterOptions()
 	writerOpts.Flush.Interval = 0
 	writerOpts.Memtable.TargetBytes = 1024
+	writerOpts.Memtable.MaxPendingMemtables = 128
 
 	writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
@@ -1084,6 +1085,7 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 	writerOpts := DefaultWriterOptions()
 	writerOpts.Flush.Interval = 0
 	writerOpts.Memtable.TargetBytes = 256
+	writerOpts.Memtable.MaxPendingMemtables = 128
 
 	writer1, err := newWriter(ctx, store, manifestStore, writerOpts)
 	if err != nil {
