@@ -77,7 +77,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "s3-e2e-writer"
 	writerOpts.Memtable.TargetBytes = 512
-	writerOpts.Memtable.MaxFrozen = 4
+	writerOpts.Memtable.MaxPendingMemtables = 4
 	writerOpts.Flush.Interval = 0
 	writerOpts.SST.BlockBytes = 1024
 	writerOpts.SST.Compression = "none"
