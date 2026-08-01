@@ -271,11 +271,15 @@ type failOnceStorage struct {
 	manifest.Storage
 	writeCount  atomic.Int32
 	failOnWrite int32
+	failErr     error
 }
 
 func (s *failOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	count := s.writeCount.Add(1)
 	if count == s.failOnWrite {
+		if s.failErr != nil {
+			return "", s.failErr
+		}
 		return "", errors.New("inject current write failure")
 	}
 	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
@@ -429,8 +433,15 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	if err := w.flush(ctx); err == nil {
+	firstErr := w.flush(ctx)
+	if firstErr == nil {
 		t.Fatalf("expected flush error")
+	}
+	if errors.Is(firstErr, ErrWriterFailed) {
+		t.Fatalf("explicit flush failure must remain retryable: %v", firstErr)
+	}
+	if err := w.backgroundError(); err != nil {
+		t.Fatalf("explicit flush stored terminal error: %v", err)
 	}
 
 	w.mu.Lock()
@@ -452,6 +463,84 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	w.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("pending memtables after retry=%d, want=0", pending)
+	}
+}
+
+func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-background-failure")
+	defer store.Close()
+
+	rootCause := errors.New("injected background publish failure")
+	storage := &failOnceStorage{
+		Storage:     manifest.NewBlobStoreBackend(store),
+		failOnWrite: 3,
+		failErr:     rootCause,
+	}
+	callback := make(chan error, 2)
+	opts := testWriterOptions(1<<20, 0)
+	opts.Flush.Interval = time.Millisecond
+	opts.OnFlushError = func(err error) {
+		callback <- err
+	}
+
+	w, err := newWriter(ctx, store, manifest.NewStoreWithStorage(storage), opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	var terminalErr error
+	select {
+	case terminalErr = <-callback:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background flush failure was not reported")
+	}
+	if !errors.Is(terminalErr, ErrWriterFailed) {
+		t.Fatalf("background error=%v, want %v", terminalErr, ErrWriterFailed)
+	}
+	if !errors.Is(terminalErr, rootCause) {
+		t.Fatalf("background error=%v, want root cause %v", terminalErr, rootCause)
+	}
+
+	w.mu.Lock()
+	seqBefore := w.seq
+	pending := w.pendingMemtables
+	w.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending memtables after background failure=%d, want=1", pending)
+	}
+
+	operations := []struct {
+		name string
+		call func() error
+	}{
+		{name: "put", call: func() error { return w.put(ctx, []byte("b"), []byte("v")) }},
+		{name: "delete", call: func() error { return w.delete(ctx, []byte("a")) }},
+		{name: "flush", call: func() error { return w.flush(ctx) }},
+	}
+	for _, operation := range operations {
+		err := operation.call()
+		if err != terminalErr {
+			t.Fatalf("%s error=%v, want stored error %v", operation.name, err, terminalErr)
+		}
+	}
+	w.mu.Lock()
+	seqAfter := w.seq
+	w.mu.Unlock()
+	if seqAfter != seqBefore {
+		t.Fatalf("terminal operations advanced seq: before=%d after=%d", seqBefore, seqAfter)
+	}
+
+	if err := w.close(ctx); err != terminalErr {
+		t.Fatalf("close error=%v, want stored error %v", err, terminalErr)
+	}
+	select {
+	case err := <-callback:
+		t.Fatalf("OnFlushError called more than once: %v", err)
+	default:
 	}
 }
 

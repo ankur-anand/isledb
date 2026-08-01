@@ -36,8 +36,8 @@ type WriterOptions struct {
 	// batches under changes/. Disabled by default.
 	ChangeFeed ChangeFeedOptions
 
-	// OnFlushError is called when the background flush loop observes an error.
-	// Explicit Flush and Close calls return their errors directly.
+	// OnFlushError is called once when background flushing fails. That failure
+	// makes the writer terminal and is returned by later operations.
 	OnFlushError func(error)
 
 	// Metrics receives optional writer observations. Nil disables metrics.
@@ -64,7 +64,7 @@ type WriterMemtableOptions struct {
 
 type WriterFlushOptions struct {
 	// Interval is the background flush cadence. Zero disables background flush.
-	// Background errors are delivered to WriterOptions.OnFlushError when set.
+	// A background error makes the writer terminal.
 	Interval time.Duration
 }
 
