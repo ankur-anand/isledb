@@ -137,7 +137,7 @@ type ChangeFeedOptions struct {
 
 type WriterMemtableOptions struct {
     TargetBytes int64 // Approximate active memtable size before rotation.
-    MaxFrozen   int   // Max full memtables waiting for flush. Zero means unbounded.
+    MaxPendingMemtables int // Max queued or flushing memtables. Zero selects the default.
 }
 
 type WriterFlushOptions struct {
@@ -154,7 +154,8 @@ func DefaultWriterOptions() WriterOptions
 ```
 
 **Errors:**
-- `ErrBackpressure` - writer hit `Memtable.MaxFrozen`; caller should retry after a delay or flush.
+- `ErrBackpressure` - writer hit `Memtable.MaxPendingMemtables`; caller should retry after a delay or flush.
+- `ErrInvalidWriterOptions` - writer configuration contains an invalid value.
 
 Background flush:
 
@@ -169,7 +170,7 @@ Example:
 opts := isledb.DefaultWriterOptions()
 opts.Flush.Interval = time.Second
 opts.Memtable.TargetBytes = 16 << 20
-opts.Memtable.MaxFrozen = 4
+opts.Memtable.MaxPendingMemtables = 4
 
 w, err := db.OpenWriter(ctx, opts)
 if err != nil {
