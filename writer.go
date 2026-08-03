@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,11 @@ var (
 	ErrWriterFailed         = errors.New("writer failed")
 )
 
-const minMemtableArenaHeadroom = 1 << 20
+const (
+	minMemtableArenaHeadroom = 1 << 20
+	maxMemtableArenaBytes    = 1<<32 - 1
+	maxWriterOwnerIDBytes    = 256
+)
 
 type writer struct {
 	store       *blobstore.Store
@@ -47,7 +52,7 @@ type writer struct {
 	flushMu     sync.Mutex
 	flushTicker *time.Ticker
 	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	workerDone  chan struct{}
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -106,6 +111,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		epoch:                   m.NextEpoch,
 		blobStorage:             internal.NewBlobStorage(store, valueConfig),
 		stopCh:                  make(chan struct{}),
+		workerDone:              make(chan struct{}),
 		metrics:                 opts.Metrics,
 	}
 
@@ -121,8 +127,9 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 
 	if opts.Flush.Interval > 0 {
 		w.flushTicker = time.NewTicker(opts.Flush.Interval)
-		w.wg.Add(1)
 		go w.flushLoop()
+	} else {
+		close(w.workerDone)
 	}
 
 	return w, nil
@@ -130,7 +137,15 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 
 func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStorageConfig, error) {
 	d := DefaultWriterOptions()
-	if opts.Memtable.TargetBytes <= 0 {
+	if len(opts.OwnerID) > maxWriterOwnerIDBytes {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: owner_id bytes=%d max=%d", ErrInvalidWriterOptions, len(opts.OwnerID), maxWriterOwnerIDBytes)
+	}
+	if opts.Memtable.TargetBytes < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: target_bytes=%d", ErrInvalidWriterOptions, opts.Memtable.TargetBytes)
+	}
+	if opts.Memtable.TargetBytes == 0 {
 		opts.Memtable.TargetBytes = d.Memtable.TargetBytes
 	}
 	if opts.Memtable.MaxPendingMemtables < 0 {
@@ -140,20 +155,77 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	if opts.Memtable.MaxPendingMemtables == 0 {
 		opts.Memtable.MaxPendingMemtables = d.Memtable.MaxPendingMemtables
 	}
+	if opts.Flush.Interval < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: flush_interval=%s", ErrInvalidWriterOptions, opts.Flush.Interval)
+	}
+	if opts.SST.BloomBitsPerKey < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: bloom_bits_per_key=%d", ErrInvalidWriterOptions, opts.SST.BloomBitsPerKey)
+	}
 	if opts.SST.BloomBitsPerKey == 0 {
 		opts.SST.BloomBitsPerKey = d.SST.BloomBitsPerKey
+	}
+	if opts.SST.BlockBytes < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: block_bytes=%d", ErrInvalidWriterOptions, opts.SST.BlockBytes)
 	}
 	if opts.SST.BlockBytes == 0 {
 		opts.SST.BlockBytes = d.SST.BlockBytes
 	}
-	opts.SST.Compression = cmp.Or(opts.SST.Compression, d.SST.Compression)
+	compression := strings.ToLower(strings.TrimSpace(cmp.Or(opts.SST.Compression, d.SST.Compression)))
+	switch compression {
+	case "none", "snappy", "zstd":
+		opts.SST.Compression = compression
+	default:
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: unsupported compression=%q", ErrInvalidWriterOptions, opts.SST.Compression)
+	}
 
 	vd := config.DefaultValueStorageConfig()
 	valueConfig := opts.Values
+	if valueConfig.BlobThreshold < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: blob_threshold=%d", ErrInvalidWriterOptions, valueConfig.BlobThreshold)
+	}
+	if valueConfig.MaxKeySize < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: max_key_size=%d", ErrInvalidWriterOptions, valueConfig.MaxKeySize)
+	}
+	if valueConfig.MaxValueSize < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: max_value_size=%d", ErrInvalidWriterOptions, valueConfig.MaxValueSize)
+	}
 	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
-	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
-	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
+	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, vd.MaxKeySize)
+	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, vd.MaxValueSize)
+	if err := validateMemtableArena(opts.Memtable.TargetBytes, valueConfig); err != nil {
+		return WriterOptions{}, config.ValueStorageConfig{}, err
+	}
 	return opts, valueConfig, nil
+}
+
+func validateMemtableArena(targetBytes int64, valueConfig config.ValueStorageConfig) error {
+	if targetBytes > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: target_bytes=%d exceeds arena max=%d",
+			ErrInvalidWriterOptions, targetBytes, maxMemtableArenaBytes)
+	}
+
+	maxInlineValue := int64(valueConfig.BlobThreshold - 1)
+	if maxInlineValue > valueConfig.MaxValueSize {
+		maxInlineValue = valueConfig.MaxValueSize
+	}
+	maxKeySize := int64(valueConfig.MaxKeySize)
+	if maxKeySize > maxMemtableArenaBytes || maxInlineValue > maxMemtableArenaBytes ||
+		maxKeySize+maxInlineValue+1024 > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: maximum inline entry exceeds arena max=%d",
+			ErrInvalidWriterOptions, maxMemtableArenaBytes)
+	}
+	if arenaBytes := defaultMemtableArenaBytes(targetBytes, valueConfig); arenaBytes > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: memtable arena bytes=%d max=%d",
+			ErrInvalidWriterOptions, arenaBytes, maxMemtableArenaBytes)
+	}
+	return nil
 }
 
 func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorageConfig) int64 {
@@ -500,7 +572,23 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 }
 
 func (w *writer) flushLoop() {
-	defer w.wg.Done()
+	var notifyErr error
+	defer func() {
+		w.flushTicker.Stop()
+		// The flush worker is considered finished before user code runs.
+		// OnFlushError may therefore call Close without waiting on itself.
+		close(w.workerDone)
+		if notifyErr == nil {
+			return
+		}
+		if w.opts.OnFlushError != nil {
+			w.opts.OnFlushError(notifyErr)
+			return
+		}
+		slog.Error("isledb: background flush failed",
+			"component", "writer", "error", notifyErr)
+	}()
+
 	for {
 		select {
 		case <-w.flushTicker.C:
@@ -513,12 +601,7 @@ func (w *writer) flushLoop() {
 						"component", "writer", "epoch", w.epoch)
 					return
 				}
-				if w.opts.OnFlushError != nil {
-					w.opts.OnFlushError(err)
-				} else {
-					slog.Error("isledb: background flush failed",
-						"component", "writer", "error", err)
-				}
+				notifyErr = err
 				return
 			}
 		case <-w.stopCh:
@@ -539,8 +622,10 @@ func (w *writer) close(ctx context.Context) error {
 			w.flushTicker.Stop()
 		}
 	}
-	if err := waitGroupContext(ctx, &w.wg); err != nil {
-		return err
+	select {
+	case <-w.workerDone:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	return w.flush(ctx)
@@ -550,20 +635,6 @@ func (w *writer) closeWithTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return w.close(ctx)
-}
-
-func waitGroupContext(ctx context.Context, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func checkContext(ctx context.Context) error {

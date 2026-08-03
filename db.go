@@ -159,14 +159,15 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 
 	w, err := newWriter(ctx, db.store, db.manifestStore, opts)
 	if err != nil {
-		db.releaseWriter()
+		db.releaseWriter(nil)
 		return nil, err
 	}
 
-	writer := &Writer{w: w, release: db.releaseWriter}
+	writer := &Writer{w: w}
+	writer.release = func() { db.releaseWriter(writer) }
 	if err := db.registerCloser(writer); err != nil {
 		_ = writer.Close(ctx)
-		db.releaseWriter()
+		db.releaseWriter(writer)
 		return nil, err
 	}
 	return writer, nil
@@ -186,9 +187,12 @@ func (db *DB) reserveWriter() error {
 	return nil
 }
 
-func (db *DB) releaseWriter() {
+func (db *DB) releaseWriter(writer *Writer) {
 	db.mu.Lock()
 	db.writerOpen = false
+	if writer != nil {
+		db.removeCloserLocked(writer)
+	}
 	db.mu.Unlock()
 }
 
@@ -200,13 +204,13 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 
 	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcMarkStorage, opts)
 	if err != nil {
-		db.releaseMaintenance()
+		db.releaseMaintenance(nil)
 		return nil, err
 	}
-	maintenance.release = db.releaseMaintenance
+	maintenance.release = func() { db.releaseMaintenance(maintenance) }
 	if err := db.registerCloser(maintenance); err != nil {
 		_ = maintenance.Close(ctx)
-		db.releaseMaintenance()
+		db.releaseMaintenance(maintenance)
 		return nil, err
 	}
 	return maintenance, nil
@@ -226,9 +230,12 @@ func (db *DB) reserveMaintenance() error {
 	return nil
 }
 
-func (db *DB) releaseMaintenance() {
+func (db *DB) releaseMaintenance(maintenance *Maintenance) {
 	db.mu.Lock()
 	db.maintenanceOpen = false
+	if maintenance != nil {
+		db.removeCloserLocked(maintenance)
+	}
 	db.mu.Unlock()
 }
 
@@ -241,6 +248,7 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	closers := make([]dbCloser, len(db.closers))
 	copy(closers, db.closers)
+	clear(db.closers)
 	db.closers = nil
 	db.mu.Unlock()
 
@@ -262,4 +270,19 @@ func (db *DB) registerCloser(closer dbCloser) error {
 	}
 	db.closers = append(db.closers, closer)
 	return nil
+}
+
+// removeCloserLocked removes a released active handle while preserving the
+// registration order used by DB.Close. The caller holds db.mu.
+func (db *DB) removeCloserLocked(target dbCloser) {
+	for i, closer := range db.closers {
+		if closer != target {
+			continue
+		}
+		copy(db.closers[i:], db.closers[i+1:])
+		last := len(db.closers) - 1
+		db.closers[last] = nil
+		db.closers = db.closers[:last]
+		return
+	}
 }

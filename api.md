@@ -139,7 +139,7 @@ type ChangeFeedOptions struct {
 }
 
 type WriterMemtableOptions struct {
-    TargetBytes int64 // Approximate active memtable size before rotation.
+    TargetBytes int64 // Approximate active memtable size before rotation. Zero selects the default.
     MaxPendingMemtables int // Max queued or flushing memtables. Zero selects the default.
 }
 
@@ -148,9 +148,9 @@ type WriterFlushOptions struct {
 }
 
 type WriterSSTOptions struct {
-    BloomBitsPerKey int
-    BlockBytes      int
-    Compression     string
+    BloomBitsPerKey int    // Zero selects the default.
+    BlockBytes      int    // Zero selects the default.
+    Compression     string // "none", "snappy", or "zstd"; empty selects the default.
 }
 
 func DefaultWriterOptions() WriterOptions
@@ -158,14 +158,17 @@ func DefaultWriterOptions() WriterOptions
 
 **Errors:**
 - `ErrBackpressure` - writer hit `Memtable.MaxPendingMemtables`; caller should retry after a delay or flush.
-- `ErrInvalidWriterOptions` - writer configuration contains an invalid value.
+- `ErrInvalidWriterOptions` - writer configuration contains a negative size or
+  interval, unsupported compression, oversized identity, invalid value limit,
+  or a memtable configuration that exceeds the arena format limit.
 - `ErrWriterFailed` - background flushing failed. The writer is terminal and the error wraps the original cause.
 
 Background flush:
 
 - `Flush.Interval > 0` starts a background flush loop.
 - The first background flush error makes the writer terminal. It is delivered
-  once to `WriterOptions.OnFlushError` when set, otherwise it is logged.
+  once to `WriterOptions.OnFlushError` after the background worker stops,
+  otherwise it is logged. The callback may call `Writer.Close`.
 - Later mutations, `Flush`, and `Close` return the stored `ErrWriterFailed`
   value wrapping the original failure.
 - Explicit `Flush` and `Close` return flush errors directly.

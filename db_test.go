@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +123,36 @@ func TestDBOpenWriterReleasesReservationAfterConstructionFailure(t *testing.T) {
 	}
 }
 
+func TestDBClosedWritersAreNotRetained(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-closed-writers")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 100; i++ {
+		writer, err := db.OpenWriter(ctx, WriterOptions{})
+		if err != nil {
+			t.Fatalf("OpenWriter(%d): %v", i, err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("Close(%d): %v", i, err)
+		}
+
+		db.mu.Lock()
+		closers := len(db.closers)
+		writerOpen := db.writerOpen
+		db.mu.Unlock()
+		if closers != 0 || writerOpen {
+			t.Fatalf("after writer %d: closers=%d writer_open=%t", i, closers, writerOpen)
+		}
+	}
+}
+
 func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-writer-close-error")
@@ -176,31 +207,42 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 	}
 	defer db.Close()
 
-	callback := make(chan error, 1)
+	type callbackResult struct {
+		flushErr error
+		closeErr error
+	}
+	callback := make(chan callbackResult, 1)
+	var writerRef atomic.Pointer[Writer]
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = time.Millisecond
-	opts.OnFlushError = func(err error) {
-		callback <- err
+	opts.OnFlushError = func(flushErr error) {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		callback <- callbackResult{
+			flushErr: flushErr,
+			closeErr: writerRef.Load().Close(closeCtx),
+		}
 	}
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
+	writerRef.Store(writer)
 	if err := writer.Put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	select {
-	case err := <-callback:
-		if !errors.Is(err, ErrWriterFailed) || !errors.Is(err, rootCause) {
-			t.Fatalf("callback error=%v", err)
+	case result := <-callback:
+		if !errors.Is(result.flushErr, ErrWriterFailed) || !errors.Is(result.flushErr, rootCause) {
+			t.Fatalf("callback error=%v", result.flushErr)
+		}
+		if result.closeErr != result.flushErr {
+			t.Fatalf("Close error=%v, want callback error %v", result.closeErr, result.flushErr)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("background flush failure was not reported")
+		t.Fatal("OnFlushError calling Writer.Close deadlocked")
 	}
 
-	if err := writer.Close(ctx); !errors.Is(err, ErrWriterFailed) {
-		t.Fatalf("Close error=%v, want %v", err, ErrWriterFailed)
-	}
 	reopened, err := db.OpenWriter(ctx, DefaultWriterOptions())
 	if err != nil {
 		t.Fatalf("OpenWriter after terminal close: %v", err)
