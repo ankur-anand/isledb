@@ -107,6 +107,9 @@ Visibility contract:
 - `DeleteWithTTL` stores an expiring tombstone. `ttl <= 0` means the tombstone does not expire.
 - `Flush` is the synchronous publish boundary. It writes pending memtables as
   SST files and commits manifest entries.
+- A retry of an explicit `Flush` reuses the same uploaded SST, change batch,
+  and logical commit ID. An uncertain `CURRENT` response is reconciled before
+  another manifest entry can be appended.
 - `Close` stops background flushing and flushes pending writes before returning.
 - Readers see newly flushed data after they open or call `Reader.Refresh`.
 
@@ -727,6 +730,7 @@ func NewStoreWithStorage(storage Storage) *Store
 | CheckWriterFence | `(ctx) error` | Verify writer fence still valid |
 | CheckCompactorFence | `(ctx) error` | Verify compactor fence still valid |
 | Replay | `(ctx) (*Manifest, error)` | Rebuild manifest from CURRENT, snapshots, and committed entries |
+| AppendWriterCommit | `(ctx, WriterCommit) (*ManifestLogEntry, error)` | Idempotently publish one SST and optional change batch using a stable commit ID |
 | AppendAddSSTableWithFence | `(ctx, SSTMeta) (*ManifestLogEntry, error)` | Append SST add entry |
 | AppendAddSSTableWithChangeBatchWithFence | `(ctx, SSTMeta, *ChangeBatchMeta) (*ManifestLogEntry, error)` | Append paired SST and change-batch entry |
 | AppendRemoveSSTablesWithFence | `(ctx, []string) (*ManifestLogEntry, error)` | Append SST remove entry |
@@ -736,3 +740,5 @@ func NewStoreWithStorage(storage Storage) *Store
 **Errors:**
 - `manifest.ErrFenced` - Epoch superseded by newer owner
 - `manifest.ErrFenceConflict` - Concurrent claim detected
+- `manifest.ErrInvalidWriterCommit` - Commit identity or SST/change metadata is invalid
+- `manifest.ErrWriterCommitConflict` - A commit ID was reused with different metadata

@@ -15,6 +15,7 @@ import (
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/manifest"
+	"github.com/segmentio/ksuid"
 )
 
 var (
@@ -36,7 +37,7 @@ type writer struct {
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
-	immQueue                []*internal.Memtable
+	immQueue                []*pendingFlush
 	pendingMemtables        int
 	memtableInlineThreshold int
 	seq                     uint64
@@ -58,6 +59,21 @@ type writer struct {
 
 type writerFailure struct {
 	err error
+}
+
+// pendingFlush owns one logical memtable publication. Uploaded objects and the
+// commit ID survive manifest retries, so publication never creates a second
+// visible commit for the same sequence range.
+type pendingFlush struct {
+	commitID    string
+	epoch       uint64
+	memtable    *internal.Memtable
+	sstable     *manifest.SSTMeta
+	changeBatch *manifest.ChangeBatchMeta
+}
+
+func (p *pendingFlush) SeqLo() uint64 {
+	return p.memtable.SeqLo()
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
@@ -164,6 +180,18 @@ func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorag
 func (w *writer) newMemtable() *internal.Memtable {
 	arenaBytes := defaultMemtableArenaBytes(w.opts.Memtable.TargetBytes, w.valueConfig)
 	return internal.NewMemtable(arenaBytes, w.memtableInlineThreshold)
+}
+
+// newPendingFlushLocked assigns identity and epoch exactly once. The caller
+// holds w.mu.
+func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlush {
+	pending := &pendingFlush{
+		commitID: ksuid.New().String(),
+		epoch:    w.epoch,
+		memtable: memtable,
+	}
+	w.epoch++
+	return pending
 }
 
 func (w *writer) ensureWritable() error {
@@ -310,7 +338,7 @@ func (w *writer) ensureCapacityLocked() error {
 		return ErrBackpressure
 	}
 	if !w.memtable.Empty() {
-		w.immQueue = append(w.immQueue, w.memtable)
+		w.immQueue = append(w.immQueue, w.newPendingFlushLocked(w.memtable))
 		w.pendingMemtables++
 		w.memtable = w.newMemtable()
 	}
@@ -352,9 +380,9 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError bool) error 
 			return nil
 		}
 
-		for i, mt := range toFlush {
+		for i, pending := range toFlush {
 			start := time.Now()
-			err := w.flushMemtable(ctx, mt)
+			err := w.flushPending(ctx, pending)
 			w.metrics.ObserveFlush(time.Since(start), err)
 			if err != nil && !errors.Is(err, ErrEmptyIterator) {
 				w.mu.Lock()
@@ -399,30 +427,25 @@ func (w *writer) recordBackgroundFailureLocked(cause error) error {
 // takeFlushBatchLocked returns pending work that may contain mutations at or
 // below throughSeq. Work already in immQueue remains counted while it is in
 // flight. The active memtable is rotated only when a pending slot is available.
-func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*internal.Memtable {
+func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 	cut := 0
 	for cut < len(w.immQueue) && w.immQueue[cut].SeqLo() <= throughSeq {
 		cut++
 	}
-	toFlush := append([]*internal.Memtable(nil), w.immQueue[:cut]...)
+	toFlush := append([]*pendingFlush(nil), w.immQueue[:cut]...)
 	clear(w.immQueue[:cut])
 	w.immQueue = w.immQueue[cut:]
 
 	if !w.memtable.Empty() && w.memtable.SeqLo() <= throughSeq &&
 		w.pendingMemtables < w.opts.Memtable.MaxPendingMemtables {
-		toFlush = append(toFlush, w.memtable)
+		toFlush = append(toFlush, w.newPendingFlushLocked(w.memtable))
 		w.pendingMemtables++
 		w.memtable = w.newMemtable()
 	}
 	return toFlush
 }
 
-func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error {
-	w.mu.Lock()
-	epoch := w.epoch
-	w.epoch++
-	w.mu.Unlock()
-
+func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error {
 	sstOpts := SSTWriterOptions{
 		BloomBitsPerKey: w.opts.SST.BloomBitsPerKey,
 		BlockSize:       w.opts.SST.BlockBytes,
@@ -435,15 +458,19 @@ func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error
 		return err
 	}
 
-	seqLo, seqHi := mt.SeqLo(), mt.SeqHi()
-	result, err := writeSSTStreaming(ctx, mt.Iterator(), sstOpts, epoch, seqLo, seqHi, uploadFn)
-	if err != nil {
-		return fmt.Errorf("stream sst: %w", err)
+	seqLo, seqHi := pending.memtable.SeqLo(), pending.memtable.SeqHi()
+	if pending.sstable == nil {
+		result, err := writeSSTStreaming(ctx, pending.memtable.Iterator(), sstOpts,
+			pending.epoch, seqLo, seqHi, uploadFn)
+		if err != nil {
+			return fmt.Errorf("stream sst: %w", err)
+		}
+		pending.sstable = &result.Meta
 	}
 
-	var changeBatchMeta *manifest.ChangeBatchMeta
-	if w.opts.ChangeFeed.Enabled {
-		changeBatch, err := buildChangeBatch(ctx, mt.Iterator(), epoch, seqLo, seqHi, result.Meta.CreatedAt)
+	if w.opts.ChangeFeed.Enabled && pending.changeBatch == nil {
+		changeBatch, err := buildChangeBatch(ctx, pending.memtable.Iterator(), pending.epoch,
+			seqLo, seqHi, pending.sstable.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("build change batch: %w", err)
 		}
@@ -451,22 +478,24 @@ func (w *writer) flushMemtable(ctx context.Context, mt *internal.Memtable) error
 		if _, err := w.store.Write(ctx, changeBatch.Meta.Path, changeBatch.Data); err != nil {
 			return fmt.Errorf("write change batch: %w", err)
 		}
-		changeBatchMeta = &changeBatch.Meta
+		pending.changeBatch = &changeBatch.Meta
 	}
 
-	var appendErr error
-	_, appendErr = w.manifestLog.AppendAddSSTableWithChangeBatchWithFence(ctx, result.Meta, changeBatchMeta)
-
+	_, appendErr := w.manifestLog.AppendWriterCommit(ctx, manifest.WriterCommit{
+		ID:          pending.commitID,
+		SSTable:     *pending.sstable,
+		ChangeBatch: pending.changeBatch,
+	})
 	if appendErr != nil {
 		if isFenceError(appendErr) {
 			w.fenced.Store(true)
 		}
 		return fmt.Errorf("update manifest: %w", appendErr)
 	}
-	w.metrics.ObserveFlushBytes(result.Meta.Size)
+	w.metrics.ObserveFlushBytes(pending.sstable.Size)
 
-	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", result.Meta.ID,
-		"size", result.Meta.Size, "epoch", epoch)
+	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
+		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
 	return nil
 }
 

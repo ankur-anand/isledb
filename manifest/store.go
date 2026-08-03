@@ -3,6 +3,7 @@ package manifest
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,15 +15,18 @@ import (
 )
 
 var (
-	ErrFenced          = errors.New("fenced: epoch superseded by newer owner")
-	ErrFenceConflict   = errors.New("fence conflict: concurrent claim detected")
-	ErrCurrentTooLarge = errors.New("manifest CURRENT exceeds size limit")
+	ErrFenced               = errors.New("fenced: epoch superseded by newer owner")
+	ErrFenceConflict        = errors.New("fence conflict: concurrent claim detected")
+	ErrCurrentTooLarge      = errors.New("manifest CURRENT exceeds size limit")
+	ErrInvalidWriterCommit  = errors.New("invalid writer commit")
+	ErrWriterCommitConflict = errors.New("writer commit identity conflict")
 )
 
 const (
 	defaultActiveEntryLimit = 64
 	defaultPageFanout       = 32
 	defaultMaxCurrentBytes  = 64 << 10
+	maxWriterCommitIDBytes  = 128
 )
 
 type FenceRole int
@@ -355,6 +359,10 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		}
 		normalizeCurrent(current)
 
+		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
+			return err
+		}
+
 		if err := s.checkFenceWithCurrent(role, current); err != nil {
 			return err
 		}
@@ -399,6 +407,13 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
 		updated.NextSeq = nextEntry.Seq + 1
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
+		if nextEntry.Role == FenceRoleWriter && nextEntry.Op == LogOpAddSSTable && nextEntry.CommitID != "" {
+			marker, err := writerCommitMarker(&nextEntry)
+			if err != nil {
+				return err
+			}
+			updated.LastWriterCommit = marker
+		}
 		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
 			return err
 		}
@@ -425,7 +440,27 @@ func (s *Store) AppendAddSSTableWithFence(ctx context.Context, sst SSTMeta) (*Ma
 }
 
 func (s *Store) AppendAddSSTableWithChangeBatchWithFence(ctx context.Context, sst SSTMeta, changeBatch *ChangeBatchMeta) (*ManifestLogEntry, error) {
+	return s.AppendWriterCommit(ctx, WriterCommit{
+		ID:          writerCommitIDForSST(sst.ID),
+		SSTable:     sst,
+		ChangeBatch: changeBatch,
+	})
+}
+
+// AppendWriterCommit idempotently publishes one uploaded memtable. Reusing the
+// same commit ID after an uncertain CAS result cannot append the SST twice.
+func (s *Store) AppendWriterCommit(ctx context.Context, commit WriterCommit) (*ManifestLogEntry, error) {
+	if err := validateWriterCommit(commit); err != nil {
+		return nil, err
+	}
+	sst := commit.SSTable
+	var changeBatch *ChangeBatchMeta
+	if commit.ChangeBatch != nil {
+		copy := *commit.ChangeBatch
+		changeBatch = &copy
+	}
 	entry := &ManifestLogEntry{
+		CommitID:    commit.ID,
 		Op:          LogOpAddSSTable,
 		SSTable:     &sst,
 		ChangeBatch: changeBatch,
@@ -434,6 +469,105 @@ func (s *Store) AppendAddSSTableWithChangeBatchWithFence(ctx context.Context, ss
 		return nil, err
 	}
 	return entry, nil
+}
+
+func validateWriterCommit(commit WriterCommit) error {
+	if commit.ID == "" {
+		return fmt.Errorf("%w: empty commit_id", ErrInvalidWriterCommit)
+	}
+	if len(commit.ID) > maxWriterCommitIDBytes {
+		return fmt.Errorf("%w: commit_id bytes=%d max=%d", ErrInvalidWriterCommit,
+			len(commit.ID), maxWriterCommitIDBytes)
+	}
+	if commit.SSTable.ID == "" {
+		return fmt.Errorf("%w: empty sstable_id", ErrInvalidWriterCommit)
+	}
+	if commit.SSTable.SeqHi < commit.SSTable.SeqLo {
+		return fmt.Errorf("%w: invalid sequence range %d-%d", ErrInvalidWriterCommit,
+			commit.SSTable.SeqLo, commit.SSTable.SeqHi)
+	}
+	if change := commit.ChangeBatch; change != nil {
+		if change.ID == "" || change.Path == "" {
+			return fmt.Errorf("%w: incomplete change batch", ErrInvalidWriterCommit)
+		}
+		if change.Epoch != commit.SSTable.Epoch {
+			return fmt.Errorf("%w: change batch epoch=%d does not match sstable epoch=%d",
+				ErrInvalidWriterCommit, change.Epoch, commit.SSTable.Epoch)
+		}
+		if change.SeqLo != commit.SSTable.SeqLo || change.SeqHi != commit.SSTable.SeqHi {
+			return fmt.Errorf("%w: change batch range %d-%d does not match sstable %d-%d",
+				ErrInvalidWriterCommit, change.SeqLo, change.SeqHi,
+				commit.SSTable.SeqLo, commit.SSTable.SeqHi)
+		}
+	}
+	return nil
+}
+
+func reconcileWriterCommit(current *Current, entry *ManifestLogEntry) (bool, error) {
+	if current == nil || entry == nil || entry.CommitID == "" ||
+		entry.Role == FenceRoleCompactor || entry.Op != LogOpAddSSTable {
+		return false, nil
+	}
+	marker := current.LastWriterCommit
+	if marker == nil || marker.CommitID != entry.CommitID {
+		return false, nil
+	}
+	if entry.SSTable == nil {
+		return true, fmt.Errorf("%w: commit_id=%q", ErrWriterCommitConflict, entry.CommitID)
+	}
+	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	if err != nil {
+		return true, err
+	}
+	if marker.Fingerprint != fingerprint {
+		return true, fmt.Errorf("%w: commit_id=%q metadata mismatch", ErrWriterCommitConflict, entry.CommitID)
+	}
+	entry.ID = marker.EntryID
+	entry.Seq = marker.ManifestSeq
+	entry.Role = FenceRoleWriter
+	entry.Epoch = marker.WriterEpoch
+	entry.Timestamp = marker.CommittedAt
+	return true, nil
+}
+
+func writerCommitMarker(entry *ManifestLogEntry) (*WriterCommitMarker, error) {
+	if entry == nil || entry.SSTable == nil {
+		return nil, fmt.Errorf("%w: missing sstable metadata", ErrInvalidWriterCommit)
+	}
+	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	if err != nil {
+		return nil, err
+	}
+	return &WriterCommitMarker{
+		CommitID:    entry.CommitID,
+		Fingerprint: fingerprint,
+		EntryID:     entry.ID,
+		ManifestSeq: entry.Seq,
+		WriterEpoch: entry.Epoch,
+		SeqLo:       entry.SSTable.SeqLo,
+		SeqHi:       entry.SSTable.SeqHi,
+		CommittedAt: entry.Timestamp,
+	}, nil
+}
+
+func writerCommitIDForSST(sstableID string) string {
+	sum := sha256.Sum256([]byte(sstableID))
+	return fmt.Sprintf("sst:%x", sum[:])
+}
+
+func writerCommitFingerprint(sstable *SSTMeta, changeBatch *ChangeBatchMeta) (string, error) {
+	payload, err := json.Marshal(struct {
+		SSTable     *SSTMeta         `json:"sstable"`
+		ChangeBatch *ChangeBatchMeta `json:"change_batch,omitempty"`
+	}{
+		SSTable:     sstable,
+		ChangeBatch: changeBatch,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: encode metadata fingerprint: %v", ErrInvalidWriterCommit, err)
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", sum[:]), nil
 }
 
 func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []string) (*ManifestLogEntry, error) {
@@ -1324,6 +1458,7 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 	}
 	newETag, err := s.storage.WriteCurrentCAS(ctx, data, etag)
 	if err != nil {
+		s.clearCurrentCache()
 		return err
 	}
 	s.mu.Lock()

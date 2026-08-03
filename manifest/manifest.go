@@ -3,6 +3,8 @@ package manifest
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/segmentio/ksuid"
 )
 
 type CompactionConfig struct {
@@ -84,6 +86,27 @@ type ChangeBatchMeta struct {
 	Version   int       `json:"version,omitempty"`
 }
 
+// WriterCommit is one logical memtable publication. ID remains unchanged when
+// SST upload or manifest publication is retried.
+type WriterCommit struct {
+	ID          string
+	SSTable     SSTMeta
+	ChangeBatch *ChangeBatchMeta
+}
+
+// WriterCommitMarker is the bounded idempotency receipt retained in CURRENT.
+// Maintenance updates preserve it even when the committed SST is compacted.
+type WriterCommitMarker struct {
+	CommitID    string      `json:"commit_id"`
+	Fingerprint string      `json:"fingerprint"`
+	EntryID     ksuid.KSUID `json:"entry_id"`
+	ManifestSeq uint64      `json:"manifest_seq"`
+	WriterEpoch uint64      `json:"writer_epoch"`
+	SeqLo       uint64      `json:"seq_lo"`
+	SeqHi       uint64      `json:"seq_hi"`
+	CommittedAt time.Time   `json:"committed_at"`
+}
+
 type Current struct {
 	LayoutVersion int    `json:"layout_version,omitempty"`
 	Format        string `json:"format,omitempty"`
@@ -97,8 +120,9 @@ type Current struct {
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
 
-	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
-	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
+	WriterFence      *FenceToken         `json:"writer_fence,omitempty"`
+	CompactorFence   *FenceToken         `json:"compactor_fence,omitempty"`
+	LastWriterCommit *WriterCommitMarker `json:"last_writer_commit,omitempty"`
 }
 
 type PageRef struct {

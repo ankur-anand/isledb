@@ -25,12 +25,12 @@ func TestChangeFeedCleanerRetiresOldBatches(t *testing.T) {
 
 	now := time.Now().UTC()
 	oldMeta := writeChangeBatchForCleanerTest(t, ctx, store, "old.chg", now.Add(-2*time.Hour))
-	oldEntry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "old.sst", Epoch: 1, Level: 0, CreatedAt: oldMeta.CreatedAt}, &oldMeta)
+	oldEntry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "old.sst", Epoch: oldMeta.Epoch, SeqLo: oldMeta.SeqLo, SeqHi: oldMeta.SeqHi, Level: 0, CreatedAt: oldMeta.CreatedAt}, &oldMeta)
 	if err != nil {
 		t.Fatalf("append old sst: %v", err)
 	}
 	recentMeta := writeChangeBatchForCleanerTest(t, ctx, store, "recent.chg", now)
-	recentEntry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "recent.sst", Epoch: 2, Level: 0, CreatedAt: recentMeta.CreatedAt}, &recentMeta)
+	recentEntry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "recent.sst", Epoch: recentMeta.Epoch, SeqLo: recentMeta.SeqLo, SeqHi: recentMeta.SeqHi, Level: 0, CreatedAt: recentMeta.CreatedAt}, &recentMeta)
 	if err != nil {
 		t.Fatalf("append recent sst: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestPendingChangeBatchSweeperDoesNotDeleteRetainedBatch(t *testing.T) {
 	}
 
 	meta := writeChangeBatchForCleanerTest(t, ctx, store, "retained.chg", time.Now().Add(-2*time.Hour))
-	entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "retained.sst", Epoch: 1, Level: 0, CreatedAt: meta.CreatedAt}, &meta)
+	entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{ID: "retained.sst", Epoch: 1, SeqLo: meta.SeqLo, SeqHi: meta.SeqHi, Level: 0, CreatedAt: meta.CreatedAt}, &meta)
 	if err != nil {
 		t.Fatalf("append retained sst: %v", err)
 	}

@@ -26,6 +26,40 @@ type cancelCASStorage struct {
 	calls int
 }
 
+type appliedThenErrorStorage struct {
+	Storage
+
+	mu       sync.Mutex
+	failNext bool
+	failErr  error
+}
+
+func (s *appliedThenErrorStorage) arm(err error) {
+	s.mu.Lock()
+	s.failNext = true
+	s.failErr = err
+	s.mu.Unlock()
+}
+
+func (s *appliedThenErrorStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	etag, err := s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.Lock()
+	fail := s.failNext
+	failErr := s.failErr
+	if fail {
+		s.failNext = false
+	}
+	s.mu.Unlock()
+	if fail {
+		return "", failErr
+	}
+	return etag, nil
+}
+
 func (s *casInjectStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
 	return s.base.ReadCurrent(ctx)
 }
@@ -128,6 +162,119 @@ func (s *cancelCASStorage) ReadSnapshot(ctx context.Context, path string) ([]byt
 
 func (s *cancelCASStorage) WriteSnapshot(ctx context.Context, id string, data []byte) (string, error) {
 	return s.base.WriteSnapshot(ctx, id, data)
+}
+
+func TestAppendWriterCommitReconcilesAppliedCASAfterLostResponse(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-lost-response")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	storage := &appliedThenErrorStorage{Storage: base}
+	manifestStore := NewStoreWithStorage(storage)
+	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+
+	commit := WriterCommit{
+		ID: "commit-1",
+		SSTable: SSTMeta{
+			ID:    "sst-1",
+			SeqLo: 10,
+			SeqHi: 20,
+			Level: 0,
+		},
+		ChangeBatch: &ChangeBatchMeta{
+			ID:    "change-1",
+			Path:  "changes/change-1",
+			SeqLo: 10,
+			SeqHi: 20,
+		},
+	}
+	lostResponse := errors.New("lost CURRENT response")
+	storage.arm(lostResponse)
+	if _, err := manifestStore.AppendWriterCommit(ctx, commit); !errors.Is(err, lostResponse) {
+		t.Fatalf("first AppendWriterCommit error=%v, want %v", err, lostResponse)
+	}
+
+	// A successor may claim the writer fence after the commit reached CURRENT
+	// but before the original writer receives the response. The old writer must
+	// still recognize its completed commit instead of reporting a false failure.
+	successor := NewStoreWithStorage(base)
+	if _, err := successor.ClaimWriter(ctx, "writer-2"); err != nil {
+		t.Fatalf("successor ClaimWriter: %v", err)
+	}
+
+	entry, err := manifestStore.AppendWriterCommit(ctx, commit)
+	if err != nil {
+		t.Fatalf("retry AppendWriterCommit: %v", err)
+	}
+	if entry.CommitID != commit.ID || entry.SSTable == nil || entry.SSTable.ID != commit.SSTable.ID {
+		t.Fatalf("reconciled entry=%+v", entry)
+	}
+
+	data, _, err := base.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	current, err := DecodeCurrent(data)
+	if err != nil {
+		t.Fatalf("DecodeCurrent: %v", err)
+	}
+	marker := current.LastWriterCommit
+	if marker == nil || marker.CommitID != commit.ID || marker.Fingerprint == "" ||
+		marker.SeqLo != 10 || marker.SeqHi != 20 {
+		t.Fatalf("last writer commit=%+v", marker)
+	}
+
+	seqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	commits := 0
+	for _, seq := range seqs {
+		entry, err := manifestStore.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID == commit.ID {
+			commits++
+		}
+	}
+	if commits != 1 {
+		t.Fatalf("committed entries with commit_id=%q: got=%d want=1", commit.ID, commits)
+	}
+
+	conflict := commit
+	conflict.SSTable.Checksum = "sha256:different"
+	if _, err := manifestStore.AppendWriterCommit(ctx, conflict); !errors.Is(err, ErrWriterCommitConflict) {
+		t.Fatalf("conflicting retry error=%v, want %v", err, ErrWriterCommitConflict)
+	}
+}
+
+func TestAppendWriterCommitRejectsInvalidIdentity(t *testing.T) {
+	store := blobstore.NewMemory("writer-commit-invalid")
+	defer store.Close()
+	manifestStore := NewStoreWithStorage(NewBlobStoreBackend(store))
+
+	tests := []WriterCommit{
+		{SSTable: SSTMeta{ID: "sst", SeqLo: 1, SeqHi: 1}},
+		{ID: string(make([]byte, maxWriterCommitIDBytes+1)), SSTable: SSTMeta{ID: "sst", SeqLo: 1, SeqHi: 1}},
+		{ID: "commit", SSTable: SSTMeta{SeqLo: 1, SeqHi: 1}},
+		{ID: "commit", SSTable: SSTMeta{ID: "sst", SeqLo: 2, SeqHi: 1}},
+		{
+			ID:      "commit",
+			SSTable: SSTMeta{ID: "sst", SeqLo: 1, SeqHi: 2},
+			ChangeBatch: &ChangeBatchMeta{
+				ID: "change", Path: "changes/change", SeqLo: 1, SeqHi: 3,
+			},
+		},
+	}
+	for i, commit := range tests {
+		if _, err := manifestStore.AppendWriterCommit(context.Background(), commit); !errors.Is(err, ErrInvalidWriterCommit) {
+			t.Fatalf("case %d error=%v, want %v", i, err, ErrInvalidWriterCommit)
+		}
+	}
 }
 
 func (s *cancelCASStorage) callCount() int {

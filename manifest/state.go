@@ -70,6 +70,7 @@ func (c *Current) Clone() *Current {
 		ChangeFeedLogStart: c.ChangeFeedLogStart,
 		WriterFence:        c.WriterFence.Clone(),
 		CompactorFence:     c.CompactorFence.Clone(),
+		LastWriterCommit:   c.LastWriterCommit.Clone(),
 	}
 	if len(c.ActiveEntries) > 0 {
 		clone.ActiveEntries = make([]ManifestLogEntry, len(c.ActiveEntries))
@@ -80,6 +81,14 @@ func (c *Current) Clone() *Current {
 		copy(clone.IndexFrontier, c.IndexFrontier)
 	}
 	return clone
+}
+
+func (m *WriterCommitMarker) Clone() *WriterCommitMarker {
+	if m == nil {
+		return nil
+	}
+	clone := *m
+	return &clone
 }
 
 func (m *Manifest) L0SSTCount() int {
