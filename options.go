@@ -36,8 +36,9 @@ type WriterOptions struct {
 	// batches under changes/. Disabled by default.
 	ChangeFeed ChangeFeedOptions
 
-	// OnFlushError is called once when background flushing fails. That failure
-	// makes the writer terminal and is returned by later operations.
+	// OnFlushError is called once after the background flush worker stops. The
+	// callback may call Writer.Close. The failure makes the writer terminal and
+	// is returned by later operations.
 	OnFlushError func(error)
 
 	// Metrics receives optional writer observations. Nil disables metrics.

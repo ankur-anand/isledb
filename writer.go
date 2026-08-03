@@ -47,7 +47,7 @@ type writer struct {
 	flushMu     sync.Mutex
 	flushTicker *time.Ticker
 	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	workerDone  chan struct{}
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -106,6 +106,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		epoch:                   m.NextEpoch,
 		blobStorage:             internal.NewBlobStorage(store, valueConfig),
 		stopCh:                  make(chan struct{}),
+		workerDone:              make(chan struct{}),
 		metrics:                 opts.Metrics,
 	}
 
@@ -121,8 +122,9 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 
 	if opts.Flush.Interval > 0 {
 		w.flushTicker = time.NewTicker(opts.Flush.Interval)
-		w.wg.Add(1)
 		go w.flushLoop()
+	} else {
+		close(w.workerDone)
 	}
 
 	return w, nil
@@ -500,7 +502,23 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 }
 
 func (w *writer) flushLoop() {
-	defer w.wg.Done()
+	var notifyErr error
+	defer func() {
+		w.flushTicker.Stop()
+		// The flush worker is considered finished before user code runs.
+		// OnFlushError may therefore call Close without waiting on itself.
+		close(w.workerDone)
+		if notifyErr == nil {
+			return
+		}
+		if w.opts.OnFlushError != nil {
+			w.opts.OnFlushError(notifyErr)
+			return
+		}
+		slog.Error("isledb: background flush failed",
+			"component", "writer", "error", notifyErr)
+	}()
+
 	for {
 		select {
 		case <-w.flushTicker.C:
@@ -513,12 +531,7 @@ func (w *writer) flushLoop() {
 						"component", "writer", "epoch", w.epoch)
 					return
 				}
-				if w.opts.OnFlushError != nil {
-					w.opts.OnFlushError(err)
-				} else {
-					slog.Error("isledb: background flush failed",
-						"component", "writer", "error", err)
-				}
+				notifyErr = err
 				return
 			}
 		case <-w.stopCh:
@@ -539,8 +552,10 @@ func (w *writer) close(ctx context.Context) error {
 			w.flushTicker.Stop()
 		}
 	}
-	if err := waitGroupContext(ctx, &w.wg); err != nil {
-		return err
+	select {
+	case <-w.workerDone:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	return w.flush(ctx)
@@ -550,20 +565,6 @@ func (w *writer) closeWithTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return w.close(ctx)
-}
-
-func waitGroupContext(ctx context.Context, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func checkContext(ctx context.Context) error {

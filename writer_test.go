@@ -354,11 +354,13 @@ func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
 		t.Fatalf("pending memtables during background flush=%d, want=1", pending)
 	}
 
-	closeCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
-	err = w.close(closeCtx)
-	cancel()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("first close error=%v, want %v", err, context.DeadlineExceeded)
+	for attempt := 0; attempt < 20; attempt++ {
+		closeCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
+		err = w.close(closeCtx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("close attempt %d error=%v, want %v", attempt, err, context.DeadlineExceeded)
+		}
 	}
 
 	close(storage.release)
@@ -621,6 +623,21 @@ func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 	if !errors.Is(terminalErr, rootCause) {
 		t.Fatalf("background error=%v, want root cause %v", terminalErr, rootCause)
 	}
+	select {
+	case <-w.workerDone:
+	default:
+		t.Fatal("flush worker still running when OnFlushError was delivered")
+	}
+	// Drain any tick that raced with Stop, then verify no new ticks arrive.
+	select {
+	case <-w.flushTicker.C:
+	default:
+	}
+	select {
+	case <-w.flushTicker.C:
+		t.Fatal("flush ticker remained active after terminal background failure")
+	case <-time.After(10 * time.Millisecond):
+	}
 
 	w.mu.Lock()
 	seqBefore := w.seq
@@ -658,6 +675,57 @@ func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 	case err := <-callback:
 		t.Fatalf("OnFlushError called more than once: %v", err)
 	default:
+	}
+}
+
+func TestWriter_OnFlushErrorCanClose(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-callback-close")
+	defer store.Close()
+
+	rootCause := errors.New("injected background publish failure")
+	storage := &failOnceStorage{
+		Storage:     manifest.NewBlobStoreBackend(store),
+		failOnWrite: 3,
+		failErr:     rootCause,
+	}
+
+	type callbackResult struct {
+		flushErr error
+		closeErr error
+	}
+	result := make(chan callbackResult, 1)
+	var writerRef atomic.Pointer[writer]
+	opts := testWriterOptions(1<<20, 0)
+	opts.Flush.Interval = time.Millisecond
+	opts.OnFlushError = func(flushErr error) {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		result <- callbackResult{
+			flushErr: flushErr,
+			closeErr: writerRef.Load().close(closeCtx),
+		}
+	}
+
+	w, err := newWriter(ctx, store, manifest.NewStoreWithStorage(storage), opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	writerRef.Store(w)
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	select {
+	case got := <-result:
+		if !errors.Is(got.flushErr, ErrWriterFailed) || !errors.Is(got.flushErr, rootCause) {
+			t.Fatalf("callback flush error=%v", got.flushErr)
+		}
+		if got.closeErr != got.flushErr {
+			t.Fatalf("Close error=%v, want callback error %v", got.closeErr, got.flushErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnFlushError calling Close deadlocked")
 	}
 }
 

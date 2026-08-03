@@ -165,7 +165,8 @@ Background flush:
 
 - `Flush.Interval > 0` starts a background flush loop.
 - The first background flush error makes the writer terminal. It is delivered
-  once to `WriterOptions.OnFlushError` when set, otherwise it is logged.
+  once to `WriterOptions.OnFlushError` after the background worker stops,
+  otherwise it is logged. The callback may call `Writer.Close`.
 - Later mutations, `Flush`, and `Close` return the stored `ErrWriterFailed`
   value wrapping the original failure.
 - Explicit `Flush` and `Close` return flush errors directly.
