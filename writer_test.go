@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -825,19 +826,71 @@ func TestWriter_InFlightMemtableCountsTowardBackpressure(t *testing.T) {
 	}
 }
 
-func TestWriterOptions_DefaultAndInvalidPendingMemtables(t *testing.T) {
+func TestWriterOptions_Defaults(t *testing.T) {
 	if got, want := DefaultWriterOptions().Memtable.MaxPendingMemtables, 4; got != want {
 		t.Fatalf("default max pending memtables=%d, want=%d", got, want)
 	}
 
-	ctx := context.Background()
-	store := blobstore.NewMemory("writer-invalid-pending")
-	defer store.Close()
+	normalized, values, err := normalizeWriterOptions(WriterOptions{})
+	if err != nil {
+		t.Fatalf("normalizeWriterOptions: %v", err)
+	}
+	defaults := DefaultWriterOptions()
+	if normalized.Memtable != defaults.Memtable || normalized.SST != defaults.SST {
+		t.Fatalf("normalized options=%+v defaults=%+v", normalized, defaults)
+	}
+	if normalized.Flush.Interval != 0 {
+		t.Fatalf("zero-value flush interval=%s, want disabled", normalized.Flush.Interval)
+	}
+	if values.MaxKeySize <= 0 || values.BlobThreshold <= 0 || values.MaxValueSize <= 0 {
+		t.Fatalf("normalized value options=%+v", values.ValueOptions)
+	}
+}
+
+func TestWriterOptions_RejectInvalidValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*WriterOptions)
+	}{
+		{name: "owner id too long", mutate: func(o *WriterOptions) { o.OwnerID = strings.Repeat("x", maxWriterOwnerIDBytes+1) }},
+		{name: "negative target bytes", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = -1 }},
+		{name: "negative pending memtables", mutate: func(o *WriterOptions) { o.Memtable.MaxPendingMemtables = -1 }},
+		{name: "negative flush interval", mutate: func(o *WriterOptions) { o.Flush.Interval = -time.Nanosecond }},
+		{name: "negative bloom bits", mutate: func(o *WriterOptions) { o.SST.BloomBitsPerKey = -1 }},
+		{name: "negative block bytes", mutate: func(o *WriterOptions) { o.SST.BlockBytes = -1 }},
+		{name: "unsupported compression", mutate: func(o *WriterOptions) { o.SST.Compression = "gzip" }},
+		{name: "negative blob threshold", mutate: func(o *WriterOptions) { o.Values.BlobThreshold = -1 }},
+		{name: "negative max key size", mutate: func(o *WriterOptions) { o.Values.MaxKeySize = -1 }},
+		{name: "negative max value size", mutate: func(o *WriterOptions) { o.Values.MaxValueSize = -1 }},
+		{name: "target exceeds arena", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = maxMemtableArenaBytes + 1 }},
+		{name: "inline entry exceeds arena", mutate: func(o *WriterOptions) {
+			o.Values.MaxKeySize = int(maxMemtableArenaBytes / 2)
+			o.Values.BlobThreshold = int(maxMemtableArenaBytes / 2)
+			o.Values.MaxValueSize = maxMemtableArenaBytes
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := DefaultWriterOptions()
+			test.mutate(&opts)
+			_, _, err := normalizeWriterOptions(opts)
+			if !errors.Is(err, ErrInvalidWriterOptions) {
+				t.Fatalf("normalizeWriterOptions error=%v, want %v", err, ErrInvalidWriterOptions)
+			}
+		})
+	}
+}
+
+func TestWriterOptions_NormalizeCompression(t *testing.T) {
 	opts := DefaultWriterOptions()
-	opts.Memtable.MaxPendingMemtables = -1
-	_, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
-	if !errors.Is(err, ErrInvalidWriterOptions) {
-		t.Fatalf("newWriter error=%v, want %v", err, ErrInvalidWriterOptions)
+	opts.SST.Compression = " ZSTD "
+	normalized, _, err := normalizeWriterOptions(opts)
+	if err != nil {
+		t.Fatalf("normalizeWriterOptions: %v", err)
+	}
+	if normalized.SST.Compression != "zstd" {
+		t.Fatalf("compression=%q, want zstd", normalized.SST.Compression)
 	}
 }
 

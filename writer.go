@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,11 @@ var (
 	ErrWriterFailed         = errors.New("writer failed")
 )
 
-const minMemtableArenaHeadroom = 1 << 20
+const (
+	minMemtableArenaHeadroom = 1 << 20
+	maxMemtableArenaBytes    = 1<<32 - 1
+	maxWriterOwnerIDBytes    = 256
+)
 
 type writer struct {
 	store       *blobstore.Store
@@ -132,7 +137,15 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 
 func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStorageConfig, error) {
 	d := DefaultWriterOptions()
-	if opts.Memtable.TargetBytes <= 0 {
+	if len(opts.OwnerID) > maxWriterOwnerIDBytes {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: owner_id bytes=%d max=%d", ErrInvalidWriterOptions, len(opts.OwnerID), maxWriterOwnerIDBytes)
+	}
+	if opts.Memtable.TargetBytes < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: target_bytes=%d", ErrInvalidWriterOptions, opts.Memtable.TargetBytes)
+	}
+	if opts.Memtable.TargetBytes == 0 {
 		opts.Memtable.TargetBytes = d.Memtable.TargetBytes
 	}
 	if opts.Memtable.MaxPendingMemtables < 0 {
@@ -142,20 +155,77 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	if opts.Memtable.MaxPendingMemtables == 0 {
 		opts.Memtable.MaxPendingMemtables = d.Memtable.MaxPendingMemtables
 	}
+	if opts.Flush.Interval < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: flush_interval=%s", ErrInvalidWriterOptions, opts.Flush.Interval)
+	}
+	if opts.SST.BloomBitsPerKey < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: bloom_bits_per_key=%d", ErrInvalidWriterOptions, opts.SST.BloomBitsPerKey)
+	}
 	if opts.SST.BloomBitsPerKey == 0 {
 		opts.SST.BloomBitsPerKey = d.SST.BloomBitsPerKey
+	}
+	if opts.SST.BlockBytes < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: block_bytes=%d", ErrInvalidWriterOptions, opts.SST.BlockBytes)
 	}
 	if opts.SST.BlockBytes == 0 {
 		opts.SST.BlockBytes = d.SST.BlockBytes
 	}
-	opts.SST.Compression = cmp.Or(opts.SST.Compression, d.SST.Compression)
+	compression := strings.ToLower(strings.TrimSpace(cmp.Or(opts.SST.Compression, d.SST.Compression)))
+	switch compression {
+	case "none", "snappy", "zstd":
+		opts.SST.Compression = compression
+	default:
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: unsupported compression=%q", ErrInvalidWriterOptions, opts.SST.Compression)
+	}
 
 	vd := config.DefaultValueStorageConfig()
 	valueConfig := opts.Values
+	if valueConfig.BlobThreshold < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: blob_threshold=%d", ErrInvalidWriterOptions, valueConfig.BlobThreshold)
+	}
+	if valueConfig.MaxKeySize < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: max_key_size=%d", ErrInvalidWriterOptions, valueConfig.MaxKeySize)
+	}
+	if valueConfig.MaxValueSize < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: max_value_size=%d", ErrInvalidWriterOptions, valueConfig.MaxValueSize)
+	}
 	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
-	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, 64*1024)
-	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, 256*1024*1024)
+	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, vd.MaxKeySize)
+	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, vd.MaxValueSize)
+	if err := validateMemtableArena(opts.Memtable.TargetBytes, valueConfig); err != nil {
+		return WriterOptions{}, config.ValueStorageConfig{}, err
+	}
 	return opts, valueConfig, nil
+}
+
+func validateMemtableArena(targetBytes int64, valueConfig config.ValueStorageConfig) error {
+	if targetBytes > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: target_bytes=%d exceeds arena max=%d",
+			ErrInvalidWriterOptions, targetBytes, maxMemtableArenaBytes)
+	}
+
+	maxInlineValue := int64(valueConfig.BlobThreshold - 1)
+	if maxInlineValue > valueConfig.MaxValueSize {
+		maxInlineValue = valueConfig.MaxValueSize
+	}
+	maxKeySize := int64(valueConfig.MaxKeySize)
+	if maxKeySize > maxMemtableArenaBytes || maxInlineValue > maxMemtableArenaBytes ||
+		maxKeySize+maxInlineValue+1024 > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: maximum inline entry exceeds arena max=%d",
+			ErrInvalidWriterOptions, maxMemtableArenaBytes)
+	}
+	if arenaBytes := defaultMemtableArenaBytes(targetBytes, valueConfig); arenaBytes > maxMemtableArenaBytes {
+		return fmt.Errorf("%w: memtable arena bytes=%d max=%d",
+			ErrInvalidWriterOptions, arenaBytes, maxMemtableArenaBytes)
+	}
+	return nil
 }
 
 func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorageConfig) int64 {

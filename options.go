@@ -54,7 +54,7 @@ type ChangeFeedOptions struct {
 type WriterMemtableOptions struct {
 	// TargetBytes is the approximate active memtable size that triggers rotation.
 	// Rotation does not publish data by itself; Flush, background flush, or Close
-	// publishes frozen memtables as SSTs.
+	// publishes frozen memtables as SSTs. Zero selects the default.
 	TargetBytes int64
 
 	// MaxPendingMemtables limits frozen memtables that are queued or currently
@@ -70,13 +70,14 @@ type WriterFlushOptions struct {
 }
 
 type WriterSSTOptions struct {
-	// BloomBitsPerKey controls SST bloom filter size.
+	// BloomBitsPerKey controls SST bloom filter size. Zero selects the default.
 	BloomBitsPerKey int
 
-	// BlockBytes is the target SST data block size.
+	// BlockBytes is the target SST data block size. Zero selects the default.
 	BlockBytes int
 
-	// Compression is the SST compression algorithm.
+	// Compression is one of "none", "snappy", or "zstd". Empty selects the
+	// default.
 	Compression string
 }
 
