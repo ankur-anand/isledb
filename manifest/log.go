@@ -19,6 +19,7 @@ const (
 
 type ManifestLogEntry struct {
 	ID               ksuid.KSUID           `json:"id"`
+	CommitID         string                `json:"commit_id,omitempty"`
 	Seq              uint64                `json:"seq"`
 	Role             FenceRole             `json:"role"`
 	Epoch            uint64                `json:"epoch"`

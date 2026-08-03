@@ -274,6 +274,24 @@ type failOnceStorage struct {
 	failErr     error
 }
 
+type applyThenFailOnceStorage struct {
+	manifest.Storage
+	writeCount  atomic.Int32
+	failOnWrite int32
+	failErr     error
+}
+
+func (s *applyThenFailOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	etag, err := s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
+	if err != nil {
+		return "", err
+	}
+	if s.writeCount.Add(1) == s.failOnWrite {
+		return "", s.failErr
+	}
+	return etag, nil
+}
+
 func (s *failOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	count := s.writeCount.Add(1)
 	if count == s.failOnWrite {
@@ -454,6 +472,13 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	if pending != 1 {
 		t.Fatalf("pending memtables after failed flush=%d, want=1", pending)
 	}
+	sstsAfterFailure, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list SSTs after failure: %v", err)
+	}
+	if len(sstsAfterFailure) != 1 {
+		t.Fatalf("SSTs after failed manifest publish=%d, want=1", len(sstsAfterFailure))
+	}
 
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush retry: %v", err)
@@ -463,6 +488,98 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	w.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("pending memtables after retry=%d, want=0", pending)
+	}
+	sstsAfterRetry, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list SSTs after retry: %v", err)
+	}
+	if len(sstsAfterRetry) != 1 {
+		t.Fatalf("SSTs after manifest retry=%d, want=1", len(sstsAfterRetry))
+	}
+}
+
+func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-ambiguous-manifest-cas")
+	defer store.Close()
+
+	lostResponse := errors.New("lost CURRENT response")
+	storage := &applyThenFailOnceStorage{
+		Storage:     manifest.NewBlobStoreBackend(store),
+		failOnWrite: 3,
+		failErr:     lostResponse,
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	opts := testWriterOptions(1<<20, 0)
+	opts.ChangeFeed.Enabled = true
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
+		t.Fatalf("first flush error=%v, want %v", err, lostResponse)
+	}
+
+	w.mu.Lock()
+	if len(w.immQueue) != 1 {
+		w.mu.Unlock()
+		t.Fatalf("pending queue length=%d, want=1", len(w.immQueue))
+	}
+	commitID := w.immQueue[0].commitID
+	sstableID := w.immQueue[0].sstable.ID
+	w.mu.Unlock()
+	if commitID == "" || sstableID == "" {
+		t.Fatalf("pending identity commit_id=%q sstable_id=%q", commitID, sstableID)
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush retry: %v", err)
+	}
+	ssts, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("ListSSTFiles: %v", err)
+	}
+	if len(ssts) != 1 {
+		t.Fatalf("SST object count=%d, want=1", len(ssts))
+	}
+	changes, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
+	if err != nil {
+		t.Fatalf("list change batches: %v", err)
+	}
+	if len(changes.Objects) != 1 {
+		t.Fatalf("change batch object count=%d, want=1", len(changes.Objects))
+	}
+
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.LastWriterCommit == nil || current.LastWriterCommit.CommitID != commitID ||
+		current.LastWriterCommit.Fingerprint == "" {
+		t.Fatalf("last writer commit=%+v", current.LastWriterCommit)
+	}
+
+	seqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	commits := 0
+	for _, seq := range seqs {
+		entry, err := manifestStore.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID == commitID {
+			commits++
+		}
+	}
+	if commits != 1 {
+		t.Fatalf("manifest entries with commit_id=%q: got=%d want=1", commitID, commits)
 	}
 }
 

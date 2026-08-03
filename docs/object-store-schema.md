@@ -123,6 +123,7 @@ Example:
   "active_entries": [
     {
       "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
+      "commit_id": "39xAPN6YtrMhPX69wjUb4V3S3xA",
       "seq": 420,
       "role": 0,
       "epoch": 18,
@@ -135,6 +136,16 @@ Example:
     "owner": "writer-p000",
     "claimed_at": "2026-04-15T10:12:01Z"
   },
+  "last_writer_commit": {
+    "commit_id": "39xAPN6YtrMhPX69wjUb4V3S3xA",
+    "fingerprint": "sha256:8e5d8f3b9f2c7ad9b143f602b54abdc3c5166c118ad6e52f63caed592a9b45fe",
+    "entry_id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
+    "manifest_seq": 420,
+    "writer_epoch": 18,
+    "seq_lo": 9001,
+    "seq_hi": 9256,
+    "committed_at": "2026-04-15T10:14:11Z"
+  },
   "compactor_fence": {
     "epoch": 7,
     "owner": "compactor-p000",
@@ -142,6 +153,12 @@ Example:
   }
 }
 ```
+
+`last_writer_commit` is a bounded receipt for the newest writer commit. A
+writer keeps one stable `commit_id` while retrying a memtable publication. If a
+`CURRENT` CAS succeeds but its response is lost, the retry compares the receipt
+and metadata fingerprint and returns the already committed entry instead of
+appending a duplicate. Compaction and fence updates preserve this receipt.
 
 ## `manifest/snapshots/<id>.manifest`
 
