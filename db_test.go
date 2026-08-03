@@ -123,6 +123,36 @@ func TestDBOpenWriterReleasesReservationAfterConstructionFailure(t *testing.T) {
 	}
 }
 
+func TestDBClosedWritersAreNotRetained(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-closed-writers")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 100; i++ {
+		writer, err := db.OpenWriter(ctx, WriterOptions{})
+		if err != nil {
+			t.Fatalf("OpenWriter(%d): %v", i, err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("Close(%d): %v", i, err)
+		}
+
+		db.mu.Lock()
+		closers := len(db.closers)
+		writerOpen := db.writerOpen
+		db.mu.Unlock()
+		if closers != 0 || writerOpen {
+			t.Fatalf("after writer %d: closers=%d writer_open=%t", i, closers, writerOpen)
+		}
+	}
+}
+
 func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-writer-close-error")
