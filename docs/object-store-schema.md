@@ -252,7 +252,11 @@ behind by a failed CURRENT CAS are ignored by readers and can be cleaned by GC.
 
 Level `0` pages contain actual `ManifestLogEntry` objects. Higher levels contain
 `PageRef` children that point at lower-level pages. This keeps `CURRENT` bounded
-while allowing the committed history to grow.
+while allowing the committed history to grow. A level `0` page normally holds
+up to the active-entry limit, but it may contain fewer entries when `CURRENT`
+crosses its byte limit. If one entry is larger than that limit, the complete
+active tail, including that entry, is stored in a level `0` page rather than
+directly in `CURRENT`.
 
 Path:
 

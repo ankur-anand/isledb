@@ -766,10 +766,9 @@ func (s *Store) currentByteLimit() int {
 	return s.maxCurrentBytes
 }
 
-// rotateActiveEntriesForCurrentSize keeps the newest entry in CURRENT and
-// moves its predecessors into the immutable page tree when CURRENT crosses
-// the byte limit. Entry count remains the normal rollover trigger; this is the
-// guard for variable-sized manifest entries.
+// rotateActiveEntriesForCurrentSize moves the active tail into the immutable
+// page tree when CURRENT crosses its byte limit. Entry count remains the
+// normal rollover trigger; this guards variable-sized manifest entries.
 func (s *Store) rotateActiveEntriesForCurrentSize(ctx context.Context, current *Current) error {
 	if current == nil {
 		return nil
@@ -783,13 +782,10 @@ func (s *Store) rotateActiveEntriesForCurrentSize(ctx context.Context, current *
 		return nil
 	}
 
-	if len(current.ActiveEntries) > 1 {
-		newest := current.ActiveEntries[len(current.ActiveEntries)-1]
-		current.ActiveEntries = current.ActiveEntries[:len(current.ActiveEntries)-1]
+	if len(current.ActiveEntries) > 0 {
 		if err := s.rotateActiveEntries(ctx, current); err != nil {
 			return err
 		}
-		current.ActiveEntries = append(current.ActiveEntries, newest)
 		size, err = encodedCurrentSize(current)
 		if err != nil {
 			return err
