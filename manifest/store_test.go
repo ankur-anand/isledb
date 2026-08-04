@@ -1602,7 +1602,7 @@ func TestStoreCurrentByteLimitRotatesBeforeEntryLimit(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsSingleEntryLargerThanCurrentLimit(t *testing.T) {
+func TestStorePagesEntryLargerThanCurrentLimit(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("oversized-current-entry")
 	defer store.Close()
@@ -1615,25 +1615,97 @@ func TestStoreRejectsSingleEntryLargerThanCurrentLimit(t *testing.T) {
 		t.Fatalf("claim writer: %v", err)
 	}
 	before := ms.CurrentData()
-	beforeData, err := EncodeCurrent(before)
-	if err != nil {
-		t.Fatalf("encode CURRENT before append: %v", err)
-	}
-	ms.maxCurrentBytes = len(beforeData) + 512
+	ms.maxCurrentBytes = 4 << 10
+	oversizedID := "oversized-" + strings.Repeat("x", ms.maxCurrentBytes*2)
 
-	_, err = ms.AppendAddSSTableWithFence(ctx, SSTMeta{
-		ID:    "oversized-" + strings.Repeat("x", ms.maxCurrentBytes),
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{
+		ID:    oversizedID,
 		Epoch: 1,
 		Level: 0,
-	})
-	if !errors.Is(err, ErrCurrentTooLarge) {
-		t.Fatalf("append error=%v, want %v", err, ErrCurrentTooLarge)
+	}); err != nil {
+		t.Fatalf("append oversized entry: %v", err)
 	}
 	after := ms.CurrentData()
-	if after.NextSeq != before.NextSeq {
-		t.Fatalf("CURRENT next_seq=%d after rejected append, want=%d", after.NextSeq, before.NextSeq)
+	if got, want := after.NextSeq, before.NextSeq+1; got != want {
+		t.Fatalf("CURRENT next_seq=%d, want=%d", got, want)
 	}
-	if len(after.ActiveEntries) != len(before.ActiveEntries) {
-		t.Fatalf("CURRENT active entries=%d after rejected append, want=%d", len(after.ActiveEntries), len(before.ActiveEntries))
+	if got := len(after.ActiveEntries); got != 0 {
+		t.Fatalf("CURRENT active entries=%d, want=0", got)
+	}
+	afterData, err := EncodeCurrent(after)
+	if err != nil {
+		t.Fatalf("encode CURRENT after append: %v", err)
+	}
+	if got := len(afterData); got > ms.currentByteLimit() {
+		t.Fatalf("CURRENT bytes=%d exceed limit=%d", got, ms.currentByteLimit())
+	}
+	if got := len(after.IndexFrontier); got != 1 {
+		t.Fatalf("CURRENT frontier refs=%d, want=1", got)
+	}
+
+	ref := after.IndexFrontier[0]
+	if ref.Level != 0 {
+		t.Fatalf("page level=%d, want=0", ref.Level)
+	}
+	pages, ok := ms.storage.(PageStorage)
+	if !ok {
+		t.Fatal("manifest storage does not support pages")
+	}
+	pageData, err := pages.ReadPage(ctx, ref.Path)
+	if err != nil {
+		t.Fatalf("read oversized entry page: %v", err)
+	}
+	if got := len(pageData); got <= ms.currentByteLimit() {
+		t.Fatalf("page bytes=%d, want greater than CURRENT limit=%d", got, ms.currentByteLimit())
+	}
+	sum := sha256.Sum256(pageData)
+	if got, want := ref.Checksum, fmt.Sprintf("sha256:%x", sum[:]); got != want {
+		t.Fatalf("page checksum=%q, want=%q", got, want)
+	}
+	page, err := DecodeCommitPage(pageData)
+	if err != nil {
+		t.Fatalf("decode oversized entry page: %v", err)
+	}
+	if err := validateCommitPage(page, ref.Path); err != nil {
+		t.Fatalf("validate oversized entry page: %v", err)
+	}
+	if page.SeqLo != before.LogSeqStart || page.SeqHi != before.NextSeq || page.Count != uint32(len(before.ActiveEntries)+1) {
+		t.Fatalf("page range/count=(%d,%d,%d), want=(%d,%d,%d)",
+			page.SeqLo, page.SeqHi, page.Count,
+			before.LogSeqStart, before.NextSeq, len(before.ActiveEntries)+1)
+	}
+	var matches int
+	for i := range page.Entries {
+		entry := &page.Entries[i]
+		if entry.Seq == before.NextSeq && entry.SSTable != nil && entry.SSTable.ID == oversizedID {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("oversized entry occurrences=%d, want=1", matches)
+	}
+
+	replayed, err := NewStore(store).Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh replay: %v", err)
+	}
+	if got := len(replayed.L0SSTs); got != 1 {
+		t.Fatalf("replayed L0 SSTs=%d, want=1", got)
+	}
+	if got := replayed.L0SSTs[0].ID; got != oversizedID {
+		t.Fatalf("replayed SST ID=%q, want=%q", got, oversizedID)
+	}
+}
+
+func TestStoreRejectsFixedCurrentMetadataLargerThanLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("oversized-fixed-current")
+	defer store.Close()
+
+	ms := NewStore(store)
+	ms.maxCurrentBytes = 1
+	current := &Current{NextSeq: 1, NextEpoch: 1}
+	if err := ms.rotateActiveEntriesForCurrentSize(ctx, current); !errors.Is(err, ErrCurrentTooLarge) {
+		t.Fatalf("rotate error=%v, want %v", err, ErrCurrentTooLarge)
 	}
 }
