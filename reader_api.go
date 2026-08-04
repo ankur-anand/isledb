@@ -2,11 +2,38 @@ package isledb
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/manifest"
 )
+
+var ErrInvalidReaderOptions = errors.New("invalid reader options")
+
+const (
+	defaultReaderRefreshAfter   = time.Minute
+	defaultReaderSnapshotMaxAge = 5 * time.Minute
+	defaultReaderIteratorMaxAge = 2 * time.Minute
+)
+
+// ReaderViewPolicy bounds how long a Reader may retain one manifest view.
+type ReaderViewPolicy struct {
+	// RefreshAfter is the maximum age of the Reader's loaded manifest before a
+	// read refreshes it. Concurrent refreshes are coalesced. Zero selects the
+	// default.
+	RefreshAfter time.Duration
+
+	// SnapshotMaxAge is the maximum lifetime of an explicit Snapshot. Zero
+	// selects the default.
+	SnapshotMaxAge time.Duration
+
+	// IteratorMaxAge is the maximum lifetime of an Iterator. Zero selects the
+	// default. Snapshot iterators also cannot outlive their Snapshot.
+	IteratorMaxAge time.Duration
+}
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
@@ -42,6 +69,9 @@ type ReaderOpenOptions struct {
 	// If provided and the SST has a signature, verification is enforced.
 	SSTHashVerifier SSTHashVerifier
 
+	// Views controls manifest refresh and the lifetime of retained read views.
+	Views ReaderViewPolicy
+
 	Metrics *ReaderMetrics
 
 	BlobReadOptions config.BlobReadOptions
@@ -56,12 +86,18 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 		CacheDir:        cacheDir,
 		SSTCacheSize:    defaults.SSTCacheSize,
 		BlobCacheSize:   defaults.BlobCacheSize,
+		Views:           defaults.ViewPolicy,
 		BlobReadOptions: config.DefaultBlobReadOptions(),
 	}
 }
 
 // OpenReader opens a read-only handle.
 func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error) {
+	views, err := normalizeReaderViewPolicy(opts.Views)
+	if err != nil {
+		return nil, err
+	}
+
 	blobReadOpts := opts.BlobReadOptions
 	if blobReadOpts == (config.BlobReadOptions{}) {
 		blobReadOpts = config.DefaultBlobReadOptions()
@@ -77,6 +113,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
 		SSTHashVerifier:          opts.SSTHashVerifier,
+		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,
 		ValueStorageConfig: config.ValueStorageConfig{
 			ValueOptions:    config.DefaultValueOptions(),
@@ -86,4 +123,27 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		ManifestStorage: opts.ManifestStorage,
 	}
 	return newReader(ctx, store, ropts)
+}
+
+func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error) {
+	if policy.RefreshAfter < 0 {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: refresh_after=%s", ErrInvalidReaderOptions, policy.RefreshAfter)
+	}
+	if policy.SnapshotMaxAge < 0 {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: snapshot_max_age=%s", ErrInvalidReaderOptions, policy.SnapshotMaxAge)
+	}
+	if policy.IteratorMaxAge < 0 {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: iterator_max_age=%s", ErrInvalidReaderOptions, policy.IteratorMaxAge)
+	}
+
+	if policy.RefreshAfter == 0 {
+		policy.RefreshAfter = defaultReaderRefreshAfter
+	}
+	if policy.SnapshotMaxAge == 0 {
+		policy.SnapshotMaxAge = defaultReaderSnapshotMaxAge
+	}
+	if policy.IteratorMaxAge == 0 {
+		policy.IteratorMaxAge = defaultReaderIteratorMaxAge
+	}
+	return policy, nil
 }

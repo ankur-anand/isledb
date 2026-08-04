@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -20,12 +21,16 @@ var (
 	ErrCurrentTooLarge      = errors.New("manifest CURRENT exceeds size limit")
 	ErrInvalidWriterCommit  = errors.New("invalid writer commit")
 	ErrWriterCommitConflict = errors.New("writer commit identity conflict")
+	ErrInvalidRetirement    = errors.New("invalid retired object batch")
+	ErrRetirementHistory    = errors.New("retirement history unavailable")
+	ErrInvalidManifest      = errors.New("invalid manifest topology")
 )
 
 const (
 	defaultActiveEntryLimit = 64
 	defaultPageFanout       = 32
 	defaultMaxCurrentBytes  = 64 << 10
+	currentCASMaxRetries    = 8
 	maxWriterCommitIDBytes  = 128
 )
 
@@ -61,8 +66,13 @@ type replayCache struct {
 
 type Store struct {
 	storage Storage
-	mu      sync.Mutex
-	nextSeq uint64
+
+	// commitMu serializes read-modify-CAS operations issued through this Store.
+	// Writer and maintenance are independent fenced roles, but they share one
+	// CURRENT object and must not make each other exhaust optimistic retries.
+	commitMu sync.Mutex
+	mu       sync.Mutex
+	nextSeq  uint64
 
 	current     *Current
 	currentETag string
@@ -129,6 +139,9 @@ func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken
 }
 
 func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) (*FenceToken, error) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
 	const maxRetries = 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -213,6 +226,17 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func sleepBeforeCurrentCASRetry(ctx context.Context, attempt int) error {
+	shift := attempt
+	if shift > 5 {
+		shift = 5
+	}
+	delay := 2 * time.Millisecond * time.Duration(1<<shift)
+	jitterWindow := delay / 2
+	jitter := time.Duration(time.Now().UnixNano() % int64(jitterWindow+1))
+	return sleepWithContext(ctx, delay/2+jitter)
 }
 
 func (s *Store) writeFenceClaimEntry(ctx context.Context, role FenceRole, token *FenceToken) error {
@@ -336,9 +360,14 @@ func (s *Store) checkLocalFence(role FenceRole) error {
 }
 
 func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, role FenceRole) error {
-	const maxRetries = 3
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	if err := validateRetiredObjects(entry); err != nil {
+		return err
+	}
+
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		var current *Current
 		var etag string
 		var err error
@@ -420,6 +449,11 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			return err
@@ -481,6 +515,9 @@ func validateWriterCommit(commit WriterCommit) error {
 	}
 	if commit.SSTable.ID == "" {
 		return fmt.Errorf("%w: empty sstable_id", ErrInvalidWriterCommit)
+	}
+	if commit.SSTable.Level != 0 {
+		return fmt.Errorf("%w: writer SST level=%d, want L0", ErrInvalidWriterCommit, commit.SSTable.Level)
 	}
 	if commit.SSTable.SeqHi < commit.SSTable.SeqLo {
 		return fmt.Errorf("%w: invalid sequence range %d-%d", ErrInvalidWriterCommit,
@@ -570,10 +607,11 @@ func writerCommitFingerprint(sstable *SSTMeta, changeBatch *ChangeBatchMeta) (st
 	return fmt.Sprintf("sha256:%x", sum[:]), nil
 }
 
-func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []string) (*ManifestLogEntry, error) {
+func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []string, retired []RetiredObject) (*ManifestLogEntry, error) {
 	entry := &ManifestLogEntry{
 		Op:               LogOpRemoveSSTable,
 		RemoveSSTableIDs: sstableIDs,
+		RetiredObjects:   retired,
 	}
 	if err := s.AppendWithCompactorFence(ctx, entry); err != nil {
 		return nil, err
@@ -581,15 +619,130 @@ func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []
 	return entry, nil
 }
 
-func (s *Store) AppendCompactionWithFence(ctx context.Context, payload CompactionLogPayload) (*ManifestLogEntry, error) {
+func (s *Store) AppendCompactionWithFence(ctx context.Context, payload CompactionLogPayload, retired []RetiredObject) (*ManifestLogEntry, error) {
+	if err := validateCompactionPayload(payload); err != nil {
+		return nil, err
+	}
 	entry := &ManifestLogEntry{
-		Op:         LogOpCompaction,
-		Compaction: &payload,
+		Op:             LogOpCompaction,
+		Compaction:     &payload,
+		RetiredObjects: retired,
 	}
 	if err := s.AppendWithCompactorFence(ctx, entry); err != nil {
 		return nil, err
 	}
 	return entry, nil
+}
+
+func validateCompactionPayload(payload CompactionLogPayload) error {
+	if payload.SourceLevel == ^uint32(0) || payload.DestinationLevel != payload.SourceLevel+1 {
+		return fmt.Errorf("%w: compaction source=L%d destination=L%d must target the adjacent level",
+			ErrInvalidManifest, payload.SourceLevel, payload.DestinationLevel)
+	}
+	if len(payload.RemoveSSTableIDs) == 0 {
+		return fmt.Errorf("%w: compaction has no inputs", ErrInvalidManifest)
+	}
+	if len(payload.RemoveSSTableIDs) > MaxRetiredObjectsPerEntry || len(payload.AddSSTables) > MaxRetiredObjectsPerEntry {
+		return fmt.Errorf("%w: compaction inputs=%d outputs=%d max=%d", ErrInvalidManifest,
+			len(payload.RemoveSSTableIDs), len(payload.AddSSTables), MaxRetiredObjectsPerEntry)
+	}
+	seen := make(map[string]struct{}, len(payload.RemoveSSTableIDs))
+	for _, id := range payload.RemoveSSTableIDs {
+		if id == "" {
+			return fmt.Errorf("%w: empty compaction input id", ErrInvalidManifest)
+		}
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("%w: duplicate compaction input id=%q", ErrInvalidManifest, id)
+		}
+		seen[id] = struct{}{}
+	}
+	outputs := append([]SSTMeta(nil), payload.AddSSTables...)
+	for _, sst := range outputs {
+		if sst.ID == "" || sst.Level != payload.DestinationLevel {
+			return fmt.Errorf("%w: output id=%q level=%d destination=%d", ErrInvalidManifest,
+				sst.ID, sst.Level, payload.DestinationLevel)
+		}
+	}
+	sort.Slice(outputs, func(i, j int) bool {
+		return bytes.Compare(outputs[i].MinKey, outputs[j].MinKey) < 0
+	})
+	for i := 1; i < len(outputs); i++ {
+		if bytes.Compare(outputs[i-1].MaxKey, outputs[i].MinKey) >= 0 {
+			return fmt.Errorf("%w: overlapping compaction outputs %q and %q", ErrInvalidManifest,
+				outputs[i-1].ID, outputs[i].ID)
+		}
+	}
+	return nil
+}
+
+func validateReplayEntry(entry *ManifestLogEntry) error {
+	if entry == nil || entry.Op != LogOpCompaction {
+		return nil
+	}
+	if entry.Compaction == nil {
+		return fmt.Errorf("%w: compaction entry seq=%d has no payload", ErrInvalidManifest, entry.Seq)
+	}
+	if err := validateCompactionPayload(*entry.Compaction); err != nil {
+		return fmt.Errorf("compaction entry seq=%d: %w", entry.Seq, err)
+	}
+	return nil
+}
+
+func validateRetiredObjects(entry *ManifestLogEntry) error {
+	if entry == nil {
+		return fmt.Errorf("%w: nil manifest entry", ErrInvalidRetirement)
+	}
+	if len(entry.RetiredObjects) > MaxRetiredObjectsPerEntry {
+		return fmt.Errorf("%w: count=%d max=%d", ErrInvalidRetirement, len(entry.RetiredObjects), MaxRetiredObjectsPerEntry)
+	}
+
+	removed := make(map[string]struct{})
+	switch entry.Op {
+	case LogOpRemoveSSTable:
+		for _, id := range entry.RemoveSSTableIDs {
+			removed[id] = struct{}{}
+		}
+	case LogOpCompaction:
+		if entry.Compaction != nil {
+			added := make(map[string]struct{}, len(entry.Compaction.AddSSTables))
+			for _, sst := range entry.Compaction.AddSSTables {
+				added[sst.ID] = struct{}{}
+			}
+			for _, id := range entry.Compaction.RemoveSSTableIDs {
+				if _, stillLive := added[id]; !stillLive {
+					removed[id] = struct{}{}
+				}
+			}
+		}
+	}
+
+	retiredSSTs := make(map[string]struct{}, len(entry.RetiredObjects))
+	seenKeys := make(map[string]struct{}, len(entry.RetiredObjects))
+	for _, retired := range entry.RetiredObjects {
+		if retired.Kind != RetiredObjectSST && retired.Kind != RetiredObjectChangeBatch {
+			return fmt.Errorf("%w: unsupported kind=%q", ErrInvalidRetirement, retired.Kind)
+		}
+		if retired.ID == "" || retired.Key == "" || retired.NotBefore.IsZero() || retired.Size < 0 {
+			return fmt.Errorf("%w: incomplete object kind=%q id=%q key=%q", ErrInvalidRetirement, retired.Kind, retired.ID, retired.Key)
+		}
+		if _, exists := seenKeys[retired.Key]; exists {
+			return fmt.Errorf("%w: duplicate key=%q", ErrInvalidRetirement, retired.Key)
+		}
+		seenKeys[retired.Key] = struct{}{}
+		if retired.Kind == RetiredObjectSST {
+			if _, exists := removed[retired.ID]; !exists {
+				return fmt.Errorf("%w: sst id=%q is not removed by entry", ErrInvalidRetirement, retired.ID)
+			}
+			retiredSSTs[retired.ID] = struct{}{}
+		}
+	}
+
+	for id := range removed {
+		if _, exists := retiredSSTs[id]; !exists {
+			return fmt.Errorf("%w: removed sst id=%q has no retirement record", ErrInvalidRetirement, id)
+		}
+	}
+	return nil
 }
 
 func (s *Store) activeLimit() int {
@@ -781,10 +934,19 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	// Attempt incremental replay: if the snapshot and log window base haven't
 	// changed, we only need to read the new delta entries.
 	if m, ok := s.tryIncrementalReplay(ctx, current); ok {
+		if err := m.ValidateLevels(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+		}
 		return m, nil
 	}
-
-	return s.fullReplay(ctx, current)
+	m, err := s.fullReplay(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ValidateLevels(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
+	return m, nil
 }
 
 // tryIncrementalReplay checks whether we can avoid a full replay by applying
@@ -859,6 +1021,9 @@ func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Ma
 			continue
 		}
 
+		if err := validateReplayEntry(entry); err != nil {
+			return nil, false
+		}
 		m = ApplyLogEntry(m, entry)
 	}
 
@@ -1002,6 +1167,9 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 			continue
 		}
 
+		if err := validateReplayEntry(entry); err != nil {
+			return nil, err
+		}
 		m = ApplyLogEntry(m, entry)
 	}
 
@@ -1080,6 +1248,41 @@ func (s *Store) ReadEntry(ctx context.Context, seq uint64) (*ManifestLogEntry, e
 	return entries[0], nil
 }
 
+// ReadRetirementEntries returns a bounded contiguous manifest range used by
+// deterministic object reclamation. head is the first uncommitted sequence.
+func (s *Store) ReadRetirementEntries(ctx context.Context, start uint64, limit int) (entries []*ManifestLogEntry, head uint64, err error) {
+	if limit <= 0 {
+		limit = MaxRetiredObjectsPerEntry
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+
+	current, err := s.readCurrent(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if current == nil {
+		return nil, 0, nil
+	}
+	if start < current.RetirementLogStart {
+		return nil, current.NextSeq, fmt.Errorf("%w: start=%d retained_from=%d", ErrRetirementHistory, start, current.RetirementLogStart)
+	}
+	if start >= current.NextSeq {
+		return nil, current.NextSeq, nil
+	}
+
+	end := start + uint64(limit)
+	if end < start || end > current.NextSeq {
+		end = current.NextSeq
+	}
+	entries, err = s.entriesInRange(ctx, current, start, end)
+	if err != nil {
+		return nil, current.NextSeq, err
+	}
+	return entries, current.NextSeq, nil
+}
+
 func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) {
 	if m == nil {
 		return "", errors.New("nil manifest")
@@ -1102,8 +1305,7 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	manifestNextSeq := m.LogSeq + 1
 	if m.LogSeq == 0 &&
 		len(m.L0SSTs) == 0 &&
-		len(m.SortedRuns) == 0 &&
-		m.NextSortedRunID == 0 &&
+		len(m.Levels) == 0 &&
 		m.WriterFence == nil &&
 		m.CompactorFence == nil &&
 		m.NextEpoch <= 1 {
@@ -1128,6 +1330,12 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 	if err != nil {
 		return "", err
 	}
+
+	// Snapshot upload is immutable and may overlap normal commits. Serialize
+	// only the visibility CAS; a concurrent commit makes this candidate stale
+	// and the caller can retry from a fresh manifest.
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 
 	if current == nil {
 		current = &Current{NextEpoch: m.NextEpoch}
@@ -1195,10 +1403,14 @@ func retainedEntryFloor(current *Current) uint64 {
 	if current == nil {
 		return 0
 	}
-	if current.ChangeFeedLogStart < current.LogSeqStart {
-		return current.ChangeFeedLogStart
+	floor := current.LogSeqStart
+	if current.ChangeFeedLogStart < floor {
+		floor = current.ChangeFeedLogStart
 	}
-	return current.LogSeqStart
+	if current.RetirementLogStart < floor {
+		floor = current.RetirementLogStart
+	}
+	return floor
 }
 
 func currentNextSeq(current *Current) uint64 {
@@ -1472,9 +1684,10 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 // retained manifest entry refs below the new floor. The floor is clamped to
 // [current.change_feed_log_start, current.next_seq].
 func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
-	const maxRetries = 3
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil {
 			return nil, err
@@ -1508,6 +1721,62 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, tok
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			}
+			return nil, err
+		}
+		return updated, nil
+	}
+
+	return nil, ErrFenceConflict
+}
+
+// AdvanceRetirementLogStart records that deterministic GC has consumed every
+// manifest entry below floor. It never moves the floor backwards.
+func (s *Store) AdvanceRetirementLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
+		current, etag, err := s.readCurrentWithETag(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if current == nil {
+			return nil, nil
+		}
+		if err := checkFenceToken(token, current.CompactorFence); err != nil {
+			return nil, err
+		}
+
+		updated := current.Clone()
+		if floor < updated.RetirementLogStart {
+			floor = updated.RetirementLogStart
+		}
+		if floor > updated.NextSeq {
+			floor = updated.NextSeq
+		}
+		if floor == updated.RetirementLogStart {
+			return updated, nil
+		}
+
+		updated.RetirementLogStart = floor
+		retainedFrom := retainedEntryFloor(updated)
+		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, retainedFrom)
+		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, retainedFrom)
+
+		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
+			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return nil, err
+					}
+				}
 				continue
 			}
 			return nil, err

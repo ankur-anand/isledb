@@ -211,6 +211,55 @@ func TestClaimCompactor_WritesFenceClaimEntry(t *testing.T) {
 	}
 }
 
+func TestValidateCompactionPayloadRequiresAdjacentLevel(t *testing.T) {
+	tests := []CompactionLogPayload{
+		{
+			RemoveSSTableIDs: []string{"l1-a"},
+			SourceLevel:      1,
+			DestinationLevel: 3,
+			AddSSTables:      []SSTMeta{{ID: "l3-a", Level: 3, MinKey: []byte("a"), MaxKey: []byte("z")}},
+		},
+		{
+			RemoveSSTableIDs: []string{"last"},
+			SourceLevel:      ^uint32(0),
+			DestinationLevel: 0,
+		},
+	}
+
+	for _, payload := range tests {
+		err := validateCompactionPayload(payload)
+		if !errors.Is(err, ErrInvalidManifest) {
+			t.Fatalf("validateCompactionPayload(%+v) error = %v, want %v", payload, err, ErrInvalidManifest)
+		}
+	}
+}
+
+func TestReplayRejectsNonAdjacentCompactionEntry(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	ms := NewStore(store)
+	backend := NewBlobStoreBackend(store)
+	commitEntriesForTest(t, ctx, backend, []*ManifestLogEntry{{
+		ID:    ksuid.New(),
+		Seq:   1,
+		Role:  FenceRoleCompactor,
+		Epoch: 1,
+		Op:    LogOpCompaction,
+		Compaction: &CompactionLogPayload{
+			RemoveSSTableIDs: []string{"l1-a"},
+			SourceLevel:      1,
+			DestinationLevel: 3,
+			AddSSTables:      []SSTMeta{{ID: "l3-a", Level: 3, MinKey: []byte("a"), MaxKey: []byte("z")}},
+		},
+	}})
+
+	if _, err := ms.Replay(ctx); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("Replay error = %v, want %v", err, ErrInvalidManifest)
+	}
+}
+
 func TestAppendWithWriterFence_SetsRoleAndEpoch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
@@ -417,7 +466,9 @@ func TestReplay_IndependentWriterCompactorFiltering(t *testing.T) {
 			Epoch: 1,
 			Op:    LogOpCompaction,
 			Compaction: &CompactionLogPayload{
-				AddSSTables: []SSTMeta{{ID: "compacted.sst", Epoch: 1, Level: 1}},
+				RemoveSSTableIDs: []string{"compaction-input"},
+				DestinationLevel: 1,
+				AddSSTables:      []SSTMeta{{ID: "compacted.sst", Epoch: 1, Level: 1}},
 			},
 		},
 	}
@@ -436,11 +487,11 @@ func TestReplay_IndependentWriterCompactorFiltering(t *testing.T) {
 		t.Errorf("expected valid-writer.sst, got %s", manifest.L0SSTs[0].ID)
 	}
 
-	if len(manifest.SortedRuns) != 1 {
-		t.Fatalf("expected 1 sorted run, got %d", len(manifest.SortedRuns))
+	if len(manifest.Levels) != 1 {
+		t.Fatalf("expected 1 level, got %d", len(manifest.Levels))
 	}
-	if manifest.SortedRuns[0].SSTs[0].ID != "compacted.sst" {
-		t.Errorf("expected compacted.sst, got %s", manifest.SortedRuns[0].SSTs[0].ID)
+	if manifest.Levels[0].SSTs[0].ID != "compacted.sst" {
+		t.Errorf("expected compacted.sst, got %s", manifest.Levels[0].SSTs[0].ID)
 	}
 }
 
@@ -663,7 +714,9 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 			Epoch: 2,
 			Op:    LogOpCompaction,
 			Compaction: &CompactionLogPayload{
-				AddSSTables: []SSTMeta{{ID: "stale-compacted.sst", Epoch: 2, Level: 1}},
+				RemoveSSTableIDs: []string{"stale-input"},
+				DestinationLevel: 1,
+				AddSSTables:      []SSTMeta{{ID: "stale-compacted.sst", Epoch: 2, Level: 1}},
 			},
 		},
 		{
@@ -673,7 +726,9 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 			Epoch: 3,
 			Op:    LogOpCompaction,
 			Compaction: &CompactionLogPayload{
-				AddSSTables: []SSTMeta{{ID: "valid-compacted.sst", Epoch: 3, Level: 1}},
+				RemoveSSTableIDs: []string{"valid-input"},
+				DestinationLevel: 1,
+				AddSSTables:      []SSTMeta{{ID: "valid-compacted.sst", Epoch: 3, Level: 1}},
 			},
 		},
 	}
@@ -685,11 +740,11 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	if len(manifest.SortedRuns) != 1 {
-		t.Fatalf("expected 1 sorted run, got %d", len(manifest.SortedRuns))
+	if len(manifest.Levels) != 1 {
+		t.Fatalf("expected 1 level, got %d", len(manifest.Levels))
 	}
-	if manifest.SortedRuns[0].SSTs[0].ID != "valid-compacted.sst" {
-		t.Errorf("expected valid-compacted.sst, got %s", manifest.SortedRuns[0].SSTs[0].ID)
+	if manifest.Levels[0].SSTs[0].ID != "valid-compacted.sst" {
+		t.Errorf("expected valid-compacted.sst, got %s", manifest.Levels[0].SSTs[0].ID)
 	}
 }
 
@@ -841,6 +896,7 @@ func TestWriteSnapshot_PrunesRefsBelowChangeFeedFloor(t *testing.T) {
 		NextEpoch:          1,
 		LogSeqStart:        0,
 		ChangeFeedLogStart: 2,
+		RetirementLogStart: 2,
 		NextSeq:            4,
 		ActiveEntries: []ManifestLogEntry{
 			testManifestEntry(1),
@@ -888,6 +944,7 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 		NextEpoch:          1,
 		LogSeqStart:        0,
 		ChangeFeedLogStart: 0,
+		RetirementLogStart: 2,
 		NextSeq:            2,
 		ActiveEntries: []ManifestLogEntry{
 			testManifestEntry(0),
@@ -908,6 +965,37 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	}
 	if len(current.ActiveEntries) != 0 {
 		t.Fatalf("expected active entries below new floor to be pruned, got=%d", len(current.ActiveEntries))
+	}
+}
+
+func TestWriteSnapshotKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("test")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        0,
+		ChangeFeedLogStart: 2,
+		RetirementLogStart: 0,
+		NextSeq:            2,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(0),
+			testManifestEntry(1),
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if got := len(current.ActiveEntries); got != 2 {
+		t.Fatalf("active entries=%d, want 2 while retirement floor is unconsumed", got)
 	}
 }
 

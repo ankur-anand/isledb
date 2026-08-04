@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/ankur-anand/isledb/manifest"
 )
 
 var ErrSnapshotClosed = errors.New("snapshot closed")
+var ErrSnapshotExpired = errors.New("snapshot expired")
+var ErrIteratorExpired = errors.New("iterator expired")
 var ErrReaderClosed = errors.New("reader closed")
 
 // Version is an opaque identifier for one loaded visible state.
@@ -30,17 +33,19 @@ func (v Version) IsZero() bool {
 // A Snapshot does not refresh. It keeps reading the same visible state even if
 // its parent Reader is refreshed later.
 type Snapshot struct {
-	reader   *Reader
-	manifest *Manifest
-	version  Version
-	closed   atomic.Bool
+	reader    *Reader
+	manifest  *Manifest
+	version   Version
+	expiresAt time.Time
+	closed    atomic.Bool
 }
 
-func newSnapshot(reader *Reader, m *Manifest, current *manifest.Current) *Snapshot {
+func newSnapshot(reader *Reader, m *Manifest, version Version, expiresAt time.Time) *Snapshot {
 	return &Snapshot{
-		reader:   reader,
-		manifest: m,
-		version:  versionFromCurrent(current),
+		reader:    reader,
+		manifest:  m,
+		version:   version,
+		expiresAt: expiresAt,
 	}
 }
 
@@ -58,7 +63,9 @@ func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	}
 	defer done()
 
-	return s.reader.getWithManifest(ctx, s.manifest, key)
+	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
+	defer cancel()
+	return s.reader.getWithManifest(readCtx, s.manifest, key)
 }
 
 func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
@@ -68,7 +75,8 @@ func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iter
 	}
 	defer done()
 
-	it, err := s.reader.newIteratorWithManifest(ctx, s.manifest, opts)
+	expiresAt := minTime(s.expiresAt, time.Now().Add(s.reader.viewPolicy.IteratorMaxAge))
+	it, err := s.reader.newIteratorWithManifest(ctx, s.manifest, opts, expiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +90,9 @@ func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit i
 	}
 	defer done()
 
-	return s.reader.scanInternalWithManifest(ctx, s.manifest, minKey, maxKey, limit)
+	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
+	defer cancel()
+	return s.reader.scanInternalWithManifest(readCtx, s.manifest, minKey, maxKey, limit)
 }
 
 func (s *Snapshot) Close() error {
@@ -100,6 +110,9 @@ func (s *Snapshot) ensureOpen() error {
 	if s.closed.Load() {
 		return ErrSnapshotClosed
 	}
+	if !time.Now().Before(s.expiresAt) {
+		return ErrSnapshotExpired
+	}
 	return nil
 }
 
@@ -116,6 +129,13 @@ func (s *Snapshot) beginRead() (func(), error) {
 		return nil, err
 	}
 	return done, nil
+}
+
+func minTime(left, right time.Time) time.Time {
+	if left.Before(right) {
+		return left
+	}
+	return right
 }
 
 func versionFromCurrent(current *manifest.Current) Version {

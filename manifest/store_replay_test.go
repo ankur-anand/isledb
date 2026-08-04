@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
@@ -230,8 +231,8 @@ func TestIncrementalReplay_ConsistencyWithFullReplay(t *testing.T) {
 	if mIncremental.LogSeq != mFull.LogSeq {
 		t.Fatalf("LogSeq mismatch: incremental=%d full=%d", mIncremental.LogSeq, mFull.LogSeq)
 	}
-	if mIncremental.NextSortedRunID != mFull.NextSortedRunID {
-		t.Fatalf("NextSortedRunID mismatch: incremental=%d full=%d", mIncremental.NextSortedRunID, mFull.NextSortedRunID)
+	if len(mIncremental.Levels) != len(mFull.Levels) {
+		t.Fatalf("level count mismatch: incremental=%d full=%d", len(mIncremental.Levels), len(mFull.Levels))
 	}
 
 	for _, sst := range mFull.L0SSTs {
@@ -276,14 +277,22 @@ func TestIncrementalReplay_WithCompaction(t *testing.T) {
 	}
 	compactionPayload := CompactionLogPayload{
 		RemoveSSTableIDs: removeIDs,
-		AddSortedRun: &SortedRun{
-			ID: m1.NextSortedRunID,
-			SSTs: []SSTMeta{
-				{ID: "compacted-0", Epoch: 1, MinKey: []byte("l0-00"), MaxKey: []byte("l0-03z")},
-			},
+		SourceLevel:      0,
+		DestinationLevel: 1,
+		AddSSTables: []SSTMeta{
+			{ID: "compacted-0", Epoch: 1, Level: 1, MinKey: []byte("l0-00"), MaxKey: []byte("l0-03z")},
 		},
 	}
-	if _, err := ms.AppendCompactionWithFence(ctx, compactionPayload); err != nil {
+	retired := make([]RetiredObject, 0, len(removeIDs))
+	for _, id := range removeIDs {
+		retired = append(retired, RetiredObject{
+			Kind:      RetiredObjectSST,
+			ID:        id,
+			Key:       "sstable/" + id,
+			NotBefore: time.Now().UTC().Add(time.Hour),
+		})
+	}
+	if _, err := ms.AppendCompactionWithFence(ctx, compactionPayload, retired); err != nil {
 		t.Fatalf("append compaction: %v", err)
 	}
 
@@ -295,11 +304,11 @@ func TestIncrementalReplay_WithCompaction(t *testing.T) {
 	if len(m2.L0SSTs) != 0 {
 		t.Fatalf("expected 0 L0 SSTs after compaction, got %d", len(m2.L0SSTs))
 	}
-	if len(m2.SortedRuns) != 1 {
-		t.Fatalf("expected 1 sorted run after compaction, got %d", len(m2.SortedRuns))
+	if len(m2.Levels) != 1 {
+		t.Fatalf("expected 1 level after compaction, got %d", len(m2.Levels))
 	}
 	if m2.LookupSST("compacted-0") == nil {
-		t.Fatal("missing compacted-0 in sorted run")
+		t.Fatal("missing compacted-0 in L1")
 	}
 
 	ms2 := NewStore(bs)
@@ -310,8 +319,8 @@ func TestIncrementalReplay_WithCompaction(t *testing.T) {
 	if len(mFull.L0SSTs) != len(m2.L0SSTs) {
 		t.Fatalf("L0 mismatch: incremental=%d full=%d", len(m2.L0SSTs), len(mFull.L0SSTs))
 	}
-	if len(mFull.SortedRuns) != len(m2.SortedRuns) {
-		t.Fatalf("SortedRuns mismatch: incremental=%d full=%d", len(m2.SortedRuns), len(mFull.SortedRuns))
+	if len(mFull.Levels) != len(m2.Levels) {
+		t.Fatalf("levels mismatch: incremental=%d full=%d", len(m2.Levels), len(mFull.Levels))
 	}
 }
 

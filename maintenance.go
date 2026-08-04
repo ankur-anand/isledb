@@ -38,6 +38,8 @@ type MaintenanceOptions struct {
 
 	Compaction CompactionPolicy
 
+	GarbageCollection GarbageCollectionPolicy
+
 	// Retention is nil by default because enabling it removes historical data.
 	Retention *RetentionPolicy
 
@@ -48,14 +50,14 @@ type MaintenanceOptions struct {
 	OnError func(error)
 }
 
-// CompactionPolicy controls L0 and sorted-run compaction.
+// CompactionPolicy controls L0 and leveled compaction.
 type CompactionPolicy struct {
 	InputReadParallelism        int
 	L0SSTCount                  int
 	MaxConsecutiveL0Compactions int
-	MinSortedRunSources         int
-	MaxSortedRunSources         int
-	SortedRunSizeRatio          int
+	BaseLevelBytes              int64
+	LevelSizeMultiplier         int
+	MaxInputSSTs                int
 	TargetSSTBytes              int64
 	BloomBitsPerKey             int
 	BlockBytes                  int
@@ -64,6 +66,13 @@ type CompactionPolicy struct {
 	SSTHashVerifier             SSTHashVerifier
 	OnCompactionStart           func(CompactionJob)
 	OnCompactionEnd             func(CompactionJob, error)
+}
+
+// GarbageCollectionPolicy controls deterministic deletion of objects retired
+// by committed manifest entries.
+type GarbageCollectionPolicy struct {
+	DeleteBatchSize int
+	GracePeriod     time.Duration
 }
 
 // RetentionPolicy controls removal of old SSTs. It is enabled only when the
@@ -120,13 +129,17 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 			InputReadParallelism:        compaction.InputReadParallelism,
 			L0SSTCount:                  compaction.Trigger.L0SSTCount,
 			MaxConsecutiveL0Compactions: compaction.Trigger.MaxConsecutiveL0Compactions,
-			MinSortedRunSources:         compaction.Trigger.MinSources,
-			MaxSortedRunSources:         compaction.Trigger.MaxSources,
-			SortedRunSizeRatio:          compaction.Trigger.SizeRatio,
+			BaseLevelBytes:              compaction.Trigger.BaseLevelBytes,
+			LevelSizeMultiplier:         compaction.Trigger.LevelSizeMultiplier,
+			MaxInputSSTs:                compaction.Trigger.MaxInputSSTs,
 			TargetSSTBytes:              compaction.Output.TargetSSTBytes,
 			BloomBitsPerKey:             compaction.Output.BloomBitsPerKey,
 			BlockBytes:                  compaction.Output.BlockBytes,
 			Compression:                 compaction.Output.Compression,
+		},
+		GarbageCollection: GarbageCollectionPolicy{
+			DeleteBatchSize: compaction.GCDeleteBatchSize,
+			GracePeriod:     compaction.GCGracePeriod,
 		},
 	}
 }
@@ -180,7 +193,7 @@ type Maintenance struct {
 	release     func()
 }
 
-func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcMarks manifest.GCMarkStorage, opts MaintenanceOptions) (*Maintenance, error) {
+func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcCursor manifest.GCCursorStorage, opts MaintenanceOptions) (*Maintenance, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -210,14 +223,14 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 		runGate:     make(chan struct{}, 1),
 	}
 
-	compactorOpts := m.compactorOptions(gcMarks)
+	compactorOpts := m.compactorOptions(gcCursor)
 	m.compactor, err = newCompactorWithFence(ctx, store, manifestLog, compactorOpts, token)
 	if err != nil {
 		return nil, fmt.Errorf("open compaction stage: %w", err)
 	}
 
 	if opts.Retention != nil {
-		retentionOpts := m.retentionOptions(gcMarks)
+		retentionOpts := m.retentionOptions(gcCursor)
 		m.retention, err = newRetentionCompactorWithFence(ctx, store, manifestLog, retentionOpts, token)
 		if err != nil {
 			_ = m.compactor.Close(ctx)
@@ -248,10 +261,19 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	if opts.Retention != nil && opts.Retention.Mode != RetentionByAge && opts.Retention.Mode != RetentionByTimeWindow {
 		return MaintenanceOptions{}, fmt.Errorf("%w: retention mode=%d", ErrInvalidMaintenanceOptions, opts.Retention.Mode)
 	}
+	if opts.GarbageCollection.DeleteBatchSize < 0 || opts.GarbageCollection.GracePeriod < 0 {
+		return MaintenanceOptions{}, fmt.Errorf("%w: invalid garbage collection policy", ErrInvalidMaintenanceOptions)
+	}
+	if opts.GarbageCollection.DeleteBatchSize == 0 {
+		opts.GarbageCollection.DeleteBatchSize = defaults.GarbageCollection.DeleteBatchSize
+	}
+	if opts.GarbageCollection.GracePeriod == 0 {
+		opts.GarbageCollection.GracePeriod = defaults.GarbageCollection.GracePeriod
+	}
 	return opts, nil
 }
 
-func (m *Maintenance) compactorOptions(gcMarks manifest.GCMarkStorage) compactorOptions {
+func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compactorOptions {
 	p := m.opts.Compaction
 	return compactorOptions{
 		OwnerID:              m.opts.OwnerID,
@@ -260,9 +282,9 @@ func (m *Maintenance) compactorOptions(gcMarks manifest.GCMarkStorage) compactor
 			CheckInterval:               m.opts.Every,
 			L0SSTCount:                  p.L0SSTCount,
 			MaxConsecutiveL0Compactions: p.MaxConsecutiveL0Compactions,
-			MinSources:                  p.MinSortedRunSources,
-			MaxSources:                  p.MaxSortedRunSources,
-			SizeRatio:                   p.SortedRunSizeRatio,
+			BaseLevelBytes:              p.BaseLevelBytes,
+			LevelSizeMultiplier:         p.LevelSizeMultiplier,
+			MaxInputSSTs:                p.MaxInputSSTs,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  p.TargetSSTBytes,
@@ -276,11 +298,13 @@ func (m *Maintenance) compactorOptions(gcMarks manifest.GCMarkStorage) compactor
 		},
 		OnCompactionStart: p.OnCompactionStart,
 		OnCompactionEnd:   m.recordCompaction,
-		GCMarkStorage:     gcMarks,
+		GCCursorStorage:   gcCursor,
+		GCDeleteBatchSize: m.opts.GarbageCollection.DeleteBatchSize,
+		GCGracePeriod:     m.opts.GarbageCollection.GracePeriod,
 	}
 }
 
-func (m *Maintenance) retentionOptions(gcMarks manifest.GCMarkStorage) retentionCompactorOptions {
+func (m *Maintenance) retentionOptions(gcCursor manifest.GCCursorStorage) retentionCompactorOptions {
 	p := m.opts.Retention
 	mode := compactByAge
 	if p.Mode == RetentionByTimeWindow {
@@ -294,7 +318,9 @@ func (m *Maintenance) retentionOptions(gcMarks manifest.GCMarkStorage) retention
 		CheckInterval:      m.opts.Every,
 		SegmentDuration:    p.Window,
 		OnCleanup:          m.recordRetention,
-		GCMarkStorage:      gcMarks,
+		GCCursorStorage:    gcCursor,
+		GCDeleteBatchSize:  m.opts.GarbageCollection.DeleteBatchSize,
+		GCGracePeriod:      m.opts.GarbageCollection.GracePeriod,
 	}
 }
 
@@ -524,11 +550,9 @@ func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
 		if m.currentStats != nil {
 			m.currentStats.CompactionJobs++
 			m.currentStats.CompactionInputSSTs += len(job.InputSSTs)
-			if job.OutputRun != nil {
-				m.currentStats.CompactionOutputSSTs += len(job.OutputRun.SSTs)
-				for _, sst := range job.OutputRun.SSTs {
-					m.currentStats.CompactionOutputBytes += sst.Size
-				}
+			m.currentStats.CompactionOutputSSTs += len(job.OutputSSTs)
+			for _, sst := range job.OutputSSTs {
+				m.currentStats.CompactionOutputBytes += sst.Size
 			}
 		}
 		m.statsMu.Unlock()

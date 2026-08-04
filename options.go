@@ -145,6 +145,8 @@ type readerOptions struct {
 	// If provided and the SST has a signature, verification is enforced.
 	SSTHashVerifier SSTHashVerifier
 
+	ViewPolicy ReaderViewPolicy
+
 	Metrics *ReaderMetrics
 }
 
@@ -152,6 +154,11 @@ func defaultReaderOptions() readerOptions {
 	return readerOptions{
 		SSTCacheSize:  defaultSSTCacheSize,
 		BlobCacheSize: defaultBlobCacheSize,
+		ViewPolicy: ReaderViewPolicy{
+			RefreshAfter:   defaultReaderRefreshAfter,
+			SnapshotMaxAge: defaultReaderSnapshotMaxAge,
+			IteratorMaxAge: defaultReaderIteratorMaxAge,
+		},
 	}
 }
 
@@ -175,8 +182,9 @@ type compactorOptions struct {
 	OnCompactionStart func(CompactionJob)
 	OnCompactionEnd   func(CompactionJob, error)
 
-	// GCMarkStorage allows using a custom storage backend for GC mark state.
-	GCMarkStorage manifest.GCMarkStorage
+	GCCursorStorage   manifest.GCCursorStorage
+	GCDeleteBatchSize int
+	GCGracePeriod     time.Duration
 }
 
 type compactionTriggerOptions struct {
@@ -186,17 +194,19 @@ type compactionTriggerOptions struct {
 	// L0SSTCount is the number of L0 SSTs that triggers an L0 merge.
 	L0SSTCount int
 
-	// MaxConsecutiveL0Compactions is the fairness budget for L0 compaction.
-	// After this many L0 jobs, an eligible sorted-run merge gets one turn
-	// even if L0 is still over threshold. Values <= 0 use the default.
+	// MaxConsecutiveL0Compactions bounds L0 priority when a lower level is
+	// already over budget.
 	MaxConsecutiveL0Compactions int
 
-	// MinSources and MaxSources bound consecutive sorted-run merge candidates.
-	MinSources int
-	MaxSources int
+	// BaseLevelBytes is the target size of L1. Each subsequent level target is
+	// multiplied by LevelSizeMultiplier.
+	BaseLevelBytes int64
 
-	// SizeRatio is the similarity threshold for consecutive sorted-run merges.
-	SizeRatio int
+	// LevelSizeMultiplier controls geometric growth of L1..Ln.
+	LevelSizeMultiplier int
+
+	// MaxInputSSTs bounds one atomic compaction and its retirement record.
+	MaxInputSSTs int
 }
 
 type compactionOutputOptions struct {
@@ -224,13 +234,15 @@ type compactionSafetyOptions struct {
 func defaultCompactorOptions() compactorOptions {
 	return compactorOptions{
 		InputReadParallelism: 4,
+		GCDeleteBatchSize:    defaultSSTSweepBatchSize,
+		GCGracePeriod:        defaultSSTSweepGracePeriod,
 		Trigger: compactionTriggerOptions{
 			CheckInterval:               5 * time.Second,
 			L0SSTCount:                  8,
 			MaxConsecutiveL0Compactions: 4,
-			MinSources:                  4,
-			MaxSources:                  8,
-			SizeRatio:                   4,
+			BaseLevelBytes:              512 * 1024 * 1024,
+			LevelSizeMultiplier:         8,
+			MaxInputSSTs:                manifest.MaxRetiredObjectsPerEntry,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,

@@ -185,7 +185,9 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 		Epoch: 1,
 		Op:    LogOpCompaction,
 		Compaction: &CompactionLogPayload{
-			AddSSTables: []SSTMeta{{ID: "compactor-stale.sst", Epoch: 1, Level: 1}},
+			RemoveSSTableIDs: []string{"stale-input"},
+			DestinationLevel: 1,
+			AddSSTables:      []SSTMeta{{ID: "compactor-stale.sst", Epoch: 1, Level: 1}},
 		},
 	})
 	writeLogEntry(t, ctx, backend, &ManifestLogEntry{
@@ -194,7 +196,9 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 		Epoch: 2,
 		Op:    LogOpCompaction,
 		Compaction: &CompactionLogPayload{
-			AddSSTables: []SSTMeta{{ID: "compactor-valid.sst", Epoch: 2, Level: 1}},
+			RemoveSSTableIDs: []string{"valid-input"},
+			DestinationLevel: 1,
+			AddSSTables:      []SSTMeta{{ID: "compactor-valid.sst", Epoch: 2, Level: 1}},
 		},
 	})
 

@@ -3,6 +3,7 @@ package manifest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,49 @@ type appliedThenErrorStorage struct {
 	mu       sync.Mutex
 	failNext bool
 	failErr  error
+}
+
+type trackingCASStorage struct {
+	Storage
+
+	mu           sync.Mutex
+	activeWrites int
+	maxActive    int
+	conflicts    int
+}
+
+func (s *trackingCASStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	s.mu.Lock()
+	if s.conflicts > 0 {
+		s.conflicts--
+		s.mu.Unlock()
+		return "", ErrPreconditionFailed
+	}
+	s.activeWrites++
+	if s.activeWrites > s.maxActive {
+		s.maxActive = s.activeWrites
+	}
+	s.mu.Unlock()
+
+	time.Sleep(2 * time.Millisecond)
+	etag, err := s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
+
+	s.mu.Lock()
+	s.activeWrites--
+	s.mu.Unlock()
+	return etag, err
+}
+
+func (s *trackingCASStorage) armConflicts(count int) {
+	s.mu.Lock()
+	s.conflicts = count
+	s.mu.Unlock()
+}
+
+func (s *trackingCASStorage) maximumActiveWrites() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxActive
 }
 
 func (s *appliedThenErrorStorage) arm(err error) {
@@ -305,6 +349,101 @@ func TestAppendEntry_CASRetry_SucceedsWhenFenceValid(t *testing.T) {
 
 	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}); err != nil {
 		t.Fatalf("append add sstable: %v", err)
+	}
+}
+
+func TestAppendEntry_CASRetry_SurvivesTransientConflictBurst(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("cas-retry-burst")
+	defer store.Close()
+
+	tracked := &trackingCASStorage{Storage: NewBlobStoreBackend(store)}
+	ms := NewStoreWithStorage(tracked)
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+
+	tracked.armConflicts(4)
+	if _, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "burst.sst", Epoch: 1, Level: 0}); err != nil {
+		t.Fatalf("append after transient conflict burst: %v", err)
+	}
+}
+
+func TestStoreSerializesLocalWriterAndCompactorCAS(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("cas-local-roles")
+	defer store.Close()
+
+	tracked := &trackingCASStorage{Storage: NewBlobStoreBackend(store)}
+	ms := NewStoreWithStorage(tracked)
+	if _, err := ms.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := ms.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	compactorFence, err := ms.ClaimCompactor(ctx, "compactor-1")
+	if err != nil {
+		t.Fatalf("claim compactor: %v", err)
+	}
+
+	const commitsPerRole = 12
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		for i := 0; i < commitsPerRole; i++ {
+			_, err := ms.AppendAddSSTableWithFence(ctx, SSTMeta{
+				ID:    fmt.Sprintf("writer-%02d.sst", i),
+				Epoch: 1,
+				Level: 0,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	go func() {
+		<-start
+		for i := 0; i < commitsPerRole; i++ {
+			entry := &ManifestLogEntry{
+				Op: LogOpFenceClaim,
+				FenceClaim: &FenceClaimPayload{
+					Role:      FenceRoleCompactor,
+					Epoch:     compactorFence.Epoch,
+					Owner:     compactorFence.Owner,
+					ClaimedAt: compactorFence.ClaimedAt,
+				},
+			}
+			if err := ms.AppendWithCompactorFence(ctx, entry); err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	close(start)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent manifest mutation: %v", err)
+		}
+	}
+	if got := tracked.maximumActiveWrites(); got != 1 {
+		t.Fatalf("maximum concurrent CURRENT writes=%d, want 1", got)
+	}
+
+	replayed, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay committed entries: %v", err)
+	}
+	if got := replayed.L0SSTCount(); got != commitsPerRole {
+		t.Fatalf("L0 SST count=%d, want %d", got, commitsPerRole)
 	}
 }
 

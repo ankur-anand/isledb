@@ -27,13 +27,30 @@ func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms 
 		t.Fatalf("writeSST: %v", err)
 	}
 
-	res.Meta.Level = level
 	if _, err := store.Write(ctx, store.SSTPath(res.Meta.ID), res.SSTData); err != nil {
 		t.Fatalf("write sst: %v", err)
 	}
 
 	if _, err := ms.AppendAddSSTableWithFence(ctx, res.Meta); err != nil {
 		t.Fatalf("append manifest log: %v", err)
+	}
+	if level > 0 {
+		if ms.CompactorEpoch() == 0 {
+			if _, err := ms.ClaimCompactor(ctx, "reader-test-compactor"); err != nil {
+				t.Fatalf("claim compactor fence: %v", err)
+			}
+		}
+		for destination := uint32(1); destination <= uint32(level); destination++ {
+			res.Meta.Level = destination
+			if _, err := ms.AppendCompactionWithFence(ctx, manifest.CompactionLogPayload{
+				RemoveSSTableIDs: []string{res.Meta.ID},
+				SourceLevel:      destination - 1,
+				DestinationLevel: destination,
+				AddSSTables:      []manifest.SSTMeta{res.Meta},
+			}, nil); err != nil {
+				t.Fatalf("promote test sst to L%d: %v", destination, err)
+			}
+		}
 	}
 
 	return res

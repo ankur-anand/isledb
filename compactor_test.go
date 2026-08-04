@@ -257,9 +257,6 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	}
 	compactorOpts.OnCompactionEnd = func(job CompactionJob, err error) {
 		compactionEnded = true
-		if err != nil {
-		} else if job.OutputRun != nil {
-		}
 	}
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
@@ -288,8 +285,8 @@ func TestCompactor_L0Compaction(t *testing.T) {
 		t.Errorf("L0 still has %d SSTs after compaction", m.L0SSTCount())
 	}
 
-	if m.SortedRunCount() == 0 {
-		t.Error("no sorted runs created after compaction")
+	if len(m.Levels) == 0 {
+		t.Error("no compacted level created after compaction")
 	}
 
 }
@@ -570,17 +567,17 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 	m := compactor.manifest.Clone()
 	compactor.mu.Unlock()
 
-	if m.SortedRunCount() == 0 {
-		t.Fatal("no sorted runs created after compaction")
+	if len(m.Levels) == 0 {
+		t.Fatal("no compacted level created after compaction")
 	}
 
 	totalSSTs := 0
-	for _, sr := range m.SortedRuns {
-		totalSSTs += len(sr.SSTs)
+	for _, level := range m.Levels {
+		totalSSTs += len(level.SSTs)
 	}
 
 	if totalSSTs <= 1 {
-		t.Errorf("expected multiple SSTs in sorted runs, got %d", totalSSTs)
+		t.Errorf("expected multiple SSTs in compacted levels, got %d", totalSSTs)
 	}
 }
 
@@ -592,11 +589,11 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 
 	compactorOpts := compactorOptions{
 		Trigger: compactionTriggerOptions{
-			L0SSTCount:    2,
-			MinSources:    2,
-			MaxSources:    4,
-			SizeRatio:     4,
-			CheckInterval: time.Hour,
+			L0SSTCount:          2,
+			BaseLevelBytes:      512 * 1024 * 1024,
+			LevelSizeMultiplier: 8,
+			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
+			CheckInterval:       time.Hour,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -612,7 +609,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 
 	expectedData := make(map[string]string)
 
-	t.Run("Phase1_L0CompactionCreatesSortedRun", func(t *testing.T) {
+	t.Run("Phase1_L0CompactionCreatesLevel", func(t *testing.T) {
 		writer, err := newWriter(ctx, store, manifestStore, writerOpts)
 		if err != nil {
 			t.Fatalf("newWriter: %v", err)
@@ -664,8 +661,8 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		if m.L0SSTCount() != 0 {
 			t.Errorf("expected 0 L0 SSTs after compaction, got %d", m.L0SSTCount())
 		}
-		if m.SortedRunCount() != 1 {
-			t.Errorf("expected 1 sorted run, got %d", m.SortedRunCount())
+		if len(m.Levels) != 1 {
+			t.Errorf("expected 1 compacted level, got %d", len(m.Levels))
 		}
 
 	})
@@ -952,7 +949,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	})
 }
 
-func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
+func TestCompactor_RunOnceGivesLowerLevelsFairTurn(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()
 
@@ -987,8 +984,7 @@ func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
 
 	buildRunOpts := defaultCompactorOptions()
 	buildRunOpts.Trigger.L0SSTCount = 2
-	buildRunOpts.Trigger.MinSources = 100
-	buildRunOpts.Trigger.MaxSources = 100
+	buildRunOpts.Trigger.BaseLevelBytes = 1 << 60
 	buildRunOpts.Trigger.CheckInterval = time.Hour
 	buildRunOpts.Output.Compression = "none"
 	buildRunOpts.Output.TargetSSTBytes = 64 * 1024
@@ -1012,8 +1008,8 @@ func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay before fairness run: %v", err)
 	}
-	if before.SortedRunCount() != 2 || before.L0SSTCount() != 0 {
-		t.Fatalf("setup manifest l0=%d sorted_runs=%d, want l0=0 sorted_runs=2", before.L0SSTCount(), before.SortedRunCount())
+	if len(before.Levels) != 1 || before.L0SSTCount() != 0 {
+		t.Fatalf("setup manifest l0=%d levels=%d, want l0=0 levels=1", before.L0SSTCount(), len(before.Levels))
 	}
 
 	writeL0("initial-l0", 2)
@@ -1022,8 +1018,7 @@ func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
 	injectedL0 := false
 	fairOpts := defaultCompactorOptions()
 	fairOpts.Trigger.L0SSTCount = 2
-	fairOpts.Trigger.MinSources = 2
-	fairOpts.Trigger.MaxSources = 4
+	fairOpts.Trigger.BaseLevelBytes = 1
 	fairOpts.Trigger.MaxConsecutiveL0Compactions = 1
 	fairOpts.Trigger.CheckInterval = time.Hour
 	fairOpts.Output.Compression = "none"
@@ -1032,7 +1027,7 @@ func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
 		order = append(order, job.Type)
 	}
 	fairOpts.OnCompactionEnd = func(job CompactionJob, err error) {
-		if err != nil || job.Type != CompactionL0Flush || injectedL0 {
+		if err != nil || job.Type != CompactionL0ToL1 || injectedL0 {
 			return
 		}
 		injectedL0 = true
@@ -1050,13 +1045,13 @@ func TestCompactor_RunOnceGivesSortedRunsFairTurn(t *testing.T) {
 	}
 
 	if len(order) < 2 {
-		t.Fatalf("compaction order=%v, want at least L0 then sorted-run", order)
+		t.Fatalf("compaction order=%v, want at least L0 then lower level", order)
 	}
-	if order[0] != CompactionL0Flush {
+	if order[0] != CompactionL0ToL1 {
 		t.Fatalf("first compaction=%v, want L0", order[0])
 	}
-	if order[1] != CompactionConsecutiveMerge {
-		t.Fatalf("second compaction=%v, want sorted-run merge after fairness budget", order[1])
+	if order[1] != CompactionLevelToLevel {
+		t.Fatalf("second compaction=%v, want level merge after fairness budget", order[1])
 	}
 }
 
@@ -1068,11 +1063,11 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 
 	compactorOpts := compactorOptions{
 		Trigger: compactionTriggerOptions{
-			L0SSTCount:    2,
-			MinSources:    2,
-			MaxSources:    4,
-			SizeRatio:     4,
-			CheckInterval: time.Hour,
+			L0SSTCount:          2,
+			BaseLevelBytes:      512 * 1024 * 1024,
+			LevelSizeMultiplier: 8,
+			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
+			CheckInterval:       time.Hour,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -1249,11 +1244,11 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 
 	compactorOpts := compactorOptions{
 		Trigger: compactionTriggerOptions{
-			L0SSTCount:    1,
-			MinSources:    2,
-			MaxSources:    4,
-			SizeRatio:     4,
-			CheckInterval: time.Hour,
+			L0SSTCount:          1,
+			BaseLevelBytes:      512 * 1024 * 1024,
+			LevelSizeMultiplier: 8,
+			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
+			CheckInterval:       time.Hour,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -1350,7 +1345,7 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	}
 }
 
-func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
+func TestCompactorCommitsRetirementRecords(t *testing.T) {
 	store := blobstore.NewMemory("")
 	defer store.Close()
 	ctx := context.Background()
@@ -1366,8 +1361,7 @@ func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
 	defer writer.close(ctx)
 
 	for i := 0; i < 6; i++ {
-		key := fmt.Sprintf("mark-key-%03d", i)
-		if err := writer.put(ctx, []byte(key), []byte("value")); err != nil {
+		if err := writer.put(ctx, []byte("mark-key"), []byte(fmt.Sprintf("value-%03d", i))); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		if err := writer.flush(ctx); err != nil {
@@ -1397,13 +1391,27 @@ func TestCompactor_EnqueuesPendingDeleteMarks(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
-	for _, sst := range before.L0SSTs {
-		found, err := hasPendingSSTDeleteMark(ctx, store, sst.ID)
+	seqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("list manifest entries: %v", err)
+	}
+	retired := make(map[string]manifest.RetiredObject)
+	for _, seq := range seqs {
+		entry, err := manifestStore.ReadEntry(ctx, seq)
 		if err != nil {
-			t.Fatalf("lookup pending delete mark for %s: %v", sst.ID, err)
+			t.Fatalf("read manifest entry %d: %v", seq, err)
 		}
+		for _, object := range entry.RetiredObjects {
+			retired[object.ID] = object
+		}
+	}
+	for _, sst := range before.L0SSTs {
+		object, found := retired[sst.ID]
 		if !found {
-			t.Fatalf("expected pending delete mark for %s", sst.ID)
+			t.Fatalf("missing retirement record for %s", sst.ID)
+		}
+		if object.Key != store.SSTPath(sst.ID) || object.NotBefore.IsZero() {
+			t.Fatalf("invalid retirement record for %s: %+v", sst.ID, object)
 		}
 	}
 }

@@ -38,6 +38,7 @@ type Reader struct {
 	bloomLoads    singleflight.Group
 	sstLoads      singleflight.Group
 	blobLoads     singleflight.Group
+	manifestLoads singleflight.Group
 
 	blobStorage              *internal.BlobStorage
 	blobCache                internal.BlobCache
@@ -55,6 +56,12 @@ type Reader struct {
 	lifecycleMu sync.RWMutex
 	mu          sync.RWMutex
 	manifest    *Manifest
+	version     Version
+	viewPolicy  ReaderViewPolicy
+	viewExpired atomic.Bool
+	viewTimerMu sync.Mutex
+	viewTimer   *time.Timer
+	viewTimerID atomic.Uint64
 	metrics     *ReaderMetrics
 	closed      atomic.Bool
 }
@@ -65,6 +72,11 @@ type KV struct {
 }
 
 func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) (*Reader, error) {
+	viewPolicy, err := normalizeReaderViewPolicy(opts.ViewPolicy)
+	if err != nil {
+		return nil, err
+	}
+
 	ms := newManifestStoreWithCache(store, &opts)
 	m, err := ms.Replay(ctx)
 	if err != nil {
@@ -113,6 +125,8 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		store:                    store,
 		manifestStore:            ms,
 		manifest:                 m,
+		version:                  versionFromCurrent(ms.CurrentData()),
+		viewPolicy:               viewPolicy,
 		sstCache:                 sstCache,
 		blockCache:               blockCache,
 		blobStorage:              internal.NewBlobStorage(store, valueConfig),
@@ -128,6 +142,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:                 opts.CacheDir,
 		metrics:                  opts.Metrics,
 	}
+	reader.armManifestExpiry()
 	cleanupSSTCache = false
 	cleanupBlockCache = false
 	cleanupBlobCache = false
@@ -183,16 +198,36 @@ func initBlobCache(opts readerOptions) (diskcache.Cache, bool, error) {
 
 // Refresh reloads the manifest and invalidates caches for removed SSTs.
 func (r *Reader) Refresh(ctx context.Context) (err error) {
-	start := time.Now()
-	defer func() {
-		r.metrics.ObserveRefresh(time.Since(start), err)
-	}()
-
 	done, err := r.beginRead()
 	if err != nil {
 		return err
 	}
 	defer done()
+	return r.refreshManifest(ctx, true)
+}
+
+func (r *Reader) ensureFreshManifest(ctx context.Context) error {
+	if !r.viewExpired.Load() {
+		return nil
+	}
+	return r.refreshManifest(ctx, false)
+}
+
+func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
+	_, err, _ := r.manifestLoads.Do("manifest", func() (any, error) {
+		if !force && !r.viewExpired.Load() {
+			return nil, nil
+		}
+		return nil, r.reloadManifest(ctx)
+	})
+	return err
+}
+
+func (r *Reader) reloadManifest(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.ObserveRefresh(time.Since(start), err)
+	}()
 
 	var m *Manifest
 	m, err = r.manifestStore.Replay(ctx)
@@ -210,7 +245,38 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 	// Publish a new manifest pointer. Existing readers/views may still retain
 	// the previous manifest as an immutable snapshot.
 	r.manifest = m
+	r.version = versionFromCurrent(r.manifestStore.CurrentData())
+	r.armManifestExpiry()
 	return nil
+}
+
+func (r *Reader) armManifestExpiry() {
+	timerID := r.viewTimerID.Add(1)
+	r.viewExpired.Store(false)
+	timer := time.AfterFunc(r.viewPolicy.RefreshAfter, func() {
+		if r.viewTimerID.Load() == timerID && !r.closed.Load() {
+			r.viewExpired.Store(true)
+		}
+	})
+
+	r.viewTimerMu.Lock()
+	previous := r.viewTimer
+	r.viewTimer = timer
+	r.viewTimerMu.Unlock()
+	if previous != nil {
+		previous.Stop()
+	}
+}
+
+func (r *Reader) stopManifestExpiry() {
+	r.viewTimerID.Add(1)
+	r.viewTimerMu.Lock()
+	timer := r.viewTimer
+	r.viewTimer = nil
+	r.viewTimerMu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
 }
 
 func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
@@ -243,6 +309,7 @@ func (r *Reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	r.stopManifestExpiry()
 
 	var firstErr error
 
@@ -303,21 +370,29 @@ func (r *Reader) currentManifest() *Manifest {
 	return r.manifest
 }
 
-// Snapshot returns an immutable read handle over the Reader's currently loaded
-// manifest state. The returned snapshot does not refresh, even if the Reader is
-// refreshed later.
-func (r *Reader) Snapshot() *Snapshot {
+func (r *Reader) currentManifestState() (*Manifest, Version) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.manifest, r.version
+}
+
+// Snapshot returns an immutable read handle over a fresh manifest state. The
+// returned snapshot does not refresh and expires according to Views.
+func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 	done, err := r.beginRead()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer done()
 
-	m := r.currentManifest()
-	if m == nil {
-		return nil
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, err
 	}
-	return newSnapshot(r, m, r.manifestStore.CurrentData())
+	m, version := r.currentManifestState()
+	if m == nil {
+		return nil, errors.New("manifest not loaded")
+	}
+	return newSnapshot(r, m, version, time.Now().Add(r.viewPolicy.SnapshotMaxAge)), nil
 }
 
 // Get returns the value for key if present and not deleted/expired.
@@ -335,6 +410,9 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 
 	if len(key) == 0 {
 		return nil, false, errors.New("empty key")
+	}
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, false, err
 	}
 
 	return r.getWithManifest(ctx, r.currentManifest(), key)
@@ -361,9 +439,8 @@ func (r *Reader) getWithManifest(ctx context.Context, m *Manifest, key []byte) (
 		}
 	}
 
-	for _, sr := range m.SortedRuns {
-
-		sst := sr.FindSST(key)
+	for i := range m.Levels {
+		sst := m.Levels[i].FindSST(key)
 		if sst == nil {
 			continue
 		}
@@ -395,6 +472,9 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		return nil, err
 	}
 	defer done()
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, err
+	}
 
 	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, 0)
 }
@@ -410,6 +490,9 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		return nil, err
 	}
 	defer done()
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, err
+	}
 
 	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, limit)
 }
@@ -504,8 +587,8 @@ func (r *Reader) openRangeIters(ctx context.Context, m *Manifest, minKey, maxKey
 		allIters = append(allIters, iter)
 	}
 
-	for _, sr := range m.SortedRuns {
-		overlapping := sr.OverlappingSSTs(minKey, maxKey)
+	for i := range m.Levels {
+		overlapping := m.Levels[i].OverlappingSSTs(minKey, maxKey)
 		for _, sst := range overlapping {
 			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
 			if err != nil {
@@ -1079,6 +1162,8 @@ func (m *sstReadable) Size() int64 {
 type Iterator struct {
 	reader    *Reader
 	ctx       context.Context
+	cancel    context.CancelFunc
+	expiresAt time.Time
 	minKey    []byte
 	maxKey    []byte
 	nowMs     int64
@@ -1101,39 +1186,49 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		return nil, err
 	}
 	defer done()
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, err
+	}
 
-	it, err := r.newIteratorWithManifest(ctx, r.currentManifest(), opts)
+	expiresAt := time.Now().Add(r.viewPolicy.IteratorMaxAge)
+	it, err := r.newIteratorWithManifest(ctx, r.currentManifest(), opts, expiresAt)
 	if err != nil {
 		return nil, err
 	}
 	return it, nil
 }
 
-func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts IteratorOptions) (*Iterator, error) {
+func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts IteratorOptions, expiresAt time.Time) (*Iterator, error) {
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
+	iterCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrIteratorExpired)
 
-	allIters, err := r.openRangeIters(ctx, m, opts.MinKey, opts.MaxKey)
+	allIters, err := r.openRangeIters(iterCtx, m, opts.MinKey, opts.MaxKey)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	if len(allIters) == 0 {
 
 		return &Iterator{
-			reader: r,
-			ctx:    ctx,
-			minKey: opts.MinKey,
-			maxKey: opts.MaxKey,
-			nowMs:  time.Now().UnixMilli(),
-			closed: false,
+			reader:    r,
+			ctx:       iterCtx,
+			cancel:    cancel,
+			expiresAt: expiresAt,
+			minKey:    opts.MinKey,
+			maxKey:    opts.MaxKey,
+			nowMs:     time.Now().UnixMilli(),
+			closed:    false,
 		}, nil
 	}
 
 	return &Iterator{
 		reader:    r,
-		ctx:       ctx,
+		ctx:       iterCtx,
+		cancel:    cancel,
+		expiresAt: expiresAt,
 		minKey:    opts.MinKey,
 		maxKey:    opts.MaxKey,
 		nowMs:     time.Now().UnixMilli(),
@@ -1151,13 +1246,17 @@ func (it *Iterator) Next() bool {
 		it.err = ErrReaderClosed
 		return false
 	}
+	if err := it.contextErr(); err != nil {
+		it.err = err
+		return false
+	}
 	if it.mergeIter == nil {
 		return false
 	}
 
 	for {
 
-		if err := it.ctx.Err(); err != nil {
+		if err := it.contextErr(); err != nil {
 			it.err = err
 			return false
 		}
@@ -1223,6 +1322,12 @@ func (it *Iterator) Err() error {
 	if it.err != nil {
 		return it.err
 	}
+	if it.closed {
+		return nil
+	}
+	if err := it.contextErr(); err != nil {
+		return err
+	}
 	if it.mergeIter != nil {
 		return it.mergeIter.Err()
 	}
@@ -1241,12 +1346,20 @@ func (it *Iterator) Close() error {
 	}
 	it.sstIters = nil
 	it.mergeIter = nil
+	if it.cancel != nil {
+		it.cancel()
+		it.cancel = nil
+	}
 
 	return nil
 }
 
 func (it *Iterator) SeekGE(target []byte) bool {
 	if it.closed || it.err != nil {
+		return false
+	}
+	if err := it.contextErr(); err != nil {
+		it.err = err
 		return false
 	}
 	it.current = nil
@@ -1259,4 +1372,17 @@ func (it *Iterator) SeekGE(target []byte) bool {
 		return false
 	}
 	return it.Next()
+}
+
+func (it *Iterator) contextErr() error {
+	if !it.expiresAt.IsZero() && !time.Now().Before(it.expiresAt) {
+		return ErrIteratorExpired
+	}
+	if err := it.ctx.Err(); err != nil {
+		if cause := context.Cause(it.ctx); cause != nil {
+			return cause
+		}
+		return err
+	}
+	return nil
 }

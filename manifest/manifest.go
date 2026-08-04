@@ -7,13 +7,6 @@ import (
 	"github.com/segmentio/ksuid"
 )
 
-type CompactionConfig struct {
-	L0CompactionThreshold int `json:"l0_compaction_threshold,omitempty"`
-	MinSources            int `json:"min_sources,omitempty"`
-	MaxSources            int `json:"max_sources,omitempty"`
-	SizeThreshold         int `json:"size_threshold,omitempty"`
-}
-
 type Manifest struct {
 	Version   int    `json:"version"`
 	NextEpoch uint64 `json:"next_epoch"`
@@ -22,10 +15,8 @@ type Manifest struct {
 	WriterFence    *FenceToken `json:"writer_fence,omitempty"`
 	CompactorFence *FenceToken `json:"compactor_fence,omitempty"`
 
-	L0SSTs           []SSTMeta        `json:"l0_ssts,omitempty"`
-	SortedRuns       []SortedRun      `json:"sorted_runs,omitempty"`
-	NextSortedRunID  uint32           `json:"next_sorted_run_id,omitempty"`
-	CompactionConfig CompactionConfig `json:"compaction_config,omitempty"`
+	L0SSTs []SSTMeta `json:"l0_ssts,omitempty"`
+	Levels []Level   `json:"levels,omitempty"`
 }
 
 type FenceToken struct {
@@ -34,9 +25,11 @@ type FenceToken struct {
 	ClaimedAt time.Time `json:"claimed_at"`
 }
 
-type SortedRun struct {
-	ID   uint32    `json:"id"`
-	SSTs []SSTMeta `json:"ssts"`
+// Level is one non-overlapping, key-sorted level. Number starts at 1; L0 is
+// represented separately because its SSTs may overlap.
+type Level struct {
+	Number uint32    `json:"number"`
+	SSTs   []SSTMeta `json:"ssts,omitempty"`
 }
 
 type SSTSignature struct {
@@ -66,7 +59,9 @@ type SSTMeta struct {
 	Bloom     BloomMeta
 	CreatedAt time.Time
 
-	Level       int
+	// Level records the logical placement committed with this metadata. L0 is
+	// zero; compacted levels start at one.
+	Level       uint32
 	HasBlobRefs bool
 }
 
@@ -116,6 +111,7 @@ type Current struct {
 	NextEpoch     uint64 `json:"next_epoch"`
 
 	ChangeFeedLogStart uint64 `json:"change_feed_log_start,omitempty"`
+	RetirementLogStart uint64 `json:"retirement_log_start"`
 
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`

@@ -25,8 +25,8 @@ import (
 type CompactionJobType int
 
 const (
-	CompactionL0Flush CompactionJobType = iota
-	CompactionConsecutiveMerge
+	CompactionL0ToL1 CompactionJobType = iota
+	CompactionLevelToLevel
 )
 
 const CompactionMaxIterations = 100
@@ -34,18 +34,20 @@ const CompactionMaxIterations = 100
 var errCompactorClosed = errors.New("compactor closed")
 
 type CompactionJob struct {
-	Type      CompactionJobType
-	InputSSTs []string
-	InputRuns []uint32
-	OutputRun *SortedRun
+	Type             CompactionJobType
+	SourceLevel      uint32
+	DestinationLevel uint32
+	InputSSTs        []string
+	OutputSSTs       []SSTMeta
+	MetadataOnly     bool
 }
 
-// compactor merges SSTs into sorted runs in the background.
+// compactor moves and rewrites SSTs through non-overlapping levels.
 type compactor struct {
-	store       *blobstore.Store
-	manifestLog *manifest.Store
-	gcMarkStore manifest.GCMarkStorage
-	opts        compactorOptions
+	store         *blobstore.Store
+	manifestLog   *manifest.Store
+	gcCursorStore manifest.GCCursorStorage
+	opts          compactorOptions
 
 	mu       sync.Mutex
 	manifest *Manifest
@@ -57,9 +59,8 @@ type compactor struct {
 	activeRuns  sync.WaitGroup
 	runGate     chan struct{}
 
-	fenced     atomic.Bool
-	fenceToken *manifest.FenceToken
-
+	fenced                   atomic.Bool
+	fenceToken               *manifest.FenceToken
 	consecutiveL0Compactions int
 
 	running atomic.Bool
@@ -82,12 +83,12 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 	}
 
 	c := &compactor{
-		store:       store,
-		manifestLog: manifestLog,
-		gcMarkStore: opts.GCMarkStorage,
-		opts:        opts,
-		manifest:    m,
-		runGate:     make(chan struct{}, 1),
+		store:         store,
+		manifestLog:   manifestLog,
+		gcCursorStore: opts.GCCursorStorage,
+		opts:          opts,
+		manifest:      m,
+		runGate:       make(chan struct{}, 1),
 	}
 
 	if fence == nil {
@@ -121,14 +122,14 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	if opts.Trigger.MaxConsecutiveL0Compactions <= 0 {
 		opts.Trigger.MaxConsecutiveL0Compactions = d.Trigger.MaxConsecutiveL0Compactions
 	}
-	if opts.Trigger.MinSources <= 0 {
-		opts.Trigger.MinSources = d.Trigger.MinSources
+	if opts.Trigger.BaseLevelBytes <= 0 {
+		opts.Trigger.BaseLevelBytes = d.Trigger.BaseLevelBytes
 	}
-	if opts.Trigger.MaxSources <= 0 {
-		opts.Trigger.MaxSources = d.Trigger.MaxSources
+	if opts.Trigger.LevelSizeMultiplier < 2 {
+		opts.Trigger.LevelSizeMultiplier = d.Trigger.LevelSizeMultiplier
 	}
-	if opts.Trigger.SizeRatio <= 0 {
-		opts.Trigger.SizeRatio = d.Trigger.SizeRatio
+	if opts.Trigger.MaxInputSSTs <= 0 || opts.Trigger.MaxInputSSTs > manifest.MaxRetiredObjectsPerEntry {
+		opts.Trigger.MaxInputSSTs = d.Trigger.MaxInputSSTs
 	}
 	if opts.Output.BloomBitsPerKey == 0 {
 		opts.Output.BloomBitsPerKey = d.Output.BloomBitsPerKey
@@ -140,8 +141,14 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	if opts.Output.TargetSSTBytes <= 0 {
 		opts.Output.TargetSSTBytes = d.Output.TargetSSTBytes
 	}
-	if opts.GCMarkStorage == nil {
-		opts.GCMarkStorage = newGCMarkStorage(store)
+	if opts.GCCursorStorage == nil {
+		opts.GCCursorStorage = newGCCursorStorage(store)
+	}
+	if opts.GCDeleteBatchSize <= 0 {
+		opts.GCDeleteBatchSize = d.GCDeleteBatchSize
+	}
+	if opts.GCGracePeriod == 0 {
+		opts.GCGracePeriod = d.GCGracePeriod
 	}
 	return opts
 }
@@ -279,32 +286,23 @@ func (c *compactor) RunOnce(ctx context.Context) error {
 		m := c.manifest.Clone()
 		c.mu.Unlock()
 
-		l0Ready := m.L0SSTCount() >= c.opts.Trigger.L0SSTCount
-		runJob := c.findConsecutiveCompaction(m)
-
-		if runJob != nil && (!l0Ready || c.shouldRunSortedRunForFairness()) {
-			if err := c.compactRuns(ctx, m, runJob); err != nil {
-
-				if isFenceError(err) {
-					c.fenced.Store(true)
-					return err
-				}
-				return fmt.Errorf("consecutive compaction: %w", err)
-			}
-			c.consecutiveL0Compactions = 0
-			continue
+		plan, err := c.planCompaction(m)
+		if err != nil {
+			return err
 		}
-
-		if l0Ready {
-			if err := c.compactL0(ctx, m); err != nil {
-
+		if plan != nil {
+			if err := c.executeCompaction(ctx, m, plan); err != nil {
 				if isFenceError(err) {
 					c.fenced.Store(true)
 					return err
 				}
-				return fmt.Errorf("L0 compaction: %w", err)
+				return fmt.Errorf("L%d to L%d compaction: %w", plan.sourceLevel, plan.destinationLevel, err)
 			}
-			c.consecutiveL0Compactions++
+			if plan.sourceLevel == 0 {
+				c.consecutiveL0Compactions++
+			} else {
+				c.consecutiveL0Compactions = 0
+			}
 			continue
 		}
 
@@ -358,15 +356,11 @@ func (c *compactor) releaseRun() {
 	}
 }
 
-func (c *compactor) shouldRunSortedRunForFairness() bool {
-	return c.consecutiveL0Compactions >= c.opts.Trigger.MaxConsecutiveL0Compactions
-}
-
 func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
-	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+	if _, err := runRetirementSweeper(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -374,223 +368,195 @@ func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
 	}
 }
 
-func (c *compactor) compactL0(ctx context.Context, m *Manifest) error {
-	if len(m.L0SSTs) == 0 {
-		return nil
+type levelCompactionPlan struct {
+	sourceLevel      uint32
+	destinationLevel uint32
+	sourceSSTs       []SSTMeta
+	destinationSSTs  []SSTMeta
+	metadataOnly     bool
+}
+
+func (c *compactor) planCompaction(m *Manifest) (*levelCompactionPlan, error) {
+	var levelPlan *levelCompactionPlan
+	for i := range m.Levels {
+		level := &m.Levels[i]
+		if level.TotalSize() <= c.levelTargetBytes(level.Number) {
+			continue
+		}
+		limit := c.opts.Trigger.MaxInputSSTs
+		if limit > len(level.SSTs) {
+			limit = len(level.SSTs)
+		}
+		var err error
+		levelPlan, err = c.buildLevelPlan(m, level.Number, level.Number+1, level.SSTs[:limit])
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 
+	if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount &&
+		(levelPlan == nil || c.consecutiveL0Compactions < c.opts.Trigger.MaxConsecutiveL0Compactions) {
+		inputs := m.L0SSTs
+		if len(inputs) > c.opts.Trigger.MaxInputSSTs {
+			inputs = inputs[len(inputs)-c.opts.Trigger.MaxInputSSTs:]
+		}
+		return c.buildLevelPlan(m, 0, 1, inputs)
+	}
+
+	return levelPlan, nil
+}
+
+func (c *compactor) levelTargetBytes(level uint32) int64 {
+	target := c.opts.Trigger.BaseLevelBytes
+	for n := uint32(1); n < level; n++ {
+		multiplier := int64(c.opts.Trigger.LevelSizeMultiplier)
+		if target > (1<<63-1)/multiplier {
+			return 1<<63 - 1
+		}
+		target *= multiplier
+	}
+	return target
+}
+
+func (c *compactor) buildLevelPlan(m *Manifest, sourceLevel, destinationLevel uint32, candidates []SSTMeta) (*levelCompactionPlan, error) {
+	for count := len(candidates); count > 0; count-- {
+		selected := candidates[:count]
+		if sourceLevel == 0 {
+			selected = candidates[len(candidates)-count:]
+		}
+		source := append([]SSTMeta(nil), selected...)
+		minKey, maxKey := sstBounds(source)
+		var destination []SSTMeta
+		if level := m.Level(destinationLevel); level != nil {
+			destination = level.OverlappingSSTs(minKey, maxKey)
+		}
+		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source) &&
+			!c.opts.Safety.ValidateSSTChecksum && c.opts.Safety.SSTHashVerifier == nil
+		if metadataOnly || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
+			return &levelCompactionPlan{
+				sourceLevel:      sourceLevel,
+				destinationLevel: destinationLevel,
+				sourceSSTs:       source,
+				destinationSSTs:  destination,
+				metadataOnly:     metadataOnly,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("compaction overlap exceeds max input SSTs=%d for L%d to L%d", c.opts.Trigger.MaxInputSSTs, sourceLevel, destinationLevel)
+}
+
+func sstBounds(ssts []SSTMeta) ([]byte, []byte) {
+	var minKey, maxKey []byte
+	for i := range ssts {
+		if i == 0 || bytes.Compare(ssts[i].MinKey, minKey) < 0 {
+			minKey = ssts[i].MinKey
+		}
+		if i == 0 || bytes.Compare(ssts[i].MaxKey, maxKey) > 0 {
+			maxKey = ssts[i].MaxKey
+		}
+	}
+	return minKey, maxKey
+}
+
+func sstsDoNotOverlap(ssts []SSTMeta) bool {
+	if len(ssts) < 2 {
+		return true
+	}
+	ordered := append([]SSTMeta(nil), ssts...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return bytes.Compare(ordered[i].MinKey, ordered[j].MinKey) < 0
+	})
+	for i := 1; i < len(ordered); i++ {
+		if bytes.Compare(ordered[i-1].MaxKey, ordered[i].MinKey) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *levelCompactionPlan) (err error) {
+	jobType := CompactionLevelToLevel
+	if plan.sourceLevel == 0 {
+		jobType = CompactionL0ToL1
+	}
 	job := CompactionJob{
-		Type:      CompactionL0Flush,
-		InputSSTs: make([]string, len(m.L0SSTs)),
+		Type:             jobType,
+		SourceLevel:      plan.sourceLevel,
+		DestinationLevel: plan.destinationLevel,
+		MetadataOnly:     plan.metadataOnly,
 	}
-	for i, sst := range m.L0SSTs {
-		job.InputSSTs[i] = sst.ID
+	for _, sst := range plan.sourceSSTs {
+		job.InputSSTs = append(job.InputSSTs, sst.ID)
 	}
-
+	for _, sst := range plan.destinationSSTs {
+		job.InputSSTs = append(job.InputSSTs, sst.ID)
+	}
 	if c.opts.OnCompactionStart != nil {
 		c.opts.OnCompactionStart(job)
 	}
-
-	iters, readers, err := c.openSSTs(ctx, m.L0SSTs)
-	if err != nil {
+	defer func() {
 		if c.opts.OnCompactionEnd != nil {
 			c.opts.OnCompactionEnd(job, err)
-		}
-		return err
-	}
-	defer func() {
-		for _, r := range readers {
-			_ = r.Close()
 		}
 	}()
 
-	mergeIter := newMergeIterator(iters)
-
-	newEpoch := m.NextEpoch
-	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
-	if err != nil {
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(job, err)
+	outputs := plan.sourceSSTs
+	if !plan.metadataOnly {
+		inputs := append(append([]SSTMeta(nil), plan.sourceSSTs...), plan.destinationSSTs...)
+		iters, readers, openErr := c.openSSTs(ctx, inputs)
+		if openErr != nil {
+			return openErr
 		}
-		return err
-	}
-
-	if len(results) == 0 {
-
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(job, nil)
+		defer func() {
+			for _, reader := range readers {
+				_ = reader.Close()
+			}
+		}()
+		results, writeErr := c.writeCompactedSSTs(ctx, newMergeIterator(iters), m.NextEpoch)
+		if writeErr != nil {
+			return writeErr
 		}
-		return nil
+		outputs = make([]SSTMeta, len(results))
+		for i := range results {
+			outputs[i] = results[i].Meta
+		}
+	}
+	for i := range outputs {
+		outputs[i].Level = plan.destinationLevel
 	}
 
-	newRunID := m.NextSortedRunID
-	newRun := &SortedRun{
-		ID:   newRunID,
-		SSTs: make([]SSTMeta, len(results)),
-	}
-	for i, r := range results {
-		newRun.SSTs[i] = r.Meta
-	}
-	sort.Slice(newRun.SSTs, func(i, j int) bool {
-		return bytes.Compare(newRun.SSTs[i].MinKey, newRun.SSTs[j].MinKey) < 0
-	})
-	job.OutputRun = newRun
-
+	job.OutputSSTs = append(job.OutputSSTs, outputs...)
 	payload := manifest.CompactionLogPayload{
 		RemoveSSTableIDs: job.InputSSTs,
-		AddSortedRun:     newRun,
+		SourceLevel:      plan.sourceLevel,
+		DestinationLevel: plan.destinationLevel,
+		AddSSTables:      outputs,
 	}
-	if err := c.appendCompaction(ctx, payload); err != nil {
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(job, err)
-		}
-		return err
-	}
-
-	if c.opts.OnCompactionEnd != nil {
-		c.opts.OnCompactionEnd(job, nil)
-	}
-
-	return nil
+	return c.appendCompaction(ctx, m, payload)
 }
 
-func (c *compactor) findConsecutiveCompaction(m *Manifest) *CompactionJob {
-	runs := m.FindConsecutiveSimilarRuns(
-		c.opts.Trigger.MinSources,
-		c.opts.Trigger.MaxSources,
-		c.opts.Trigger.SizeRatio,
-	)
-
-	if len(runs) == 0 {
-		return nil
+func (c *compactor) appendCompaction(ctx context.Context, m *Manifest, payload manifest.CompactionLogPayload) error {
+	added := make(map[string]struct{}, len(payload.AddSSTables))
+	for _, sst := range payload.AddSSTables {
+		added[sst.ID] = struct{}{}
 	}
-
-	job := &CompactionJob{
-		Type:      CompactionConsecutiveMerge,
-		InputRuns: make([]uint32, len(runs)),
-		InputSSTs: make([]string, 0),
-	}
-
-	for i, run := range runs {
-		job.InputRuns[i] = run.ID
-		for _, sst := range run.SSTs {
-			job.InputSSTs = append(job.InputSSTs, sst.ID)
+	retiredIDs := make([]string, 0, len(payload.RemoveSSTableIDs))
+	for _, id := range payload.RemoveSSTableIDs {
+		if _, stillLive := added[id]; !stillLive {
+			retiredIDs = append(retiredIDs, id)
 		}
 	}
-
-	return job
-}
-
-func (c *compactor) compactRuns(ctx context.Context, m *Manifest, job *CompactionJob) error {
-	if c.opts.OnCompactionStart != nil {
-		c.opts.OnCompactionStart(*job)
-	}
-
-	var sstsToMerge []SSTMeta
-	for _, runID := range job.InputRuns {
-		run := m.GetSortedRun(runID)
-		if run != nil {
-			sstsToMerge = append(sstsToMerge, run.SSTs...)
-		}
-	}
-
-	if len(sstsToMerge) == 0 {
-		return nil
-	}
-
-	iters, readers, err := c.openSSTs(ctx, sstsToMerge)
+	retired, err := retiredSSTObjects(c.store, m, retiredIDs, c.opts.GCGracePeriod)
 	if err != nil {
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(*job, err)
-		}
 		return err
 	}
-	defer func() {
-		for _, r := range readers {
-			_ = r.Close()
-		}
-	}()
-
-	mergeIter := newMergeIterator(iters)
-
-	newEpoch := m.NextEpoch
-	results, err := c.writeCompactedSSTs(ctx, mergeIter, newEpoch)
-	if err != nil {
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(*job, err)
-		}
-		return err
-	}
-
-	if len(results) == 0 {
-
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(*job, nil)
-		}
-		return nil
-	}
-
-	newRunID := m.NextSortedRunID
-	newRun := &SortedRun{
-		ID:   newRunID,
-		SSTs: make([]SSTMeta, len(results)),
-	}
-	for i, r := range results {
-		newRun.SSTs[i] = r.Meta
-	}
-
-	sort.Slice(newRun.SSTs, func(i, j int) bool {
-		return bytes.Compare(newRun.SSTs[i].MinKey, newRun.SSTs[j].MinKey) < 0
-	})
-	job.OutputRun = newRun
-
-	payload := manifest.CompactionLogPayload{
-		RemoveSSTableIDs:   job.InputSSTs,
-		RemoveSortedRunIDs: job.InputRuns,
-		AddSortedRun:       newRun,
-	}
-	if err := c.appendCompaction(ctx, payload); err != nil {
-		if c.opts.OnCompactionEnd != nil {
-			c.opts.OnCompactionEnd(*job, err)
-		}
-		return err
-	}
-
-	if c.opts.OnCompactionEnd != nil {
-		c.opts.OnCompactionEnd(*job, nil)
-	}
-
-	return nil
-}
-
-func (c *compactor) appendCompaction(ctx context.Context, payload manifest.CompactionLogPayload) error {
-	entry, err := c.manifestLog.AppendCompactionWithFence(ctx, payload)
+	_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload, retired)
 	if err != nil && isFenceError(err) {
 		c.fenced.Store(true)
 	}
 	if err != nil {
 		return err
-	}
-
-	if len(payload.RemoveSSTableIDs) > 0 {
-		if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, payload.RemoveSSTableIDs, "compaction", entry.Seq); err != nil {
-			slog.Warn("isledb: enqueue pending sst delete marks failed after compaction append", "error", err, "count", len(payload.RemoveSSTableIDs), "seq", entry.Seq)
-		}
-	}
-
-	addedIDs := make([]string, 0, len(payload.AddSSTables))
-	for _, sst := range payload.AddSSTables {
-		addedIDs = append(addedIDs, sst.ID)
-	}
-	if payload.AddSortedRun != nil {
-		for _, sst := range payload.AddSortedRun.SSTs {
-			addedIDs = append(addedIDs, sst.ID)
-		}
-	}
-	if len(addedIDs) > 0 {
-		if err := clearPendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, addedIDs); err != nil {
-			slog.Warn("isledb: clear pending sst delete marks failed after compaction append", "error", err, "count", len(addedIDs), "seq", entry.Seq)
-		}
 	}
 
 	return nil
@@ -801,9 +767,6 @@ func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 		return nil, err
 	}
 
-	for i := range results {
-		results[i].Meta.Level = 1
-	}
 	return results, nil
 }
 

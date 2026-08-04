@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -14,219 +13,169 @@ import (
 const (
 	defaultSSTSweepBatchSize   = 128
 	defaultSSTSweepGracePeriod = 10 * time.Minute
+	defaultRetirementReadLimit = 128
 )
 
 type sstSweepStats struct {
-	Attempted   int
-	Deleted     int
-	ClearedLive int
-	Failed      int
+	Attempted       int
+	Deleted         int
+	Failed          int
+	EntriesAdvanced uint64
+	NextManifestSeq uint64
+	NextObjectIndex uint32
 }
 
-type sstSweepPlan struct {
-	deleteIDs   []string
-	clearedLive int
-	changed     bool
+type retirementSweepPlan struct {
+	keys             []string
+	nextManifestSeq  uint64
+	nextObjectIndex  uint32
+	entriesAdvanced  uint64
+	blockedNotBefore bool
 }
 
-func runPendingSSTSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, batchSize int, gracePeriod time.Duration) (sstSweepStats, error) {
-	return runPendingSSTSweeperWithStorage(ctx, store, manifestLog, newGCMarkStorage(store), batchSize, gracePeriod)
-}
-
-func runPendingSSTSweeperWithStorage(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, markStorage manifest.GCMarkStorage, batchSize int, gracePeriod time.Duration) (sstSweepStats, error) {
+func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, storage manifest.GCCursorStorage, fence *manifest.FenceToken, batchSize int) (sstSweepStats, error) {
 	stats := sstSweepStats{}
 	if batchSize <= 0 {
 		batchSize = defaultSSTSweepBatchSize
 	}
-	if gracePeriod < 0 {
-		gracePeriod = 0
+	if storage == nil {
+		return stats, errors.New("nil gc cursor storage")
 	}
-	if markStorage == nil {
-		return stats, errors.New("nil gc mark storage")
-	}
-
-	liveSet, err := currentLiveSSTSet(ctx, manifestLog)
-	if err != nil {
-		return stats, err
+	if fence == nil {
+		return stats, manifest.ErrFenced
 	}
 
 	var lastErr error
 	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
 		stats = sstSweepStats{}
-
-		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, markStorage)
+		cursor, matchToken, exists, err := loadGCCursorWithCAS(ctx, storage)
 		if err != nil {
 			return stats, err
 		}
-		if len(set.Marks) == 0 {
+		if !exists {
+			current, err := manifestLog.ReadCurrentData(ctx)
+			if err != nil {
+				return stats, fmt.Errorf("read current for gc cursor: %w", err)
+			}
+			if current != nil {
+				cursor.NextManifestSeq = current.RetirementLogStart
+			}
+			if err := storeGCCursorCAS(ctx, storage, cursor, matchToken, false); err != nil {
+				if isGCMarkCASConflict(err) {
+					lastErr = err
+					continue
+				}
+				return stats, fmt.Errorf("initialize gc cursor: %w", err)
+			}
+			continue
+		}
+
+		entries, _, err := manifestLog.ReadRetirementEntries(ctx, cursor.NextManifestSeq, defaultRetirementReadLimit)
+		if err != nil {
+			return stats, err
+		}
+		plan, err := planRetirementSweep(entries, cursor, time.Now().UTC(), batchSize)
+		if err != nil {
+			return stats, err
+		}
+		stats.Attempted = len(plan.keys)
+		stats.EntriesAdvanced = plan.entriesAdvanced
+		stats.NextManifestSeq = plan.nextManifestSeq
+		stats.NextObjectIndex = plan.nextObjectIndex
+
+		if len(plan.keys) > 0 {
+			if err := store.BatchDelete(ctx, plan.keys); err != nil {
+				stats.Failed = len(plan.keys)
+				return stats, fmt.Errorf("delete retired objects: %w", err)
+			}
+			stats.Deleted = len(plan.keys)
+		}
+
+		advanced := plan.nextManifestSeq != cursor.NextManifestSeq || plan.nextObjectIndex != cursor.NextObjectIndex
+		if !advanced {
+			if cursor.NextObjectIndex == 0 {
+				if _, err := manifestLog.AdvanceRetirementLogStart(ctx, cursor.NextManifestSeq, fence); err != nil {
+					return stats, fmt.Errorf("sync retirement floor: %w", err)
+				}
+			}
 			return stats, nil
 		}
 
-		byID := pendingMarkMapFromSet(set)
-		now := time.Now().UTC()
-		plan := planPendingSSTSweep(byID, liveSet, now, gracePeriod, batchSize)
-		stats.ClearedLive = plan.clearedLive
-
-		deleteKeys := deleteKeysForSSTIDs(store, plan.deleteIDs)
-		stats.Attempted = len(plan.deleteIDs)
-		deleted, failed, deleteChanged := applySweepDeleteBatch(ctx, store, byID, plan.deleteIDs, deleteKeys)
-		stats.Deleted = deleted
-		stats.Failed = failed
-
-		changed := plan.changed || deleteChanged
-		if !changed {
-			return stats, nil
+		next := &gcCursor{
+			Version:         gcMarkSchemaVersion,
+			NextManifestSeq: plan.nextManifestSeq,
+			NextObjectIndex: plan.nextObjectIndex,
 		}
-
-		pendingMarkMapToSet(set, byID)
-		if err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, markStorage, set, matchToken, exists); err != nil {
+		if err := storeGCCursorCAS(ctx, storage, next, matchToken, true); err != nil {
 			if isGCMarkCASConflict(err) {
 				lastErr = err
 				continue
 			}
-			return stats, fmt.Errorf("store pending sst delete marks after sweep: %w", err)
+			return stats, fmt.Errorf("advance gc cursor: %w", err)
+		}
+
+		if next.NextObjectIndex == 0 {
+			if _, err := manifestLog.AdvanceRetirementLogStart(ctx, next.NextManifestSeq, fence); err != nil {
+				return stats, fmt.Errorf("advance retirement floor: %w", err)
+			}
 		}
 		return stats, nil
 	}
 
 	if lastErr != nil {
-		return stats, fmt.Errorf("store pending sst delete marks after retries: %w", lastErr)
+		return stats, fmt.Errorf("advance gc cursor after retries: %w", lastErr)
 	}
-	return stats, fmt.Errorf("store pending sst delete marks exceeded retries")
+	return stats, errors.New("advance gc cursor exceeded retries")
 }
 
-func planPendingSSTSweep(byID map[string]pendingSSTDeleteMark, liveSet map[string]struct{}, now time.Time, gracePeriod time.Duration, batchSize int) sstSweepPlan {
-	deleteCap := 0
-	if batchSize > 0 {
-		deleteCap = batchSize
+func planRetirementSweep(entries []*manifest.ManifestLogEntry, cursor *gcCursor, now time.Time, batchSize int) (retirementSweepPlan, error) {
+	plan := retirementSweepPlan{
+		keys:            make([]string, 0, batchSize),
+		nextManifestSeq: cursor.NextManifestSeq,
+		nextObjectIndex: cursor.NextObjectIndex,
 	}
-	plan := sstSweepPlan{
-		deleteIDs: make([]string, 0, deleteCap),
-	}
-
-	liveIDs := make([]string, 0, len(liveSet))
-	for id := range liveSet {
-		liveIDs = append(liveIDs, id)
-	}
-	beforeLiveClear := len(byID)
-	if applyPendingSSTDeleteMarkClears(byID, liveIDs) {
-		plan.changed = true
-		plan.clearedLive = beforeLiveClear - len(byID)
-	}
-
 	if batchSize <= 0 {
-		return plan
+		return plan, nil
 	}
 
-	ids := sortedPendingMarkIDs(byID, now, gracePeriod)
-	for _, id := range ids {
-		if len(plan.deleteIDs) >= batchSize {
-			break
+	expectedSeq := cursor.NextManifestSeq
+	objectIndex := int(cursor.NextObjectIndex)
+	for _, entry := range entries {
+		if entry == nil || entry.Seq != expectedSeq {
+			return retirementSweepPlan{}, fmt.Errorf("%w: expected seq=%d", manifest.ErrRetirementHistory, expectedSeq)
 		}
-		mark, ok := byID[id]
-		if !ok {
-			continue
+		if objectIndex > len(entry.RetiredObjects) {
+			return retirementSweepPlan{}, fmt.Errorf("invalid gc cursor object index=%d count=%d seq=%d", objectIndex, len(entry.RetiredObjects), entry.Seq)
 		}
-		if now.Before(pendingMarkDueAt(mark, now, gracePeriod)) {
-			break
-		}
-		plan.deleteIDs = append(plan.deleteIDs, id)
-	}
 
-	return plan
-}
-
-func deleteKeysForSSTIDs(store *blobstore.Store, ids []string) []string {
-	keys := make([]string, 0, len(ids))
-	for _, id := range ids {
-		keys = append(keys, store.SSTPath(id))
-	}
-	return keys
-}
-
-func applySweepDeleteBatch(ctx context.Context, store *blobstore.Store, byID map[string]pendingSSTDeleteMark, deleteIDs, deleteKeys []string) (deleted, failed int, changed bool) {
-	if len(deleteIDs) == 0 {
-		return 0, 0, false
-	}
-
-	failedByKey := map[string]error{}
-	if err := store.BatchDelete(ctx, deleteKeys); err != nil {
-		var batchErr *blobstore.BatchDeleteError
-		if errors.As(err, &batchErr) {
-			failedByKey = batchErr.Failed
-		} else {
-			for _, key := range deleteKeys {
-				failedByKey[key] = err
+		for objectIndex < len(entry.RetiredObjects) {
+			retired := entry.RetiredObjects[objectIndex]
+			if now.Before(retired.NotBefore) {
+				plan.blockedNotBefore = true
+				plan.nextManifestSeq = expectedSeq
+				plan.nextObjectIndex = uint32(objectIndex)
+				return plan, nil
+			}
+			plan.keys = append(plan.keys, retired.Key)
+			objectIndex++
+			if len(plan.keys) >= batchSize {
+				if objectIndex == len(entry.RetiredObjects) {
+					plan.nextManifestSeq = expectedSeq + 1
+					plan.nextObjectIndex = 0
+					plan.entriesAdvanced++
+				} else {
+					plan.nextManifestSeq = expectedSeq
+					plan.nextObjectIndex = uint32(objectIndex)
+				}
+				return plan, nil
 			}
 		}
-	}
 
-	successfulDeleteIDs := make([]string, 0, len(deleteIDs))
-	for i, id := range deleteIDs {
-		key := deleteKeys[i]
-		if _, hadFailure := failedByKey[key]; hadFailure {
-			failed++
-			continue
-		}
-		successfulDeleteIDs = append(successfulDeleteIDs, id)
+		expectedSeq++
+		objectIndex = 0
+		plan.nextManifestSeq = expectedSeq
+		plan.nextObjectIndex = 0
+		plan.entriesAdvanced++
 	}
-	changed = applyPendingSSTDeleteMarkClears(byID, successfulDeleteIDs)
-	deleted = len(successfulDeleteIDs)
-	return deleted, failed, changed
-}
-
-func currentLiveSSTSet(ctx context.Context, manifestLog *manifest.Store) (map[string]struct{}, error) {
-	m, err := manifestLog.Replay(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("replay manifest: %w", err)
-	}
-
-	liveSet := make(map[string]struct{}, len(m.L0SSTs))
-	for _, sst := range m.L0SSTs {
-		if sst.ID == "" {
-			continue
-		}
-		liveSet[sst.ID] = struct{}{}
-	}
-	for _, sr := range m.SortedRuns {
-		for _, sst := range sr.SSTs {
-			if sst.ID == "" {
-				continue
-			}
-			liveSet[sst.ID] = struct{}{}
-		}
-	}
-	return liveSet, nil
-}
-
-func sortedPendingMarkIDs(byID map[string]pendingSSTDeleteMark, now time.Time, gracePeriod time.Duration) []string {
-	ids := make([]string, 0, len(byID))
-	for id := range byID {
-		if id == "" {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		li := pendingMarkDueAt(byID[ids[i]], now, gracePeriod)
-		lj := pendingMarkDueAt(byID[ids[j]], now, gracePeriod)
-		if li.Equal(lj) {
-			return ids[i] < ids[j]
-		}
-		return li.Before(lj)
-	})
-	return ids
-}
-
-func pendingMarkDueAt(mark pendingSSTDeleteMark, now time.Time, gracePeriod time.Duration) time.Time {
-	if !mark.DueAt.IsZero() {
-		return mark.DueAt
-	}
-	if !mark.FirstSeenUnreferencedAt.IsZero() {
-		return mark.FirstSeenUnreferencedAt.Add(gracePeriod)
-	}
-	if !mark.LastSeenUnreferencedAt.IsZero() {
-		return mark.LastSeenUnreferencedAt.Add(gracePeriod)
-	}
-	return now
+	return plan, nil
 }
