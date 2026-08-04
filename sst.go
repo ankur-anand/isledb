@@ -150,7 +150,6 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 			Length:     int64(len(bloomBytes)),
 		},
 		CreatedAt:   time.Now().UTC(),
-		Level:       0,
 		HasBlobRefs: hasBlobRefs,
 	}
 	if opts.Signer != nil {

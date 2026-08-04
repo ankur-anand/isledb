@@ -23,11 +23,11 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 
 	compactorOpts := compactorOptions{
 		Trigger: compactionTriggerOptions{
-			L0SSTCount:    1,
-			MinSources:    1,
-			MaxSources:    4,
-			SizeRatio:     1,
-			CheckInterval: time.Hour,
+			L0SSTCount:          1,
+			BaseLevelBytes:      512 * 1024 * 1024,
+			LevelSizeMultiplier: 8,
+			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
+			CheckInterval:       time.Hour,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -110,6 +110,8 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 		Timestamp: time.Now().UTC(),
 		Op:        manifest.LogOpCompaction,
 		Compaction: &manifest.CompactionLogPayload{
+			RemoveSSTableIDs: []string{"stale-input"},
+			DestinationLevel: 1,
 			AddSSTables: []manifest.SSTMeta{{
 				ID:        "stale-compacted.sst",
 				Epoch:     1,
@@ -150,7 +152,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	if m.LookupSST("stale-compacted.sst") != nil {
 		t.Fatalf("stale-compacted.sst should be filtered after newer fence claim")
 	}
-	if m.L0SSTCount() == 0 && m.SortedRunCount() == 0 {
+	if m.L0SSTCount() == 0 && len(m.Levels) == 0 {
 		t.Fatalf("expected manifest to contain data from earlier phases")
 	}
 }

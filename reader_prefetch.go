@@ -58,10 +58,7 @@ type PrefetchStats struct {
 	BytesRead   int64
 }
 
-// Prefetch warms the reader's SST cache for the currently loaded manifest.
-//
-// Prefetch does not refresh the manifest. Call Refresh first when the caller
-// wants to discover newly committed SSTs before warming the cache.
+// Prefetch warms the reader's SST cache for a fresh manifest view.
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error) {
 	if err := validatePrefetchOptions(opts); err != nil {
 		return PrefetchStats{}, err
@@ -72,6 +69,9 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		return PrefetchStats{}, err
 	}
 	defer done()
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return PrefetchStats{}, err
+	}
 
 	m := r.currentManifest()
 	if m != nil {
@@ -199,8 +199,8 @@ func (r *Reader) selectPrefetchSSTs(m *Manifest, opts PrefetchOptions) ([]SSTMet
 	for _, sst := range m.L0SSTs {
 		visit(sst)
 	}
-	for _, sr := range m.SortedRuns {
-		for _, sst := range sr.SSTs {
+	for _, level := range m.Levels {
+		for _, sst := range level.SSTs {
 			visit(sst)
 		}
 	}

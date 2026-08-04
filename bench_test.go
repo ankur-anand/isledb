@@ -64,7 +64,7 @@ func BenchmarkDB_Put_Sequential(b *testing.B) {
 	ctx := context.Background()
 
 	opts := DefaultWriterOptions()
-	opts.Flush.Interval = -1
+	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 64 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, opts)
@@ -93,7 +93,7 @@ func BenchmarkDB_Put_Random(b *testing.B) {
 	ctx := context.Background()
 
 	opts := DefaultWriterOptions()
-	opts.Flush.Interval = -1
+	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 64 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, opts)
@@ -124,7 +124,7 @@ func BenchmarkDB_Put_ValueSizes(b *testing.B) {
 			ctx := context.Background()
 
 			opts := DefaultWriterOptions()
-			opts.Flush.Interval = -1
+			opts.Flush.Interval = 0
 			opts.Memtable.TargetBytes = 64 * 1024 * 1024
 
 			db, writer := openBenchWriter(b, ctx, store, opts)
@@ -154,7 +154,7 @@ func BenchmarkDB_Put_WithFlush(b *testing.B) {
 	ctx := context.Background()
 
 	opts := DefaultWriterOptions()
-	opts.Flush.Interval = -1
+	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 1 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, opts)
@@ -187,7 +187,7 @@ func BenchmarkDB_Get_Sequential(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
 	defer closeBenchResources(b, writer, db, store)
@@ -231,7 +231,7 @@ func BenchmarkDB_Get_Random(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
 	defer closeBenchResources(b, writer, db, store)
@@ -278,7 +278,7 @@ func BenchmarkDB_Get_NotFound(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
 	defer closeBenchResources(b, writer, db, store)
@@ -322,7 +322,7 @@ func BenchmarkDB_Get_MultipleSSTs(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 	wOpts.Memtable.TargetBytes = 32 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
@@ -375,7 +375,7 @@ func BenchmarkDB_Get_AfterCompaction(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 	wOpts.Memtable.TargetBytes = 32 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
@@ -443,7 +443,7 @@ func BenchmarkDB_Scan_Full(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
 	defer closeBenchResources(b, writer, db, store)
@@ -488,7 +488,7 @@ func BenchmarkDB_Scan_Range(b *testing.B) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
 	defer closeBenchResources(b, writer, db, store)
@@ -546,7 +546,7 @@ func benchmarkMixedWorkload(b *testing.B, readPercent int) {
 	ctx := context.Background()
 
 	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = -1
+	wOpts.Flush.Interval = 0
 	wOpts.Memtable.TargetBytes = 4 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, wOpts)
@@ -626,7 +626,7 @@ func BenchmarkWriter_Put(b *testing.B) {
 	ctx := context.Background()
 
 	opts := DefaultWriterOptions()
-	opts.Flush.Interval = -1
+	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 64 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, opts)
@@ -650,7 +650,7 @@ func BenchmarkWriter_Flush(b *testing.B) {
 	ctx := context.Background()
 
 	opts := DefaultWriterOptions()
-	opts.Flush.Interval = -1
+	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 64 * 1024 * 1024
 
 	db, writer := openBenchWriter(b, ctx, store, opts)
@@ -681,7 +681,7 @@ func BenchmarkWriter_Flush(b *testing.B) {
 	}
 }
 
-func BenchmarkCompactor_L0Compaction(b *testing.B) {
+func BenchmarkCompactor_L0Promotion(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 
@@ -694,7 +694,7 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 		}
 
 		writerOpts := DefaultWriterOptions()
-		writerOpts.Flush.Interval = -1
+		writerOpts.Flush.Interval = 0
 		writerOpts.Memtable.TargetBytes = 32 * 1024
 
 		writer, err := db.OpenWriter(ctx, writerOpts)
@@ -752,6 +752,61 @@ func BenchmarkCompactor_L0Compaction(b *testing.B) {
 		}
 		if err := store.Close(); err != nil {
 			b.Fatalf("Store close: %v", err)
+		}
+	}
+}
+
+func BenchmarkCompactor_L0Rewrite(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store := blobstore.NewMemory("bench")
+		ctx := context.Background()
+		db, err := OpenDB(ctx, store, DBOptions{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		writerOpts := DefaultWriterOptions()
+		writerOpts.Flush.Interval = 0
+		writerOpts.Memtable.TargetBytes = 32 * 1024
+		writer, err := db.OpenWriter(ctx, writerOpts)
+		if err != nil {
+			b.Fatal(err)
+		}
+		value := make([]byte, 100)
+		for flush := 0; flush < 8; flush++ {
+			for key := 0; key < 100; key++ {
+				if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%016d", key)), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := writer.Flush(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := writer.Close(ctx); err != nil {
+			b.Fatal(err)
+		}
+		maintenanceOpts := DefaultMaintenanceOptions()
+		maintenanceOpts.Compaction.L0SSTCount = 4
+		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.StartTimer()
+		if _, err := maintenance.RunOnce(ctx); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+
+		if err := maintenance.Close(ctx); err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

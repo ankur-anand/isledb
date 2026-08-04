@@ -91,8 +91,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	maintenanceOpts.OwnerID = "s3-e2e-maintenance"
 	maintenanceOpts.Every = 10 * time.Millisecond
 	maintenanceOpts.Compaction.L0SSTCount = 4
-	maintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
-	maintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 2 * 1024
 	maintenanceOpts.Compaction.BlockBytes = 1024
 	maintenanceOpts.Compaction.Compression = "none"
@@ -144,8 +143,8 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	}
 
 	compacted := replayManifestForTest(t, ctx, store)
-	if compacted.SortedRunCount() == 0 {
-		t.Fatalf("expected compaction to create sorted runs, got l0=%d sorted_runs=0", compacted.L0SSTCount())
+	if len(compacted.Levels) == 0 {
+		t.Fatalf("expected compaction to create a level, got l0=%d levels=0", compacted.L0SSTCount())
 	}
 	liveSSTsBeforeRetention := compacted.AllSSTIDs()
 	if len(liveSSTsBeforeRetention) < 2 {
@@ -201,8 +200,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	}
 	retentionMaintenanceOpts := DefaultMaintenanceOptions()
 	retentionMaintenanceOpts.Compaction.L0SSTCount = 1 << 20
-	retentionMaintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
-	retentionMaintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	retentionMaintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	retentionMaintenanceOpts.Retention = &retentionPolicy
 
 	retentionMaintenance, err := db.OpenMaintenance(ctx, retentionMaintenanceOpts)
@@ -387,11 +385,12 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "kv-lifecycle-maintenance"
 	opts.Compaction.L0SSTCount = 2
-	opts.Compaction.MinSortedRunSources = 1 << 20
-	opts.Compaction.MaxSortedRunSources = 1 << 20
+	opts.Compaction.BaseLevelBytes = 1 << 60
 	opts.Compaction.TargetSSTBytes = 1 << 20
 	opts.Compaction.BlockBytes = 1024
 	opts.Compaction.Compression = "none"
+	opts.GarbageCollection.GracePeriod = time.Nanosecond
+	opts.GarbageCollection.DeleteBatchSize = len(oldSSTs)
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
@@ -407,16 +406,14 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 		t.Fatalf("close maintenance: %v", err)
 	}
 
-	// The pre-compaction reader view remains valid during the GC grace period.
-	assertCurrentKVState(t, ctx, reader)
 	if err := reader.Refresh(ctx); err != nil {
 		t.Fatalf("refresh compacted state: %v", err)
 	}
 	assertCurrentKVState(t, ctx, reader)
 
 	compacted := replayManifestForTest(t, ctx, store)
-	if compacted.L0SSTCount() != 0 || compacted.SortedRunCount() == 0 {
-		t.Fatalf("unexpected compacted manifest: l0=%d sorted_runs=%d", compacted.L0SSTCount(), compacted.SortedRunCount())
+	if compacted.L0SSTCount() != 0 || len(compacted.Levels) == 0 {
+		t.Fatalf("unexpected compacted manifest: l0=%d levels=%d", compacted.L0SSTCount(), len(compacted.Levels))
 	}
 	for _, id := range compacted.AllSSTIDs() {
 		if _, stale := oldSSTs[id]; stale {
@@ -424,20 +421,6 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 		}
 	}
 
-	sweep, err := runPendingSSTSweeperWithStorage(
-		ctx,
-		store,
-		db.manifestStore,
-		db.gcMarkStorage,
-		len(oldSSTs),
-		-1,
-	)
-	if err != nil {
-		t.Fatalf("sweep compacted L0 SSTs: %v", err)
-	}
-	if sweep.Deleted != len(oldSSTs) || sweep.Failed != 0 {
-		t.Fatalf("unexpected SST sweep stats: %+v want_deleted=%d", sweep, len(oldSSTs))
-	}
 	for id := range oldSSTs {
 		if _, _, err := store.Read(ctx, store.SSTPath(id)); !errors.Is(err, blobstore.ErrNotFound) {
 			t.Fatalf("old SST %q read error=%v, want %v", id, err, blobstore.ErrNotFound)
@@ -613,8 +596,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	maintenanceOpts.OwnerID = "s3-bench-maintenance"
 	maintenanceOpts.Every = 25 * time.Millisecond
 	maintenanceOpts.Compaction.L0SSTCount = 8
-	maintenanceOpts.Compaction.MinSortedRunSources = 1 << 20
-	maintenanceOpts.Compaction.MaxSortedRunSources = 1 << 20
+	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 64 << 10
 	maintenanceOpts.Compaction.Compression = "none"
 

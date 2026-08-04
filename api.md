@@ -83,7 +83,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 ```go
 type DBOptions struct {
     ManifestStorage manifest.Storage // Optional custom manifest storage backend
-    GCMarkStorage   manifest.GCMarkStorage // Optional custom GC mark storage backend
+    GCCursorStorage manifest.GCCursorStorage // Optional custom retirement cursor backend
 }
 ```
 
@@ -207,7 +207,9 @@ return w.Flush(ctx)
 
 Immutable read handle over one loaded reader state. A snapshot does not refresh.
 It keeps reading the same visible state even if its parent `Reader` is refreshed
-later.
+later. Snapshots expire after `ReaderOpenOptions.Views.SnapshotMaxAge`; their
+iterators expire after the smaller of the snapshot deadline and
+`IteratorMaxAge`.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -230,9 +232,9 @@ Read-only handle for database access. Supports point lookups, range scans, and i
 func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error)
 ```
 
-Reader state is explicit. Opening a reader loads a view. `Refresh` reloads the
-manifest so the reader can see newly flushed data. Reads use the currently
-loaded view.
+Opening a reader loads a view. Reads refresh it when `Views.RefreshAfter` has
+elapsed; concurrent refreshes are coalesced. `Refresh` remains available when
+the caller needs an immediate visibility check.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -241,7 +243,7 @@ loaded view.
 | Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range into memory |
 | ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan a bounded number of records |
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Stream a bounded key range |
-| Snapshot | `() *Snapshot` | Pin the current loaded state for consistent multi-operation reads |
+| Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
 | Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
 | Manifest | `() *Manifest` | Return cloned manifest snapshot |
 | Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
@@ -260,16 +262,23 @@ type ReaderOpenOptions struct {
     RangeReadMinSSTSize      int64                // Minimum SST size for range-read optimization
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
+    Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
     BlobReadOptions          config.BlobReadOptions
     ManifestStorage          manifest.Storage     // Optional custom manifest storage
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
+
+type ReaderViewPolicy struct {
+    RefreshAfter   time.Duration // Default: 1 minute
+    SnapshotMaxAge time.Duration // Default: 5 minutes
+    IteratorMaxAge time.Duration // Default: 2 minutes
+}
 ```
 
-`Refresh` and `Prefetch` are separate operations. `Refresh` discovers committed
-manifest state. `Prefetch` downloads SSTs from the currently loaded manifest
-into the local cache. `Prefetch` does not call `Refresh`.
+`Prefetch` first applies the same freshness policy as a read, then downloads
+selected SSTs from that manifest into the local cache. It does not force an
+object-store refresh while the loaded view is still fresh.
 
 Example:
 
@@ -388,6 +397,7 @@ type MaintenanceOptions struct {
     OwnerID            string
     Every              time.Duration
     Compaction         CompactionPolicy
+    GarbageCollection  GarbageCollectionPolicy
     Retention          *RetentionPolicy
     ChangeFeedRetention *ChangeFeedRetentionPolicy
     OnCycle            func(MaintenanceStats)
@@ -395,20 +405,34 @@ type MaintenanceOptions struct {
 }
 
 type CompactionPolicy struct {
-    InputReadParallelism         int
-    L0SSTCount                   int
+    InputReadParallelism        int
+    L0SSTCount                  int
     MaxConsecutiveL0Compactions int
-    MinSortedRunSources          int
-    MaxSortedRunSources          int
-    SortedRunSizeRatio           int
-    TargetSSTBytes               int64
-    BloomBitsPerKey              int
-    BlockBytes                   int
-    Compression                  string
-    ValidateSSTChecksum          bool
-    SSTHashVerifier              SSTHashVerifier
-    OnCompactionStart            func(CompactionJob)
-    OnCompactionEnd              func(CompactionJob, error)
+    BaseLevelBytes              int64
+    LevelSizeMultiplier         int
+    MaxInputSSTs                int
+    TargetSSTBytes              int64
+    BloomBitsPerKey             int
+    BlockBytes                  int
+    Compression                 string
+    ValidateSSTChecksum         bool
+    SSTHashVerifier             SSTHashVerifier
+    OnCompactionStart           func(CompactionJob)
+    OnCompactionEnd             func(CompactionJob, error)
+}
+
+type GarbageCollectionPolicy struct {
+    DeleteBatchSize int
+    GracePeriod     time.Duration
+}
+
+type CompactionJob struct {
+    Type             CompactionJobType
+    SourceLevel      uint32
+    DestinationLevel uint32
+    InputSSTs        []string
+    OutputSSTs       []SSTMeta
+    MetadataOnly     bool
 }
 
 type RetentionPolicy struct {
@@ -490,17 +514,16 @@ type Manifest = manifest.Manifest
 | LogSeq | `uint64` | Current log sequence |
 | WriterFence | `*FenceToken` | Writer ownership claim |
 | CompactorFence | `*FenceToken` | Compactor ownership claim |
-| L0SSTs | `[]SSTMeta` | Level-0 SSTs |
-| SortedRuns | `[]SortedRun` | Sorted runs (level 1+) |
-| NextSortedRunID | `uint32` | Next run ID to assign |
+| L0SSTs | `[]SSTMeta` | Overlapping level-0 SSTs, newest first |
+| Levels | `[]Level` | Non-overlapping levels ordered by level number |
 
 | Method | Signature |
 |--------|-----------|
 | Clone | `() *Manifest` |
 | L0SSTCount | `() int` |
-| SortedRunCount | `() int` |
 | LookupSST | `(id string) *SSTMeta` |
-| GetSortedRun | `(id uint32) *SortedRun` |
+| Level | `(number uint32) *Level` |
+| ValidateLevels | `() error` |
 | AllSSTIDs | `() []string` |
 | MaxSeqNum | `() uint64` |
 
@@ -523,7 +546,7 @@ type SSTMeta = manifest.SSTMeta
 | Signature | `*SSTSignature` | Digital signature |
 | Bloom | `BloomMeta` | Bloom filter metadata |
 | CreatedAt | `time.Time` | Creation timestamp |
-| Level | `int` | LSM level (0 = L0) |
+| Level | `uint32` | Logical LSM level (0 = L0) |
 | HasBlobRefs | `bool` | Contains external blob references |
 
 ### ChangeBatchMeta
@@ -549,15 +572,15 @@ type ChangeBatchMeta = manifest.ChangeBatchMeta
 | CreatedAt | `time.Time` | Creation time |
 | Version | `int` | Change batch format version |
 
-### SortedRun
+### Level
 
 ```go
-type SortedRun = manifest.SortedRun
+type Level = manifest.Level
 ```
 
 | Field | Type |
 |-------|------|
-| ID | `uint32` |
+| Number | `uint32` |
 | SSTs | `[]SSTMeta` |
 
 ### SSTSignature
@@ -736,8 +759,10 @@ func NewStoreWithStorage(storage Storage) *Store
 | AppendWriterCommit | `(ctx, WriterCommit) (*ManifestLogEntry, error)` | Idempotently publish one SST and optional change batch using a stable commit ID |
 | AppendAddSSTableWithFence | `(ctx, SSTMeta) (*ManifestLogEntry, error)` | Append SST add entry |
 | AppendAddSSTableWithChangeBatchWithFence | `(ctx, SSTMeta, *ChangeBatchMeta) (*ManifestLogEntry, error)` | Append paired SST and change-batch entry |
-| AppendRemoveSSTablesWithFence | `(ctx, []string) (*ManifestLogEntry, error)` | Append SST remove entry |
-| AppendCompactionWithFence | `(ctx, CompactionLogPayload) (*ManifestLogEntry, error)` | Append compaction entry |
+| AppendRemoveSSTablesWithFence | `(ctx, []string, []RetiredObject) (*ManifestLogEntry, error)` | Atomically remove SST metadata and record exact retired objects |
+| AppendCompactionWithFence | `(ctx, CompactionLogPayload, []RetiredObject) (*ManifestLogEntry, error)` | Append one bounded adjacent-level compaction entry with explicit source and destination levels |
+| ReadRetirementEntries | `(ctx, start uint64, limit int) ([]*ManifestLogEntry, uint64, error)` | Read a bounded retirement-history page |
+| AdvanceRetirementLogStart | `(ctx, floor uint64, *FenceToken) (*Current, error)` | Advance the retained retirement floor after cursor commit |
 | WriteSnapshot | `(ctx, *Manifest) (string, error)` | Write manifest snapshot |
 
 **Errors:**
@@ -745,3 +770,5 @@ func NewStoreWithStorage(storage Storage) *Store
 - `manifest.ErrFenceConflict` - Concurrent claim detected
 - `manifest.ErrInvalidWriterCommit` - Commit identity or SST/change metadata is invalid
 - `manifest.ErrWriterCommitConflict` - A commit ID was reused with different metadata
+- `manifest.ErrInvalidRetirement` - Removed SSTs and exact retirement records do not match
+- `manifest.ErrInvalidManifest` - A replayed or submitted level topology is invalid

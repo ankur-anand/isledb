@@ -12,60 +12,76 @@ import (
 	"github.com/ankur-anand/isledb/manifest"
 )
 
-// SST GC is a two-phase physical-delete protocol.
-//
-// Compaction and retention first remove SSTs from the manifest, then record
-// pending delete marks. A later sweeper deletes only marked SST objects that
-// are still absent from the current manifest after a grace period.
-//
-// Retention also catches up marks from manifest history so a crash between
-// "manifest commit" and "pending mark write" does not leak obsolete SST files:
-// it replays remove/add entries from the last GC checkpoint, runs an orphan
-// scan when the manifest log window changes, stores the pending mark set once,
-// and advances the checkpoint.
-
 const (
-	pendingSSTDeletePrefix    = "manifest/gc/pending-sst"
-	pendingSSTDeleteSetObject = pendingSSTDeletePrefix + "/pending.json"
-	gcCheckpointObjectKey     = "manifest/gc/checkpoint.json"
-	gcMarkSchemaVersion       = 1
-	gcMarkCatchupBatchSize    = 100
-	gcCASMaxRetries           = 8
+	gcCursorObjectKey   = "manifest/gc/CURRENT.json"
+	gcMarkSchemaVersion = 1
+	gcCASMaxRetries     = 8
 )
 
-type pendingSSTDeleteMark struct {
-	Version int `json:"version,omitempty"`
-
-	SSTID string `json:"sst_id"`
-
-	FirstSeenUnreferencedAt time.Time `json:"first_seen_unreferenced_at,omitempty"`
-	LastSeenUnreferencedAt  time.Time `json:"last_seen_unreferenced_at,omitempty"`
-	FirstSeenSeq            uint64    `json:"first_seen_seq,omitempty"`
-	LastSeenSeq             uint64    `json:"last_seen_seq,omitempty"`
-	FirstReason             string    `json:"first_reason,omitempty"`
-	LastReason              string    `json:"last_reason,omitempty"`
-	HasBlobRefs             bool      `json:"has_blob_refs,omitempty"`
-	DueAt                   time.Time `json:"due_at,omitempty"`
+type gcCursor struct {
+	Version         int       `json:"version"`
+	NextManifestSeq uint64    `json:"next_manifest_seq"`
+	NextObjectIndex uint32    `json:"next_object_index,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
-type pendingSSTDeleteMarkSet struct {
-	Version int                    `json:"version,omitempty"`
-	Marks   []pendingSSTDeleteMark `json:"marks,omitempty"`
-}
-
-type gcMarkCheckpoint struct {
-	Version             int       `json:"version,omitempty"`
-	LastAppliedSeq      uint64    `json:"last_applied_seq"`
-	LastSeenLogSeqStart uint64    `json:"last_seen_log_seq_start,omitempty"`
-	UpdatedAt           time.Time `json:"updated_at"`
-}
-
-type gcMarkStorageAdapter struct {
+type gcCursorStorageAdapter struct {
 	store *blobstore.Store
 }
 
-func newGCMarkStorage(store *blobstore.Store) manifest.GCMarkStorage {
-	return gcMarkStorageAdapter{store: store}
+func newGCCursorStorage(store *blobstore.Store) manifest.GCCursorStorage {
+	return gcCursorStorageAdapter{store: store}
+}
+
+func (s gcCursorStorageAdapter) LoadGCCursor(ctx context.Context) ([]byte, string, bool, error) {
+	return readObjectWithCAS(ctx, s.store, gcCursorPath(s.store))
+}
+
+func (s gcCursorStorageAdapter) StoreGCCursor(ctx context.Context, data []byte, matchToken string, exists bool) error {
+	return writeObjectCAS(ctx, s.store, gcCursorPath(s.store), data, matchToken, exists)
+}
+
+func loadGCCursorWithCAS(ctx context.Context, storage manifest.GCCursorStorage) (*gcCursor, string, bool, error) {
+	if storage == nil {
+		return nil, "", false, errors.New("nil gc cursor storage")
+	}
+	data, matchToken, exists, err := storage.LoadGCCursor(ctx)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if !exists {
+		return &gcCursor{Version: gcMarkSchemaVersion}, "", false, nil
+	}
+
+	var cursor gcCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return nil, "", false, fmt.Errorf("decode gc cursor: %w", err)
+	}
+	if cursor.Version != gcMarkSchemaVersion {
+		return nil, "", false, fmt.Errorf("unsupported gc cursor version=%d", cursor.Version)
+	}
+	return &cursor, matchToken, true, nil
+}
+
+func storeGCCursorCAS(ctx context.Context, storage manifest.GCCursorStorage, cursor *gcCursor, matchToken string, exists bool) error {
+	if storage == nil {
+		return errors.New("nil gc cursor storage")
+	}
+	if cursor == nil {
+		return errors.New("nil gc cursor")
+	}
+	next := *cursor
+	next.Version = gcMarkSchemaVersion
+	next.UpdatedAt = time.Now().UTC()
+	payload, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	return storage.StoreGCCursor(ctx, payload, matchToken, exists)
+}
+
+func gcCursorPath(store *blobstore.Store) string {
+	return storeKey(store, gcCursorObjectKey)
 }
 
 func readObjectWithCAS(ctx context.Context, store *blobstore.Store, key string) ([]byte, string, bool, error) {
@@ -85,242 +101,6 @@ func readObjectWithCAS(ctx context.Context, store *blobstore.Store, key string) 
 		matchToken = matchTokenFromAttrs(attrs)
 	}
 	return data, matchToken, true, nil
-}
-
-func (s gcMarkStorageAdapter) LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error) {
-	return readObjectWithCAS(ctx, s.store, pendingSSTDeleteSetPath(s.store))
-}
-
-func (s gcMarkStorageAdapter) StorePendingDeleteMarks(ctx context.Context, data []byte, matchToken string, exists bool) error {
-	return writeObjectCAS(ctx, s.store, pendingSSTDeleteSetPath(s.store), data, matchToken, exists)
-}
-
-func (s gcMarkStorageAdapter) LoadGCCheckpoint(ctx context.Context) ([]byte, string, bool, error) {
-	return readObjectWithCAS(ctx, s.store, gcCheckpointPath(s.store))
-}
-
-func (s gcMarkStorageAdapter) StoreGCCheckpoint(ctx context.Context, data []byte, matchToken string, exists bool) error {
-	return writeObjectCAS(ctx, s.store, gcCheckpointPath(s.store), data, matchToken, exists)
-}
-
-func enqueuePendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store, sstIDs []string, reason string, seq uint64) error {
-	return enqueuePendingSSTDeleteMarksWithStorage(ctx, newGCMarkStorage(store), sstIDs, reason, seq)
-}
-
-func enqueuePendingSSTDeleteMarksWithStorage(ctx context.Context, storage manifest.GCMarkStorage, sstIDs []string, reason string, seq uint64) error {
-	now := time.Now().UTC()
-	ids := uniqueSSTIDs(sstIDs)
-	if len(ids) == 0 {
-		return nil
-	}
-	if storage == nil {
-		return errors.New("nil gc mark storage")
-	}
-
-	return withGCMarkCASRetries("store pending mark set", func() error {
-		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, storage)
-		if err != nil {
-			return err
-		}
-
-		byID := pendingMarkMapFromSet(set)
-		if !applyPendingSSTDeleteMarkUpserts(byID, ids, reason, seq, now) {
-			return nil
-		}
-		pendingMarkMapToSet(set, byID)
-
-		return storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
-	})
-}
-
-func clearPendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store, sstIDs []string) error {
-	return clearPendingSSTDeleteMarksWithStorage(ctx, newGCMarkStorage(store), sstIDs)
-}
-
-func clearPendingSSTDeleteMarksWithStorage(ctx context.Context, storage manifest.GCMarkStorage, sstIDs []string) error {
-	ids := uniqueSSTIDs(sstIDs)
-	if len(ids) == 0 {
-		return nil
-	}
-	if storage == nil {
-		return errors.New("nil gc mark storage")
-	}
-
-	return withGCMarkCASRetries("clear pending mark set", func() error {
-		set, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, storage)
-		if err != nil {
-			return err
-		}
-
-		byID := pendingMarkMapFromSet(set)
-		if !applyPendingSSTDeleteMarkClears(byID, ids) {
-			return nil
-		}
-		pendingMarkMapToSet(set, byID)
-
-		return storePendingSSTDeleteMarkSetWithStorageCAS(ctx, storage, set, matchToken, exists)
-	})
-}
-
-func loadGCMarkCheckpoint(ctx context.Context, store *blobstore.Store) (*gcMarkCheckpoint, error) {
-	checkpoint, _, _, err := loadGCMarkCheckpointWithCAS(ctx, store)
-	return checkpoint, err
-}
-
-func loadGCMarkCheckpointWithStorage(ctx context.Context, storage manifest.GCMarkStorage) (*gcMarkCheckpoint, error) {
-	checkpoint, _, _, err := loadGCMarkCheckpointWithStorageCAS(ctx, storage)
-	return checkpoint, err
-}
-
-func loadGCMarkCheckpointWithCAS(ctx context.Context, store *blobstore.Store) (*gcMarkCheckpoint, string, bool, error) {
-	return loadGCMarkCheckpointWithStorageCAS(ctx, newGCMarkStorage(store))
-}
-
-func loadGCMarkCheckpointWithStorageCAS(ctx context.Context, storage manifest.GCMarkStorage) (*gcMarkCheckpoint, string, bool, error) {
-	if storage == nil {
-		return nil, "", false, errors.New("nil gc mark storage")
-	}
-	data, matchToken, exists, err := storage.LoadGCCheckpoint(ctx)
-	if err != nil {
-		return nil, "", false, err
-	}
-	if !exists {
-		return &gcMarkCheckpoint{Version: gcMarkSchemaVersion}, "", false, nil
-	}
-
-	var checkpoint gcMarkCheckpoint
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return nil, "", false, err
-	}
-	if checkpoint.Version == 0 {
-		checkpoint.Version = gcMarkSchemaVersion
-	}
-	return &checkpoint, matchToken, true, nil
-}
-
-func storeGCMarkCheckpoint(ctx context.Context, store *blobstore.Store, checkpoint *gcMarkCheckpoint) error {
-	return storeGCMarkCheckpointWithStorage(ctx, newGCMarkStorage(store), checkpoint)
-}
-
-func storeGCMarkCheckpointWithStorage(ctx context.Context, storage manifest.GCMarkStorage, checkpoint *gcMarkCheckpoint) error {
-	if storage == nil {
-		return errors.New("nil gc mark storage")
-	}
-	if checkpoint == nil {
-		return errors.New("nil gc checkpoint")
-	}
-
-	return withGCMarkCASRetries("store gc checkpoint", func() error {
-		current, matchToken, exists, err := loadGCMarkCheckpointWithStorageCAS(ctx, storage)
-		if err != nil {
-			return err
-		}
-
-		merged := *checkpoint
-		merged.Version = gcMarkSchemaVersion
-		if current != nil {
-			if merged.LastAppliedSeq < current.LastAppliedSeq {
-				merged.LastAppliedSeq = current.LastAppliedSeq
-			}
-			if merged.LastSeenLogSeqStart < current.LastSeenLogSeqStart {
-				merged.LastSeenLogSeqStart = current.LastSeenLogSeqStart
-			}
-		}
-		merged.UpdatedAt = time.Now().UTC()
-
-		payload, err := json.Marshal(merged)
-		if err != nil {
-			return err
-		}
-		err = storage.StoreGCCheckpoint(ctx, payload, matchToken, exists)
-		return err
-	})
-}
-
-func loadPendingSSTDeleteMarks(ctx context.Context, store *blobstore.Store) ([]pendingSSTDeleteMark, error) {
-	set, err := loadPendingSSTDeleteMarkSet(ctx, store)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]pendingSSTDeleteMark, len(set.Marks))
-	copy(out, set.Marks)
-	return out, nil
-}
-
-func hasPendingSSTDeleteMark(ctx context.Context, store *blobstore.Store, sstID string) (bool, error) {
-	set, err := loadPendingSSTDeleteMarkSet(ctx, store)
-	if err != nil {
-		return false, err
-	}
-	for _, mark := range set.Marks {
-		if mark.SSTID == sstID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func loadPendingSSTDeleteMarkSet(ctx context.Context, store *blobstore.Store) (*pendingSSTDeleteMarkSet, error) {
-	set, _, _, err := loadPendingSSTDeleteMarkSetWithCAS(ctx, store)
-	return set, err
-}
-
-func loadPendingSSTDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store) (*pendingSSTDeleteMarkSet, string, bool, error) {
-	return loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, newGCMarkStorage(store))
-}
-
-func loadPendingSSTDeleteMarkSetWithStorageCAS(ctx context.Context, storage manifest.GCMarkStorage) (*pendingSSTDeleteMarkSet, string, bool, error) {
-	if storage == nil {
-		return nil, "", false, errors.New("nil gc mark storage")
-	}
-	data, matchToken, exists, err := storage.LoadPendingDeleteMarks(ctx)
-	if err != nil {
-		return nil, "", false, err
-	}
-	if !exists {
-		return &pendingSSTDeleteMarkSet{Version: gcMarkSchemaVersion}, "", false, nil
-	}
-
-	var set pendingSSTDeleteMarkSet
-	if err := json.Unmarshal(data, &set); err != nil {
-		return nil, "", false, err
-	}
-	if set.Version == 0 {
-		set.Version = gcMarkSchemaVersion
-	}
-	return &set, matchToken, true, nil
-}
-
-func storePendingSSTDeleteMarkSet(ctx context.Context, store *blobstore.Store, set *pendingSSTDeleteMarkSet) error {
-	return storePendingSSTDeleteMarkSetWithCAS(ctx, store, set, "", false)
-}
-
-func storePendingSSTDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store, set *pendingSSTDeleteMarkSet, matchToken string, exists bool) error {
-	return storePendingSSTDeleteMarkSetWithStorageCAS(ctx, newGCMarkStorage(store), set, matchToken, exists)
-}
-
-func storePendingSSTDeleteMarkSetWithStorageCAS(ctx context.Context, storage manifest.GCMarkStorage, set *pendingSSTDeleteMarkSet, matchToken string, exists bool) error {
-	if storage == nil {
-		return errors.New("nil gc mark storage")
-	}
-	if set == nil {
-		return errors.New("nil pending sst delete mark set")
-	}
-	set.Version = gcMarkSchemaVersion
-
-	payload, err := json.Marshal(set)
-	if err != nil {
-		return err
-	}
-	return storage.StorePendingDeleteMarks(ctx, payload, matchToken, exists)
-}
-
-func pendingSSTDeleteSetPath(store *blobstore.Store) string {
-	return storeKey(store, pendingSSTDeleteSetObject)
-}
-
-func gcCheckpointPath(store *blobstore.Store) string {
-	return storeKey(store, gcCheckpointObjectKey)
 }
 
 func storeKey(store *blobstore.Store, parts ...string) string {

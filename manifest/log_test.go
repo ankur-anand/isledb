@@ -1,257 +1,73 @@
 package manifest
 
 import (
+	"reflect"
 	"testing"
-	"time"
 
 	"github.com/segmentio/ksuid"
 )
 
 func TestLogEntryRoundTrip(t *testing.T) {
-	now := time.Unix(1700000000, 0).UTC()
-	created := time.Unix(1700000010, 0).UTC()
-
 	entry := &ManifestLogEntry{
-		ID:        ksuid.New(),
-		Seq:       7,
-		Timestamp: now,
-		Op:        LogOpAddSSTable,
+		ID:    ksuid.New(),
+		Seq:   7,
+		Role:  FenceRoleWriter,
+		Epoch: 2,
+		Op:    LogOpAddSSTable,
 		SSTable: &SSTMeta{
-			ID:          "1-1-2-abc.sst",
-			Epoch:       1,
-			SeqLo:       1,
-			SeqHi:       2,
-			MinKey:      []byte("a"),
-			MaxKey:      []byte("b"),
-			Size:        123,
-			Checksum:    "sha256:abc",
-			CreatedAt:   created,
-			Level:       0,
-			HasBlobRefs: true,
-		},
-		ChangeBatch: &ChangeBatchMeta{
-			ID:        "1-1-2-abc.chg",
-			Path:      "changes/abc/1-1-2-abc.chg",
-			Epoch:     1,
-			SeqLo:     1,
-			SeqHi:     2,
-			Count:     2,
-			Size:      99,
-			Checksum:  "sha256:def",
-			CreatedAt: created,
-			Version:   1,
+			ID: "sst-a", SeqLo: 1, SeqHi: 3,
 		},
 	}
-
-	data, err := EncodeLogEntry(entry)
+	body, err := EncodeLogEntry(entry)
 	if err != nil {
-		t.Fatalf("encode: %v", err)
+		t.Fatal(err)
 	}
-	got, err := DecodeLogEntry(data)
+	got, err := DecodeLogEntry(body)
 	if err != nil {
-		t.Fatalf("decode: %v", err)
+		t.Fatal(err)
 	}
-	if got.Op != entry.Op || got.Seq != entry.Seq || !got.Timestamp.Equal(entry.Timestamp) {
-		t.Fatalf("header mismatch")
-	}
-	if got.SSTable == nil || got.SSTable.ID != entry.SSTable.ID {
-		t.Fatalf("sstable mismatch")
-	}
-	if !got.SSTable.CreatedAt.Equal(created) {
-		t.Fatalf("createdAt mismatch")
-	}
-	if !got.SSTable.HasBlobRefs {
-		t.Fatalf("hasBlobRefs mismatch")
-	}
-	if got.ChangeBatch == nil || got.ChangeBatch.ID != entry.ChangeBatch.ID || got.ChangeBatch.Count != 2 {
-		t.Fatalf("change batch mismatch: %+v", got.ChangeBatch)
+	if !reflect.DeepEqual(got, entry) {
+		t.Fatalf("round trip\n got=%+v\nwant=%+v", got, entry)
 	}
 }
 
-func TestApplyLogEntryAddSSTable(t *testing.T) {
-	entry := &ManifestLogEntry{
-		Op: LogOpAddSSTable,
-		SSTable: &SSTMeta{
-			ID:    "1-1-1-aaa.sst",
-			Epoch: 2,
-			SeqLo: 1,
-			SeqHi: 1,
-			Level: 0,
-		},
-		ChangeBatch: &ChangeBatchMeta{
-			ID:    "1-1-1-aaa.chg",
-			Path:  "changes/aaa/1-1-1-aaa.chg",
-			Epoch: 2,
-			SeqLo: 1,
-			SeqHi: 1,
-			Count: 1,
-		},
+func TestApplyLogEntryAddRemoveAndCompaction(t *testing.T) {
+	m := ApplyLogEntry(nil, &ManifestLogEntry{Seq: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a", Epoch: 1, MinKey: []byte("a"), MaxKey: []byte("c")}})
+	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 2, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "b", Epoch: 2, MinKey: []byte("d"), MaxKey: []byte("f")}})
+	if len(m.L0SSTs) != 2 || m.L0SSTs[0].ID != "b" || m.NextEpoch != 3 {
+		t.Fatalf("after add=%+v", m)
 	}
 
-	m := &Manifest{Version: 2, NextEpoch: 1}
-	got := ApplyLogEntry(m, entry)
-
-	if got.NextEpoch != 3 {
-		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
+	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 3, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
+		RemoveSSTableIDs: []string{"a", "b"},
+		SourceLevel:      0,
+		DestinationLevel: 1,
+		AddSSTables:      []SSTMeta{{ID: "c", Epoch: 3, Level: 1, MinKey: []byte("a"), MaxKey: []byte("f")}},
+	}})
+	if len(m.L0SSTs) != 0 || len(m.Levels) != 1 || m.Levels[0].SSTs[0].ID != "c" {
+		t.Fatalf("after compaction=%+v", m)
 	}
 
-	if len(got.L0SSTs) != 1 {
-		t.Fatalf("L0SSTs mismatch: %d", len(got.L0SSTs))
+	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 4, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
+		RemoveSSTableIDs: []string{"c"},
+		SourceLevel:      1,
+		DestinationLevel: 2,
+		AddSSTables:      []SSTMeta{{ID: "c", Epoch: 3, Level: 2, MinKey: []byte("a"), MaxKey: []byte("f")}},
+	}})
+	if m.Level(1) != nil || m.Level(2) == nil || m.Level(2).SSTs[0].ID != "c" {
+		t.Fatalf("after promotion=%+v", m)
 	}
-	if got.L0SSTs[0].ID != "1-1-1-aaa.sst" {
-		t.Fatalf("L0 SST ID mismatch: %s", got.L0SSTs[0].ID)
+
+	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 5, Op: LogOpRemoveSSTable, RemoveSSTableIDs: []string{"c"}})
+	if len(m.Levels) != 0 {
+		t.Fatalf("after remove=%+v", m)
 	}
 }
 
-func TestApplyLogEntryAddSSTableL1(t *testing.T) {
-
-	entry := &ManifestLogEntry{
-		Op: LogOpAddSSTable,
-		SSTable: &SSTMeta{
-			ID:     "1-1-1-aaa.sst",
-			Epoch:  2,
-			SeqLo:  1,
-			SeqHi:  1,
-			Level:  1,
-			MinKey: []byte("a"),
-			MaxKey: []byte("z"),
-		},
-	}
-
-	m := &Manifest{Version: 2, NextEpoch: 1}
-	got := ApplyLogEntry(m, entry)
-
-	if got.NextEpoch != 3 {
-		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
-	}
-	if len(got.L0SSTs) != 0 {
-		t.Fatalf("L0SSTs should be empty: %d", len(got.L0SSTs))
-	}
-	if len(got.SortedRuns) != 1 {
-		t.Fatalf("SortedRuns mismatch: %d", len(got.SortedRuns))
-	}
-	if len(got.SortedRuns[0].SSTs) != 1 {
-		t.Fatalf("SortedRun SSTs mismatch: %d", len(got.SortedRuns[0].SSTs))
-	}
-	if got.SortedRuns[0].SSTs[0].ID != "1-1-1-aaa.sst" {
-		t.Fatalf("SortedRun SST ID mismatch: %s", got.SortedRuns[0].SSTs[0].ID)
-	}
-}
-
-func TestApplyLogEntryRemoveSSTable(t *testing.T) {
-	m := &Manifest{
-		L0SSTs: []SSTMeta{
-			{ID: "a.sst", Level: 0},
-			{ID: "b.sst", Level: 0},
-		},
-	}
-
-	entry := &ManifestLogEntry{
-		Op:               LogOpRemoveSSTable,
-		RemoveSSTableIDs: []string{"a.sst"},
-	}
-	got := ApplyLogEntry(m, entry)
-
-	if len(got.L0SSTs) != 1 || got.L0SSTs[0].ID != "b.sst" {
-		t.Fatalf("L0SSTs mismatch: got %d", len(got.L0SSTs))
-	}
-}
-
-func TestApplyLogEntryRemoveSSTableFromSortedRun(t *testing.T) {
-	m := &Manifest{
-		SortedRuns: []SortedRun{
-			{
-				ID: 1,
-				SSTs: []SSTMeta{
-					{ID: "a.sst", MinKey: []byte("a"), MaxKey: []byte("m")},
-					{ID: "b.sst", MinKey: []byte("n"), MaxKey: []byte("z")},
-				},
-			},
-		},
-	}
-
-	entry := &ManifestLogEntry{
-		Op:               LogOpRemoveSSTable,
-		RemoveSSTableIDs: []string{"a.sst"},
-	}
-	got := ApplyLogEntry(m, entry)
-
-	if len(got.SortedRuns) != 1 {
-		t.Fatalf("SortedRuns count mismatch: %d", len(got.SortedRuns))
-	}
-	if len(got.SortedRuns[0].SSTs) != 1 || got.SortedRuns[0].SSTs[0].ID != "b.sst" {
-		t.Fatalf("SortedRun SSTs mismatch")
-	}
-}
-
-func TestApplyLogEntryCompaction(t *testing.T) {
-	m := &Manifest{
-		NextEpoch: 3,
-		L0SSTs: []SSTMeta{
-			{ID: "a.sst", Level: 0, Epoch: 1},
-			{ID: "b.sst", Level: 0, Epoch: 2},
-		},
-	}
-
-	entry := &ManifestLogEntry{
-		Op: LogOpCompaction,
-		Compaction: &CompactionLogPayload{
-			RemoveSSTableIDs: []string{"a.sst", "b.sst"},
-			AddSortedRun: &SortedRun{
-				ID: 1,
-				SSTs: []SSTMeta{
-					{ID: "c.sst", Level: 1, Epoch: 5, MinKey: []byte("a"), MaxKey: []byte("z")},
-				},
-			},
-		},
-	}
-
-	got := ApplyLogEntry(m, entry)
-
-	if got.NextEpoch != 3 {
-		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
-	}
-	if len(got.L0SSTs) != 0 {
-		t.Fatalf("L0SSTs should be empty: %d", len(got.L0SSTs))
-	}
-	if len(got.SortedRuns) != 1 || got.SortedRuns[0].SSTs[0].ID != "c.sst" {
-		t.Fatalf("SortedRuns mismatch")
-	}
-}
-
-func TestApplyLogEntryCheckpoint(t *testing.T) {
-	cp := &Manifest{
-		Version:   9,
-		NextEpoch: 10,
-		L0SSTs:    []SSTMeta{{ID: "x.sst", Level: 0}},
-	}
-	entry := &ManifestLogEntry{
-		Op:         LogOpCheckpoint,
-		Checkpoint: cp,
-	}
-
-	got := ApplyLogEntry(&Manifest{Version: 1}, entry)
-	if got.Version != 9 || got.NextEpoch != 10 {
-		t.Fatalf("checkpoint mismatch")
-	}
-	if len(got.L0SSTs) != 1 || got.L0SSTs[0].ID != "x.sst" {
-		t.Fatalf("checkpoint L0SSTs mismatch")
-	}
-}
-
-func TestApplyLogEntries(t *testing.T) {
-	m := &Manifest{Version: 2}
-	entries := []*ManifestLogEntry{
-		{Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a.sst", Epoch: 1, Level: 0}},
-		{Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "b.sst", Epoch: 2, Level: 0}},
-	}
-
-	got := ApplyLogEntries(m, entries)
-
-	if len(got.L0SSTs) != 2 {
-		t.Fatalf("L0SSTs mismatch: %d", len(got.L0SSTs))
-	}
-	if got.NextEpoch != 3 {
-		t.Fatalf("nextEpoch mismatch: %d", got.NextEpoch)
+func TestApplyCheckpoint(t *testing.T) {
+	checkpoint := &Manifest{Version: 2, LogSeq: 4, Levels: []Level{{Number: 1, SSTs: []SSTMeta{{ID: "a"}}}}}
+	got := ApplyLogEntry(&Manifest{}, &ManifestLogEntry{Seq: 9, Op: LogOpCheckpoint, Checkpoint: checkpoint})
+	if got != checkpoint || got.LogSeq != 9 {
+		t.Fatalf("checkpoint=%+v", got)
 	}
 }

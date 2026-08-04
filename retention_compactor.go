@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -40,10 +39,10 @@ type retentionCompactorOptions struct {
 
 	OnCleanup func(CleanupStats)
 
-	OnCleanupError func(error)
-	// GCMarkStorage allows using a custom storage backend for GC mark state.
-	// If nil, the blob store is used.
-	GCMarkStorage manifest.GCMarkStorage
+	OnCleanupError    func(error)
+	GCCursorStorage   manifest.GCCursorStorage
+	GCDeleteBatchSize int
+	GCGracePeriod     time.Duration
 }
 
 type CleanupStats struct {
@@ -60,14 +59,16 @@ func defaultRetentionCompactorOptions() retentionCompactorOptions {
 		KeepAtLeastWindows: 1,
 		CheckInterval:      time.Minute,
 		SegmentDuration:    time.Hour,
+		GCDeleteBatchSize:  defaultSSTSweepBatchSize,
+		GCGracePeriod:      defaultSSTSweepGracePeriod,
 	}
 }
 
 type retentionCompactor struct {
-	store       *blobstore.Store
-	manifestLog *manifest.Store
-	gcMarkStore manifest.GCMarkStorage
-	opts        retentionCompactorOptions
+	store         *blobstore.Store
+	manifestLog   *manifest.Store
+	gcCursorStore manifest.GCCursorStorage
+	opts          retentionCompactorOptions
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -110,8 +111,14 @@ func newRetentionCompactorWithFence(ctx context.Context, store *blobstore.Store,
 	if opts.SegmentDuration <= 0 {
 		opts.SegmentDuration = defaults.SegmentDuration
 	}
-	if opts.GCMarkStorage == nil {
-		opts.GCMarkStorage = newGCMarkStorage(store)
+	if opts.GCCursorStorage == nil {
+		opts.GCCursorStorage = newGCCursorStorage(store)
+	}
+	if opts.GCDeleteBatchSize <= 0 {
+		opts.GCDeleteBatchSize = defaults.GCDeleteBatchSize
+	}
+	if opts.GCGracePeriod == 0 {
+		opts.GCGracePeriod = defaults.GCGracePeriod
 	}
 
 	m, err := manifestLog.Replay(ctx)
@@ -130,13 +137,13 @@ func newRetentionCompactorWithFence(ctx context.Context, store *blobstore.Store,
 	token := *fence
 
 	return &retentionCompactor{
-		store:       store,
-		manifestLog: manifestLog,
-		gcMarkStore: opts.GCMarkStorage,
-		opts:        opts,
-		manifest:    m,
-		runGate:     make(chan struct{}, 1),
-		fenceToken:  &token,
+		store:         store,
+		manifestLog:   manifestLog,
+		gcCursorStore: opts.GCCursorStorage,
+		opts:          opts,
+		manifest:      m,
+		runGate:       make(chan struct{}, 1),
+		fenceToken:    &token,
 	}, nil
 }
 
@@ -284,10 +291,6 @@ func (c *retentionCompactor) RunOnce(ctx context.Context) error {
 		return err
 	}
 
-	if err := c.catchupPendingSSTDeleteMarksFromLogs(ctx, gcMarkCatchupBatchSize); err != nil {
-		return fmt.Errorf("mark catchup from manifest log: %w", err)
-	}
-
 	if err := c.refresh(ctx); err != nil {
 		return fmt.Errorf("refresh manifest: %w", err)
 	}
@@ -377,7 +380,7 @@ func (c *retentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
 		return
 	}
-	if _, err := runPendingSSTSweeperWithStorage(ctx, c.store, c.manifestLog, c.gcMarkStore, defaultSSTSweepBatchSize, defaultSSTSweepGracePeriod); err != nil {
+	if _, err := runRetirementSweeper(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -392,7 +395,6 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 		id        string
 		createdAt time.Time
 		size      int64
-		isL0      bool
 	}
 
 	var allSSTs []sstAge
@@ -402,17 +404,15 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 			id:        sst.ID,
 			createdAt: sst.CreatedAt,
 			size:      sst.Size,
-			isL0:      true,
 		})
 	}
 
-	for _, sr := range m.SortedRuns {
-		for _, sst := range sr.SSTs {
+	for _, level := range m.Levels {
+		for _, sst := range level.SSTs {
 			allSSTs = append(allSSTs, sstAge{
 				id:        sst.ID,
 				createdAt: sst.CreatedAt,
 				size:      sst.Size,
-				isL0:      false,
 			})
 		}
 	}
@@ -439,6 +439,9 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 		if sst.createdAt.Before(cutoff) {
 			toDelete = append(toDelete, sst.id)
 			bytesReclaimed += sst.size
+			if len(toDelete) >= manifest.MaxRetiredObjectsPerEntry {
+				break
+			}
 		}
 	}
 
@@ -446,18 +449,17 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 		return 0, 0, nil
 	}
 
-	entry, err := c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete)
+	retired, err := retiredSSTObjects(c.store, m, toDelete, c.opts.GCGracePeriod)
+	if err != nil {
+		return 0, 0, fmt.Errorf("build retirement records: %w", err)
+	}
+	_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
 	updated := m.Clone()
-	updated.RemoveL0SSTs(toDelete)
-	updated.RemoveSSTsFromSortedRuns(toDelete)
+	updated.RemoveSSTables(toDelete)
 	c.setManifest(updated)
-
-	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_fifo", entry.Seq); err != nil {
-		slog.Warn("isledb: enqueue pending sst delete marks failed after retention manifest update", "mode", "fifo", "error", err, "count", len(toDelete), "seq", entry.Seq)
-	}
 
 	return len(toDelete), bytesReclaimed, nil
 }
@@ -488,8 +490,8 @@ func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 		segments[key].size += sst.Size
 	}
 
-	for _, sr := range m.SortedRuns {
-		for _, sst := range sr.SSTs {
+	for _, level := range m.Levels {
+		for _, sst := range level.SSTs {
 			key := segmentFor(sst.CreatedAt)
 			if segments[key] == nil {
 				segments[key] = &segment{
@@ -515,6 +517,7 @@ func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 	var bytesReclaimed int64
 	deletedSegments := 0
 
+segmentLoop:
 	for i, seg := range sortedSegments {
 
 		remaining := len(sortedSegments) - i
@@ -527,6 +530,9 @@ func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 			for _, sst := range seg.ssts {
 				toDelete = append(toDelete, sst.ID)
 				bytesReclaimed += sst.Size
+				if len(toDelete) >= manifest.MaxRetiredObjectsPerEntry {
+					break segmentLoop
+				}
 			}
 			deletedSegments++
 		}
@@ -536,368 +542,19 @@ func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) 
 		return 0, 0, nil
 	}
 
-	entry, err := c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete)
+	retired, err := retiredSSTObjects(c.store, m, toDelete, c.opts.GCGracePeriod)
+	if err != nil {
+		return 0, 0, fmt.Errorf("build retirement records: %w", err)
+	}
+	_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
 	updated := m.Clone()
-	updated.RemoveL0SSTs(toDelete)
-	updated.RemoveSSTsFromSortedRuns(toDelete)
+	updated.RemoveSSTables(toDelete)
 	c.setManifest(updated)
 
-	if err := enqueuePendingSSTDeleteMarksWithStorage(ctx, c.gcMarkStore, toDelete, "retention_segmented", entry.Seq); err != nil {
-		slog.Warn("isledb: enqueue pending sst delete marks failed after retention manifest update", "mode", "segmented", "error", err, "count", len(toDelete), "seq", entry.Seq)
-	}
-
 	return len(toDelete), bytesReclaimed, nil
-}
-
-func (c *retentionCompactor) catchupPendingSSTDeleteMarksFromLogs(ctx context.Context, batchSize uint64) error {
-	if batchSize == 0 {
-		return nil
-	}
-
-	current, err := c.readManifestCurrent(ctx)
-	if err != nil {
-		return err
-	}
-	if current == nil || current.NextSeq == 0 {
-		return nil
-	}
-
-	checkpoint, err := loadGCMarkCheckpointWithStorage(ctx, c.gcMarkStore)
-	if err != nil {
-		return err
-	}
-	window := computeGCMarkCatchupWindow(checkpoint, current, batchSize)
-
-	var lastErr error
-	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
-		retry, err := c.catchupPendingSSTDeleteMarksAttempt(ctx, current, checkpoint, window)
-		if err == nil {
-			return nil
-		}
-		if retry {
-			lastErr = err
-			continue
-		}
-		return err
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("store pending sst delete mark set after retries: %w", lastErr)
-	}
-	return fmt.Errorf("store pending sst delete mark set exceeded retries")
-}
-
-type gcMarkCatchupWindow struct {
-	fullReplay bool
-	startSeq   uint64
-	endSeq     uint64
-}
-
-func computeGCMarkCatchupWindow(checkpoint *gcMarkCheckpoint, current *manifest.Current, batchSize uint64) gcMarkCatchupWindow {
-	window := gcMarkCatchupWindow{}
-	if checkpoint == nil || current == nil {
-		return window
-	}
-
-	window.fullReplay = checkpoint.LastSeenLogSeqStart != current.LogSeqStart
-	window.startSeq = checkpoint.LastAppliedSeq
-	if window.fullReplay {
-		window.startSeq = current.LogSeqStart
-	}
-	if window.startSeq < current.LogSeqStart {
-		window.startSeq = current.LogSeqStart
-	}
-	if window.startSeq > current.NextSeq {
-		window.startSeq = current.NextSeq
-	}
-
-	window.endSeq = current.NextSeq
-	if window.startSeq < current.NextSeq && batchSize > 0 {
-		window.endSeq = window.startSeq + batchSize
-		if window.endSeq > current.NextSeq {
-			window.endSeq = current.NextSeq
-		}
-	}
-
-	return window
-}
-
-func (c *retentionCompactor) catchupPendingSSTDeleteMarksAttempt(ctx context.Context, current *manifest.Current, checkpoint *gcMarkCheckpoint, window gcMarkCatchupWindow) (bool, error) {
-	pendingSet, matchToken, exists, err := loadPendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore)
-	if err != nil {
-		return false, err
-	}
-
-	marksByID := pendingMarkMapFromSet(pendingSet)
-	now := time.Now().UTC()
-	marksChanged, err := c.applyCatchupWindowToDeleteMarks(ctx, marksByID, window, current.NextSeq, now)
-	if err != nil {
-		return false, err
-	}
-
-	if marksChanged {
-		pendingMarkMapToSet(pendingSet, marksByID)
-		err := storePendingSSTDeleteMarkSetWithStorageCAS(ctx, c.gcMarkStore, pendingSet, matchToken, exists)
-		if isGCMarkCASConflict(err) {
-			return true, err
-		}
-		if err != nil {
-			return false, fmt.Errorf("store pending sst delete mark set: %w", err)
-		}
-	}
-
-	checkpoint.LastAppliedSeq = window.endSeq
-	checkpoint.LastSeenLogSeqStart = current.LogSeqStart
-	return false, storeGCMarkCheckpointWithStorage(ctx, c.gcMarkStore, checkpoint)
-}
-
-func (c *retentionCompactor) applyCatchupWindowToDeleteMarks(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, window gcMarkCatchupWindow, seq uint64, now time.Time) (bool, error) {
-	marksChanged := false
-
-	if window.fullReplay {
-		changed, err := c.applyOrphanSSTMarkScanToMap(ctx, marksByID, seq, now)
-		if err != nil {
-			return false, fmt.Errorf("orphan sst mark scan: %w", err)
-		}
-		marksChanged = marksChanged || changed
-	}
-
-	changed, err := c.applyManifestLogRangeToDeleteMarksMap(ctx, marksByID, window.startSeq, window.endSeq, now)
-	if err != nil {
-		return false, err
-	}
-	marksChanged = marksChanged || changed
-	return marksChanged, nil
-}
-
-func (c *retentionCompactor) applyManifestLogRangeToDeleteMarksMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, startSeq, endSeq uint64, now time.Time) (bool, error) {
-	changed := false
-	for seq := startSeq; seq < endSeq; seq++ {
-		entry, err := c.manifestLog.ReadEntry(ctx, seq)
-		if err != nil {
-			return false, fmt.Errorf("read manifest entry seq=%d: %w", seq, err)
-		}
-		changed = c.applyManifestLogEntryToDeleteMarksMap(marksByID, entry, now) || changed
-	}
-	return changed, nil
-}
-
-func (c *retentionCompactor) applyOrphanSSTMarkScanToMap(ctx context.Context, marksByID map[string]pendingSSTDeleteMark, seq uint64, now time.Time) (bool, error) {
-	m, err := c.manifestLog.Replay(ctx)
-	if err != nil {
-		c.mu.Lock()
-		if c.manifest != nil {
-			m = c.manifest.Clone()
-		}
-		c.mu.Unlock()
-		if m == nil {
-			return false, fmt.Errorf("replay manifest: %w", err)
-		}
-	}
-
-	liveSet := make(map[string]struct{}, len(m.L0SSTs))
-	liveIDs := make([]string, 0, len(m.L0SSTs))
-	for _, sst := range m.L0SSTs {
-		if sst.ID == "" {
-			continue
-		}
-		liveSet[sst.ID] = struct{}{}
-		liveIDs = append(liveIDs, sst.ID)
-	}
-	for _, sr := range m.SortedRuns {
-		for _, sst := range sr.SSTs {
-			if sst.ID == "" {
-				continue
-			}
-			if _, exists := liveSet[sst.ID]; exists {
-				continue
-			}
-			liveSet[sst.ID] = struct{}{}
-			liveIDs = append(liveIDs, sst.ID)
-		}
-	}
-
-	changed := applyPendingSSTDeleteMarkClears(marksByID, liveIDs)
-
-	files, err := c.store.ListSSTFiles(ctx)
-	if err != nil {
-		return false, fmt.Errorf("list sst files: %w", err)
-	}
-
-	orphanIDs := make([]string, 0, len(files))
-	for _, obj := range files {
-		if obj.IsDir {
-			continue
-		}
-		sstID := path.Base(obj.Key)
-		if sstID == "" || sstID == "." || sstID == "sstable" {
-			continue
-		}
-		if _, live := liveSet[sstID]; live {
-			continue
-		}
-		orphanIDs = append(orphanIDs, sstID)
-	}
-
-	if len(orphanIDs) == 0 {
-		return changed, nil
-	}
-	if applyPendingSSTDeleteMarkUpserts(marksByID, orphanIDs, "orphan_scan", seq, now) {
-		changed = true
-	}
-	return changed, nil
-}
-
-func (c *retentionCompactor) readManifestCurrent(ctx context.Context) (*manifest.Current, error) {
-	data, _, err := c.manifestLog.Storage().ReadCurrent(ctx)
-	if err != nil {
-		if errors.Is(err, manifest.ErrNotFound) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	return manifest.DecodeCurrent(data)
-}
-
-func (c *retentionCompactor) applyManifestLogEntryToDeleteMarksMap(marksByID map[string]pendingSSTDeleteMark, entry *manifest.ManifestLogEntry, now time.Time) bool {
-	if entry == nil {
-		return false
-	}
-
-	switch entry.Op {
-	case manifest.LogOpRemoveSSTable:
-		return applyPendingSSTDeleteMarkUpserts(marksByID, entry.RemoveSSTableIDs, "log_remove_sstable", entry.Seq, now)
-	case manifest.LogOpCompaction:
-		if entry.Compaction == nil {
-			return false
-		}
-		changed := false
-		if len(entry.Compaction.RemoveSSTableIDs) > 0 {
-			changed = applyPendingSSTDeleteMarkUpserts(marksByID, entry.Compaction.RemoveSSTableIDs, "log_compaction_remove", entry.Seq, now) || changed
-		}
-
-		addedIDs := make([]string, 0, len(entry.Compaction.AddSSTables))
-		for _, sst := range entry.Compaction.AddSSTables {
-			addedIDs = append(addedIDs, sst.ID)
-		}
-		if entry.Compaction.AddSortedRun != nil {
-			for _, sst := range entry.Compaction.AddSortedRun.SSTs {
-				addedIDs = append(addedIDs, sst.ID)
-			}
-		}
-		if len(addedIDs) > 0 {
-			changed = applyPendingSSTDeleteMarkClears(marksByID, addedIDs) || changed
-		}
-		return changed
-	case manifest.LogOpAddSSTable:
-		if entry.SSTable != nil && entry.SSTable.ID != "" {
-			return applyPendingSSTDeleteMarkClears(marksByID, []string{entry.SSTable.ID})
-		}
-	}
-
-	return false
-}
-
-func pendingMarkMapFromSet(set *pendingSSTDeleteMarkSet) map[string]pendingSSTDeleteMark {
-	byID := make(map[string]pendingSSTDeleteMark)
-	if set == nil {
-		return byID
-	}
-	for _, mark := range set.Marks {
-		if mark.SSTID == "" {
-			continue
-		}
-		byID[mark.SSTID] = mark
-	}
-	return byID
-}
-
-func pendingMarkMapToSet(set *pendingSSTDeleteMarkSet, byID map[string]pendingSSTDeleteMark) {
-	if set == nil {
-		return
-	}
-	set.Marks = set.Marks[:0]
-	for _, mark := range byID {
-		set.Marks = append(set.Marks, mark)
-	}
-	sort.Slice(set.Marks, func(i, j int) bool {
-		return set.Marks[i].SSTID < set.Marks[j].SSTID
-	})
-}
-
-func applyPendingSSTDeleteMarkUpserts(byID map[string]pendingSSTDeleteMark, sstIDs []string, reason string, seq uint64, now time.Time) bool {
-	changed := false
-	ids := uniqueSSTIDs(sstIDs)
-	if len(ids) == 0 {
-		return false
-	}
-
-	for _, id := range ids {
-		mark, found := byID[id]
-		if !found {
-			byID[id] = pendingSSTDeleteMark{
-				Version:                 gcMarkSchemaVersion,
-				SSTID:                   id,
-				FirstSeenUnreferencedAt: now,
-				LastSeenUnreferencedAt:  now,
-				FirstSeenSeq:            seq,
-				LastSeenSeq:             seq,
-				FirstReason:             reason,
-				LastReason:              reason,
-			}
-			changed = true
-			continue
-		}
-
-		prev := mark
-		if mark.Version == 0 {
-			mark.Version = gcMarkSchemaVersion
-		}
-		if mark.SSTID == "" {
-			mark.SSTID = id
-		}
-		if mark.FirstSeenUnreferencedAt.IsZero() {
-			mark.FirstSeenUnreferencedAt = now
-		}
-		if mark.FirstReason == "" {
-			mark.FirstReason = reason
-		}
-		if mark.FirstSeenSeq == 0 && seq != 0 {
-			mark.FirstSeenSeq = seq
-		}
-
-		mark.LastSeenUnreferencedAt = now
-		mark.LastReason = reason
-		if seq != 0 {
-			mark.LastSeenSeq = seq
-		} else if mark.LastSeenSeq == 0 {
-			mark.LastSeenSeq = mark.FirstSeenSeq
-		}
-
-		byID[id] = mark
-		if mark != prev {
-			changed = true
-		}
-	}
-	return changed
-}
-
-func applyPendingSSTDeleteMarkClears(byID map[string]pendingSSTDeleteMark, sstIDs []string) bool {
-	changed := false
-	ids := uniqueSSTIDs(sstIDs)
-	for _, id := range ids {
-		if _, exists := byID[id]; exists {
-			delete(byID, id)
-			changed = true
-		}
-	}
-	return changed
 }
 
 func (c *retentionCompactor) Stats() retentionCompactorStats {
@@ -911,13 +568,13 @@ func (c *retentionCompactor) Stats() retentionCompactorStats {
 
 	if c.manifest != nil {
 		stats.L0SSTCount = len(c.manifest.L0SSTs)
-		stats.SortedRunCount = len(c.manifest.SortedRuns)
+		stats.LevelCount = len(c.manifest.Levels)
 
 		for _, sst := range c.manifest.L0SSTs {
 			stats.TotalSize += sst.Size
 		}
-		for _, sr := range c.manifest.SortedRuns {
-			for _, sst := range sr.SSTs {
+		for _, level := range c.manifest.Levels {
+			for _, sst := range level.SSTs {
 				stats.TotalSize += sst.Size
 			}
 		}
@@ -930,8 +587,8 @@ func (c *retentionCompactor) Stats() retentionCompactorStats {
 				foundOldest = true
 			}
 		}
-		for _, sr := range c.manifest.SortedRuns {
-			for _, sst := range sr.SSTs {
+		for _, level := range c.manifest.Levels {
+			for _, sst := range level.SSTs {
 				if !foundOldest || sst.CreatedAt.Before(oldest) {
 					oldest = sst.CreatedAt
 					foundOldest = true
@@ -954,7 +611,7 @@ type retentionCompactorStats struct {
 	Mode            retentionCompactorMode
 	RetentionPeriod time.Duration
 	L0SSTCount      int
-	SortedRunCount  int
+	LevelCount      int
 	TotalSize       int64
 	OldestSST       time.Time
 }

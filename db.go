@@ -109,7 +109,7 @@ func (w *Writer) releaseWriter() {
 type DB struct {
 	store           *blobstore.Store
 	manifestStore   *manifest.Store
-	gcMarkStorage   manifest.GCMarkStorage
+	gcCursorStorage manifest.GCCursorStorage
 	mu              sync.Mutex
 	closers         []dbCloser
 	writerOpen      bool
@@ -126,17 +126,17 @@ type DBOptions struct {
 	// ManifestStorage allows using a custom manifest storage backend.
 	// If nil, the blob store is used.
 	ManifestStorage manifest.Storage
-	// GCMarkStorage allows using a custom storage backend for GC mark state.
+	// GCCursorStorage allows using a custom backend for the bounded GC cursor.
 	// If nil, the blob store is used.
-	GCMarkStorage manifest.GCMarkStorage
+	GCCursorStorage manifest.GCCursorStorage
 }
 
 // OpenDB opens a database and initializes it.
 func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
 	manifestStore := newManifestStore(store, opts.ManifestStorage)
-	gcMarkStorage := opts.GCMarkStorage
-	if gcMarkStorage == nil {
-		gcMarkStorage = newGCMarkStorage(store)
+	gcCursorStorage := opts.GCCursorStorage
+	if gcCursorStorage == nil {
+		gcCursorStorage = newGCCursorStorage(store)
 	}
 
 	if _, err := manifestStore.Replay(ctx); err != nil {
@@ -144,9 +144,9 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 	}
 
 	return &DB{
-		store:         store,
-		manifestStore: manifestStore,
-		gcMarkStorage: gcMarkStorage,
+		store:           store,
+		manifestStore:   manifestStore,
+		gcCursorStorage: gcCursorStorage,
 	}, nil
 }
 
@@ -202,7 +202,7 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		return nil, err
 	}
 
-	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcMarkStorage, opts)
+	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts)
 	if err != nil {
 		db.releaseMaintenance(nil)
 		return nil, err

@@ -3,7 +3,9 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
@@ -23,9 +25,9 @@ func TestReaderSnapshotPinsLoadedState(t *testing.T) {
 	reader := openTestReader(t, ctx, store)
 	defer reader.Close()
 
-	snap1 := reader.Snapshot()
-	if snap1 == nil {
-		t.Fatal("Snapshot() = nil")
+	snap1, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot(): %v", err)
 	}
 	defer snap1.Close()
 
@@ -48,9 +50,9 @@ func TestReaderSnapshotPinsLoadedState(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 
-	snap2 := reader.Snapshot()
-	if snap2 == nil {
-		t.Fatal("Snapshot() after refresh = nil")
+	snap2, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot() after refresh: %v", err)
 	}
 	defer snap2.Close()
 
@@ -86,9 +88,9 @@ func TestReaderSnapshotScanLimitAndIterator(t *testing.T) {
 	reader := openTestReader(t, ctx, store)
 	defer reader.Close()
 
-	snap := reader.Snapshot()
-	if snap == nil {
-		t.Fatal("Snapshot() = nil")
+	snap, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot(): %v", err)
 	}
 	defer snap.Close()
 
@@ -137,9 +139,9 @@ func TestReaderSnapshotCloseIsIdempotentAndRejectsFurtherUse(t *testing.T) {
 	reader := openTestReader(t, ctx, store)
 	defer reader.Close()
 
-	snap := reader.Snapshot()
-	if snap == nil {
-		t.Fatal("Snapshot() = nil")
+	snap, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot(): %v", err)
 	}
 
 	if err := snap.Close(); err != nil {
@@ -171,9 +173,9 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
-	snap := reader.Snapshot()
-	if snap == nil {
-		t.Fatal("Snapshot() = nil")
+	snap, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot(): %v", err)
 	}
 
 	if err := reader.Close(); err != nil {
@@ -204,8 +206,8 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	if got := reader.Manifest(); got != nil {
 		t.Fatalf("Manifest after Reader.Close = %#v, want nil", got)
 	}
-	if got := reader.Snapshot(); got != nil {
-		t.Fatalf("Snapshot after Reader.Close = %#v, want nil", got)
+	if _, err := reader.Snapshot(ctx); err != ErrReaderClosed {
+		t.Fatalf("Snapshot after Reader.Close error=%v, want %v", err, ErrReaderClosed)
 	}
 	if _, _, err := snap.Get(ctx, []byte("a")); err != ErrReaderClosed {
 		t.Fatalf("Snapshot.Get after Reader.Close error=%v, want %v", err, ErrReaderClosed)
@@ -238,6 +240,94 @@ func TestOpenReaderRequiresExplicitCacheDir(t *testing.T) {
 
 	if _, err := OpenReader(ctx, store, DefaultReaderOpenOptions("")); err == nil {
 		t.Fatal("OpenReader with empty cache dir succeeded, want error")
+	}
+}
+
+func TestReaderRefreshesExpiredManifestBeforeRead(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-auto-refresh")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+	}, 0, 1)
+
+	reader := openTestReader(t, ctx, store)
+	defer reader.Close()
+
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
+	}, 0, 1)
+
+	if _, found, err := reader.Get(ctx, []byte("b")); err != nil {
+		t.Fatalf("Get before expiry: %v", err)
+	} else if found {
+		t.Fatal("Get before expiry observed unrefreshed key")
+	}
+
+	reader.viewExpired.Store(true)
+	value, found, err := reader.Get(ctx, []byte("b"))
+	if err != nil {
+		t.Fatalf("Get after expiry: %v", err)
+	}
+	if !found || !bytes.Equal(value, []byte("vb")) {
+		t.Fatalf("Get after expiry = %q, %v; want vb, true", value, found)
+	}
+}
+
+func TestReaderSnapshotAndIteratorExpire(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-view-expiry")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+	}, 0, 1)
+
+	reader := openTestReader(t, ctx, store)
+	defer reader.Close()
+
+	snapshot, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	iterator, err := snapshot.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewIterator: %v", err)
+	}
+	iterator.expiresAt = time.Now().Add(-time.Second)
+	if iterator.Next() {
+		t.Fatal("expired iterator advanced")
+	}
+	if !errors.Is(iterator.Err(), ErrIteratorExpired) {
+		t.Fatalf("expired iterator error = %v, want %v", iterator.Err(), ErrIteratorExpired)
+	}
+	_ = iterator.Close()
+
+	snapshot.expiresAt = time.Now().Add(-time.Second)
+	if _, _, err := snapshot.Get(ctx, []byte("a")); !errors.Is(err, ErrSnapshotExpired) {
+		t.Fatalf("expired snapshot Get error = %v, want %v", err, ErrSnapshotExpired)
+	}
+	if _, err := snapshot.NewIterator(ctx, IteratorOptions{}); !errors.Is(err, ErrSnapshotExpired) {
+		t.Fatalf("expired snapshot NewIterator error = %v, want %v", err, ErrSnapshotExpired)
+	}
+	if _, err := snapshot.ScanLimit(ctx, nil, nil, 1); !errors.Is(err, ErrSnapshotExpired) {
+		t.Fatalf("expired snapshot ScanLimit error = %v, want %v", err, ErrSnapshotExpired)
+	}
+}
+
+func TestOpenReaderRejectsNegativeViewPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-invalid-views")
+	defer store.Close()
+
+	opts := DefaultReaderOpenOptions(t.TempDir())
+	opts.Views.RefreshAfter = -time.Second
+	if _, err := OpenReader(ctx, store, opts); !errors.Is(err, ErrInvalidReaderOptions) {
+		t.Fatalf("OpenReader error = %v, want %v", err, ErrInvalidReaderOptions)
 	}
 }
 

@@ -244,7 +244,6 @@ func writeSSTStreaming(
 		Checksum:    "sha256:" + hashStr,
 		Bloom:       pResult.bloom,
 		CreatedAt:   ts,
-		Level:       0,
 		HasBlobRefs: pResult.hasBlobRefs,
 	}
 
@@ -396,7 +395,6 @@ func writeMultipleSSTsStreaming(
 					Length:     int64(len(bloomBytes)),
 				},
 				CreatedAt:   ts,
-				Level:       0,
 				HasBlobRefs: hasBlobRefs,
 			},
 		}

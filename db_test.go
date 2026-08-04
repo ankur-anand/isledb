@@ -252,25 +252,17 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 	}
 }
 
-type testGCMarkStorage struct{}
+type testGCCursorStorage struct{}
 
-func (t *testGCMarkStorage) LoadPendingDeleteMarks(context.Context) ([]byte, string, bool, error) {
+func (t *testGCCursorStorage) LoadGCCursor(context.Context) ([]byte, string, bool, error) {
 	return nil, "", false, nil
 }
 
-func (t *testGCMarkStorage) StorePendingDeleteMarks(context.Context, []byte, string, bool) error {
+func (t *testGCCursorStorage) StoreGCCursor(context.Context, []byte, string, bool) error {
 	return nil
 }
 
-func (t *testGCMarkStorage) LoadGCCheckpoint(context.Context) ([]byte, string, bool, error) {
-	return nil, "", false, nil
-}
-
-func (t *testGCMarkStorage) StoreGCCheckpoint(context.Context, []byte, string, bool) error {
-	return nil
-}
-
-var _ manifest.GCMarkStorage = (*testGCMarkStorage)(nil)
+var _ manifest.GCCursorStorage = (*testGCCursorStorage)(nil)
 
 func TestOpenDBSharesManifestStore(t *testing.T) {
 	ctx := context.Background()
@@ -364,13 +356,13 @@ func TestDBCloseClosesHandles(t *testing.T) {
 	}
 }
 
-func TestOpenDBPropagatesGCMarkStorageToMaintenance(t *testing.T) {
+func TestOpenDBPropagatesGCCursorStorageToMaintenance(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-gc-mark-storage")
 	defer store.Close()
 
-	custom := &testGCMarkStorage{}
-	db, err := OpenDB(ctx, store, DBOptions{GCMarkStorage: custom})
+	custom := &testGCCursorStorage{}
+	db, err := OpenDB(ctx, store, DBOptions{GCCursorStorage: custom})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -383,10 +375,10 @@ func TestOpenDBPropagatesGCMarkStorageToMaintenance(t *testing.T) {
 	}
 	defer maintenance.Close(ctx)
 
-	if maintenance.compactor.gcMarkStore != custom {
-		t.Fatal("compactor did not inherit db gc mark storage")
+	if maintenance.compactor.gcCursorStore != custom {
+		t.Fatal("compactor did not inherit db gc cursor storage")
 	}
-	if maintenance.retention.gcMarkStore != custom {
-		t.Fatal("retention compactor did not inherit db gc mark storage")
+	if maintenance.retention.gcCursorStore != custom {
+		t.Fatal("retention compactor did not inherit db gc cursor storage")
 	}
 }

@@ -17,6 +17,25 @@ const (
 	LogOpFenceClaim    LogOpType = "fence_claim"
 )
 
+const MaxRetiredObjectsPerEntry = 128
+
+type RetiredObjectKind string
+
+const (
+	RetiredObjectSST         RetiredObjectKind = "sst"
+	RetiredObjectChangeBatch RetiredObjectKind = "change_batch"
+)
+
+// RetiredObject records one immutable object made unreachable by this
+// manifest commit. Key is the exact backend object key used for deletion.
+type RetiredObject struct {
+	Kind      RetiredObjectKind `json:"kind"`
+	ID        string            `json:"id"`
+	Key       string            `json:"key"`
+	Size      int64             `json:"size,omitempty"`
+	NotBefore time.Time         `json:"not_before"`
+}
+
 type ManifestLogEntry struct {
 	ID               ksuid.KSUID           `json:"id"`
 	CommitID         string                `json:"commit_id,omitempty"`
@@ -30,6 +49,7 @@ type ManifestLogEntry struct {
 	RemoveSSTableIDs []string              `json:"remove_sstable_ids,omitempty"`
 	Checkpoint       *Manifest             `json:"checkpoint,omitempty"`
 	Compaction       *CompactionLogPayload `json:"compaction,omitempty"`
+	RetiredObjects   []RetiredObject       `json:"retired_objects,omitempty"`
 	FenceClaim       *FenceClaimPayload    `json:"fence_claim,omitempty"`
 }
 
@@ -41,10 +61,10 @@ type FenceClaimPayload struct {
 }
 
 type CompactionLogPayload struct {
-	RemoveSSTableIDs   []string   `json:"remove_sstable_ids"`
-	RemoveSortedRunIDs []uint32   `json:"remove_sorted_run_ids,omitempty"`
-	AddSSTables        []SSTMeta  `json:"add_sstables"`
-	AddSortedRun       *SortedRun `json:"add_sorted_run,omitempty"`
+	RemoveSSTableIDs []string  `json:"remove_sstable_ids"`
+	SourceLevel      uint32    `json:"source_level"`
+	DestinationLevel uint32    `json:"destination_level"`
+	AddSSTables      []SSTMeta `json:"add_sstables,omitempty"`
 }
 
 func EncodeLogEntry(entry *ManifestLogEntry) ([]byte, error) {
@@ -83,21 +103,7 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 	case LogOpAddSSTable:
 		if entry.SSTable != nil {
 			sst := *entry.SSTable
-
-			if sst.Level == 0 {
-				m.L0SSTs = append(m.L0SSTs, SSTMeta{})
-				copy(m.L0SSTs[1:], m.L0SSTs[:len(m.L0SSTs)-1])
-				m.L0SSTs[0] = sst
-			} else {
-				sr := SortedRun{
-					ID:   m.NextSortedRunID,
-					SSTs: []SSTMeta{sst},
-				}
-				m.NextSortedRunID++
-				m.SortedRuns = append(m.SortedRuns, SortedRun{})
-				copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
-				m.SortedRuns[0] = sr
-			}
+			m.AddL0SST(sst)
 
 			if sst.Epoch >= m.NextEpoch {
 				m.NextEpoch = sst.Epoch + 1
@@ -105,45 +111,7 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 		}
 
 	case LogOpRemoveSSTable:
-		if len(entry.RemoveSSTableIDs) > 0 {
-			removeSet := make(map[string]bool, len(entry.RemoveSSTableIDs))
-			for _, id := range entry.RemoveSSTableIDs {
-				removeSet[id] = true
-			}
-
-			n := 0
-			for _, sst := range m.L0SSTs {
-				if !removeSet[sst.ID] {
-					m.L0SSTs[n] = sst
-					n++
-				}
-			}
-			clear(m.L0SSTs[n:])
-			m.L0SSTs = m.L0SSTs[:n]
-
-			for i := range m.SortedRuns {
-				ssts := m.SortedRuns[i].SSTs
-				k := 0
-				for _, sst := range ssts {
-					if !removeSet[sst.ID] {
-						ssts[k] = sst
-						k++
-					}
-				}
-				clear(ssts[k:])
-				m.SortedRuns[i].SSTs = ssts[:k]
-			}
-
-			r := 0
-			for _, sr := range m.SortedRuns {
-				if len(sr.SSTs) > 0 {
-					m.SortedRuns[r] = sr
-					r++
-				}
-			}
-			clear(m.SortedRuns[r:])
-			m.SortedRuns = m.SortedRuns[:r]
-		}
+		m.RemoveSSTables(entry.RemoveSSTableIDs)
 
 	case LogOpCheckpoint:
 		if entry.Checkpoint != nil {
@@ -156,56 +124,15 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 	case LogOpCompaction:
 		if entry.Compaction != nil {
 			c := entry.Compaction
-
-			if len(c.RemoveSSTableIDs) > 0 {
-				removeSet := make(map[string]bool, len(c.RemoveSSTableIDs))
-				for _, id := range c.RemoveSSTableIDs {
-					removeSet[id] = true
+			m.RemoveCompactionInputs(c.SourceLevel, c.DestinationLevel, c.RemoveSSTableIDs)
+			if c.DestinationLevel == 0 {
+				for i := len(c.AddSSTables) - 1; i >= 0; i-- {
+					m.AddL0SST(c.AddSSTables[i])
 				}
-
-				n := 0
-				for _, sst := range m.L0SSTs {
-					if !removeSet[sst.ID] {
-						m.L0SSTs[n] = sst
-						n++
-					}
-				}
-				clear(m.L0SSTs[n:])
-				m.L0SSTs = m.L0SSTs[:n]
-
-				m.RemoveSSTsFromSortedRuns(c.RemoveSSTableIDs)
+			} else {
+				m.AddLevelSSTs(c.DestinationLevel, c.AddSSTables)
 			}
-
-			if len(c.RemoveSortedRunIDs) > 0 {
-				m.RemoveSortedRuns(c.RemoveSortedRunIDs)
-			}
-
-			if c.AddSortedRun != nil {
-
-				sr := *c.AddSortedRun
-				if sr.ID >= m.NextSortedRunID {
-					m.NextSortedRunID = sr.ID + 1
-				}
-				m.SortedRuns = append(m.SortedRuns, SortedRun{})
-				copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
-				m.SortedRuns[0] = sr
-			}
-
 			for _, sst := range c.AddSSTables {
-				if sst.Level == 0 {
-					m.L0SSTs = append(m.L0SSTs, SSTMeta{})
-					copy(m.L0SSTs[1:], m.L0SSTs[:len(m.L0SSTs)-1])
-					m.L0SSTs[0] = sst
-				} else {
-					sr := SortedRun{
-						ID:   m.NextSortedRunID,
-						SSTs: []SSTMeta{sst},
-					}
-					m.NextSortedRunID++
-					m.SortedRuns = append(m.SortedRuns, SortedRun{})
-					copy(m.SortedRuns[1:], m.SortedRuns[:len(m.SortedRuns)-1])
-					m.SortedRuns[0] = sr
-				}
 				if sst.Epoch >= m.NextEpoch {
 					m.NextEpoch = sst.Epoch + 1
 				}

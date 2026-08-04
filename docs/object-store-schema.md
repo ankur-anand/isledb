@@ -40,7 +40,7 @@ demo/p000/
   - `0` = writer
   - `1` = compactor
 - Top-level manifest fields use explicit `snake_case` JSON tags.
-- Nested `SSTMeta`, `SortedRun`, `BloomMeta`, and `SSTSignature` fields currently serialize with Go's default exported field names, so the on-disk JSON uses keys like `ID`, `SeqLo`, `MinKey`, `Bloom`, and `HasBlobRefs`.
+- Nested `SSTMeta`, `BloomMeta`, and `SSTSignature` fields currently serialize with Go's default exported field names, so the on-disk JSON uses keys like `ID`, `SeqLo`, `MinKey`, `Bloom`, and `HasBlobRefs`. `Level` uses explicit `number` and `ssts` fields.
 
 ## Directory View
 
@@ -209,9 +209,9 @@ Example:
       "HasBlobRefs": false
     }
   ],
-  "sorted_runs": [
+  "levels": [
     {
-      "id": 12,
+      "number": 1,
       "ssts": [
         {
           "ID": "sst-b010",
@@ -235,14 +235,7 @@ Example:
         }
       ]
     }
-  ],
-  "next_sorted_run_id": 13,
-  "compaction_config": {
-    "l0_compaction_threshold": 8,
-    "min_sources": 4,
-    "max_sources": 8,
-    "size_threshold": 4
-  }
+  ]
 }
 ```
 
