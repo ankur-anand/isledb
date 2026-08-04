@@ -30,6 +30,7 @@ const (
 	defaultActiveEntryLimit = 64
 	defaultPageFanout       = 32
 	defaultMaxCurrentBytes  = 64 << 10
+	currentCASMaxRetries    = 8
 	maxWriterCommitIDBytes  = 128
 )
 
@@ -65,8 +66,13 @@ type replayCache struct {
 
 type Store struct {
 	storage Storage
-	mu      sync.Mutex
-	nextSeq uint64
+
+	// commitMu serializes read-modify-CAS operations issued through this Store.
+	// Writer and maintenance are independent fenced roles, but they share one
+	// CURRENT object and must not make each other exhaust optimistic retries.
+	commitMu sync.Mutex
+	mu       sync.Mutex
+	nextSeq  uint64
 
 	current     *Current
 	currentETag string
@@ -133,6 +139,9 @@ func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken
 }
 
 func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) (*FenceToken, error) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
 	const maxRetries = 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -217,6 +226,17 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func sleepBeforeCurrentCASRetry(ctx context.Context, attempt int) error {
+	shift := attempt
+	if shift > 5 {
+		shift = 5
+	}
+	delay := 2 * time.Millisecond * time.Duration(1<<shift)
+	jitterWindow := delay / 2
+	jitter := time.Duration(time.Now().UnixNano() % int64(jitterWindow+1))
+	return sleepWithContext(ctx, delay/2+jitter)
 }
 
 func (s *Store) writeFenceClaimEntry(ctx context.Context, role FenceRole, token *FenceToken) error {
@@ -340,12 +360,14 @@ func (s *Store) checkLocalFence(role FenceRole) error {
 }
 
 func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, role FenceRole) error {
-	const maxRetries = 3
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
 	if err := validateRetiredObjects(entry); err != nil {
 		return err
 	}
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		var current *Current
 		var etag string
 		var err error
@@ -427,6 +449,11 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			return err
@@ -1304,6 +1331,12 @@ func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) 
 		return "", err
 	}
 
+	// Snapshot upload is immutable and may overlap normal commits. Serialize
+	// only the visibility CAS; a concurrent commit makes this candidate stale
+	// and the caller can retry from a fresh manifest.
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
 	if current == nil {
 		current = &Current{NextEpoch: m.NextEpoch}
 	}
@@ -1651,9 +1684,10 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 // retained manifest entry refs below the new floor. The floor is clamped to
 // [current.change_feed_log_start, current.next_seq].
 func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
-	const maxRetries = 3
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil {
 			return nil, err
@@ -1687,6 +1721,11 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, tok
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return nil, err
+					}
+				}
 				continue
 			}
 			return nil, err
@@ -1700,9 +1739,10 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, tok
 // AdvanceRetirementLogStart records that deterministic GC has consumed every
 // manifest entry below floor. It never moves the floor backwards.
 func (s *Store) AdvanceRetirementLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
-	const maxRetries = 3
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil {
 			return nil, err
@@ -1732,6 +1772,11 @@ func (s *Store) AdvanceRetirementLogStart(ctx context.Context, floor uint64, tok
 
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				if attempt+1 < currentCASMaxRetries {
+					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+						return nil, err
+					}
+				}
 				continue
 			}
 			return nil, err
