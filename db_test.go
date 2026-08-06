@@ -17,7 +17,7 @@ func TestDBOpenWriterRejectsSecondActiveWriter(t *testing.T) {
 	store := blobstore.NewMemory("db-single-writer")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestDBOpenReaderRejectsSecondActiveReader(t *testing.T) {
 	store := blobstore.NewMemory("db-single-reader")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestDBOpenReaderFailureReleasesReservation(t *testing.T) {
 	store := blobstore.NewMemory("db-reader-construction-failure")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestDBOpenReaderConcurrentCallsAllowOneReader(t *testing.T) {
 	store := blobstore.NewMemory("db-concurrent-single-reader")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestDBCloseClosesReader(t *testing.T) {
 	store := blobstore.NewMemory("db-close-reader")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestDBOpenWriterConcurrentCallsAllowOneWriter(t *testing.T) {
 	store := blobstore.NewMemory("db-concurrent-single-writer")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestDBOpenWriterReleasesReservationAfterConstructionFailure(t *testing.T) {
 	store := blobstore.NewMemory("db-writer-construction-failure")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestDBClosedWritersAreNotRetained(t *testing.T) {
 	store := blobstore.NewMemory("db-closed-writers")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	store := blobstore.NewMemory("db-writer-close-error")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 		failOnWrite: 3,
 		failErr:     rootCause,
 	}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -403,7 +403,7 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	store := blobstore.NewMemory("db-test")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestOpenDBClosed(t *testing.T) {
 	store := blobstore.NewMemory("db-closed")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestDBCloseClosesHandles(t *testing.T) {
 	store := blobstore.NewMemory("db-close-handles")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestOpenDBPropagatesGCCursorStorageToMaintenance(t *testing.T) {
 	defer store.Close()
 
 	custom := &testGCCursorStorage{}
-	db, err := OpenDB(ctx, store, DBOptions{GCCursorStorage: custom})
+	db, err := openDB(ctx, store, dbOpenOptions{gcCursorStorage: custom})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}

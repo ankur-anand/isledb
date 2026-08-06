@@ -235,7 +235,7 @@ func TestOpenReaderRequiresExplicitCacheDir(t *testing.T) {
 	store := blobstore.NewMemory("reader-cache-dir-required")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestOpenReaderRejectsNegativeViewPolicy(t *testing.T) {
 
 	opts := DefaultReaderOpenOptions(t.TempDir())
 	opts.Views.RefreshAfter = -time.Second
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}

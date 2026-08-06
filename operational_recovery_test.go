@@ -100,7 +100,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 	defer store.Close()
 	faults := &operationalCASStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
 
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: faults})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: faults})
 	if err != nil {
 		t.Fatalf("open first db: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 		t.Fatalf("physical SSTs before restart=%d, want=%d", got, want)
 	}
 
-	restarted, err := OpenDB(ctx, store, DBOptions{})
+	restarted, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open restarted db: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestOperationalRecovery_LostManifestResponseIsIdempotent(t *testing.T) {
 	store := blobstore.NewMemory("operational-lost-response")
 	defer store.Close()
 	faults := &operationalCASStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: faults})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: faults})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	store := blobstore.NewMemory("operational-cas-contention")
 	defer store.Close()
 	faults := &operationalCASStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: faults})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: faults})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -322,12 +322,12 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 
 	store := blobstore.NewMemory("operational-stale-writer")
 	defer store.Close()
-	db1, err := OpenDB(ctx, store, DBOptions{})
+	db1, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open first db: %v", err)
 	}
 	defer db1.Close()
-	db2, err := OpenDB(ctx, store, DBOptions{})
+	db2, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open second db: %v", err)
 	}
@@ -386,7 +386,7 @@ func TestOperationalSignals_BackpressureCounter(t *testing.T) {
 
 	store := blobstore.NewMemory("operational-backpressure-signal")
 	defer store.Close()
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 	cacheDir := t.TempDir()
 	cycles := 0
 	for time.Now().Before(deadline) {
-		db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: faults})
+		db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: faults})
 		if err != nil {
 			t.Fatalf("cycle %d open db: %v", cycles, err)
 		}
@@ -509,7 +509,7 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		cycles++
 	}
 
-	finalDB, err := OpenDB(ctx, store, DBOptions{})
+	finalDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open final db: %v", err)
 	}

@@ -75,7 +75,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("e2e-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestS3E2E_KVLifecycle(t *testing.T) {
 func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -457,7 +457,7 @@ func assertReaderValue(t testing.TB, ctx context.Context, reader *Reader, key, w
 func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -552,7 +552,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	store := setupFakeS3StoreWithPrefix(b, fmt.Sprintf("bench-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		b.Fatalf("open db: %v", err)
 	}

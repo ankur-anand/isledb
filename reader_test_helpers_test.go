@@ -10,7 +10,7 @@ import (
 func openReaderFromDBForTest(tb testing.TB, ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) *Reader {
 	tb.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		tb.Fatalf("OpenDB for reader: %v", err)
 	}

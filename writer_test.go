@@ -928,7 +928,7 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	defer store.Close()
 
 	storage := &maintenanceReadCountingStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}

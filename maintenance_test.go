@@ -37,7 +37,7 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-checkpoint")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestDBOpenMaintenanceRejectsSecondActiveHandle(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-single-owner")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestDBOpenMaintenanceConcurrentCallsAllowOneHandle(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-concurrent-owner")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	store := blobstore.NewMemory("maintenance-invalid-policy")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-shared-fence")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -296,12 +296,12 @@ func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-writer-replacement")
 	defer store.Close()
 
-	firstDB, err := OpenDB(ctx, store, DBOptions{})
+	firstDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB(first): %v", err)
 	}
 	defer firstDB.Close()
-	secondDB, err := OpenDB(ctx, store, DBOptions{})
+	secondDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB(second): %v", err)
 	}
@@ -360,7 +360,7 @@ func TestNewMaintenanceOwnerClearsReceiptAfterPreviousOwnerStops(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-receipt-recovery")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestMaintenanceRunStopsOnClose(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-run-close")
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -458,12 +458,12 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-stale-fence")
 	defer store.Close()
 
-	firstDB, err := OpenDB(ctx, store, DBOptions{})
+	firstDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB(first): %v", err)
 	}
 	defer firstDB.Close()
-	secondDB, err := OpenDB(ctx, store, DBOptions{})
+	secondDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB(second): %v", err)
 	}

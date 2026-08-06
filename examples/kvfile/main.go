@@ -8,7 +8,6 @@ import (
 	"strconv"
 
 	"github.com/ankur-anand/isledb"
-	"github.com/ankur-anand/isledb/blobstore"
 )
 
 func main() {
@@ -22,23 +21,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	store, err := blobstore.Open(ctx, "file://"+absDir, "db1")
+	db, err := isledb.Open(ctx, "file://"+absDir, isledb.DBOptions{Prefix: "db1"})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	defer store.Close()
+	defer db.Close()
 
 	cacheDir := filepath.Join(dir, "cache")
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Fatal(err)
 	}
-
-	db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
 
 	writer, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
 	if err != nil {

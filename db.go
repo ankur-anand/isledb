@@ -111,6 +111,7 @@ func (w *Writer) releaseWriter() {
 // Writer, one active Reader, and one active Maintenance handle.
 type DB struct {
 	store           *blobstore.Store
+	closeStore      bool
 	manifestStore   *manifest.Store
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
@@ -128,18 +129,18 @@ type dbCloser interface {
 
 // DBOptions configures a DB instance.
 type DBOptions struct {
-	// ManifestStorage allows using a custom manifest storage backend.
-	// If nil, the blob store is used.
-	ManifestStorage manifest.Storage
-	// GCCursorStorage allows using a custom backend for the bounded GC cursor.
-	// If nil, the blob store is used.
-	GCCursorStorage manifest.GCCursorStorage
+	// Prefix is the database's root path inside the bucket or container.
+	Prefix string
 }
 
-// OpenDB opens a database and initializes it.
-func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
-	manifestStore := newManifestStore(store, opts.ManifestStorage)
-	gcCursorStorage := opts.GCCursorStorage
+type dbOpenOptions struct {
+	manifestStorage manifest.Storage
+	gcCursorStorage manifest.GCCursorStorage
+}
+
+func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*DB, error) {
+	manifestStore := newManifestStore(store, opts.manifestStorage)
+	gcCursorStorage := opts.gcCursorStorage
 	if gcCursorStorage == nil {
 		gcCursorStorage = newGCCursorStorage(store)
 	}
@@ -310,6 +311,11 @@ func (db *DB) Close() error {
 	var firstErr error
 	for _, c := range closers {
 		if err := c.closeDB(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if db.closeStore {
+		if err := db.store.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

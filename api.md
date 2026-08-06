@@ -9,26 +9,20 @@ import (
     "time"
 
     "github.com/ankur-anand/isledb"
-    "github.com/ankur-anand/isledb/blobstore"
 )
 
 ctx := context.Background()
 
-// 1. Open blob storage
-store, err := blobstore.Open(ctx, "s3://my-bucket?region=us-east-1", "mydb")
-if err != nil {
-    log.Fatal(err)
-}
-defer store.Close()
-
-// 2. Open database
-db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
+// 1. Open the database and its object-store connection.
+db, err := isledb.Open(ctx, "s3://my-bucket?region=us-east-1", isledb.DBOptions{
+    Prefix: "mydb",
+})
 if err != nil {
     log.Fatal(err)
 }
 defer db.Close()
 
-// 3. Write data. Flush is the synchronous visibility boundary.
+// 2. Write data. Flush is the synchronous visibility boundary.
 w, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
 if err != nil {
     log.Fatal(err)
@@ -45,7 +39,7 @@ if err := w.Flush(ctx); err != nil {
     log.Fatal(err)
 }
 
-// 4. Read data. Refresh discovers newly committed SSTs.
+// 3. Read data. Refresh discovers newly committed SSTs.
 r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
 if err != nil {
     log.Fatal(err)
@@ -71,7 +65,8 @@ Entry point for database operations. Manages one writer, one shared concurrent
 reader, one maintenance owner, and shared manifest state.
 
 ```go
-func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error)
+func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error)
+func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opts DBOptions) (*DB, error)
 ```
 
 | Method | Signature |
@@ -83,10 +78,12 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 
 ```go
 type DBOptions struct {
-    ManifestStorage manifest.Storage // Optional custom manifest storage backend
-    GCCursorStorage manifest.GCCursorStorage // Optional custom retirement cursor backend
+    Prefix string
 }
 ```
+
+`Open` owns the bucket connection and closes it from `DB.Close`. `OpenBucket`
+borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
 
 ---
 

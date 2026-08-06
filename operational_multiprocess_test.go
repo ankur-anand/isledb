@@ -165,7 +165,7 @@ func TestOperationalRecovery_MultiProcessWorker(t *testing.T) {
 
 func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := OpenDB(parent, store, DBOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("writer OpenDB: %v", err)
 	}
@@ -207,7 +207,7 @@ func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstor
 
 func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := OpenDB(parent, store, DBOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("maintenance OpenDB: %v", err)
 	}
@@ -243,7 +243,7 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 
 func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("drain OpenDB: %v", err)
 	}
