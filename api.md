@@ -264,7 +264,6 @@ type ReaderOpenOptions struct {
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
     BlobReadOptions          config.BlobReadOptions
-    ManifestStorage          manifest.Storage     // Optional custom manifest storage
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions

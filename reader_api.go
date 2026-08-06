@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/config"
-	"github.com/ankur-anand/isledb/manifest"
 )
 
 var ErrInvalidReaderOptions = errors.New("invalid reader options")
@@ -73,7 +72,6 @@ type ReaderOpenOptions struct {
 	Metrics *ReaderMetrics
 
 	BlobReadOptions config.BlobReadOptions
-	ManifestStorage manifest.Storage
 }
 
 // DefaultReaderOpenOptions returns default reader options using cacheDir for
@@ -117,7 +115,6 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 			BlobReadOptions: blobReadOpts,
 			BlobGCOptions:   config.DefaultBlobGCOptions(),
 		},
-		ManifestStorage: opts.ManifestStorage,
 	}, nil
 }
 
