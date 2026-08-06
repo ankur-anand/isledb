@@ -71,7 +71,8 @@ type ReaderOpenOptions struct {
 
 	Metrics *ReaderMetrics
 
-	BlobReadOptions config.BlobReadOptions
+	// VerifyBlobsOnRead re-hashes external value objects before returning them.
+	VerifyBlobsOnRead bool
 }
 
 // DefaultReaderOpenOptions returns default reader options using cacheDir for
@@ -79,11 +80,10 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
-		CacheDir:        cacheDir,
-		SSTCacheSize:    defaults.SSTCacheSize,
-		BlobCacheSize:   defaults.BlobCacheSize,
-		Views:           defaults.ViewPolicy,
-		BlobReadOptions: config.DefaultBlobReadOptions(),
+		CacheDir:      cacheDir,
+		SSTCacheSize:  defaults.SSTCacheSize,
+		BlobCacheSize: defaults.BlobCacheSize,
+		Views:         defaults.ViewPolicy,
 	}
 }
 
@@ -91,11 +91,6 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
 		return readerOptions{}, err
-	}
-
-	blobReadOpts := opts.BlobReadOptions
-	if blobReadOpts == (config.BlobReadOptions{}) {
-		blobReadOpts = config.DefaultBlobReadOptions()
 	}
 
 	return readerOptions{
@@ -111,9 +106,11 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,
 		ValueStorageConfig: config.ValueStorageConfig{
-			ValueOptions:    config.DefaultValueOptions(),
-			BlobReadOptions: blobReadOpts,
-			BlobGCOptions:   config.DefaultBlobGCOptions(),
+			ValueOptions: config.DefaultValueOptions(),
+			BlobReadOptions: config.BlobReadOptions{
+				VerifyBlobsOnRead: opts.VerifyBlobsOnRead,
+			},
+			BlobGCOptions: config.DefaultBlobGCOptions(),
 		},
 	}, nil
 }

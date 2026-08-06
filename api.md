@@ -263,7 +263,7 @@ type ReaderOpenOptions struct {
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
-    BlobReadOptions          config.BlobReadOptions
+    VerifyBlobsOnRead        bool
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
