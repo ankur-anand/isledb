@@ -64,6 +64,8 @@ type Reader struct {
 	viewTimerID atomic.Uint64
 	metrics     *ReaderMetrics
 	closed      atomic.Bool
+	releaseOnce sync.Once
+	release     func()
 }
 
 type KV struct {
@@ -309,6 +311,7 @@ func (r *Reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	defer r.releaseReader()
 	r.stopManifestExpiry()
 
 	var firstErr error
@@ -329,6 +332,17 @@ func (r *Reader) Close() error {
 		}
 	}
 	return firstErr
+}
+
+func (r *Reader) closeDB() error {
+	return r.Close()
+}
+
+func (r *Reader) releaseReader() {
+	if r == nil || r.release == nil {
+		return
+	}
+	r.releaseOnce.Do(r.release)
 }
 
 func (r *Reader) beginRead() (func(), error) {

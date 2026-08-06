@@ -46,7 +46,7 @@ if err := w.Flush(ctx); err != nil {
 }
 
 // 4. Read data. Refresh discovers newly committed SSTs.
-r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
 if err != nil {
     log.Fatal(err)
 }
@@ -67,8 +67,8 @@ _ = err
 
 ### DB
 
-Entry point for database operations. Manages one writer, one maintenance owner,
-and shared manifest state.
+Entry point for database operations. Manages one writer, one shared concurrent
+reader, one maintenance owner, and shared manifest state.
 
 ```go
 func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error)
@@ -77,6 +77,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 | Method | Signature |
 |--------|-----------|
 | OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
+| OpenReader | `(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)` |
 | OpenMaintenance | `(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)` |
 | Close | `() error` |
 
@@ -228,8 +229,10 @@ type Snapshot struct { ... }
 
 Read-only handle for database access. Supports point lookups, range scans, and iteration.
 
+Readers are opened from the database that owns the object-store prefix:
+
 ```go
-func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error)
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
 ```
 
 Opening a reader loads a view. Reads refresh it when `Views.RefreshAfter` has
@@ -283,7 +286,7 @@ object-store refresh while the loaded view is still fresh.
 Example:
 
 ```go
-r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
 if err != nil {
     return err
 }

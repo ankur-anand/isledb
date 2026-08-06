@@ -1,12 +1,10 @@
 package isledb
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/manifest"
 )
@@ -91,11 +89,10 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	}
 }
 
-// OpenReader opens a read-only handle.
-func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error) {
+func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
-		return nil, err
+		return readerOptions{}, err
 	}
 
 	blobReadOpts := opts.BlobReadOptions
@@ -103,7 +100,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		blobReadOpts = config.DefaultBlobReadOptions()
 	}
 
-	ropts := readerOptions{
+	return readerOptions{
 		CacheDir:                 opts.CacheDir,
 		SSTCacheSize:             opts.SSTCacheSize,
 		BlobCacheSize:            opts.BlobCacheSize,
@@ -121,8 +118,7 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 			BlobGCOptions:   config.DefaultBlobGCOptions(),
 		},
 		ManifestStorage: opts.ManifestStorage,
-	}
-	return newReader(ctx, store, ropts)
+	}, nil
 }
 
 func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error) {

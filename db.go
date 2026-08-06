@@ -14,6 +14,9 @@ import (
 // ErrWriterAlreadyOpen is returned when a DB already owns an active writer.
 var ErrWriterAlreadyOpen = errors.New("writer already open")
 
+// ErrReaderAlreadyOpen is returned when a DB already owns an active reader.
+var ErrReaderAlreadyOpen = errors.New("reader already open")
+
 // Writer provides write access to the database.
 //
 // A Writer owns one fenced write session for a DB bucket/prefix. It buffers
@@ -105,7 +108,7 @@ func (w *Writer) releaseWriter() {
 }
 
 // DB encapsulates manifest state for one bucket/prefix. It permits one active
-// Writer and one active Maintenance handle.
+// Writer, one active Reader, and one active Maintenance handle.
 type DB struct {
 	store           *blobstore.Store
 	manifestStore   *manifest.Store
@@ -114,6 +117,7 @@ type DB struct {
 	mu              sync.Mutex
 	closers         []dbCloser
 	writerOpen      bool
+	readerOpen      bool
 	maintenanceOpen bool
 	closed          atomic.Bool
 }
@@ -194,6 +198,54 @@ func (db *DB) releaseWriter(writer *Writer) {
 	db.writerOpen = false
 	if writer != nil {
 		db.removeCloserLocked(writer)
+	}
+	db.mu.Unlock()
+}
+
+// OpenReader opens the DB's shared concurrent reader runtime.
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error) {
+	if err := db.reserveReader(); err != nil {
+		return nil, err
+	}
+
+	ropts, err := readerOptionsFromPublic(opts)
+	if err != nil {
+		db.releaseReader(nil)
+		return nil, err
+	}
+	reader, err := newReader(ctx, db.store, ropts)
+	if err != nil {
+		db.releaseReader(nil)
+		return nil, err
+	}
+	reader.release = func() { db.releaseReader(reader) }
+	if err := db.registerCloser(reader); err != nil {
+		_ = reader.Close()
+		db.releaseReader(reader)
+		return nil, err
+	}
+	return reader, nil
+}
+
+func (db *DB) reserveReader() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed.Load() {
+		return errors.New("db closed")
+	}
+	if db.readerOpen {
+		return ErrReaderAlreadyOpen
+	}
+	db.readerOpen = true
+	return nil
+}
+
+func (db *DB) releaseReader(reader *Reader) {
+	db.mu.Lock()
+	db.readerOpen = false
+	if reader != nil {
+		db.removeCloserLocked(reader)
 	}
 	db.mu.Unlock()
 }

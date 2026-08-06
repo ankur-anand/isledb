@@ -240,11 +240,7 @@ func newPrefetchTestReader(t *testing.T, ctx context.Context, store *blobstore.S
 	if opts.CacheDir == "" {
 		opts.CacheDir = t.TempDir()
 	}
-	reader, err := OpenReader(ctx, store, opts)
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
-	return reader
+	return openReaderFromDBForTest(t, ctx, store, opts)
 }
 
 func writePrefetchBatch(t *testing.T, ctx context.Context, w *writer, prefix string, start, count int) {

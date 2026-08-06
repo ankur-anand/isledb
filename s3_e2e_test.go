@@ -172,13 +172,10 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("current has neither active entries nor index frontier")
 	}
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:       t.TempDir(),
 		BlockCacheSize: 64 << 10,
 	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
 	defer reader.Close()
 	assertReaderHasAll(t, ctx, reader, expected)
 
@@ -233,13 +230,10 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("current next_seq did not advance after retention: before=%d after=%d", currentBeforeRetention.NextSeq, currentAfterRetention.NextSeq)
 	}
 
-	retainedReader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	retainedReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:       t.TempDir(),
 		BlockCacheSize: 64 << 10,
 	})
-	if err != nil {
-		t.Fatalf("open retained reader: %v", err)
-	}
 	defer retainedReader.Close()
 
 	retained, err := retainedReader.Scan(ctx, []byte("key:"), []byte("key;"))
@@ -297,14 +291,11 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	}
 	defer db.Close()
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:            t.TempDir(),
 		BlockCacheSize:      64 << 10,
 		ValidateSSTChecksum: true,
 	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
 	defer reader.Close()
 
 	writerOpts := DefaultWriterOptions()
@@ -426,13 +417,10 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	}
 	assertCurrentKVState(t, ctx, reader)
 
-	freshReader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	freshReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:            t.TempDir(),
 		ValidateSSTChecksum: true,
 	})
-	if err != nil {
-		t.Fatalf("open fresh reader: %v", err)
-	}
 	defer freshReader.Close()
 	assertCurrentKVState(t, ctx, freshReader)
 
@@ -544,10 +532,7 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 		t.Fatalf("replayed L0 SST count=%d, want 2", replayed.L0SSTCount())
 	}
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
 	defer reader.Close()
 	for key, want := range map[string]string{"key:1": "value:1", "key:2": "value:2"} {
 		got, found, err := reader.Get(ctx, []byte(key))

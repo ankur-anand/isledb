@@ -45,6 +45,140 @@ func TestDBOpenWriterRejectsSecondActiveWriter(t *testing.T) {
 	}
 }
 
+func TestDBOpenReaderRejectsSecondActiveReader(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-single-reader")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	first, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir()))
+	if err != nil {
+		t.Fatalf("OpenReader(first): %v", err)
+	}
+
+	if _, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir())); !errors.Is(err, ErrReaderAlreadyOpen) {
+		t.Fatalf("OpenReader(second) error=%v, want %v", err, ErrReaderAlreadyOpen)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	second, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir()))
+	if err != nil {
+		t.Fatalf("OpenReader(after close): %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Close(second): %v", err)
+	}
+}
+
+func TestDBOpenReaderFailureReleasesReservation(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-reader-construction-failure")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	invalid := DefaultReaderOpenOptions(t.TempDir())
+	invalid.Views.RefreshAfter = -time.Second
+	if _, err := db.OpenReader(ctx, invalid); !errors.Is(err, ErrInvalidReaderOptions) {
+		t.Fatalf("OpenReader(invalid) error=%v, want %v", err, ErrInvalidReaderOptions)
+	}
+
+	reader, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir()))
+	if err != nil {
+		t.Fatalf("OpenReader(after invalid): %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDBOpenReaderConcurrentCallsAllowOneReader(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-concurrent-single-reader")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	const callers = 16
+	type result struct {
+		reader *Reader
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	opts := DefaultReaderOpenOptions(t.TempDir())
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			reader, err := db.OpenReader(ctx, opts)
+			results <- result{reader: reader, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var opened *Reader
+	for result := range results {
+		switch {
+		case result.err == nil:
+			if opened != nil {
+				t.Fatal("more than one concurrent OpenReader call succeeded")
+			}
+			opened = result.reader
+		case !errors.Is(result.err, ErrReaderAlreadyOpen):
+			t.Fatalf("OpenReader error=%v, want %v", result.err, ErrReaderAlreadyOpen)
+		}
+	}
+	if opened == nil {
+		t.Fatal("no concurrent OpenReader call succeeded")
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDBCloseClosesReader(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("db-close-reader")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	reader, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir()))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("DB.Close: %v", err)
+	}
+	if _, _, err := reader.Get(ctx, []byte("key")); !errors.Is(err, ErrReaderClosed) {
+		t.Fatalf("Get(after DB.Close) error=%v, want %v", err, ErrReaderClosed)
+	}
+}
+
 func TestDBOpenWriterConcurrentCallsAllowOneWriter(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-concurrent-single-writer")
@@ -314,6 +448,9 @@ func TestOpenDBClosed(t *testing.T) {
 
 	if _, err := db.OpenWriter(ctx, WriterOptions{}); err == nil {
 		t.Fatal("expected OpenWriter to fail after DB is closed")
+	}
+	if _, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir())); err == nil {
+		t.Fatal("expected OpenReader to fail after DB is closed")
 	}
 	if _, err := db.OpenMaintenance(ctx, MaintenanceOptions{}); err == nil {
 		t.Fatal("expected OpenMaintenance to fail after DB is closed")

@@ -54,7 +54,13 @@ func main() {
 	}
 	defer store.Close()
 
-	reader, err := isledb.OpenReader(ctx, store, isledb.ReaderOpenOptions{
+	db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+
+	reader, err := db.OpenReader(ctx, isledb.ReaderOpenOptions{
 		CacheDir: *cacheDir,
 	})
 	if err != nil {

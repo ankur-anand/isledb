@@ -87,10 +87,7 @@ func TestOperationalRecovery_MultiProcessWriterMaintenanceSoak(t *testing.T) {
 		t.Fatalf("final maintenance HEAD=%+v, want no pending command", head)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open final reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	rows, err := reader.Scan(ctx, []byte("mp-key-"), []byte("mp-key."))
 	if err != nil {

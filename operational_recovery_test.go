@@ -175,10 +175,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 		t.Fatalf("close restarted writer: %v", err)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open reader after restart: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderValue(t, ctx, reader, "stable", "before-crash", true)
 	assertReaderValue(t, ctx, reader, "recovered", "after-crash", true)
@@ -247,10 +244,7 @@ func TestOperationalRecovery_LostManifestResponseIsIdempotent(t *testing.T) {
 		t.Fatalf("physical SSTs=%d, want=1", len(physical))
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderValue(t, ctx, reader, "ambiguous", "committed-once", true)
 }
@@ -316,10 +310,7 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 		t.Fatalf("injected CAS conflicts=%d, want at least %d", got, 2*64)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderHasAll(t, ctx, reader, expected)
 	assertOperationalStorageHealthy(t, ctx, store)
@@ -382,10 +373,7 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 		t.Fatalf("close second writer: %v", err)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderValue(t, ctx, reader, "before-fence", "visible", true)
 	assertReaderValue(t, ctx, reader, "after-fence", "visible", true)
@@ -505,7 +493,7 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 			t.Fatalf("cycle %d close writer: %v", cycles, err)
 		}
 
-		reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(cacheDir))
+		reader, err := db.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir))
 		if err != nil {
 			t.Fatalf("cycle %d open reader: %v", cycles, err)
 		}
@@ -521,7 +509,12 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		cycles++
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(cacheDir))
+	finalDB, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("open final db: %v", err)
+	}
+	defer finalDB.Close()
+	reader, err := finalDB.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir))
 	if err != nil {
 		t.Fatalf("open final reader: %v", err)
 	}

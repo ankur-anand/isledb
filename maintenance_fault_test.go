@@ -250,10 +250,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 		t.Fatalf("maintenance Close: %v", err)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderValue(t, ctx, reader, "after-recovery", "visible", true)
 }

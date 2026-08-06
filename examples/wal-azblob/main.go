@@ -127,7 +127,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	reader, err := isledb.OpenReader(ctx, store, isledb.ReaderOpenOptions{
+	reader, err := db.OpenReader(ctx, isledb.ReaderOpenOptions{
 		CacheDir: cacheDir,
 	})
 	if err != nil {
