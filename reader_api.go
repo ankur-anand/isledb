@@ -32,11 +32,14 @@ type ReaderViewPolicy struct {
 	IteratorMaxAge time.Duration
 }
 
-// ManifestPageCacheStats reports the in-memory cache used for immutable
-// manifest commit pages.
-type ManifestPageCacheStats struct {
+// CacheStats reports one reader cache's occupancy and lookup activity. Byte
+// limits are zero for entry-count-bounded caches; MaxEntries is zero for
+// byte-bounded caches.
+type CacheStats struct {
 	Hits       int64
 	Misses     int64
+	Bytes      int64
+	MaxBytes   int64
 	EntryCount int
 	MaxEntries int
 }

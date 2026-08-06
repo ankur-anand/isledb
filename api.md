@@ -128,13 +128,8 @@ type WriterOptions struct {
     Maintenance  WriterMaintenanceOptions
     SST          WriterSSTOptions
     Values       ValueOptions
-    ChangeFeed   ChangeFeedOptions
     OnFlushError func(error)
     Metrics      *WriterMetrics
-}
-
-type ChangeFeedOptions struct {
-    Enabled bool // Write seq-ordered mutation batches under changes/.
 }
 
 type WriterMemtableOptions struct {
@@ -257,9 +252,9 @@ the caller needs an immediate visibility check.
 | Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
 | Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
 | Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
-| BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
-| SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
-| ManifestPageCacheStats | `() ManifestPageCacheStats` | Manifest commit-page cache statistics |
+| BlobCacheStats | `() CacheStats` | External-value cache statistics |
+| SSTCacheStats | `() CacheStats` | SST cache statistics |
+| ManifestPageCacheStats | `() CacheStats` | Manifest commit-page cache statistics |
 
 ```go
 type ReaderOpenOptions struct {
@@ -274,6 +269,15 @@ type ReaderOpenOptions struct {
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
     VerifyBlobsOnRead        bool
+}
+
+type CacheStats struct {
+    Hits       int64
+    Misses     int64
+    Bytes      int64
+    MaxBytes   int64
+    EntryCount int
+    MaxEntries int
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
@@ -408,7 +412,6 @@ type MaintenanceOptions struct {
     Compaction         CompactionPolicy
     GarbageCollection  GarbageCollectionPolicy
     Retention          *RetentionPolicy
-    ChangeFeedRetention *ChangeFeedRetentionPolicy
     OnCycle            func(MaintenanceStats)
     OnError            func(error)
 }
@@ -459,27 +462,15 @@ type RetentionPolicy struct {
     OnCleanup          func(CleanupStats)
 }
 
-type ChangeFeedRetentionPolicy struct {
-    KeepFor                    time.Duration
-    KeepAtLeastManifestEntries uint64
-    DeleteBatchSize            int
-    DeleteGracePeriod          time.Duration
-    OnCleanup                  func(ChangeFeedCleanupStats)
-}
 ```
 
-`DefaultMaintenanceOptions` enables compaction and leaves both retention
-policies nil. Use `DefaultRetentionPolicy` or
-`DefaultChangeFeedRetentionPolicy` before enabling destructive cleanup.
+`DefaultMaintenanceOptions` enables compaction and leaves retention disabled.
+Use `DefaultRetentionPolicy` before enabling destructive cleanup.
 
 In `RetentionByAge` mode, `KeepAtLeastSSTs` protects the newest SSTs. In
 `RetentionByTimeWindow` mode, `Window` defines the grouping interval and
 `KeepAtLeastWindows` protects the newest groups. The two limits are independent;
 there is no conversion between SST counts and window counts.
-
-`KeepAtLeastManifestEntries` protects the newest manifest entries from
-change-feed retirement. This includes entries without a change batch because
-the retention floor advances through the ordered manifest log.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()

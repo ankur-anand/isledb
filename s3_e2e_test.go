@@ -462,11 +462,11 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
+	db.changeFeedEnabled = true
 
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "change-feed-e2e-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.ChangeFeed.Enabled = true
 	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
@@ -495,28 +495,25 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	}
 
 	time.Sleep(2 * time.Millisecond)
-	changeFeed := DefaultChangeFeedRetentionPolicy()
+	changeFeed := defaultChangeFeedRetentionPolicy()
 	changeFeed.KeepFor = time.Millisecond
 	// Retain the newest writer commit and its change batch.
 	changeFeed.KeepAtLeastManifestEntries = 1
 	changeFeed.DeleteGracePeriod = -1
+	db.changeFeedRetention = &changeFeed
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "change-feed-e2e-maintenance"
-	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
+	driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {
 		t.Fatalf("close writer: %v", err)
-	}
-	if stats.ChangeFeed.EntriesRetired == 0 || stats.ChangeFeed.BatchesMarked != 1 || stats.ChangeFeed.BatchesDeleted != 1 {
-		t.Fatalf("unexpected change-feed cleanup stats: %+v", stats.ChangeFeed)
 	}
 
 	after, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
@@ -626,7 +623,7 @@ func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.S
 func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Maintenance, writer *Writer) MaintenanceStats {
 	t.Helper()
 	var total MaintenanceStats
-	for attempt := 0; attempt < CompactionMaxIterations*4; attempt++ {
+	for attempt := 0; attempt < compactionMaxIterations*4; attempt++ {
 		stats, err := maintenance.RunOnce(ctx)
 		if err != nil {
 			t.Fatalf("maintenance RunOnce(%d): %v", attempt, err)
@@ -637,11 +634,6 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 		total.CompactionOutputBytes += stats.CompactionOutputBytes
 		total.Retention.SSTsDeleted += stats.Retention.SSTsDeleted
 		total.Retention.BytesReclaimed += stats.Retention.BytesReclaimed
-		total.ChangeFeed.EntriesRetired += stats.ChangeFeed.EntriesRetired
-		total.ChangeFeed.BatchesMarked += stats.ChangeFeed.BatchesMarked
-		total.ChangeFeed.BatchesDeleted += stats.ChangeFeed.BatchesDeleted
-		total.ChangeFeed.BlockedRetained += stats.ChangeFeed.BlockedRetained
-		total.ChangeFeed.FailedDeletes += stats.ChangeFeed.FailedDeletes
 		total.CheckpointStaged = total.CheckpointStaged || stats.CheckpointStaged
 
 		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)
@@ -658,7 +650,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 			return total
 		}
 	}
-	t.Fatalf("maintenance did not become idle after %d cycles", CompactionMaxIterations*4)
+	t.Fatalf("maintenance did not become idle after %d cycles", compactionMaxIterations*4)
 	return MaintenanceStats{}
 }
 

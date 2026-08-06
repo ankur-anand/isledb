@@ -26,7 +26,7 @@ func TestMaintenanceRetentionDefaultsUseExplicitUnits(t *testing.T) {
 		t.Fatalf("KeepAtLeastWindows=%d, want 1", retention.KeepAtLeastWindows)
 	}
 
-	changeFeed := DefaultChangeFeedRetentionPolicy()
+	changeFeed := defaultChangeFeedRetentionPolicy()
 	if changeFeed.KeepAtLeastManifestEntries != 1024 {
 		t.Fatalf("KeepAtLeastManifestEntries=%d, want 1024", changeFeed.KeepAtLeastManifestEntries)
 	}
@@ -232,18 +232,17 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-shared-fence")
 	defer store.Close()
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	changeFeed := defaultChangeFeedRetentionPolicy()
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedRetention: &changeFeed})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
 	defer db.Close()
 
 	retention := DefaultRetentionPolicy()
-	changeFeed := DefaultChangeFeedRetentionPolicy()
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "maintenance-owner"
 	opts.Retention = &retention
-	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
@@ -469,10 +468,10 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	}
 	defer secondDB.Close()
 
-	changeFeed := DefaultChangeFeedRetentionPolicy()
+	changeFeed := defaultChangeFeedRetentionPolicy()
+	firstDB.changeFeedRetention = &changeFeed
 	firstOpts := DefaultMaintenanceOptions()
 	firstOpts.OwnerID = "maintenance-first"
-	firstOpts.ChangeFeedRetention = &changeFeed
 	first, err := firstDB.OpenMaintenance(ctx, firstOpts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance(first): %v", err)

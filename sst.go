@@ -19,11 +19,11 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-var ErrEmptyIterator = errors.New("iterator produced no entries")
+var errEmptyIterator = errors.New("iterator produced no entries")
 
-var ErrOutOfOrder = errors.New("iterator out of order")
+var errSSTOutOfOrder = errors.New("iterator out of order")
 
-type SSTIterator interface {
+type sstIterator interface {
 	Next() bool
 	Entry() internal.MemEntry
 	Err() error
@@ -35,7 +35,7 @@ type writeSSTResult struct {
 	SSTData []byte
 }
 
-func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (writeSSTResult, error) {
+func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch uint64) (writeSSTResult, error) {
 	defer it.Close()
 
 	var result writeSSTResult
@@ -105,7 +105,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		return abort(err)
 	}
 	if !state.found {
-		return abort(ErrEmptyIterator)
+		return abort(errEmptyIterator)
 	}
 	if err := sst.Close(); err != nil {
 		return result, err
@@ -189,9 +189,9 @@ func (s *sstBuildState) updateOrder(key []byte, seq uint64) error {
 	if s.found {
 		switch cmp := bytes.Compare(s.prevKey, key); {
 		case cmp > 0:
-			return fmt.Errorf("%w: keys must be sorted ascending (prev=%q curr=%q)", ErrOutOfOrder, s.prevKey, key)
+			return fmt.Errorf("%w: keys must be sorted ascending (prev=%q curr=%q)", errSSTOutOfOrder, s.prevKey, key)
 		case cmp == 0 && seq > s.prevSeq:
-			return fmt.Errorf("%w: sequence must be non-increasing for duplicate keys (prev=%d curr=%d)", ErrOutOfOrder, s.prevSeq, seq)
+			return fmt.Errorf("%w: sequence must be non-increasing for duplicate keys (prev=%d curr=%d)", errSSTOutOfOrder, s.prevSeq, seq)
 		}
 	}
 	s.prevKey = key

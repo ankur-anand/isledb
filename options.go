@@ -3,10 +3,10 @@ package isledb
 import (
 	"time"
 
-	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/config"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -36,10 +36,6 @@ type WriterOptions struct {
 	// Values controls inline-vs-external value storage and key/value limits.
 	Values ValueOptions
 
-	// ChangeFeed controls whether flushes also publish seq-ordered mutation
-	// batches under changes/. Disabled by default.
-	ChangeFeed ChangeFeedOptions
-
 	// OnFlushError is called once after the background flush worker stops. The
 	// callback may call Writer.Close. The failure makes the writer terminal and
 	// is returned by later operations.
@@ -47,12 +43,6 @@ type WriterOptions struct {
 
 	// Metrics receives optional writer observations. Nil disables metrics.
 	Metrics *WriterMetrics
-}
-
-type ChangeFeedOptions struct {
-	// Enabled makes Writer.Flush publish one change batch per flushed memtable
-	// and attach its metadata to the committed manifest entry.
-	Enabled bool
 }
 
 type WriterMemtableOptions struct {
@@ -291,7 +281,7 @@ func defaultCompactorOptions() compactorOptions {
 	}
 }
 
-type SSTWriterOptions struct {
+type sstWriterOptions struct {
 	BloomBitsPerKey int
 	BlockSize       int
 	Compression     string

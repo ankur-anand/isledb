@@ -29,7 +29,7 @@ const (
 	CompactionLevelToLevel
 )
 
-const CompactionMaxIterations = 100
+const compactionMaxIterations = 100
 
 var errCompactorClosed = errors.New("compactor closed")
 
@@ -278,7 +278,7 @@ func (c *compactor) RunOnce(ctx context.Context) error {
 	}
 	defer c.finishRun()
 
-	for i := 0; i < CompactionMaxIterations; i++ {
+	for i := 0; i < compactionMaxIterations; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -322,7 +322,7 @@ func (c *compactor) RunOnce(ctx context.Context) error {
 	}
 
 	slog.Warn("isledb: compaction hit max iterations, possible infinite loop or excessive L0 accumulation",
-		"CompactionMaxIterations", CompactionMaxIterations)
+		"compactionMaxIterations", compactionMaxIterations)
 	c.runSSTSweeperBestEffort(ctx)
 	return nil
 }
@@ -778,7 +778,7 @@ func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool, ve
 func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
 	defer iter.close()
 
-	sstOpts := SSTWriterOptions{
+	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: c.opts.Output.BloomBitsPerKey,
 		BlockSize:       c.opts.Output.BlockBytes,
 		Compression:     c.opts.Output.Compression,
@@ -794,7 +794,7 @@ func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 
 	results, err := writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.Output.TargetSSTBytes, uploadFn)
 	if err != nil {
-		if errors.Is(err, ErrEmptyIterator) {
+		if errors.Is(err, errEmptyIterator) {
 			return nil, nil
 		}
 		return nil, err

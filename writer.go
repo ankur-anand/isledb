@@ -37,8 +37,10 @@ type writer struct {
 	manifestLog *manifest.Store
 	opts        WriterOptions
 	valueConfig config.ValueStorageConfig
-	ctx         context.Context
-	cancel      context.CancelFunc
+
+	changeFeedEnabled bool
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
@@ -493,7 +495,7 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			start := time.Now()
 			err := w.flushPending(ctx, pending)
 			w.metrics.ObserveFlush(time.Since(start), err)
-			if err != nil && !errors.Is(err, ErrEmptyIterator) {
+			if err != nil && !errors.Is(err, errEmptyIterator) {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
 				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
@@ -576,7 +578,7 @@ func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 }
 
 func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error {
-	sstOpts := SSTWriterOptions{
+	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: w.opts.SST.BloomBitsPerKey,
 		BlockSize:       w.opts.SST.BlockBytes,
 		Compression:     w.opts.SST.Compression,
@@ -598,7 +600,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		pending.sstable = &result.Meta
 	}
 
-	if w.opts.ChangeFeed.Enabled && pending.changeBatch == nil {
+	if w.changeFeedEnabled && pending.changeBatch == nil {
 		changeBatch, err := buildChangeBatch(ctx, pending.memtable.Iterator(), pending.epoch,
 			seqLo, seqHi, pending.sstable.CreatedAt)
 		if err != nil {

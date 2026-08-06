@@ -115,12 +115,15 @@ type DB struct {
 	manifestStore   *manifest.Store
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
-	mu              sync.Mutex
-	closers         []dbCloser
-	writerOpen      bool
-	readerOpen      bool
-	maintenanceOpen bool
-	closed          atomic.Bool
+
+	changeFeedEnabled   bool
+	changeFeedRetention *changeFeedRetentionPolicy
+	mu                  sync.Mutex
+	closers             []dbCloser
+	writerOpen          bool
+	readerOpen          bool
+	maintenanceOpen     bool
+	closed              atomic.Bool
 }
 
 type dbCloser interface {
@@ -134,8 +137,10 @@ type DBOptions struct {
 }
 
 type dbOpenOptions struct {
-	manifestStorage manifest.Storage
-	gcCursorStorage manifest.GCCursorStorage
+	manifestStorage     manifest.Storage
+	gcCursorStorage     manifest.GCCursorStorage
+	changeFeedEnabled   bool
+	changeFeedRetention *changeFeedRetentionPolicy
 }
 
 func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*DB, error) {
@@ -150,10 +155,12 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 	}
 
 	return &DB{
-		store:           store,
-		manifestStore:   manifestStore,
-		gcCursorStorage: gcCursorStorage,
-		maintenanceWake: make(chan struct{}, 1),
+		store:               store,
+		manifestStore:       manifestStore,
+		gcCursorStorage:     gcCursorStorage,
+		maintenanceWake:     make(chan struct{}, 1),
+		changeFeedEnabled:   opts.changeFeedEnabled,
+		changeFeedRetention: opts.changeFeedRetention,
 	}, nil
 }
 
@@ -169,6 +176,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.releaseWriter(nil)
 		return nil, err
 	}
+	w.changeFeedEnabled = db.changeFeedEnabled
 
 	writer := &Writer{w: w}
 	writer.release = func() { db.releaseWriter(writer) }
@@ -257,7 +265,7 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		return nil, err
 	}
 
-	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts)
+	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts, db.changeFeedRetention)
 	if err != nil {
 		db.releaseMaintenance(nil)
 		return nil, err

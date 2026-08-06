@@ -30,8 +30,8 @@ type streamSSTResult struct {
 // goroutine reads from the PipeReader and uploads to the store.
 func writeSSTStreaming(
 	ctx context.Context,
-	it SSTIterator,
-	opts SSTWriterOptions,
+	it sstIterator,
+	opts sstWriterOptions,
 	epoch uint64,
 	seqLo, seqHi uint64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
@@ -165,9 +165,9 @@ func writeSSTStreaming(
 		if !state.found {
 			writable.Abort()
 			_ = sst.Close()
-			producerDone <- producerResult{err: ErrEmptyIterator}
-			pw.CloseWithError(ErrEmptyIterator)
-			return ErrEmptyIterator
+			producerDone <- producerResult{err: errEmptyIterator}
+			pw.CloseWithError(errEmptyIterator)
+			return errEmptyIterator
 		}
 
 		if err := sst.Close(); err != nil {
@@ -269,8 +269,8 @@ func writeSSTStreaming(
 // started when the current one reaches targetSize.
 func writeMultipleSSTsStreaming(
 	ctx context.Context,
-	it SSTIterator,
-	opts SSTWriterOptions,
+	it sstIterator,
+	opts sstWriterOptions,
 	epoch uint64,
 	targetSize int64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
@@ -517,7 +517,7 @@ func writeMultipleSSTsStreaming(
 	}
 
 	if len(results) == 0 {
-		return nil, ErrEmptyIterator
+		return nil, errEmptyIterator
 	}
 
 	return results, nil

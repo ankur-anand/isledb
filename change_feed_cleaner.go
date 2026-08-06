@@ -34,11 +34,11 @@ type changeFeedCleanerOptions struct {
 	// advanced beyond the marked manifest seq.
 	SweepGracePeriod time.Duration
 
-	OnCleanup      func(ChangeFeedCleanupStats)
+	OnCleanup      func(changeFeedCleanupStats)
 	OnCleanupError func(error)
 }
 
-type ChangeFeedCleanupStats struct {
+type changeFeedCleanupStats struct {
 	EntriesRetired  int
 	BatchesMarked   int
 	BatchesDeleted  int
@@ -223,7 +223,7 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 			return err
 		}
 		if c.opts.OnCleanup != nil && stats.Deleted > 0 {
-			c.opts.OnCleanup(ChangeFeedCleanupStats{BatchesDeleted: stats.Deleted, BlockedRetained: stats.BlockedRetained, FailedDeletes: stats.Failed, Duration: time.Since(start)})
+			c.opts.OnCleanup(changeFeedCleanupStats{BatchesDeleted: stats.Deleted, BlockedRetained: stats.BlockedRetained, FailedDeletes: stats.Failed, Duration: time.Since(start)})
 		}
 		return nil
 	}
@@ -262,7 +262,7 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("sweep pending change batches: %w", err)
 	}
 
-	stats := ChangeFeedCleanupStats{
+	stats := changeFeedCleanupStats{
 		EntriesRetired:  entriesRetired,
 		BatchesMarked:   len(candidates),
 		BatchesDeleted:  sweepStats.Deleted,

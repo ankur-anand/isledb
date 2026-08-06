@@ -36,7 +36,7 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 		return nil
 	}
 
-	result, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 2, uploadFn)
+	result, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 2, uploadFn)
 	if err != nil {
 		t.Fatalf("writeSSTStreaming error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestWriteSSTStreaming_UploadError(t *testing.T) {
 		return uploadErr
 	}
 
-	_, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
+	_, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -139,7 +139,7 @@ func TestWriteSSTStreaming_ProducerError(t *testing.T) {
 		return err
 	}
 
-	_, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
+	_, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -177,7 +177,7 @@ func TestWriteSSTStreaming_ContextCancellation(t *testing.T) {
 		}
 	}
 
-	_, err := writeSSTStreaming(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1000, uploadFn)
+	_, err := writeSSTStreaming(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1000, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error due to context cancellation")
 	}
@@ -191,8 +191,8 @@ func TestWriteSSTStreaming_EmptyIterator(t *testing.T) {
 		return err
 	}
 
-	_, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 0, 0, uploadFn)
-	if !errors.Is(err, ErrEmptyIterator) {
+	_, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 0, 0, uploadFn)
+	if !errors.Is(err, errEmptyIterator) {
 		t.Fatalf("expected ErrEmptyIterator, got %v", err)
 	}
 }
@@ -215,7 +215,7 @@ func TestWriteSSTStreaming_HashVerification(t *testing.T) {
 		return nil
 	}
 
-	result, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 3, uploadFn)
+	result, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 3, uploadFn)
 	if err != nil {
 		t.Fatalf("writeSSTStreaming error: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestWriteSSTStreaming_BlobReference(t *testing.T) {
 		return nil
 	}
 
-	result, err := writeSSTStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
+	result, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1, uploadFn)
 	if err != nil {
 		t.Fatalf("writeSSTStreaming error: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
@@ -433,8 +433,8 @@ func TestWriteMultipleSSTsStreaming_EmptyIterator(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
-	if !errors.Is(err, ErrEmptyIterator) {
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	if !errors.Is(err, errEmptyIterator) {
 		t.Fatalf("expected ErrEmptyIterator, got %v", err)
 	}
 }
@@ -452,7 +452,7 @@ func TestWriteMultipleSSTsStreaming_UploadError(t *testing.T) {
 		return uploadErr
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -483,7 +483,7 @@ func TestWriteMultipleSSTsStreaming_ContextCancellation(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error due to context cancellation")
 	}
@@ -506,7 +506,7 @@ func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -561,7 +561,7 @@ func TestWriteMultipleSSTsStreaming_BlobReference(t *testing.T) {
 		return err
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}

@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/config"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -32,7 +32,7 @@ import (
 type Reader struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
-	sstCache      SSTCache
+	sstCache      diskcache.RefCountedCache
 	blockCache    *ristretto.Cache[string, []byte]
 	bloomCache    sync.Map
 	bloomLoads    singleflight.Group
@@ -784,11 +784,11 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 	return 0, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
 }
 
-func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
+func (r *Reader) BlobCacheStats() CacheStats {
 	if r.blobCache != nil {
-		return r.blobCache.Stats()
+		return cacheStatsFromDisk(r.blobCache.Stats())
 	}
-	return internal.BlobCacheStats{}
+	return CacheStats{}
 }
 
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
@@ -1114,21 +1114,31 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 	return nil
 }
 
-func (r *Reader) SSTCacheStats() SSTCacheStats {
-	return r.sstCache.Stats()
+func (r *Reader) SSTCacheStats() CacheStats {
+	return cacheStatsFromDisk(r.sstCache.Stats())
 }
 
-func (r *Reader) ManifestPageCacheStats() ManifestPageCacheStats {
+func (r *Reader) ManifestPageCacheStats() CacheStats {
 	if cs, ok := r.manifestStore.Storage().(*cachestore.CachingStorage); ok {
 		stats := cs.CacheStats()
-		return ManifestPageCacheStats{
+		return CacheStats{
 			Hits:       stats.Hits,
 			Misses:     stats.Misses,
 			EntryCount: stats.EntryCount,
 			MaxEntries: stats.MaxEntries,
 		}
 	}
-	return ManifestPageCacheStats{}
+	return CacheStats{}
+}
+
+func cacheStatsFromDisk(stats diskcache.Stats) CacheStats {
+	return CacheStats{
+		Hits:       stats.Hits,
+		Misses:     stats.Misses,
+		Bytes:      stats.Size,
+		MaxBytes:   stats.MaxSize,
+		EntryCount: stats.EntryCount,
+	}
 }
 
 type sstReadable struct {

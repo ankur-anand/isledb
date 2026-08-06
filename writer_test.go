@@ -113,11 +113,11 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := testWriterOptions(1<<20, 0)
-	opts.ChangeFeed.Enabled = true
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
+	w.changeFeedEnabled = true
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
@@ -162,7 +162,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if attrs.Size != meta.Size {
 		t.Fatalf("change batch size attr=%d meta=%d", attrs.Size, meta.Size)
 	}
-	batch, err := DecodeChangeBatch(data)
+	batch, err := decodeChangeBatch(data)
 	if err != nil {
 		t.Fatalf("DecodeChangeBatch: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if batch.Changes[0].Seq != 1 || string(batch.Changes[0].Key) != "b" || string(batch.Changes[0].Value) != "vb" {
 		t.Fatalf("change[0] mismatch: %+v", batch.Changes[0])
 	}
-	if batch.Changes[1].Seq != 2 || batch.Changes[1].Kind != ChangeDelete || string(batch.Changes[1].Key) != "a" {
+	if batch.Changes[1].Seq != 2 || batch.Changes[1].Kind != changeDelete || string(batch.Changes[1].Key) != "a" {
 		t.Fatalf("change[1] mismatch: %+v", batch.Changes[1])
 	}
 	if batch.Changes[2].Seq != 3 || string(batch.Changes[2].Key) != "c" || string(batch.Changes[2].Value) != "vc" {
@@ -514,11 +514,11 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
 	opts := testWriterOptions(1<<20, 0)
-	opts.ChangeFeed.Enabled = true
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
+	w.changeFeedEnabled = true
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
