@@ -34,6 +34,10 @@ type retirementSweepPlan struct {
 }
 
 func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, storage manifest.GCCursorStorage, fence *manifest.FenceToken, batchSize int) (sstSweepStats, error) {
+	return runRetirementSweeperWithStager(ctx, store, manifestLog, storage, fence, batchSize, nil)
+}
+
+func runRetirementSweeperWithStager(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, storage manifest.GCCursorStorage, fence *manifest.FenceToken, batchSize int, stage maintenanceCommandStager) (sstSweepStats, error) {
 	stats := sstSweepStats{}
 	if batchSize <= 0 {
 		batchSize = defaultSSTSweepBatchSize
@@ -41,7 +45,7 @@ func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestL
 	if storage == nil {
 		return stats, errors.New("nil gc cursor storage")
 	}
-	if fence == nil {
+	if fence == nil && stage == nil {
 		return stats, manifest.ErrFenced
 	}
 
@@ -94,7 +98,7 @@ func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestL
 		advanced := plan.nextManifestSeq != cursor.NextManifestSeq || plan.nextObjectIndex != cursor.NextObjectIndex
 		if !advanced {
 			if cursor.NextObjectIndex == 0 {
-				if _, err := manifestLog.AdvanceRetirementLogStart(ctx, cursor.NextManifestSeq, fence); err != nil {
+				if err := advanceRetirementFloor(ctx, manifestLog, cursor.NextManifestSeq, fence, stage); err != nil {
 					return stats, fmt.Errorf("sync retirement floor: %w", err)
 				}
 			}
@@ -115,7 +119,7 @@ func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestL
 		}
 
 		if next.NextObjectIndex == 0 {
-			if _, err := manifestLog.AdvanceRetirementLogStart(ctx, next.NextManifestSeq, fence); err != nil {
+			if err := advanceRetirementFloor(ctx, manifestLog, next.NextManifestSeq, fence, stage); err != nil {
 				return stats, fmt.Errorf("advance retirement floor: %w", err)
 			}
 		}
@@ -126,6 +130,24 @@ func runRetirementSweeper(ctx context.Context, store *blobstore.Store, manifestL
 		return stats, fmt.Errorf("advance gc cursor after retries: %w", lastErr)
 	}
 	return stats, errors.New("advance gc cursor exceeded retries")
+}
+
+func advanceRetirementFloor(ctx context.Context, manifestLog *manifest.Store, floor uint64, fence *manifest.FenceToken, stage maintenanceCommandStager) error {
+	if stage != nil {
+		current, err := manifestLog.ReadCurrentData(ctx)
+		if err != nil {
+			return err
+		}
+		if current == nil || floor <= current.RetirementLogStart {
+			return nil
+		}
+		return stage(ctx, manifest.MaintenanceCommand{
+			Kind:            manifest.MaintenanceCommandRetirementFloor,
+			RetirementFloor: &manifest.AdvanceFloorCommand{Floor: floor},
+		})
+	}
+	_, err := manifestLog.AdvanceRetirementLogStart(ctx, floor, fence)
+	return err
 }
 
 func planRetirementSweep(entries []*manifest.ManifestLogEntry, cursor *gcCursor, now time.Time, batchSize int) (retirementSweepPlan, error) {

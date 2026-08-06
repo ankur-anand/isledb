@@ -13,6 +13,14 @@ type mockStorage struct {
 	readCount atomic.Int64
 }
 
+func (m *mockStorage) ReadMaintenanceHead(context.Context) ([]byte, string, error) {
+	return nil, "", manifest.ErrNotFound
+}
+
+func (m *mockStorage) WriteMaintenanceHeadCAS(context.Context, []byte, string) (string, error) {
+	return "maintenance-etag", nil
+}
+
 func newMockStorage() *mockStorage {
 	return &mockStorage{
 		pages: make(map[string][]byte),

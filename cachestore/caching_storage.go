@@ -76,6 +76,14 @@ func (s *CachingStorage) WriteCurrentCAS(ctx context.Context, data []byte, expec
 	return s.storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
+func (s *CachingStorage) ReadMaintenanceHead(ctx context.Context) ([]byte, string, error) {
+	return s.storage.ReadMaintenanceHead(ctx)
+}
+
+func (s *CachingStorage) WriteMaintenanceHeadCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	return s.storage.WriteMaintenanceHeadCAS(ctx, data, expectedETag)
+}
+
 func (s *CachingStorage) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
 	return s.storage.ReadSnapshot(ctx, path)
 }

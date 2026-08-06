@@ -26,6 +26,10 @@ type WriterOptions struct {
 	// Flush controls background flushing. A zero Interval disables auto-flush.
 	Flush WriterFlushOptions
 
+	// Maintenance controls discovery of commands staged by a maintenance
+	// process using the same object-store prefix.
+	Maintenance WriterMaintenanceOptions
+
 	// SST controls SST file encoding.
 	SST WriterSSTOptions
 
@@ -69,6 +73,13 @@ type WriterFlushOptions struct {
 	Interval time.Duration
 }
 
+type WriterMaintenanceOptions struct {
+	// PollInterval is the minimum interval between object-store reads of
+	// maintenance/HEAD. Same-process maintenance bypasses this interval through
+	// an in-memory notification. Zero selects the default.
+	PollInterval time.Duration
+}
+
 type WriterSSTOptions struct {
 	// BloomBitsPerKey controls SST bloom filter size. Zero selects the default.
 	BloomBitsPerKey int
@@ -89,6 +100,9 @@ func DefaultWriterOptions() WriterOptions {
 		},
 		Flush: WriterFlushOptions{
 			Interval: time.Second,
+		},
+		Maintenance: WriterMaintenanceOptions{
+			PollInterval: time.Second,
 		},
 		SST: WriterSSTOptions{
 			BloomBitsPerKey: 10,

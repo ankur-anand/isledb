@@ -50,13 +50,24 @@ func (c *Current) Clone() *Current {
 		NextEpoch:          c.NextEpoch,
 		ChangeFeedLogStart: c.ChangeFeedLogStart,
 		RetirementLogStart: c.RetirementLogStart,
+		StateReplayPages:   c.StateReplayPages,
+		StateReplayBytes:   c.StateReplayBytes,
 		WriterFence:        c.WriterFence.Clone(),
 		CompactorFence:     c.CompactorFence.Clone(),
 		LastWriterCommit:   c.LastWriterCommit.Clone(),
+		MaintenanceReceipt: c.MaintenanceReceipt.Clone(),
 	}
 	clone.ActiveEntries = append(clone.ActiveEntries, c.ActiveEntries...)
 	clone.IndexFrontier = append(clone.IndexFrontier, c.IndexFrontier...)
 	return clone
+}
+
+func (r *MaintenanceReceipt) Clone() *MaintenanceReceipt {
+	if r == nil {
+		return nil
+	}
+	clone := *r
+	return &clone
 }
 
 func (m *WriterCommitMarker) Clone() *WriterCommitMarker {

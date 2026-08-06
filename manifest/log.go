@@ -37,20 +37,21 @@ type RetiredObject struct {
 }
 
 type ManifestLogEntry struct {
-	ID               ksuid.KSUID           `json:"id"`
-	CommitID         string                `json:"commit_id,omitempty"`
-	Seq              uint64                `json:"seq"`
-	Role             FenceRole             `json:"role"`
-	Epoch            uint64                `json:"epoch"`
-	Timestamp        time.Time             `json:"ts"`
-	Op               LogOpType             `json:"op"`
-	SSTable          *SSTMeta              `json:"sstable,omitempty"`
-	ChangeBatch      *ChangeBatchMeta      `json:"change_batch,omitempty"`
-	RemoveSSTableIDs []string              `json:"remove_sstable_ids,omitempty"`
-	Checkpoint       *Manifest             `json:"checkpoint,omitempty"`
-	Compaction       *CompactionLogPayload `json:"compaction,omitempty"`
-	RetiredObjects   []RetiredObject       `json:"retired_objects,omitempty"`
-	FenceClaim       *FenceClaimPayload    `json:"fence_claim,omitempty"`
+	ID                   ksuid.KSUID           `json:"id"`
+	CommitID             string                `json:"commit_id,omitempty"`
+	MaintenanceCommandID string                `json:"maintenance_command_id,omitempty"`
+	Seq                  uint64                `json:"seq"`
+	Role                 FenceRole             `json:"role"`
+	Epoch                uint64                `json:"epoch"`
+	Timestamp            time.Time             `json:"ts"`
+	Op                   LogOpType             `json:"op"`
+	SSTable              *SSTMeta              `json:"sstable,omitempty"`
+	ChangeBatch          *ChangeBatchMeta      `json:"change_batch,omitempty"`
+	RemoveSSTableIDs     []string              `json:"remove_sstable_ids,omitempty"`
+	Checkpoint           *Manifest             `json:"checkpoint,omitempty"`
+	Compaction           *CompactionLogPayload `json:"compaction,omitempty"`
+	RetiredObjects       []RetiredObject       `json:"retired_objects,omitempty"`
+	FenceClaim           *FenceClaimPayload    `json:"fence_claim,omitempty"`
 }
 
 type FenceClaimPayload struct {

@@ -34,6 +34,25 @@ func (b *BlobStoreBackend) WriteCurrentCAS(ctx context.Context, data []byte, exp
 	return b.etagFromAttrs(attr), b.mapError(err)
 }
 
+func (b *BlobStoreBackend) ReadMaintenanceHead(ctx context.Context) ([]byte, string, error) {
+	path := b.store.MaintenanceHeadPath()
+	data, attr, err := b.store.Read(ctx, path)
+	if err != nil {
+		return nil, "", b.mapError(err)
+	}
+	if attr.ETag == "" && attr.Generation == 0 {
+		if refreshed, refreshErr := b.store.Attributes(ctx, path); refreshErr == nil {
+			attr = refreshed
+		}
+	}
+	return data, b.etagFromAttrs(attr), nil
+}
+
+func (b *BlobStoreBackend) WriteMaintenanceHeadCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	attr, err := b.store.WriteIfMatch(ctx, b.store.MaintenanceHeadPath(), data, expectedETag)
+	return b.etagFromAttrs(attr), b.mapError(err)
+}
+
 func (b *BlobStoreBackend) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
 	data, _, err := b.store.Read(ctx, path)
 	return data, b.mapError(err)

@@ -168,6 +168,10 @@ func (s *Store) ManifestPath() string {
 	return s.path("manifest", "CURRENT")
 }
 
+func (s *Store) MaintenanceHeadPath() string {
+	return s.path("maintenance", "HEAD")
+}
+
 func (s *Store) ManifestSnapshotPath(id string) string {
 	return s.path("manifest", "snapshots", id+".manifest")
 }

@@ -58,10 +58,11 @@ func defaultChangeFeedCleanerOptions() changeFeedCleanerOptions {
 }
 
 type changeFeedCleaner struct {
-	store       *blobstore.Store
-	manifestLog *manifest.Store
-	opts        changeFeedCleanerOptions
-	fenceToken  *manifest.FenceToken
+	store        *blobstore.Store
+	manifestLog  *manifest.Store
+	opts         changeFeedCleanerOptions
+	fenceToken   *manifest.FenceToken
+	stageCommand maintenanceCommandStager
 
 	lifecycleMu sync.Mutex
 	ticker      *time.Ticker
@@ -205,8 +206,10 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	if c.closed.Load() {
 		return errors.New("change feed cleaner closed")
 	}
-	if err := c.manifestLog.CheckCompactorFenceToken(ctx, c.fenceToken); err != nil {
-		return err
+	if c.stageCommand == nil {
+		if err := c.manifestLog.CheckCompactorFenceToken(ctx, c.fenceToken); err != nil {
+			return err
+		}
 	}
 	start := time.Now()
 
@@ -239,7 +242,16 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 
 	var entriesRetired int
 	if floor > current.ChangeFeedLogStart {
-		if _, err := c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken); err != nil {
+		var err error
+		if c.stageCommand != nil {
+			err = c.stageCommand(ctx, manifest.MaintenanceCommand{
+				Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+				ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: floor},
+			})
+		} else {
+			_, err = c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken)
+		}
+		if err != nil {
 			return fmt.Errorf("advance change-feed floor: %w", err)
 		}
 		entriesRetired = int(floor - current.ChangeFeedLogStart)

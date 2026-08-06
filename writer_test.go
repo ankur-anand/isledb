@@ -839,6 +839,9 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if normalized.Memtable != defaults.Memtable || normalized.SST != defaults.SST {
 		t.Fatalf("normalized options=%+v defaults=%+v", normalized, defaults)
 	}
+	if normalized.Maintenance != defaults.Maintenance {
+		t.Fatalf("normalized maintenance options=%+v defaults=%+v", normalized.Maintenance, defaults.Maintenance)
+	}
 	if normalized.Flush.Interval != 0 {
 		t.Fatalf("zero-value flush interval=%s, want disabled", normalized.Flush.Interval)
 	}
@@ -856,6 +859,7 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative target bytes", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = -1 }},
 		{name: "negative pending memtables", mutate: func(o *WriterOptions) { o.Memtable.MaxPendingMemtables = -1 }},
 		{name: "negative flush interval", mutate: func(o *WriterOptions) { o.Flush.Interval = -time.Nanosecond }},
+		{name: "negative maintenance poll interval", mutate: func(o *WriterOptions) { o.Maintenance.PollInterval = -time.Nanosecond }},
 		{name: "negative bloom bits", mutate: func(o *WriterOptions) { o.SST.BloomBitsPerKey = -1 }},
 		{name: "negative block bytes", mutate: func(o *WriterOptions) { o.SST.BlockBytes = -1 }},
 		{name: "unsupported compression", mutate: func(o *WriterOptions) { o.SST.Compression = "gzip" }},
@@ -879,6 +883,94 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 				t.Fatalf("normalizeWriterOptions error=%v, want %v", err, ErrInvalidWriterOptions)
 			}
 		})
+	}
+}
+
+type maintenanceReadCountingStorage struct {
+	*manifest.BlobStoreBackend
+	reads atomic.Int64
+}
+
+func (s *maintenanceReadCountingStorage) ReadMaintenanceHead(ctx context.Context) ([]byte, string, error) {
+	s.reads.Add(1)
+	return s.BlobStoreBackend.ReadMaintenanceHead(ctx)
+}
+
+func TestWriterMaintenancePollIntervalBoundsMailboxReads(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-poll-bounds")
+	defer store.Close()
+
+	storage := &maintenanceReadCountingStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
+	manifestStore := newManifestStore(store, storage)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	opts.Maintenance.PollInterval = time.Hour
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	for i := 0; i < 100; i++ {
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush(%d): %v", i, err)
+		}
+	}
+	if got := storage.reads.Load(); got != 1 {
+		t.Fatalf("maintenance HEAD reads=%d, want 1 within one poll interval", got)
+	}
+}
+
+func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-wake")
+	defer store.Close()
+
+	storage := &maintenanceReadCountingStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
+	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.Flush.Interval = 0
+	writerOpts.Maintenance.PollInterval = time.Hour
+	w, err := db.OpenWriter(ctx, writerOpts)
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("initial Flush: %v", err)
+	}
+
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
+		ID:              "same-process-wake",
+		Kind:            manifest.MaintenanceCommandRetirementFloor,
+		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}); err != nil {
+		t.Fatalf("stageCommand: %v", err)
+	}
+
+	readsBeforeFlush := storage.reads.Load()
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush after maintenance wake: %v", err)
+	}
+	if got := storage.reads.Load(); got != readsBeforeFlush+1 {
+		t.Fatalf("maintenance HEAD reads=%d, want %d after wake", got, readsBeforeFlush+1)
+	}
+
+	current, err := db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.CommandID != "same-process-wake" {
+		t.Fatalf("maintenance receipt=%+v, want same-process-wake", current.MaintenanceReceipt)
 	}
 }
 
@@ -1082,5 +1174,137 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.FlushBytes); got <= 0 {
 		t.Fatalf("flush_bytes_total must be > 0, got %v", got)
+	}
+}
+
+func TestWriterFlushAppliesPendingMaintenanceWithoutUserData(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-poll")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	staged, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
+		ID:              "retirement-floor-1",
+		Kind:            manifest.MaintenanceCommandRetirementFloor,
+		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}, token)
+	if err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.RetirementLogStart != 1 {
+		t.Fatalf("retirement_log_start=%d, want 1", current.RetirementLogStart)
+	}
+	if current.MaintenanceReceipt == nil ||
+		current.MaintenanceReceipt.CommandID != staged.Pending.ID ||
+		current.MaintenanceReceipt.Status != manifest.MaintenanceStatusApplied {
+		t.Fatalf("maintenance_receipt=%+v, pending=%+v", current.MaintenanceReceipt, staged.Pending)
+	}
+}
+
+func TestWriterRejectsInvalidMaintenanceWithoutBecomingTerminal(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-rejection")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	if _, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
+		ID:   "invalid-compaction",
+		Kind: manifest.MaintenanceCommandCompaction,
+		Compaction: &manifest.CompactionCommand{Payload: manifest.CompactionLogPayload{
+			SourceLevel:      0,
+			DestinationLevel: 1,
+		}},
+	}, token); err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush rejected command: %v", err)
+	}
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.Status != manifest.MaintenanceStatusRejected {
+		t.Fatalf("maintenance_receipt=%+v, want rejected", current.MaintenanceReceipt)
+	}
+	if err := w.put(ctx, []byte("still-writable"), []byte("value")); err != nil {
+		t.Fatalf("put after rejected maintenance: %v", err)
+	}
+}
+
+func TestWriterBackgroundFlushPollsMaintenanceWhenIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	store := blobstore.NewMemory("writer-maintenance-background-poll")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 5 * time.Millisecond
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(context.Background())
+
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	staged, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
+		ID:              "idle-floor",
+		Kind:            manifest.MaintenanceCommandRetirementFloor,
+		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}, token)
+	if err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+
+	for {
+		current, err := manifestStore.ReadCurrentData(ctx)
+		if err != nil {
+			t.Fatalf("ReadCurrentData: %v", err)
+		}
+		if current.MaintenanceReceipt.Matches(staged.Pending) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("maintenance command was not applied: %v", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
 	}
 }

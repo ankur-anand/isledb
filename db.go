@@ -110,6 +110,7 @@ type DB struct {
 	store           *blobstore.Store
 	manifestStore   *manifest.Store
 	gcCursorStorage manifest.GCCursorStorage
+	maintenanceWake chan struct{}
 	mu              sync.Mutex
 	closers         []dbCloser
 	writerOpen      bool
@@ -147,6 +148,7 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 		store:           store,
 		manifestStore:   manifestStore,
 		gcCursorStorage: gcCursorStorage,
+		maintenanceWake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -157,7 +159,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		return nil, err
 	}
 
-	w, err := newWriter(ctx, db.store, db.manifestStore, opts)
+	w, err := newWriterWithMaintenanceWake(ctx, db.store, db.manifestStore, opts, db.maintenanceWake)
 	if err != nil {
 		db.releaseWriter(nil)
 		return nil, err
@@ -208,6 +210,7 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		return nil, err
 	}
 	maintenance.release = func() { db.releaseMaintenance(maintenance) }
+	maintenance.writerWake = db.maintenanceWake
 	if err := db.registerCloser(maintenance); err != nil {
 		_ = maintenance.Close(ctx)
 		db.releaseMaintenance(maintenance)

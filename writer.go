@@ -49,10 +49,12 @@ type writer struct {
 	epoch                   uint64
 	blobStorage             *internal.BlobStorage
 
-	flushMu     sync.Mutex
-	flushTicker *time.Ticker
-	stopCh      chan struct{}
-	workerDone  chan struct{}
+	flushMu             sync.Mutex
+	flushTicker         *time.Ticker
+	maintenanceWake     <-chan struct{}
+	nextMaintenancePoll time.Time
+	stopCh              chan struct{}
+	workerDone          chan struct{}
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -82,6 +84,10 @@ func (p *pendingFlush) SeqLo() uint64 {
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
+	return newWriterWithMaintenanceWake(ctx, store, manifestLog, opts, nil)
+}
+
+func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions, maintenanceWake <-chan struct{}) (*writer, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -110,6 +116,7 @@ func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifes
 		seq:                     m.MaxSeqNum(),
 		epoch:                   m.NextEpoch,
 		blobStorage:             internal.NewBlobStorage(store, valueConfig),
+		maintenanceWake:         maintenanceWake,
 		stopCh:                  make(chan struct{}),
 		workerDone:              make(chan struct{}),
 		metrics:                 opts.Metrics,
@@ -158,6 +165,13 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	if opts.Flush.Interval < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
 			"%w: flush_interval=%s", ErrInvalidWriterOptions, opts.Flush.Interval)
+	}
+	if opts.Maintenance.PollInterval < 0 {
+		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+			"%w: maintenance_poll_interval=%s", ErrInvalidWriterOptions, opts.Maintenance.PollInterval)
+	}
+	if opts.Maintenance.PollInterval == 0 {
+		opts.Maintenance.PollInterval = d.Maintenance.PollInterval
 	}
 	if opts.SST.BloomBitsPerKey < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
@@ -418,14 +432,22 @@ func (w *writer) ensureCapacityLocked() error {
 }
 
 func (w *writer) flush(ctx context.Context) error {
-	return w.flushInternal(ctx, false)
+	return w.flushInternal(ctx, false, false)
 }
 
 func (w *writer) flushBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true)
+	return w.flushInternal(ctx, true, false)
 }
 
-func (w *writer) flushInternal(ctx context.Context, terminalOnError bool) error {
+func (w *writer) flushMaintenanceBackground(ctx context.Context) error {
+	return w.flushInternal(ctx, true, true)
+}
+
+func (w *writer) flushFinal(ctx context.Context) error {
+	return w.flushInternal(ctx, false, true)
+}
+
+func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMaintenancePoll bool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -438,6 +460,15 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError bool) error 
 	}
 	if w.fenced.Load() {
 		return manifest.ErrFenced
+	}
+	if w.consumeMaintenanceWake() {
+		forceMaintenancePoll = true
+	}
+	if err := w.pollPendingMaintenance(ctx, forceMaintenancePoll); err != nil {
+		if isFenceError(err) {
+			w.fenced.Store(true)
+		}
+		return fmt.Errorf("apply maintenance command: %w", err)
 	}
 
 	w.mu.Lock()
@@ -469,6 +500,27 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError bool) error 
 			w.pendingMemtables--
 			w.mu.Unlock()
 		}
+	}
+}
+
+func (w *writer) pollPendingMaintenance(ctx context.Context, force bool) error {
+	now := time.Now()
+	if !force && !w.nextMaintenancePoll.IsZero() && now.Before(w.nextMaintenancePoll) {
+		return nil
+	}
+	_, err := w.manifestLog.ApplyPendingMaintenance(ctx)
+	if err == nil {
+		w.nextMaintenancePoll = now.Add(w.opts.Maintenance.PollInterval)
+	}
+	return err
+}
+
+func (w *writer) consumeMaintenanceWake() bool {
+	select {
+	case <-w.maintenanceWake:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -590,23 +642,28 @@ func (w *writer) flushLoop() {
 	}()
 
 	for {
+		var err error
 		select {
 		case <-w.flushTicker.C:
-			if err := w.flushBackground(w.ctx); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				if isFenceError(err) {
-					slog.Error("isledb: writer fenced, stopping background flush",
-						"component", "writer", "epoch", w.epoch)
-					return
-				}
-				notifyErr = err
-				return
-			}
+			err = w.flushBackground(w.ctx)
+		case <-w.maintenanceWake:
+			err = w.flushMaintenanceBackground(w.ctx)
 		case <-w.stopCh:
 			return
 		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if isFenceError(err) {
+			slog.Error("isledb: writer fenced, stopping background flush",
+				"component", "writer", "epoch", w.epoch)
+			return
+		}
+		notifyErr = err
+		return
 	}
 }
 
@@ -628,7 +685,7 @@ func (w *writer) close(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	return w.flush(ctx)
+	return w.flushFinal(ctx)
 }
 
 func (w *writer) closeWithTimeout(timeout time.Duration) error {
