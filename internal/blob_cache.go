@@ -1,6 +1,6 @@
 package internal
 
-import "github.com/ankur-anand/isledb/diskcache"
+import "github.com/ankur-anand/isledb/internal/diskcache"
 
 // BlobCache is an alias to diskcache.Cache for caching blob data.
 type BlobCache = diskcache.Cache

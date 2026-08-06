@@ -9,26 +9,20 @@ import (
     "time"
 
     "github.com/ankur-anand/isledb"
-    "github.com/ankur-anand/isledb/blobstore"
 )
 
 ctx := context.Background()
 
-// 1. Open blob storage
-store, err := blobstore.Open(ctx, "s3://my-bucket?region=us-east-1", "mydb")
-if err != nil {
-    log.Fatal(err)
-}
-defer store.Close()
-
-// 2. Open database
-db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
+// 1. Open the database and its object-store connection.
+db, err := isledb.Open(ctx, "s3://my-bucket?region=us-east-1", isledb.DBOptions{
+    Prefix: "mydb",
+})
 if err != nil {
     log.Fatal(err)
 }
 defer db.Close()
 
-// 3. Write data. Flush is the synchronous visibility boundary.
+// 2. Write data. Flush is the synchronous visibility boundary.
 w, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
 if err != nil {
     log.Fatal(err)
@@ -45,8 +39,8 @@ if err := w.Flush(ctx); err != nil {
     log.Fatal(err)
 }
 
-// 4. Read data. Refresh discovers newly committed SSTs.
-r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+// 3. Read data. Refresh discovers newly committed SSTs.
+r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
 if err != nil {
     log.Fatal(err)
 }
@@ -67,25 +61,29 @@ _ = err
 
 ### DB
 
-Entry point for database operations. Manages one writer, one maintenance owner,
-and shared manifest state.
+Entry point for database operations. Manages one writer, one shared concurrent
+reader, one maintenance owner, and shared manifest state.
 
 ```go
-func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error)
+func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error)
+func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opts DBOptions) (*DB, error)
 ```
 
 | Method | Signature |
 |--------|-----------|
 | OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
+| OpenReader | `(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)` |
 | OpenMaintenance | `(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)` |
 | Close | `() error` |
 
 ```go
 type DBOptions struct {
-    ManifestStorage manifest.Storage // Optional custom manifest storage backend
-    GCCursorStorage manifest.GCCursorStorage // Optional custom retirement cursor backend
+    Prefix string
 }
 ```
+
+`Open` owns the bucket connection and closes it from `DB.Close`. `OpenBucket`
+borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
 
 ---
 
@@ -104,7 +102,6 @@ Visibility contract:
 
 - `Put` and `Delete` return after the mutation is buffered locally.
 - `PutWithTTL` stores an expiry with the value. `ttl <= 0` means no expiration.
-- `DeleteWithTTL` stores an expiring tombstone. `ttl <= 0` means the tombstone does not expire.
 - `Flush` is the synchronous publish boundary. It writes pending memtables as
   SST files and commits manifest entries.
 - A retry of an explicit `Flush` reuses the same uploaded SST, change batch,
@@ -118,24 +115,19 @@ Visibility contract:
 | Put | `(ctx context.Context, key, value []byte) error` | Buffer a key-value mutation |
 | PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Buffer a key-value mutation with time-to-live |
 | Delete | `(ctx context.Context, key []byte) error` | Buffer a tombstone |
-| DeleteWithTTL | `(ctx context.Context, key []byte, ttl time.Duration) error` | Buffer a tombstone with TTL |
 | Flush | `(ctx context.Context) error` | Publish all currently buffered writes |
 | Close | `(ctx context.Context) error` | Stop background flushing and publish pending writes |
 
 ```go
 type WriterOptions struct {
-    OwnerID      string
-    Memtable    WriterMemtableOptions
-    Flush       WriterFlushOptions
-    SST         WriterSSTOptions
-    Values      config.ValueStorageConfig
-    ChangeFeed  ChangeFeedOptions
+    OwnerID       string
+    Memtable     WriterMemtableOptions
+    Flush        WriterFlushOptions
+    Maintenance  WriterMaintenanceOptions
+    SST          WriterSSTOptions
+    Values       ValueOptions
     OnFlushError func(error)
-    Metrics     *WriterMetrics
-}
-
-type ChangeFeedOptions struct {
-    Enabled bool // Write seq-ordered mutation batches under changes/.
+    Metrics      *WriterMetrics
 }
 
 type WriterMemtableOptions struct {
@@ -147,10 +139,20 @@ type WriterFlushOptions struct {
     Interval time.Duration // Background flush cadence. Zero disables auto-flush.
 }
 
+type WriterMaintenanceOptions struct {
+    PollInterval time.Duration // Minimum interval between maintenance mailbox reads.
+}
+
 type WriterSSTOptions struct {
     BloomBitsPerKey int    // Zero selects the default.
     BlockBytes      int    // Zero selects the default.
     Compression     string // "none", "snappy", or "zstd"; empty selects the default.
+}
+
+type ValueOptions struct {
+    MaxKeyBytes      int   // Largest accepted key size.
+    InlineValueBytes int   // Values at or above this size are stored outside the SST.
+    MaxValueBytes    int64 // Largest accepted value size.
 }
 
 func DefaultWriterOptions() WriterOptions
@@ -195,7 +197,7 @@ if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
 if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), 30*time.Minute); err != nil {
     return err
 }
-if err := w.DeleteWithTTL(ctx, []byte("lock:1"), 5*time.Second); err != nil {
+if err := w.Delete(ctx, []byte("lock:1")); err != nil {
     return err
 }
 return w.Flush(ctx)
@@ -228,8 +230,10 @@ type Snapshot struct { ... }
 
 Read-only handle for database access. Supports point lookups, range scans, and iteration.
 
+Readers are opened from the database that owns the object-store prefix:
+
 ```go
-func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error)
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
 ```
 
 Opening a reader loads a view. Reads refresh it when `Views.RefreshAfter` has
@@ -245,11 +249,10 @@ the caller needs an immediate visibility check.
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Stream a bounded key range |
 | Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
 | Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
-| Manifest | `() *Manifest` | Return cloned manifest snapshot |
 | Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
-| BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
-| SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
-| ManifestPageCacheStats | `() cachestore.ManifestPageCacheStats` | Manifest commit-page cache statistics |
+| BlobCacheStats | `() CacheStats` | External-value cache statistics |
+| SSTCacheStats | `() CacheStats` | SST cache statistics |
+| ManifestPageCacheStats | `() CacheStats` | Manifest commit-page cache statistics |
 
 ```go
 type ReaderOpenOptions struct {
@@ -263,8 +266,16 @@ type ReaderOpenOptions struct {
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
-    BlobReadOptions          config.BlobReadOptions
-    ManifestStorage          manifest.Storage     // Optional custom manifest storage
+    VerifyBlobsOnRead        bool
+}
+
+type CacheStats struct {
+    Hits       int64
+    Misses     int64
+    Bytes      int64
+    MaxBytes   int64
+    EntryCount int
+    MaxEntries int
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
@@ -283,7 +294,7 @@ object-store refresh while the loaded view is still fresh.
 Example:
 
 ```go
-r, err := isledb.OpenReader(ctx, store, isledb.DefaultReaderOpenOptions("./cache"))
+r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
 if err != nil {
     return err
 }
@@ -399,7 +410,6 @@ type MaintenanceOptions struct {
     Compaction         CompactionPolicy
     GarbageCollection  GarbageCollectionPolicy
     Retention          *RetentionPolicy
-    ChangeFeedRetention *ChangeFeedRetentionPolicy
     OnCycle            func(MaintenanceStats)
     OnError            func(error)
 }
@@ -431,8 +441,14 @@ type CompactionJob struct {
     SourceLevel      uint32
     DestinationLevel uint32
     InputSSTs        []string
-    OutputSSTs       []SSTMeta
+    OutputSSTs       []CompactionOutput
     MetadataOnly     bool
+}
+
+type CompactionOutput struct {
+    ID    string
+    Bytes int64
+    Level uint32
 }
 
 type RetentionPolicy struct {
@@ -444,27 +460,15 @@ type RetentionPolicy struct {
     OnCleanup          func(CleanupStats)
 }
 
-type ChangeFeedRetentionPolicy struct {
-    KeepFor                    time.Duration
-    KeepAtLeastManifestEntries uint64
-    DeleteBatchSize            int
-    DeleteGracePeriod          time.Duration
-    OnCleanup                  func(ChangeFeedCleanupStats)
-}
 ```
 
-`DefaultMaintenanceOptions` enables compaction and leaves both retention
-policies nil. Use `DefaultRetentionPolicy` or
-`DefaultChangeFeedRetentionPolicy` before enabling destructive cleanup.
+`DefaultMaintenanceOptions` enables compaction and leaves retention disabled.
+Use `DefaultRetentionPolicy` before enabling destructive cleanup.
 
 In `RetentionByAge` mode, `KeepAtLeastSSTs` protects the newest SSTs. In
 `RetentionByTimeWindow` mode, `Window` defines the grouping interval and
 `KeepAtLeastWindows` protects the newest groups. The two limits are independent;
 there is no conversion between SST counts and window counts.
-
-`KeepAtLeastManifestEntries` protects the newest manifest entries from
-change-feed retirement. This includes entries without a change batch because
-the retention floor advances through the ordered manifest log.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()
@@ -495,98 +499,17 @@ stats, err := m.RunOnce(ctx)
 
 ---
 
-## Manifest Types
-
-Re-exported from `manifest` package for convenience.
-
-### Manifest
-
-LSM tree state snapshot.
-
-```go
-type Manifest = manifest.Manifest
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| Version | `int` | Schema version |
-| NextEpoch | `uint64` | Next epoch number |
-| LogSeq | `uint64` | Current log sequence |
-| WriterFence | `*FenceToken` | Writer ownership claim |
-| CompactorFence | `*FenceToken` | Compactor ownership claim |
-| L0SSTs | `[]SSTMeta` | Overlapping level-0 SSTs, newest first |
-| Levels | `[]Level` | Non-overlapping levels ordered by level number |
-
-| Method | Signature |
-|--------|-----------|
-| Clone | `() *Manifest` |
-| L0SSTCount | `() int` |
-| LookupSST | `(id string) *SSTMeta` |
-| Level | `(number uint32) *Level` |
-| ValidateLevels | `() error` |
-| AllSSTIDs | `() []string` |
-| MaxSeqNum | `() uint64` |
-
-### SSTMeta
-
-```go
-type SSTMeta = manifest.SSTMeta
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| ID | `string` | SST identifier |
-| Epoch | `uint64` | Writer epoch |
-| SeqLo | `uint64` | Lowest sequence number |
-| SeqHi | `uint64` | Highest sequence number |
-| MinKey | `[]byte` | Smallest key |
-| MaxKey | `[]byte` | Largest key |
-| Size | `int64` | File size in bytes |
-| Checksum | `string` | `sha256:<hex>` checksum |
-| Signature | `*SSTSignature` | Digital signature |
-| Bloom | `BloomMeta` | Bloom filter metadata |
-| CreatedAt | `time.Time` | Creation timestamp |
-| Level | `uint32` | Logical LSM level (0 = L0) |
-| HasBlobRefs | `bool` | Contains external blob references |
-
-### ChangeBatchMeta
-
-Change batches are written only when `WriterOptions.ChangeFeed.Enabled` is true.
-Manifest entries are still the source of truth; readers should not discover
-change history by listing `changes/`.
-
-```go
-type ChangeBatchMeta = manifest.ChangeBatchMeta
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| ID | `string` | Change batch identifier |
-| Path | `string` | Object path for the binary change batch |
-| Epoch | `uint64` | Writer epoch |
-| SeqLo | `uint64` | Lowest mutation sequence |
-| SeqHi | `uint64` | Highest mutation sequence |
-| Count | `uint32` | Number of changes in the batch |
-| Size | `int64` | Encoded object size |
-| Checksum | `string` | Encoded object checksum |
-| CreatedAt | `time.Time` | Creation time |
-| Version | `int` | Change batch format version |
-
-### Level
-
-```go
-type Level = manifest.Level
-```
-
-| Field | Type |
-|-------|------|
-| Number | `uint32` |
-| SSTs | `[]SSTMeta` |
+## Integrity
 
 ### SSTSignature
 
 ```go
-type SSTSignature = manifest.SSTSignature
+type SSTSignature struct {
+    Algorithm string
+    KeyID     string
+    Hash      string
+    Signature []byte
+}
 ```
 
 | Field | Type |
@@ -595,17 +518,6 @@ type SSTSignature = manifest.SSTSignature
 | KeyID | `string` |
 | Hash | `string` |
 | Signature | `[]byte` |
-
-### FenceToken
-
-```go
-// from manifest package
-type FenceToken struct {
-    Epoch     uint64
-    Owner     string
-    ClaimedAt time.Time
-}
-```
 
 ---
 
@@ -632,21 +544,6 @@ type SSTHashVerifier interface {
     VerifyHash(hash []byte, sig SSTSignature) error
 }
 ```
-
-### manifest.GCMarkStorage
-
-Stores GC coordination state (pending SST delete marks and GC checkpoint) with CAS semantics.
-
-```go
-type GCMarkStorage interface {
-    LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error)
-    StorePendingDeleteMarks(ctx context.Context, data []byte, matchToken string, exists bool) error
-    LoadGCCheckpoint(ctx context.Context) ([]byte, string, bool, error)
-    StoreGCCheckpoint(ctx context.Context, data []byte, matchToken string, exists bool) error
-}
-```
-
----
 
 ## Blob Storage
 
@@ -698,77 +595,3 @@ type Attributes struct {
 - `blobstore.ErrNotFound` - Object does not exist
 - `blobstore.ErrPreconditionFailed` - CAS condition not met
 - `blobstore.BatchDeleteError` - Partial batch delete failure (`.Failed` map)
-
----
-
-## Configuration
-
-### config.ValueStorageConfig
-
-Controls how values are stored (inline vs. blob storage).
-
-```go
-type ValueStorageConfig struct {
-    ValueOptions
-    BlobReadOptions
-    BlobGCOptions
-}
-
-func DefaultValueStorageConfig() ValueStorageConfig
-```
-
-```go
-type ValueOptions struct {
-    MaxKeySize    int   // Maximum key size
-    BlobThreshold int   // Values >= this size go to blob storage
-    MaxValueSize  int64 // Maximum value size
-}
-
-type BlobReadOptions struct {
-    VerifyBlobsOnRead bool // Re-hash blobs on read for integrity
-}
-
-// Note: Current Not Implemented Just Defined
-type BlobGCOptions struct {
-    Enabled  bool
-    Interval time.Duration
-    MinAge   time.Duration
-}
-```
-
----
-
-## Manifest Store
-
-### manifest.Store
-
-Manages manifest snapshots, committed entry pages, CURRENT, and writer/compactor fences.
-
-```go
-func NewStore(store *blobstore.Store) *Store
-func NewStoreWithStorage(storage Storage) *Store
-```
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| ClaimWriter | `(ctx, ownerID) (*FenceToken, error)` | Claim writer fence |
-| ClaimCompactor | `(ctx, ownerID) (*FenceToken, error)` | Claim compactor fence |
-| CheckWriterFence | `(ctx) error` | Verify writer fence still valid |
-| CheckCompactorFence | `(ctx) error` | Verify compactor fence still valid |
-| Replay | `(ctx) (*Manifest, error)` | Rebuild manifest from CURRENT, snapshots, and committed entries |
-| AppendWriterCommit | `(ctx, WriterCommit) (*ManifestLogEntry, error)` | Idempotently publish one SST and optional change batch using a stable commit ID |
-| AppendAddSSTableWithFence | `(ctx, SSTMeta) (*ManifestLogEntry, error)` | Append SST add entry |
-| AppendAddSSTableWithChangeBatchWithFence | `(ctx, SSTMeta, *ChangeBatchMeta) (*ManifestLogEntry, error)` | Append paired SST and change-batch entry |
-| AppendRemoveSSTablesWithFence | `(ctx, []string, []RetiredObject) (*ManifestLogEntry, error)` | Atomically remove SST metadata and record exact retired objects |
-| AppendCompactionWithFence | `(ctx, CompactionLogPayload, []RetiredObject) (*ManifestLogEntry, error)` | Append one bounded adjacent-level compaction entry with explicit source and destination levels |
-| ReadRetirementEntries | `(ctx, start uint64, limit int) ([]*ManifestLogEntry, uint64, error)` | Read a bounded retirement-history page |
-| AdvanceRetirementLogStart | `(ctx, floor uint64, *FenceToken) (*Current, error)` | Advance the retained retirement floor after cursor commit |
-| WriteSnapshot | `(ctx, *Manifest) (string, error)` | Write manifest snapshot |
-
-**Errors:**
-- `manifest.ErrFenced` - Epoch superseded by newer owner
-- `manifest.ErrFenceConflict` - Concurrent claim detected
-- `manifest.ErrInvalidWriterCommit` - Commit identity or SST/change metadata is invalid
-- `manifest.ErrWriterCommitConflict` - A commit ID was reused with different metadata
-- `manifest.ErrInvalidRetirement` - Removed SSTs and exact retirement records do not match
-- `manifest.ErrInvalidManifest` - A replayed or submitted level topology is invalid

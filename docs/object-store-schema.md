@@ -37,7 +37,8 @@ demo/p000/
 - `manifest/CURRENT`, `maintenance/HEAD`, `manifest/snapshots/*.manifest`,
   `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
 - `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
-- `changes/*` objects are written only when `WriterOptions.ChangeFeed.Enabled` is true.
+- `changes/*` is reserved for the internal change-feed implementation and is
+  not part of the stable public API.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
 - Manifest log `role` is `0` for writer-owned publication. Applied maintenance
   entries are also writer-owned because only the writer updates `CURRENT`.
@@ -455,14 +456,13 @@ JSON-style descriptor:
 
 ## `changes/<bucket>/<change-batch-id>`
 
-Immutable, seq-ordered mutation batch written alongside a memtable flush when
-change feed is enabled. This object is binary, not JSON. It preserves puts,
-deletes, TTL metadata, inline values, and blob references in row-sequence order.
+Immutable, seq-ordered mutation batch used by internal change-feed tests. This
+object is binary, not JSON. It preserves puts, deletes, TTL metadata, inline
+values, and blob references in row-sequence order.
 
 The bucket is deterministically derived from the change-batch ID using
-`blobstore.ChangeBatchBucket`. Readers should not list `changes/` to discover
-history. They read manifest metadata, then open the exact path from
-`ChangeBatchMeta.Path`.
+the internal change-batch bucket function. It is not discoverable through the
+public reader API.
 
 Path:
 

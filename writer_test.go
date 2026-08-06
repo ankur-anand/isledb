@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -113,11 +113,11 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := testWriterOptions(1<<20, 0)
-	opts.ChangeFeed.Enabled = true
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
+	w.changeFeedEnabled = true
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
@@ -162,7 +162,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if attrs.Size != meta.Size {
 		t.Fatalf("change batch size attr=%d meta=%d", attrs.Size, meta.Size)
 	}
-	batch, err := DecodeChangeBatch(data)
+	batch, err := decodeChangeBatch(data)
 	if err != nil {
 		t.Fatalf("DecodeChangeBatch: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if batch.Changes[0].Seq != 1 || string(batch.Changes[0].Key) != "b" || string(batch.Changes[0].Value) != "vb" {
 		t.Fatalf("change[0] mismatch: %+v", batch.Changes[0])
 	}
-	if batch.Changes[1].Seq != 2 || batch.Changes[1].Kind != ChangeDelete || string(batch.Changes[1].Key) != "a" {
+	if batch.Changes[1].Seq != 2 || batch.Changes[1].Kind != changeDelete || string(batch.Changes[1].Key) != "a" {
 		t.Fatalf("change[1] mismatch: %+v", batch.Changes[1])
 	}
 	if batch.Changes[2].Seq != 3 || string(batch.Changes[2].Key) != "c" || string(batch.Changes[2].Value) != "vc" {
@@ -514,11 +514,11 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
 	opts := testWriterOptions(1<<20, 0)
-	opts.ChangeFeed.Enabled = true
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
+	w.changeFeedEnabled = true
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
@@ -842,11 +842,37 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if normalized.Maintenance != defaults.Maintenance {
 		t.Fatalf("normalized maintenance options=%+v defaults=%+v", normalized.Maintenance, defaults.Maintenance)
 	}
+	if normalized.Values != defaults.Values {
+		t.Fatalf("normalized value options=%+v defaults=%+v", normalized.Values, defaults.Values)
+	}
 	if normalized.Flush.Interval != 0 {
 		t.Fatalf("zero-value flush interval=%s, want disabled", normalized.Flush.Interval)
 	}
 	if values.MaxKeySize <= 0 || values.BlobThreshold <= 0 || values.MaxValueSize <= 0 {
 		t.Fatalf("normalized value options=%+v", values.ValueOptions)
+	}
+}
+
+func TestWriterOptions_MapValueOptions(t *testing.T) {
+	opts := WriterOptions{
+		Values: ValueOptions{
+			MaxKeyBytes:      1024,
+			InlineValueBytes: 2048,
+			MaxValueBytes:    4096,
+		},
+	}
+
+	normalized, values, err := normalizeWriterOptions(opts)
+	if err != nil {
+		t.Fatalf("normalizeWriterOptions: %v", err)
+	}
+	if normalized.Values != opts.Values {
+		t.Fatalf("normalized values=%+v, want=%+v", normalized.Values, opts.Values)
+	}
+	if values.MaxKeySize != opts.Values.MaxKeyBytes ||
+		values.BlobThreshold != opts.Values.InlineValueBytes ||
+		values.MaxValueSize != opts.Values.MaxValueBytes {
+		t.Fatalf("internal values=%+v, public values=%+v", values.ValueOptions, opts.Values)
 	}
 }
 
@@ -863,14 +889,14 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative bloom bits", mutate: func(o *WriterOptions) { o.SST.BloomBitsPerKey = -1 }},
 		{name: "negative block bytes", mutate: func(o *WriterOptions) { o.SST.BlockBytes = -1 }},
 		{name: "unsupported compression", mutate: func(o *WriterOptions) { o.SST.Compression = "gzip" }},
-		{name: "negative blob threshold", mutate: func(o *WriterOptions) { o.Values.BlobThreshold = -1 }},
-		{name: "negative max key size", mutate: func(o *WriterOptions) { o.Values.MaxKeySize = -1 }},
-		{name: "negative max value size", mutate: func(o *WriterOptions) { o.Values.MaxValueSize = -1 }},
+		{name: "negative inline value bytes", mutate: func(o *WriterOptions) { o.Values.InlineValueBytes = -1 }},
+		{name: "negative max key bytes", mutate: func(o *WriterOptions) { o.Values.MaxKeyBytes = -1 }},
+		{name: "negative max value bytes", mutate: func(o *WriterOptions) { o.Values.MaxValueBytes = -1 }},
 		{name: "target exceeds arena", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = maxMemtableArenaBytes + 1 }},
 		{name: "inline entry exceeds arena", mutate: func(o *WriterOptions) {
-			o.Values.MaxKeySize = int(maxMemtableArenaBytes / 2)
-			o.Values.BlobThreshold = int(maxMemtableArenaBytes / 2)
-			o.Values.MaxValueSize = maxMemtableArenaBytes
+			o.Values.MaxKeyBytes = int(maxMemtableArenaBytes / 2)
+			o.Values.InlineValueBytes = int(maxMemtableArenaBytes / 2)
+			o.Values.MaxValueBytes = maxMemtableArenaBytes
 		}},
 	}
 
@@ -928,7 +954,7 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	defer store.Close()
 
 	storage := &maintenanceReadCountingStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -1024,7 +1050,7 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.BlobThreshold = 1
+	opts.Values.InlineValueBytes = 1
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
@@ -1124,7 +1150,7 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.BlobThreshold = 1
+	opts.Values.InlineValueBytes = 1
 	opts.Metrics = DefaultWriterMetrics(nil)
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
@@ -1140,8 +1166,8 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	if err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
 		t.Fatalf("expected putWithTTL error for empty key")
 	}
-	if err := w.deleteWithTTL(ctx, []byte("k1"), time.Second); err != nil {
-		t.Fatalf("deleteWithTTL: %v", err)
+	if err := w.delete(ctx, []byte("k1")); err != nil {
+		t.Fatalf("delete: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)

@@ -13,9 +13,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb"
-	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/examples/eventhub-minio/shared"
-	_ "gocloud.dev/blob/s3blob"
 )
 
 const producerStateVersion = 1
@@ -65,15 +63,9 @@ func main() {
 		}
 	}
 
-	store, err := blobstore.Open(ctx, *bucketURL, *prefix)
+	db, err := isledb.Open(ctx, *bucketURL, isledb.DBOptions{Prefix: *prefix})
 	if err != nil {
-		log.Fatalf("open blob store: %v", err)
-	}
-	defer store.Close()
-
-	db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
-	if err != nil {
-		log.Fatalf("open db: %v", err)
+		log.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
 

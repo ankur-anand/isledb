@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 var errInjectedMailboxIO = errors.New("injected maintenance mailbox I/O failure")
@@ -141,7 +141,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	store := blobstore.NewMemory(fmt.Sprintf("mailbox-fault-%s-%s", phase, point))
 	defer store.Close()
 	storage := &mailboxFaultStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := OpenDB(ctx, store, DBOptions{ManifestStorage: storage})
+	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -250,10 +250,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 		t.Fatalf("maintenance Close: %v", err)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	assertReaderValue(t, ctx, reader, "after-recovery", "visible", true)
 }

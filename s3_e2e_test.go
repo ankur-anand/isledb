@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -75,7 +75,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("e2e-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -172,13 +172,10 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("current has neither active entries nor index frontier")
 	}
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:       t.TempDir(),
 		BlockCacheSize: 64 << 10,
 	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
 	defer reader.Close()
 	assertReaderHasAll(t, ctx, reader, expected)
 
@@ -233,13 +230,10 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("current next_seq did not advance after retention: before=%d after=%d", currentBeforeRetention.NextSeq, currentAfterRetention.NextSeq)
 	}
 
-	retainedReader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	retainedReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:       t.TempDir(),
 		BlockCacheSize: 64 << 10,
 	})
-	if err != nil {
-		t.Fatalf("open retained reader: %v", err)
-	}
 	defer retainedReader.Close()
 
 	retained, err := retainedReader.Scan(ctx, []byte("key:"), []byte("key;"))
@@ -291,20 +285,17 @@ func TestS3E2E_KVLifecycle(t *testing.T) {
 func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:            t.TempDir(),
 		BlockCacheSize:      64 << 10,
 		ValidateSSTChecksum: true,
 	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
 	defer reader.Close()
 
 	writerOpts := DefaultWriterOptions()
@@ -426,13 +417,10 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	}
 	assertCurrentKVState(t, ctx, reader)
 
-	freshReader, err := OpenReader(ctx, store, ReaderOpenOptions{
+	freshReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
 		CacheDir:            t.TempDir(),
 		ValidateSSTChecksum: true,
 	})
-	if err != nil {
-		t.Fatalf("open fresh reader: %v", err)
-	}
 	defer freshReader.Close()
 	assertCurrentKVState(t, ctx, freshReader)
 
@@ -469,16 +457,16 @@ func assertReaderValue(t testing.TB, ctx context.Context, reader *Reader, key, w
 func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
+	db.changeFeedEnabled = true
 
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "change-feed-e2e-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.ChangeFeed.Enabled = true
 	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
@@ -507,28 +495,25 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	}
 
 	time.Sleep(2 * time.Millisecond)
-	changeFeed := DefaultChangeFeedRetentionPolicy()
+	changeFeed := defaultChangeFeedRetentionPolicy()
 	changeFeed.KeepFor = time.Millisecond
 	// Retain the newest writer commit and its change batch.
 	changeFeed.KeepAtLeastManifestEntries = 1
 	changeFeed.DeleteGracePeriod = -1
+	db.changeFeedRetention = &changeFeed
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "change-feed-e2e-maintenance"
-	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
+	driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {
 		t.Fatalf("close writer: %v", err)
-	}
-	if stats.ChangeFeed.EntriesRetired == 0 || stats.ChangeFeed.BatchesMarked != 1 || stats.ChangeFeed.BatchesDeleted != 1 {
-		t.Fatalf("unexpected change-feed cleanup stats: %+v", stats.ChangeFeed)
 	}
 
 	after, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
@@ -544,10 +529,7 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 		t.Fatalf("replayed L0 SST count=%d, want 2", replayed.L0SSTCount())
 	}
 
-	reader, err := OpenReader(ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
 	defer reader.Close()
 	for key, want := range map[string]string{"key:1": "value:1", "key:2": "value:2"} {
 		got, found, err := reader.Get(ctx, []byte(key))
@@ -567,7 +549,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	store := setupFakeS3StoreWithPrefix(b, fmt.Sprintf("bench-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		b.Fatalf("open db: %v", err)
 	}
@@ -627,7 +609,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "records/s")
 }
 
-func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.Store) *Manifest {
+func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.Store) *manifestState {
 	t.Helper()
 
 	ms := manifest.NewStore(store)
@@ -641,7 +623,7 @@ func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.S
 func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Maintenance, writer *Writer) MaintenanceStats {
 	t.Helper()
 	var total MaintenanceStats
-	for attempt := 0; attempt < CompactionMaxIterations*4; attempt++ {
+	for attempt := 0; attempt < compactionMaxIterations*4; attempt++ {
 		stats, err := maintenance.RunOnce(ctx)
 		if err != nil {
 			t.Fatalf("maintenance RunOnce(%d): %v", attempt, err)
@@ -652,11 +634,6 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 		total.CompactionOutputBytes += stats.CompactionOutputBytes
 		total.Retention.SSTsDeleted += stats.Retention.SSTsDeleted
 		total.Retention.BytesReclaimed += stats.Retention.BytesReclaimed
-		total.ChangeFeed.EntriesRetired += stats.ChangeFeed.EntriesRetired
-		total.ChangeFeed.BatchesMarked += stats.ChangeFeed.BatchesMarked
-		total.ChangeFeed.BatchesDeleted += stats.ChangeFeed.BatchesDeleted
-		total.ChangeFeed.BlockedRetained += stats.ChangeFeed.BlockedRetained
-		total.ChangeFeed.FailedDeletes += stats.ChangeFeed.FailedDeletes
 		total.CheckpointStaged = total.CheckpointStaged || stats.CheckpointStaged
 
 		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)
@@ -673,7 +650,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 			return total
 		}
 	}
-	t.Fatalf("maintenance did not become idle after %d cycles", CompactionMaxIterations*4)
+	t.Fatalf("maintenance did not become idle after %d cycles", compactionMaxIterations*4)
 	return MaintenanceStats{}
 }
 

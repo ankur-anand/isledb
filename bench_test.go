@@ -12,7 +12,7 @@ import (
 func openBenchWriter(b *testing.B, ctx context.Context, store *blobstore.Store, opts WriterOptions) (*DB, *Writer) {
 	b.Helper()
 
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		b.Fatalf("OpenDB: %v", err)
 	}
@@ -688,7 +688,7 @@ func BenchmarkCompactor_L0Promotion(b *testing.B) {
 		store := blobstore.NewMemory("bench")
 		ctx := context.Background()
 
-		db, err := OpenDB(ctx, store, DBOptions{})
+		db, err := openDB(ctx, store, dbOpenOptions{})
 		if err != nil {
 			b.Fatalf("OpenDB: %v", err)
 		}
@@ -761,7 +761,7 @@ func BenchmarkCompactor_L0Rewrite(b *testing.B) {
 		b.StopTimer()
 		store := blobstore.NewMemory("bench")
 		ctx := context.Background()
-		db, err := OpenDB(ctx, store, DBOptions{})
+		db, err := openDB(ctx, store, dbOpenOptions{})
 		if err != nil {
 			b.Fatal(err)
 		}

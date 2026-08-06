@@ -6,13 +6,13 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/stretchr/testify/require"
 )
 
-func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Context, SSTMeta, []byte, string, func()) {
+func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Context, sstMetadata, []byte, string, func()) {
 	t.Helper()
 
 	ctx := context.Background()

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 type retentionCompactorMode int
@@ -73,7 +73,7 @@ type retentionCompactor struct {
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
-	manifest    *Manifest
+	manifest    *manifestState
 
 	ticker     *time.Ticker
 	cancel     context.CancelFunc
@@ -218,7 +218,7 @@ func (c *retentionCompactor) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *retentionCompactor) setManifest(m *Manifest) {
+func (c *retentionCompactor) setManifest(m *manifestState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if m == nil {
@@ -393,7 +393,7 @@ func (c *retentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
 	}
 }
 
-func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int, int64, error) {
+func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *manifestState) (int, int64, error) {
 	cutoff := time.Now().Add(-c.opts.RetentionPeriod)
 
 	type sstAge struct {
@@ -479,12 +479,12 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	return len(toDelete), bytesReclaimed, nil
 }
 
-func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *Manifest) (int, int64, error) {
+func (c *retentionCompactor) cleanupSegmented(ctx context.Context, m *manifestState) (int, int64, error) {
 	cutoff := time.Now().Add(-c.opts.RetentionPeriod)
 
 	type segment struct {
 		start time.Time
-		ssts  []SSTMeta
+		ssts  []sstMetadata
 		size  int64
 	}
 

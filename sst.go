@@ -13,16 +13,17 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-var ErrEmptyIterator = errors.New("iterator produced no entries")
+var errEmptyIterator = errors.New("iterator produced no entries")
 
-var ErrOutOfOrder = errors.New("iterator out of order")
+var errSSTOutOfOrder = errors.New("iterator out of order")
 
-type SSTIterator interface {
+type sstIterator interface {
 	Next() bool
 	Entry() internal.MemEntry
 	Err() error
@@ -30,11 +31,11 @@ type SSTIterator interface {
 }
 
 type writeSSTResult struct {
-	Meta    SSTMeta
+	Meta    sstMetadata
 	SSTData []byte
 }
 
-func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch uint64) (writeSSTResult, error) {
+func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch uint64) (writeSSTResult, error) {
 	defer it.Close()
 
 	var result writeSSTResult
@@ -104,7 +105,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		return abort(err)
 	}
 	if !state.found {
-		return abort(ErrEmptyIterator)
+		return abort(errEmptyIterator)
 	}
 	if err := sst.Close(); err != nil {
 		return result, err
@@ -134,7 +135,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 
 	result.SSTData = sstBuf.Bytes()
 
-	result.Meta = SSTMeta{
+	result.Meta = sstMetadata{
 		ID:       buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
 		Epoch:    epoch,
 		SeqLo:    state.seqLo,
@@ -143,7 +144,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		MaxKey:   state.maxKey,
 		Size:     sstSize,
 		Checksum: "sha256:" + hashStr,
-		Bloom: BloomMeta{
+		Bloom: bloomMetadata{
 			BitsPerKey: opts.BloomBitsPerKey,
 			K:          bloomK,
 			Offset:     sstSize,
@@ -157,7 +158,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		if err != nil {
 			return result, err
 		}
-		result.Meta.Signature = &SSTSignature{
+		result.Meta.Signature = &manifest.SSTSignature{
 			Algorithm: opts.Signer.Algorithm(),
 			KeyID:     opts.Signer.KeyID(),
 			Hash:      hashStr,
@@ -188,9 +189,9 @@ func (s *sstBuildState) updateOrder(key []byte, seq uint64) error {
 	if s.found {
 		switch cmp := bytes.Compare(s.prevKey, key); {
 		case cmp > 0:
-			return fmt.Errorf("%w: keys must be sorted ascending (prev=%q curr=%q)", ErrOutOfOrder, s.prevKey, key)
+			return fmt.Errorf("%w: keys must be sorted ascending (prev=%q curr=%q)", errSSTOutOfOrder, s.prevKey, key)
 		case cmp == 0 && seq > s.prevSeq:
-			return fmt.Errorf("%w: sequence must be non-increasing for duplicate keys (prev=%d curr=%d)", ErrOutOfOrder, s.prevSeq, seq)
+			return fmt.Errorf("%w: sequence must be non-increasing for duplicate keys (prev=%d curr=%d)", errSSTOutOfOrder, s.prevSeq, seq)
 		}
 	}
 	s.prevKey = key

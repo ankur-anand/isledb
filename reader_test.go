@@ -8,7 +8,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -22,7 +22,7 @@ func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms 
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := writeSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, epoch)
+	res, err := writeSST(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, epoch)
 	if err != nil {
 		t.Fatalf("writeSST: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := writeSST(ctx, it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
 		t.Fatalf("writeSST: %v", err)
 	}
@@ -639,7 +639,7 @@ func TestReader_MetricsBlobFetch(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	wOpts := DefaultWriterOptions()
 	wOpts.Flush.Interval = 0
-	wOpts.Values.BlobThreshold = 1
+	wOpts.Values.InlineValueBytes = 1
 
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {

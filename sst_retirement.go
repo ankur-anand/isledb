@@ -5,10 +5,10 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
-func retiredSSTObjects(store *blobstore.Store, m *Manifest, ids []string, gracePeriod time.Duration) ([]manifest.RetiredObject, error) {
+func retiredSSTObjects(store *blobstore.Store, m *manifestState, ids []string, gracePeriod time.Duration) ([]manifest.RetiredObject, error) {
 	unique := uniqueSSTIDs(ids)
 	if len(unique) > manifest.MaxRetiredObjectsPerEntry {
 		return nil, fmt.Errorf("%w: count=%d max=%d", manifest.ErrInvalidRetirement, len(unique), manifest.MaxRetiredObjectsPerEntry)

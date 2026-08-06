@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/segmentio/ksuid"
 )
 
@@ -50,9 +50,6 @@ type MaintenanceOptions struct {
 
 	// Retention is nil by default because enabling it removes historical data.
 	Retention *RetentionPolicy
-
-	// ChangeFeedRetention is nil by default because enabling it retires change history.
-	ChangeFeedRetention *ChangeFeedRetentionPolicy
 
 	OnCycle func(MaintenanceStats)
 	OnError func(error)
@@ -108,9 +105,7 @@ type RetentionPolicy struct {
 	OnCleanup func(CleanupStats)
 }
 
-// ChangeFeedRetentionPolicy controls logical retirement and physical deletion
-// of change batches.
-type ChangeFeedRetentionPolicy struct {
+type changeFeedRetentionPolicy struct {
 	KeepFor time.Duration
 
 	// KeepAtLeastManifestEntries is the minimum number of newest manifest
@@ -119,7 +114,7 @@ type ChangeFeedRetentionPolicy struct {
 
 	DeleteBatchSize   int
 	DeleteGracePeriod time.Duration
-	OnCleanup         func(ChangeFeedCleanupStats)
+	OnCleanup         func(changeFeedCleanupStats)
 }
 
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
@@ -130,7 +125,6 @@ type MaintenanceStats struct {
 	CompactionOutputSSTs  int
 	CompactionOutputBytes int64
 	Retention             CleanupStats
-	ChangeFeed            ChangeFeedCleanupStats
 	CheckpointStaged      bool
 	CheckpointReplayPages uint64
 	CheckpointReplayBytes uint64
@@ -142,7 +136,7 @@ type MaintenanceStats struct {
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
-// and SST sweeping are enabled; data and change-feed retention remain disabled.
+// and SST sweeping are enabled; data retention remains disabled.
 func DefaultMaintenanceOptions() MaintenanceOptions {
 	compaction := defaultCompactorOptions()
 	return MaintenanceOptions{
@@ -178,9 +172,9 @@ func DefaultRetentionPolicy() RetentionPolicy {
 	}
 }
 
-func DefaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
+func defaultChangeFeedRetentionPolicy() changeFeedRetentionPolicy {
 	opts := defaultChangeFeedCleanerOptions()
-	return ChangeFeedRetentionPolicy{
+	return changeFeedRetentionPolicy{
 		KeepFor:                    opts.RetentionPeriod,
 		KeepAtLeastManifestEntries: opts.KeepAtLeastManifestEntries,
 		DeleteBatchSize:            opts.SweepBatchSize,
@@ -217,9 +211,11 @@ type Maintenance struct {
 
 	releaseOnce sync.Once
 	release     func()
+
+	changeFeedRetention *changeFeedRetentionPolicy
 }
 
-func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcCursor manifest.GCCursorStorage, opts MaintenanceOptions) (*Maintenance, error) {
+func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcCursor manifest.GCCursorStorage, opts MaintenanceOptions, changeFeedRetention *changeFeedRetentionPolicy) (*Maintenance, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -243,10 +239,11 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 	}
 
 	m := &Maintenance{
-		manifestLog: manifestLog,
-		opts:        opts,
-		fenceToken:  token,
-		runGate:     make(chan struct{}, 1),
+		manifestLog:         manifestLog,
+		opts:                opts,
+		fenceToken:          token,
+		runGate:             make(chan struct{}, 1),
+		changeFeedRetention: changeFeedRetention,
 	}
 
 	compactorOpts := m.compactorOptions(gcCursor)
@@ -266,7 +263,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 		m.retention.stageCommand = m.stageCommand
 	}
 
-	if opts.ChangeFeedRetention != nil {
+	if changeFeedRetention != nil {
 		changeFeedOpts := m.changeFeedOptions()
 		m.changeFeed, err = newChangeFeedCleanerWithFence(ctx, store, manifestLog, changeFeedOpts, token)
 		if err != nil {
@@ -357,7 +354,7 @@ func (m *Maintenance) retentionOptions(gcCursor manifest.GCCursorStorage) retent
 }
 
 func (m *Maintenance) changeFeedOptions() changeFeedCleanerOptions {
-	p := m.opts.ChangeFeedRetention
+	p := m.changeFeedRetention
 	return changeFeedCleanerOptions{
 		RetentionPeriod:            p.KeepFor,
 		KeepAtLeastManifestEntries: p.KeepAtLeastManifestEntries,
@@ -719,7 +716,7 @@ func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
 			m.currentStats.CompactionInputSSTs += len(job.InputSSTs)
 			m.currentStats.CompactionOutputSSTs += len(job.OutputSSTs)
 			for _, sst := range job.OutputSSTs {
-				m.currentStats.CompactionOutputBytes += sst.Size
+				m.currentStats.CompactionOutputBytes += sst.Bytes
 			}
 		}
 		m.statsMu.Unlock()
@@ -740,13 +737,10 @@ func (m *Maintenance) recordRetention(stats CleanupStats) {
 	}
 }
 
-func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
+func (m *Maintenance) recordChangeFeed(stats changeFeedCleanupStats) {
 	m.statsMu.Lock()
-	if m.currentStats != nil {
-		m.currentStats.ChangeFeed = stats
-	}
 	m.statsMu.Unlock()
-	if callback := m.opts.ChangeFeedRetention.OnCleanup; callback != nil {
+	if callback := m.changeFeedRetention.OnCleanup; callback != nil {
 		callback(stats)
 	}
 }

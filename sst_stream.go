@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -21,7 +22,7 @@ func buildSSTIDWithTimestamp(epoch, seqLo, seqHi uint64, ts time.Time) string {
 }
 
 type streamSSTResult struct {
-	Meta SSTMeta
+	Meta sstMetadata
 }
 
 // writeSSTStreaming builds and uploads an SST concurrently using io.Pipe.
@@ -29,8 +30,8 @@ type streamSSTResult struct {
 // goroutine reads from the PipeReader and uploads to the store.
 func writeSSTStreaming(
 	ctx context.Context,
-	it SSTIterator,
-	opts SSTWriterOptions,
+	it sstIterator,
+	opts sstWriterOptions,
 	epoch uint64,
 	seqLo, seqHi uint64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
@@ -59,7 +60,7 @@ func writeSSTStreaming(
 
 	type producerResult struct {
 		state       *sstBuildState
-		bloom       BloomMeta
+		bloom       bloomMetadata
 		hasBlobRefs bool
 		err         error
 	}
@@ -164,9 +165,9 @@ func writeSSTStreaming(
 		if !state.found {
 			writable.Abort()
 			_ = sst.Close()
-			producerDone <- producerResult{err: ErrEmptyIterator}
-			pw.CloseWithError(ErrEmptyIterator)
-			return ErrEmptyIterator
+			producerDone <- producerResult{err: errEmptyIterator}
+			pw.CloseWithError(errEmptyIterator)
+			return errEmptyIterator
 		}
 
 		if err := sst.Close(); err != nil {
@@ -211,7 +212,7 @@ func writeSSTStreaming(
 
 		producerDone <- producerResult{
 			state: state,
-			bloom: BloomMeta{
+			bloom: bloomMetadata{
 				BitsPerKey: opts.BloomBitsPerKey,
 				K:          bloomK,
 				Offset:     sstSize,
@@ -233,7 +234,7 @@ func writeSSTStreaming(
 	hashBytes := writable.sumBytes()
 	hashStr := hex.EncodeToString(hashBytes)
 
-	result.Meta = SSTMeta{
+	result.Meta = sstMetadata{
 		ID:          sstID,
 		Epoch:       epoch,
 		SeqLo:       pResult.state.seqLo,
@@ -252,7 +253,7 @@ func writeSSTStreaming(
 		if err != nil {
 			return result, err
 		}
-		result.Meta.Signature = &SSTSignature{
+		result.Meta.Signature = &manifest.SSTSignature{
 			Algorithm: opts.Signer.Algorithm(),
 			KeyID:     opts.Signer.KeyID(),
 			Hash:      hashStr,
@@ -268,8 +269,8 @@ func writeSSTStreaming(
 // started when the current one reaches targetSize.
 func writeMultipleSSTsStreaming(
 	ctx context.Context,
-	it SSTIterator,
-	opts SSTWriterOptions,
+	it sstIterator,
+	opts sstWriterOptions,
 	epoch uint64,
 	targetSize int64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
@@ -379,7 +380,7 @@ func writeMultipleSSTsStreaming(
 		hashStr := hex.EncodeToString(hashBytes)
 
 		result := streamSSTResult{
-			Meta: SSTMeta{
+			Meta: sstMetadata{
 				ID:       sstID,
 				Epoch:    epoch,
 				SeqLo:    state.seqLo,
@@ -388,7 +389,7 @@ func writeMultipleSSTsStreaming(
 				MaxKey:   state.maxKey,
 				Size:     sstSize,
 				Checksum: "sha256:" + hashStr,
-				Bloom: BloomMeta{
+				Bloom: bloomMetadata{
 					BitsPerKey: opts.BloomBitsPerKey,
 					K:          bloomK,
 					Offset:     sstSize,
@@ -404,7 +405,7 @@ func writeMultipleSSTsStreaming(
 			if err != nil {
 				return err
 			}
-			result.Meta.Signature = &SSTSignature{
+			result.Meta.Signature = &manifest.SSTSignature{
 				Algorithm: opts.Signer.Algorithm(),
 				KeyID:     opts.Signer.KeyID(),
 				Hash:      hashStr,
@@ -516,7 +517,7 @@ func writeMultipleSSTsStreaming(
 	}
 
 	if len(results) == 0 {
-		return nil, ErrEmptyIterator
+		return nil, errEmptyIterator
 	}
 
 	return results, nil

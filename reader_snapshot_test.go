@@ -9,7 +9,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 func TestReaderSnapshotPinsLoadedState(t *testing.T) {
@@ -203,9 +203,6 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	if _, err := reader.Prefetch(ctx, PrefetchOptions{All: true}); err != ErrReaderClosed {
 		t.Fatalf("Prefetch after Reader.Close error=%v, want %v", err, ErrReaderClosed)
 	}
-	if got := reader.Manifest(); got != nil {
-		t.Fatalf("Manifest after Reader.Close = %#v, want nil", got)
-	}
 	if _, err := reader.Snapshot(ctx); err != ErrReaderClosed {
 		t.Fatalf("Snapshot after Reader.Close error=%v, want %v", err, ErrReaderClosed)
 	}
@@ -220,10 +217,7 @@ func TestOpenReaderDefaultOptionsAreOpenable(t *testing.T) {
 	defer store.Close()
 
 	cacheDir := t.TempDir()
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(cacheDir))
-	if err != nil {
-		t.Fatalf("OpenReader with default options: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(cacheDir))
 	if reader.cacheDir != cacheDir {
 		t.Fatalf("reader cacheDir=%q, want %q", reader.cacheDir, cacheDir)
 	}
@@ -238,7 +232,12 @@ func TestOpenReaderRequiresExplicitCacheDir(t *testing.T) {
 	store := blobstore.NewMemory("reader-cache-dir-required")
 	defer store.Close()
 
-	if _, err := OpenReader(ctx, store, DefaultReaderOpenOptions("")); err == nil {
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.OpenReader(ctx, DefaultReaderOpenOptions("")); err == nil {
 		t.Fatal("OpenReader with empty cache dir succeeded, want error")
 	}
 }
@@ -326,7 +325,12 @@ func TestOpenReaderRejectsNegativeViewPolicy(t *testing.T) {
 
 	opts := DefaultReaderOpenOptions(t.TempDir())
 	opts.Views.RefreshAfter = -time.Second
-	if _, err := OpenReader(ctx, store, opts); !errors.Is(err, ErrInvalidReaderOptions) {
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.OpenReader(ctx, opts); !errors.Is(err, ErrInvalidReaderOptions) {
 		t.Fatalf("OpenReader error = %v, want %v", err, ErrInvalidReaderOptions)
 	}
 }
@@ -335,11 +339,7 @@ func openTestReader(t *testing.T, ctx context.Context, store *blobstore.Store) *
 	t.Helper()
 
 	opts := DefaultReaderOpenOptions(t.TempDir())
-	reader, err := OpenReader(ctx, store, opts)
-	if err != nil {
-		t.Fatalf("OpenReader: %v", err)
-	}
-	return reader
+	return openReaderFromDBForTest(t, ctx, store, opts)
 }
 
 func sameStrings(left, right []string) bool {

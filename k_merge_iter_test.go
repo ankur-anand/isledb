@@ -16,7 +16,7 @@ func buildTestIter(t *testing.T, entries []internal.MemEntry) (*sstable.Reader, 
 	t.Helper()
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 	if err != nil {
 		t.Fatalf("writeSST: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestTournamentMergeIterator_MatchesHeap(t *testing.T) {
 	readers := make([]*sstable.Reader, len(entries))
 	for i := range entries {
 		it := &sliceSSTIter{entries: entries[i]}
-		res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+		res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
 		if err != nil {
 			t.Fatalf("writeSST: %v", err)
 		}
@@ -429,7 +429,7 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
+	res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
 	if err != nil {
 		b.Fatalf("writeSST: %v", err)
 	}
@@ -566,7 +566,7 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 	}
 
 	it := &sliceSSTIter{entries: entries}
-	res, err := writeSST(context.Background(), it, SSTWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
+	res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "snappy"}, 1)
 	if err != nil {
 		b.Fatalf("writeSST: %v", err)
 	}

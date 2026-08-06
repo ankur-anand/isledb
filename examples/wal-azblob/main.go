@@ -14,8 +14,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/ankur-anand/isledb"
-	"github.com/ankur-anand/isledb/blobstore"
-	_ "gocloud.dev/blob/azureblob"
 )
 
 // This example can be run with the local azure emulator
@@ -80,23 +78,17 @@ func main() {
 		bucketURL = "azblob://" + container + "?protocol=http&domain=localhost:10000"
 	}
 
-	store, err := blobstore.Open(ctx, bucketURL, prefix)
+	db, err := isledb.Open(ctx, bucketURL, isledb.DBOptions{Prefix: prefix})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer store.Close()
+	defer db.Close()
 
 	cacheDir, err := os.MkdirTemp("", "isledb-cache-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(cacheDir)
-
-	db, err := isledb.OpenDB(ctx, store, isledb.DBOptions{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
 
 	walPrefix := "wal/"
 	walMax := prefixUpperBound(walPrefix)
@@ -127,7 +119,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	reader, err := isledb.OpenReader(ctx, store, isledb.ReaderOpenOptions{
+	reader, err := db.OpenReader(ctx, isledb.ReaderOpenOptions{
 		CacheDir: cacheDir,
 	})
 	if err != nil {

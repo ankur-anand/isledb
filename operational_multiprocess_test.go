@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 const (
@@ -87,10 +87,7 @@ func TestOperationalRecovery_MultiProcessWriterMaintenanceSoak(t *testing.T) {
 		t.Fatalf("final maintenance HEAD=%+v, want no pending command", head)
 	}
 
-	reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(t.TempDir()))
-	if err != nil {
-		t.Fatalf("open final reader: %v", err)
-	}
+	reader := openReaderFromDBForTest(t, ctx, store, DefaultReaderOpenOptions(t.TempDir()))
 	defer reader.Close()
 	rows, err := reader.Scan(ctx, []byte("mp-key-"), []byte("mp-key."))
 	if err != nil {
@@ -168,7 +165,7 @@ func TestOperationalRecovery_MultiProcessWorker(t *testing.T) {
 
 func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := OpenDB(parent, store, DBOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("writer OpenDB: %v", err)
 	}
@@ -210,7 +207,7 @@ func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstor
 
 func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := OpenDB(parent, store, DBOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("maintenance OpenDB: %v", err)
 	}
@@ -246,7 +243,7 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 
 func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
-	db, err := OpenDB(ctx, store, DBOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("drain OpenDB: %v", err)
 	}

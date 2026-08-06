@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/config"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/segmentio/ksuid"
 )
 
@@ -37,8 +37,10 @@ type writer struct {
 	manifestLog *manifest.Store
 	opts        WriterOptions
 	valueConfig config.ValueStorageConfig
-	ctx         context.Context
-	cancel      context.CancelFunc
+
+	changeFeedEnabled bool
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
@@ -196,23 +198,29 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 			"%w: unsupported compression=%q", ErrInvalidWriterOptions, opts.SST.Compression)
 	}
 
-	vd := config.DefaultValueStorageConfig()
-	valueConfig := opts.Values
-	if valueConfig.BlobThreshold < 0 {
+	vd := defaultWriterValueOptions()
+	values := opts.Values
+	if values.InlineValueBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: blob_threshold=%d", ErrInvalidWriterOptions, valueConfig.BlobThreshold)
+			"%w: inline_value_bytes=%d", ErrInvalidWriterOptions, values.InlineValueBytes)
 	}
-	if valueConfig.MaxKeySize < 0 {
+	if values.MaxKeyBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: max_key_size=%d", ErrInvalidWriterOptions, valueConfig.MaxKeySize)
+			"%w: max_key_bytes=%d", ErrInvalidWriterOptions, values.MaxKeyBytes)
 	}
-	if valueConfig.MaxValueSize < 0 {
+	if values.MaxValueBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: max_value_size=%d", ErrInvalidWriterOptions, valueConfig.MaxValueSize)
+			"%w: max_value_bytes=%d", ErrInvalidWriterOptions, values.MaxValueBytes)
 	}
-	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
-	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, vd.MaxKeySize)
-	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, vd.MaxValueSize)
+	values.InlineValueBytes = cmp.Or(values.InlineValueBytes, vd.InlineValueBytes)
+	values.MaxKeyBytes = cmp.Or(values.MaxKeyBytes, vd.MaxKeyBytes)
+	values.MaxValueBytes = cmp.Or(values.MaxValueBytes, vd.MaxValueBytes)
+	opts.Values = values
+
+	valueConfig := config.DefaultValueStorageConfig()
+	valueConfig.BlobThreshold = values.InlineValueBytes
+	valueConfig.MaxKeySize = values.MaxKeyBytes
+	valueConfig.MaxValueSize = values.MaxValueBytes
 	if err := validateMemtableArena(opts.Memtable.TargetBytes, valueConfig); err != nil {
 		return WriterOptions{}, config.ValueStorageConfig{}, err
 	}
@@ -374,10 +382,6 @@ func (w *writer) putBlob(ctx context.Context, key, value []byte, expireAt int64)
 }
 
 func (w *writer) delete(ctx context.Context, key []byte) error {
-	return w.deleteWithTTL(ctx, key, 0)
-}
-
-func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
 	w.metrics.ObserveDelete()
 
 	if err := checkContext(ctx); err != nil {
@@ -394,11 +398,6 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
 	}
 
-	var expireAt int64
-	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixMilli()
-	}
-
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
@@ -406,7 +405,7 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 	}
 	w.seq++
 	seq := w.seq
-	w.memtable.DeleteWithTTL(key, seq, expireAt)
+	w.memtable.Delete(key, seq)
 	w.mu.Unlock()
 
 	return nil
@@ -487,7 +486,7 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			start := time.Now()
 			err := w.flushPending(ctx, pending)
 			w.metrics.ObserveFlush(time.Since(start), err)
-			if err != nil && !errors.Is(err, ErrEmptyIterator) {
+			if err != nil && !errors.Is(err, errEmptyIterator) {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
 				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
@@ -570,7 +569,7 @@ func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 }
 
 func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error {
-	sstOpts := SSTWriterOptions{
+	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: w.opts.SST.BloomBitsPerKey,
 		BlockSize:       w.opts.SST.BlockBytes,
 		Compression:     w.opts.SST.Compression,
@@ -592,7 +591,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		pending.sstable = &result.Meta
 	}
 
-	if w.opts.ChangeFeed.Enabled && pending.changeBatch == nil {
+	if w.changeFeedEnabled && pending.changeBatch == nil {
 		changeBatch, err := buildChangeBatch(ctx, pending.memtable.Iterator(), pending.epoch,
 			seqLo, seqHi, pending.sstable.CreatedAt)
 		if err != nil {

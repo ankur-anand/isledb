@@ -8,11 +8,14 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 // ErrWriterAlreadyOpen is returned when a DB already owns an active writer.
 var ErrWriterAlreadyOpen = errors.New("writer already open")
+
+// ErrReaderAlreadyOpen is returned when a DB already owns an active reader.
+var ErrReaderAlreadyOpen = errors.New("reader already open")
 
 // Writer provides write access to the database.
 //
@@ -61,13 +64,6 @@ func (w *Writer) Delete(ctx context.Context, key []byte) error {
 	return w.w.delete(ctx, key)
 }
 
-// DeleteWithTTL marks a key as deleted with a time-to-live duration.
-//
-// ttl <= 0 means the tombstone does not expire.
-func (w *Writer) DeleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
-	return w.w.deleteWithTTL(ctx, key, ttl)
-}
-
 // Flush synchronously publishes all currently buffered writes.
 //
 // Flush rotates the active memtable, writes all frozen memtables as SST files,
@@ -105,17 +101,22 @@ func (w *Writer) releaseWriter() {
 }
 
 // DB encapsulates manifest state for one bucket/prefix. It permits one active
-// Writer and one active Maintenance handle.
+// Writer, one active Reader, and one active Maintenance handle.
 type DB struct {
 	store           *blobstore.Store
+	closeStore      bool
 	manifestStore   *manifest.Store
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
-	mu              sync.Mutex
-	closers         []dbCloser
-	writerOpen      bool
-	maintenanceOpen bool
-	closed          atomic.Bool
+
+	changeFeedEnabled   bool
+	changeFeedRetention *changeFeedRetentionPolicy
+	mu                  sync.Mutex
+	closers             []dbCloser
+	writerOpen          bool
+	readerOpen          bool
+	maintenanceOpen     bool
+	closed              atomic.Bool
 }
 
 type dbCloser interface {
@@ -124,18 +125,20 @@ type dbCloser interface {
 
 // DBOptions configures a DB instance.
 type DBOptions struct {
-	// ManifestStorage allows using a custom manifest storage backend.
-	// If nil, the blob store is used.
-	ManifestStorage manifest.Storage
-	// GCCursorStorage allows using a custom backend for the bounded GC cursor.
-	// If nil, the blob store is used.
-	GCCursorStorage manifest.GCCursorStorage
+	// Prefix is the database's root path inside the bucket or container.
+	Prefix string
 }
 
-// OpenDB opens a database and initializes it.
-func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, error) {
-	manifestStore := newManifestStore(store, opts.ManifestStorage)
-	gcCursorStorage := opts.GCCursorStorage
+type dbOpenOptions struct {
+	manifestStorage     manifest.Storage
+	gcCursorStorage     manifest.GCCursorStorage
+	changeFeedEnabled   bool
+	changeFeedRetention *changeFeedRetentionPolicy
+}
+
+func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*DB, error) {
+	manifestStore := newManifestStore(store, opts.manifestStorage)
+	gcCursorStorage := opts.gcCursorStorage
 	if gcCursorStorage == nil {
 		gcCursorStorage = newGCCursorStorage(store)
 	}
@@ -145,10 +148,12 @@ func OpenDB(ctx context.Context, store *blobstore.Store, opts DBOptions) (*DB, e
 	}
 
 	return &DB{
-		store:           store,
-		manifestStore:   manifestStore,
-		gcCursorStorage: gcCursorStorage,
-		maintenanceWake: make(chan struct{}, 1),
+		store:               store,
+		manifestStore:       manifestStore,
+		gcCursorStorage:     gcCursorStorage,
+		maintenanceWake:     make(chan struct{}, 1),
+		changeFeedEnabled:   opts.changeFeedEnabled,
+		changeFeedRetention: opts.changeFeedRetention,
 	}, nil
 }
 
@@ -164,6 +169,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.releaseWriter(nil)
 		return nil, err
 	}
+	w.changeFeedEnabled = db.changeFeedEnabled
 
 	writer := &Writer{w: w}
 	writer.release = func() { db.releaseWriter(writer) }
@@ -198,13 +204,61 @@ func (db *DB) releaseWriter(writer *Writer) {
 	db.mu.Unlock()
 }
 
+// OpenReader opens the DB's shared concurrent reader runtime.
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error) {
+	if err := db.reserveReader(); err != nil {
+		return nil, err
+	}
+
+	ropts, err := readerOptionsFromPublic(opts)
+	if err != nil {
+		db.releaseReader(nil)
+		return nil, err
+	}
+	reader, err := newReader(ctx, db.store, ropts)
+	if err != nil {
+		db.releaseReader(nil)
+		return nil, err
+	}
+	reader.release = func() { db.releaseReader(reader) }
+	if err := db.registerCloser(reader); err != nil {
+		_ = reader.Close()
+		db.releaseReader(reader)
+		return nil, err
+	}
+	return reader, nil
+}
+
+func (db *DB) reserveReader() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed.Load() {
+		return errors.New("db closed")
+	}
+	if db.readerOpen {
+		return ErrReaderAlreadyOpen
+	}
+	db.readerOpen = true
+	return nil
+}
+
+func (db *DB) releaseReader(reader *Reader) {
+	db.mu.Lock()
+	db.readerOpen = false
+	if reader != nil {
+		db.removeCloserLocked(reader)
+	}
+	db.mu.Unlock()
+}
+
 // OpenMaintenance opens the DB's single fenced maintenance owner.
 func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error) {
 	if err := db.reserveMaintenance(); err != nil {
 		return nil, err
 	}
 
-	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts)
+	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts, db.changeFeedRetention)
 	if err != nil {
 		db.releaseMaintenance(nil)
 		return nil, err
@@ -258,6 +312,11 @@ func (db *DB) Close() error {
 	var firstErr error
 	for _, c := range closers {
 		if err := c.closeDB(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if db.closeStore {
+		if err := db.store.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

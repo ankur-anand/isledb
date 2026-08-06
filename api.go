@@ -4,17 +4,21 @@ import (
 	"errors"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/cachestore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/cachestore"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
-type Manifest = manifest.Manifest
-type SSTMeta = manifest.SSTMeta
-type ChangeBatchMeta = manifest.ChangeBatchMeta
-type BloomMeta = manifest.BloomMeta
-type SSTSignature = manifest.SSTSignature
-type Level = manifest.Level
-type CompactionLogPayload = manifest.CompactionLogPayload
+type manifestState = manifest.Manifest
+type sstMetadata = manifest.SSTMeta
+type bloomMetadata = manifest.BloomMeta
+
+// SSTSignature is the signature metadata passed to SSTHashVerifier.
+type SSTSignature struct {
+	Algorithm string
+	KeyID     string
+	Hash      string
+	Signature []byte
+}
 
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {

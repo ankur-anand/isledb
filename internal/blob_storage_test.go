@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/internal/config"
 )
 
 func TestBlobStorage_WriteAndRead(t *testing.T) {

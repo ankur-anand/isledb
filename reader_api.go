@@ -1,14 +1,11 @@
 package isledb
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/config"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/config"
 )
 
 var ErrInvalidReaderOptions = errors.New("invalid reader options")
@@ -33,6 +30,18 @@ type ReaderViewPolicy struct {
 	// IteratorMaxAge is the maximum lifetime of an Iterator. Zero selects the
 	// default. Snapshot iterators also cannot outlive their Snapshot.
 	IteratorMaxAge time.Duration
+}
+
+// CacheStats reports one reader cache's occupancy and lookup activity. Byte
+// limits are zero for entry-count-bounded caches; MaxEntries is zero for
+// byte-bounded caches.
+type CacheStats struct {
+	Hits       int64
+	Misses     int64
+	Bytes      int64
+	MaxBytes   int64
+	EntryCount int
+	MaxEntries int
 }
 
 // ReaderOpenOptions configures a read-only handle.
@@ -74,8 +83,8 @@ type ReaderOpenOptions struct {
 
 	Metrics *ReaderMetrics
 
-	BlobReadOptions config.BlobReadOptions
-	ManifestStorage manifest.Storage
+	// VerifyBlobsOnRead re-hashes external value objects before returning them.
+	VerifyBlobsOnRead bool
 }
 
 // DefaultReaderOpenOptions returns default reader options using cacheDir for
@@ -83,27 +92,20 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
-		CacheDir:        cacheDir,
-		SSTCacheSize:    defaults.SSTCacheSize,
-		BlobCacheSize:   defaults.BlobCacheSize,
-		Views:           defaults.ViewPolicy,
-		BlobReadOptions: config.DefaultBlobReadOptions(),
+		CacheDir:      cacheDir,
+		SSTCacheSize:  defaults.SSTCacheSize,
+		BlobCacheSize: defaults.BlobCacheSize,
+		Views:         defaults.ViewPolicy,
 	}
 }
 
-// OpenReader opens a read-only handle.
-func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOptions) (*Reader, error) {
+func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
-		return nil, err
+		return readerOptions{}, err
 	}
 
-	blobReadOpts := opts.BlobReadOptions
-	if blobReadOpts == (config.BlobReadOptions{}) {
-		blobReadOpts = config.DefaultBlobReadOptions()
-	}
-
-	ropts := readerOptions{
+	return readerOptions{
 		CacheDir:                 opts.CacheDir,
 		SSTCacheSize:             opts.SSTCacheSize,
 		BlobCacheSize:            opts.BlobCacheSize,
@@ -116,13 +118,13 @@ func OpenReader(ctx context.Context, store *blobstore.Store, opts ReaderOpenOpti
 		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,
 		ValueStorageConfig: config.ValueStorageConfig{
-			ValueOptions:    config.DefaultValueOptions(),
-			BlobReadOptions: blobReadOpts,
-			BlobGCOptions:   config.DefaultBlobGCOptions(),
+			ValueOptions: config.DefaultValueOptions(),
+			BlobReadOptions: config.BlobReadOptions{
+				VerifyBlobsOnRead: opts.VerifyBlobsOnRead,
+			},
+			BlobGCOptions: config.DefaultBlobGCOptions(),
 		},
-		ManifestStorage: opts.ManifestStorage,
-	}
-	return newReader(ctx, store, ropts)
+	}, nil
 }
 
 func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error) {

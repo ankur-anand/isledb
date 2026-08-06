@@ -3,11 +3,11 @@ package isledb
 import (
 	"time"
 
-	"github.com/ankur-anand/isledb/cachestore"
-	"github.com/ankur-anand/isledb/config"
-	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/cachestore"
+	"github.com/ankur-anand/isledb/internal/config"
+	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 const (
@@ -33,12 +33,8 @@ type WriterOptions struct {
 	// SST controls SST file encoding.
 	SST WriterSSTOptions
 
-	// Values controls inline-vs-blob value storage and value/key limits.
-	Values config.ValueStorageConfig
-
-	// ChangeFeed controls whether flushes also publish seq-ordered mutation
-	// batches under changes/. Disabled by default.
-	ChangeFeed ChangeFeedOptions
+	// Values controls inline-vs-external value storage and key/value limits.
+	Values ValueOptions
 
 	// OnFlushError is called once after the background flush worker stops. The
 	// callback may call Writer.Close. The failure makes the writer terminal and
@@ -47,12 +43,6 @@ type WriterOptions struct {
 
 	// Metrics receives optional writer observations. Nil disables metrics.
 	Metrics *WriterMetrics
-}
-
-type ChangeFeedOptions struct {
-	// Enabled makes Writer.Flush publish one change batch per flushed memtable
-	// and attach its metadata to the committed manifest entry.
-	Enabled bool
 }
 
 type WriterMemtableOptions struct {
@@ -92,6 +82,20 @@ type WriterSSTOptions struct {
 	Compression string
 }
 
+// ValueOptions controls writer key/value limits and external value storage.
+// Zero fields select defaults.
+type ValueOptions struct {
+	// MaxKeyBytes is the largest accepted key size.
+	MaxKeyBytes int
+
+	// InlineValueBytes is the external-storage threshold. Values with a size
+	// greater than or equal to this value are stored outside the SST.
+	InlineValueBytes int
+
+	// MaxValueBytes is the largest accepted value size.
+	MaxValueBytes int64
+}
+
 func DefaultWriterOptions() WriterOptions {
 	return WriterOptions{
 		Memtable: WriterMemtableOptions{
@@ -109,6 +113,16 @@ func DefaultWriterOptions() WriterOptions {
 			BlockBytes:      4096,
 			Compression:     "snappy",
 		},
+		Values: defaultWriterValueOptions(),
+	}
+}
+
+func defaultWriterValueOptions() ValueOptions {
+	defaults := config.DefaultValueOptions()
+	return ValueOptions{
+		MaxKeyBytes:      defaults.MaxKeySize,
+		InlineValueBytes: defaults.BlobThreshold,
+		MaxValueBytes:    defaults.MaxValueSize,
 	}
 }
 
@@ -267,7 +281,7 @@ func defaultCompactorOptions() compactorOptions {
 	}
 }
 
-type SSTWriterOptions struct {
+type sstWriterOptions struct {
 	BloomBitsPerKey int
 	BlockSize       int
 	Compression     string
