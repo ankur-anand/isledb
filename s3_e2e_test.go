@@ -21,6 +21,17 @@ import (
 
 func setupFakeS3StoreWithPrefix(t testing.TB, prefix string) *blobstore.Store {
 	t.Helper()
+	bucketURL := setupFakeS3BucketURL(t)
+
+	store, err := blobstore.Open(context.Background(), bucketURL, prefix)
+	if err != nil {
+		t.Fatalf("open s3 store: %v", err)
+	}
+	return store
+}
+
+func setupFakeS3BucketURL(t testing.TB) string {
+	t.Helper()
 
 	backend := s3mem.New()
 	fake := gofakes3.New(backend)
@@ -54,11 +65,7 @@ func setupFakeS3StoreWithPrefix(t testing.TB, prefix string) *blobstore.Store {
 		t.Fatalf("create bucket: %v", err)
 	}
 
-	store, err := blobstore.Open(context.Background(), s3BucketURL(server.URL), prefix)
-	if err != nil {
-		t.Fatalf("open s3 store: %v", err)
-	}
-	return store
+	return s3BucketURL(server.URL)
 }
 
 func TestS3E2E_WriteCompactReadRetain(t *testing.T) {

@@ -143,6 +143,7 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	if _, found, err := reader.Get(ctx, []byte("key-000100")); err != nil || !found {
 		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
 	}
+	reader.blockCache.Wait()
 	if _, found, err := reader.Get(ctx, []byte("key-000100")); err != nil || !found {
 		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
 	}
