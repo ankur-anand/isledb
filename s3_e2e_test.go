@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -612,7 +612,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "records/s")
 }
 
-func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.Store) *Manifest {
+func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.Store) *manifestState {
 	t.Helper()
 
 	ms := manifest.NewStore(store)

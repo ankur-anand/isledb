@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -570,7 +570,7 @@ func assertOperationalStorageHealthy(t testing.TB, ctx context.Context, store *b
 	}
 }
 
-func physicalSSTBytes(sst SSTMeta) int64 {
+func physicalSSTBytes(sst sstMetadata) int64 {
 	size := sst.Size + sst.Bloom.Length
 	if sst.Bloom.Length > 0 {
 		size += bloomTrailerLen

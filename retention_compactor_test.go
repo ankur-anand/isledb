@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 func TestRetentionCompactor_RejectsNilContext(t *testing.T) {
@@ -232,7 +232,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	rOpts := defaultReaderOptions()
 	rOpts.CacheDir = t.TempDir()
 	reader, _ := newReader(ctx, store, rOpts)
-	m := reader.Manifest()
+	m := reader.currentManifest()
 	if m.L0SSTCount() != 5 {
 		t.Fatalf("Expected 5 L0 SSTs, got %d", m.L0SSTCount())
 	}
@@ -262,7 +262,7 @@ func TestRetentionCompactor_FIFO(t *testing.T) {
 	rOpts2 := defaultReaderOptions()
 	rOpts2.CacheDir = t.TempDir()
 	reader2, _ := newReader(ctx, store, rOpts2)
-	m2 := reader2.Manifest()
+	m2 := reader2.currentManifest()
 	reader2.Close()
 
 	total := m2.L0SSTCount()

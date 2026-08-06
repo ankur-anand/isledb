@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 var ErrSnapshotClosed = errors.New("snapshot closed")
@@ -34,13 +34,13 @@ func (v Version) IsZero() bool {
 // its parent Reader is refreshed later.
 type Snapshot struct {
 	reader    *Reader
-	manifest  *Manifest
+	manifest  *manifestState
 	version   Version
 	expiresAt time.Time
 	closed    atomic.Bool
 }
 
-func newSnapshot(reader *Reader, m *Manifest, version Version, expiresAt time.Time) *Snapshot {
+func newSnapshot(reader *Reader, m *manifestState, version Version, expiresAt time.Time) *Snapshot {
 	return &Snapshot{
 		reader:    reader,
 		manifest:  m,

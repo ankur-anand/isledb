@@ -3,7 +3,7 @@ package cachestore
 import (
 	"context"
 
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 type ManifestPageCache interface {

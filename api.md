@@ -256,11 +256,10 @@ the caller needs an immediate visibility check.
 | NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Stream a bounded key range |
 | Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
 | Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
-| Manifest | `() *Manifest` | Return cloned manifest snapshot |
 | Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
 | BlobCacheStats | `() internal.BlobCacheStats` | Blob cache statistics |
 | SSTCacheStats | `() SSTCacheStats` | SST cache statistics |
-| ManifestPageCacheStats | `() cachestore.ManifestPageCacheStats` | Manifest commit-page cache statistics |
+| ManifestPageCacheStats | `() ManifestPageCacheStats` | Manifest commit-page cache statistics |
 
 ```go
 type ReaderOpenOptions struct {
@@ -441,8 +440,14 @@ type CompactionJob struct {
     SourceLevel      uint32
     DestinationLevel uint32
     InputSSTs        []string
-    OutputSSTs       []SSTMeta
+    OutputSSTs       []CompactionOutput
     MetadataOnly     bool
+}
+
+type CompactionOutput struct {
+    ID    string
+    Bytes int64
+    Level uint32
 }
 
 type RetentionPolicy struct {
@@ -505,98 +510,17 @@ stats, err := m.RunOnce(ctx)
 
 ---
 
-## Manifest Types
-
-Re-exported from `manifest` package for convenience.
-
-### Manifest
-
-LSM tree state snapshot.
-
-```go
-type Manifest = manifest.Manifest
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| Version | `int` | Schema version |
-| NextEpoch | `uint64` | Next epoch number |
-| LogSeq | `uint64` | Current log sequence |
-| WriterFence | `*FenceToken` | Writer ownership claim |
-| CompactorFence | `*FenceToken` | Compactor ownership claim |
-| L0SSTs | `[]SSTMeta` | Overlapping level-0 SSTs, newest first |
-| Levels | `[]Level` | Non-overlapping levels ordered by level number |
-
-| Method | Signature |
-|--------|-----------|
-| Clone | `() *Manifest` |
-| L0SSTCount | `() int` |
-| LookupSST | `(id string) *SSTMeta` |
-| Level | `(number uint32) *Level` |
-| ValidateLevels | `() error` |
-| AllSSTIDs | `() []string` |
-| MaxSeqNum | `() uint64` |
-
-### SSTMeta
-
-```go
-type SSTMeta = manifest.SSTMeta
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| ID | `string` | SST identifier |
-| Epoch | `uint64` | Writer epoch |
-| SeqLo | `uint64` | Lowest sequence number |
-| SeqHi | `uint64` | Highest sequence number |
-| MinKey | `[]byte` | Smallest key |
-| MaxKey | `[]byte` | Largest key |
-| Size | `int64` | File size in bytes |
-| Checksum | `string` | `sha256:<hex>` checksum |
-| Signature | `*SSTSignature` | Digital signature |
-| Bloom | `BloomMeta` | Bloom filter metadata |
-| CreatedAt | `time.Time` | Creation timestamp |
-| Level | `uint32` | Logical LSM level (0 = L0) |
-| HasBlobRefs | `bool` | Contains external blob references |
-
-### ChangeBatchMeta
-
-Change batches are written only when `WriterOptions.ChangeFeed.Enabled` is true.
-Manifest entries are still the source of truth; readers should not discover
-change history by listing `changes/`.
-
-```go
-type ChangeBatchMeta = manifest.ChangeBatchMeta
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| ID | `string` | Change batch identifier |
-| Path | `string` | Object path for the binary change batch |
-| Epoch | `uint64` | Writer epoch |
-| SeqLo | `uint64` | Lowest mutation sequence |
-| SeqHi | `uint64` | Highest mutation sequence |
-| Count | `uint32` | Number of changes in the batch |
-| Size | `int64` | Encoded object size |
-| Checksum | `string` | Encoded object checksum |
-| CreatedAt | `time.Time` | Creation time |
-| Version | `int` | Change batch format version |
-
-### Level
-
-```go
-type Level = manifest.Level
-```
-
-| Field | Type |
-|-------|------|
-| Number | `uint32` |
-| SSTs | `[]SSTMeta` |
+## Integrity
 
 ### SSTSignature
 
 ```go
-type SSTSignature = manifest.SSTSignature
+type SSTSignature struct {
+    Algorithm string
+    KeyID     string
+    Hash      string
+    Signature []byte
+}
 ```
 
 | Field | Type |
@@ -605,17 +529,6 @@ type SSTSignature = manifest.SSTSignature
 | KeyID | `string` |
 | Hash | `string` |
 | Signature | `[]byte` |
-
-### FenceToken
-
-```go
-// from manifest package
-type FenceToken struct {
-    Epoch     uint64
-    Owner     string
-    ClaimedAt time.Time
-}
-```
 
 ---
 
@@ -642,21 +555,6 @@ type SSTHashVerifier interface {
     VerifyHash(hash []byte, sig SSTSignature) error
 }
 ```
-
-### manifest.GCMarkStorage
-
-Stores GC coordination state (pending SST delete marks and GC checkpoint) with CAS semantics.
-
-```go
-type GCMarkStorage interface {
-    LoadPendingDeleteMarks(ctx context.Context) ([]byte, string, bool, error)
-    StorePendingDeleteMarks(ctx context.Context, data []byte, matchToken string, exists bool) error
-    LoadGCCheckpoint(ctx context.Context) ([]byte, string, bool, error)
-    StoreGCCheckpoint(ctx context.Context, data []byte, matchToken string, exists bool) error
-}
-```
-
----
 
 ## Blob Storage
 
@@ -708,40 +606,3 @@ type Attributes struct {
 - `blobstore.ErrNotFound` - Object does not exist
 - `blobstore.ErrPreconditionFailed` - CAS condition not met
 - `blobstore.BatchDeleteError` - Partial batch delete failure (`.Failed` map)
-
----
-
-## Manifest Store
-
-### manifest.Store
-
-Manages manifest snapshots, committed entry pages, CURRENT, and writer/compactor fences.
-
-```go
-func NewStore(store *blobstore.Store) *Store
-func NewStoreWithStorage(storage Storage) *Store
-```
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| ClaimWriter | `(ctx, ownerID) (*FenceToken, error)` | Claim writer fence |
-| ClaimCompactor | `(ctx, ownerID) (*FenceToken, error)` | Claim compactor fence |
-| CheckWriterFence | `(ctx) error` | Verify writer fence still valid |
-| CheckCompactorFence | `(ctx) error` | Verify compactor fence still valid |
-| Replay | `(ctx) (*Manifest, error)` | Rebuild manifest from CURRENT, snapshots, and committed entries |
-| AppendWriterCommit | `(ctx, WriterCommit) (*ManifestLogEntry, error)` | Idempotently publish one SST and optional change batch using a stable commit ID |
-| AppendAddSSTableWithFence | `(ctx, SSTMeta) (*ManifestLogEntry, error)` | Append SST add entry |
-| AppendAddSSTableWithChangeBatchWithFence | `(ctx, SSTMeta, *ChangeBatchMeta) (*ManifestLogEntry, error)` | Append paired SST and change-batch entry |
-| AppendRemoveSSTablesWithFence | `(ctx, []string, []RetiredObject) (*ManifestLogEntry, error)` | Atomically remove SST metadata and record exact retired objects |
-| AppendCompactionWithFence | `(ctx, CompactionLogPayload, []RetiredObject) (*ManifestLogEntry, error)` | Append one bounded adjacent-level compaction entry with explicit source and destination levels |
-| ReadRetirementEntries | `(ctx, start uint64, limit int) ([]*ManifestLogEntry, uint64, error)` | Read a bounded retirement-history page |
-| AdvanceRetirementLogStart | `(ctx, floor uint64, *FenceToken) (*Current, error)` | Advance the retained retirement floor after cursor commit |
-| WriteSnapshot | `(ctx, *Manifest) (string, error)` | Write manifest snapshot |
-
-**Errors:**
-- `manifest.ErrFenced` - Epoch superseded by newer owner
-- `manifest.ErrFenceConflict` - Concurrent claim detected
-- `manifest.ErrInvalidWriterCommit` - Commit identity or SST/change metadata is invalid
-- `manifest.ErrWriterCommitConflict` - A commit ID was reused with different metadata
-- `manifest.ErrInvalidRetirement` - Removed SSTs and exact retirement records do not match
-- `manifest.ErrInvalidManifest` - A replayed or submitted level topology is invalid

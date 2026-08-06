@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 type blockingReadCurrentStorage struct {
@@ -252,11 +252,13 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	compactorOpts.Trigger.CheckInterval = time.Hour
 
 	var compactionStarted, compactionEnded bool
+	var completedJob CompactionJob
 	compactorOpts.OnCompactionStart = func(job CompactionJob) {
 		compactionStarted = true
 	}
 	compactorOpts.OnCompactionEnd = func(job CompactionJob, err error) {
 		compactionEnded = true
+		completedJob = job
 	}
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
@@ -271,6 +273,14 @@ func TestCompactor_L0Compaction(t *testing.T) {
 
 	if !compactionStarted || !compactionEnded {
 		t.Errorf("compaction callbacks not called: started=%v ended=%v", compactionStarted, compactionEnded)
+	}
+	if len(completedJob.OutputSSTs) == 0 {
+		t.Fatal("completed compaction has no output summaries")
+	}
+	for _, output := range completedJob.OutputSSTs {
+		if output.ID == "" || output.Bytes <= 0 || output.Level != completedJob.DestinationLevel {
+			t.Fatalf("invalid compaction output summary=%+v destination=%d", output, completedJob.DestinationLevel)
+		}
 	}
 
 	if err := compactor.refresh(ctx); err != nil {

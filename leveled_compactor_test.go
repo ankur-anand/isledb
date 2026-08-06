@@ -7,7 +7,7 @@ import (
 
 func TestLevelPlannerPromotesDisjointL0WithoutRewrite(t *testing.T) {
 	c := plannerOnlyCompactor()
-	m := &Manifest{}
+	m := &manifestState{}
 	for i := 0; i < 8; i++ {
 		m.AddL0SST(plannerSST(0, i, i))
 	}
@@ -25,11 +25,11 @@ func TestLevelPlannerPromotesDisjointL0WithoutRewrite(t *testing.T) {
 
 func TestLevelPlannerRewritesOverlappingL0AndDestination(t *testing.T) {
 	c := plannerOnlyCompactor()
-	m := &Manifest{}
+	m := &manifestState{}
 	for i := 0; i < 8; i++ {
 		m.AddL0SST(plannerSST(0, i, i+2))
 	}
-	m.AddLevelSSTs(1, []SSTMeta{plannerSST(1, 0, 20)})
+	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 20)})
 
 	plan, err := c.planCompaction(m)
 	if err != nil {
@@ -46,8 +46,8 @@ func TestLevelPlannerRewritesOverlappingL0AndDestination(t *testing.T) {
 func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 	c := plannerOnlyCompactor()
 	c.opts.Trigger.BaseLevelBytes = 1
-	m := &Manifest{}
-	m.AddLevelSSTs(1, []SSTMeta{plannerSST(1, 0, 0), plannerSST(1, 2, 2)})
+	m := &manifestState{}
+	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 0), plannerSST(1, 2, 2)})
 
 	plan, err := c.planCompaction(m)
 	if err != nil {
@@ -61,11 +61,11 @@ func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 func TestLevelPlannerRejectsUnboundedOverlap(t *testing.T) {
 	c := plannerOnlyCompactor()
 	c.opts.Trigger.MaxInputSSTs = 2
-	m := &Manifest{}
+	m := &manifestState{}
 	for i := 0; i < 8; i++ {
 		m.AddL0SST(plannerSST(0, 0, 100))
 	}
-	m.AddLevelSSTs(1, []SSTMeta{plannerSST(1, 0, 49), plannerSST(1, 50, 100)})
+	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 49), plannerSST(1, 50, 100)})
 
 	if _, err := c.planCompaction(m); err == nil {
 		t.Fatal("expected bounded-input error")
@@ -76,8 +76,8 @@ func plannerOnlyCompactor() *compactor {
 	return &compactor{opts: normalizeCompactorOptions(defaultCompactorOptions(), nil)}
 }
 
-func plannerSST(level uint32, lo, hi int) SSTMeta {
-	return SSTMeta{
+func plannerSST(level uint32, lo, hi int) sstMetadata {
+	return sstMetadata{
 		ID:     fmt.Sprintf("l%d-%03d-%03d", level, lo, hi),
 		Level:  level,
 		MinKey: []byte(fmt.Sprintf("key-%03d", lo)),

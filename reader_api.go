@@ -32,6 +32,15 @@ type ReaderViewPolicy struct {
 	IteratorMaxAge time.Duration
 }
 
+// ManifestPageCacheStats reports the in-memory cache used for immutable
+// manifest commit pages.
+type ManifestPageCacheStats struct {
+	Hits       int64
+	Misses     int64
+	EntryCount int
+	MaxEntries int
+}
+
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
 	// CacheDir is the directory for disk caches. It must be non-empty.

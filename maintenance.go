@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/segmentio/ksuid"
 )
 
@@ -719,7 +719,7 @@ func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
 			m.currentStats.CompactionInputSSTs += len(job.InputSSTs)
 			m.currentStats.CompactionOutputSSTs += len(job.OutputSSTs)
 			for _, sst := range job.OutputSSTs {
-				m.currentStats.CompactionOutputBytes += sst.Size
+				m.currentStats.CompactionOutputBytes += sst.Bytes
 			}
 		}
 		m.statsMu.Unlock()

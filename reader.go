@@ -17,11 +17,11 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/cachestore"
 	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/config"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/dgraph-io/ristretto/v2"
@@ -55,7 +55,7 @@ type Reader struct {
 
 	lifecycleMu sync.RWMutex
 	mu          sync.RWMutex
-	manifest    *Manifest
+	manifest    *manifestState
 	version     Version
 	viewPolicy  ReaderViewPolicy
 	viewExpired atomic.Bool
@@ -231,7 +231,7 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	var m *Manifest
+	var m *manifestState
 	m, err = r.manifestStore.Replay(ctx)
 	if err != nil {
 		return err
@@ -281,7 +281,7 @@ func (r *Reader) stopManifestExpiry() {
 	}
 }
 
-func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *Manifest) {
+func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *manifestState) {
 	oldIDs := make(map[string]struct{})
 	for _, id := range oldManifest.AllSSTIDs() {
 		oldIDs[id] = struct{}{}
@@ -357,34 +357,19 @@ func (r *Reader) beginRead() (func(), error) {
 	return r.lifecycleMu.RUnlock, nil
 }
 
-func (r *Reader) Manifest() *Manifest {
-	done, err := r.beginRead()
-	if err != nil {
-		return nil
-	}
-	defer done()
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.manifest == nil {
-		return nil
-	}
-	return r.manifest.Clone()
-}
-
 // currentManifest returns the currently published manifest pointer.
 // Callers must treat it as read-only.
 //
 // It is safe for snapshots to retain this pointer because Refresh swaps
 // r.manifest to a new manifest; it does not mutate the previous manifest in
 // place.
-func (r *Reader) currentManifest() *Manifest {
+func (r *Reader) currentManifest() *manifestState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.manifest
 }
 
-func (r *Reader) currentManifestState() (*Manifest, Version) {
+func (r *Reader) currentManifestState() (*manifestState, Version) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.manifest, r.version
@@ -432,7 +417,7 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 	return r.getWithManifest(ctx, r.currentManifest(), key)
 }
 
-func (r *Reader) getWithManifest(ctx context.Context, m *Manifest, key []byte) ([]byte, bool, error) {
+func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []byte) ([]byte, bool, error) {
 	if m == nil {
 		return nil, false, errors.New("manifest not loaded")
 	}
@@ -511,7 +496,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, limit)
 }
 
-func (r *Reader) scanInternalWithManifest(ctx context.Context, m *Manifest, minKey, maxKey []byte, limit int) (out []KV, err error) {
+func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState, minKey, maxKey []byte, limit int) (out []KV, err error) {
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
@@ -582,7 +567,7 @@ func closeSSTIters(iters []sstable.Iterator) {
 	}
 }
 
-func (r *Reader) openRangeIters(ctx context.Context, m *Manifest, minKey, maxKey []byte) ([]sstable.Iterator, error) {
+func (r *Reader) openRangeIters(ctx context.Context, m *manifestState, minKey, maxKey []byte) ([]sstable.Iterator, error) {
 	var allIters []sstable.Iterator
 	upper := maxKey
 	if len(maxKey) > 0 {
@@ -626,7 +611,7 @@ func keyInRange(key, minKey, maxKey []byte) bool {
 	return true
 }
 
-func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([]byte, bool, bool, error) {
+func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte) ([]byte, bool, bool, error) {
 	if sstMeta.Bloom.Length > 0 {
 		if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
 			if !filter.(*z.Bloom).Has(bloomHashKey(key)) {
@@ -694,7 +679,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta SSTMeta, key []byte) ([
 	return nil, false, false, errors.New("corrupt entry: non-inline, non-blob")
 }
 
-func (r *Reader) bloomMayContain(ctx context.Context, sstMeta SSTMeta, key []byte) (bool, error) {
+func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) (bool, error) {
 	if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
 		return filter.(*z.Bloom).Has(bloomHashKey(key)), nil
 	}
@@ -792,7 +777,7 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, 
 	return result.data, nil
 }
 
-func (r *Reader) sstPayloadSize(meta SSTMeta) (int64, error) {
+func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 	if meta.Size > 0 {
 		return meta.Size, nil
 	}
@@ -806,7 +791,7 @@ func (r *Reader) BlobCacheStats() internal.BlobCacheStats {
 	return internal.BlobCacheStats{}
 }
 
-func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
+func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	path := r.store.SSTPath(sstMeta.ID)
 
 	if cached, ok := r.sstCache.Acquire(path); ok {
@@ -836,7 +821,7 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta SSTMeta, lower,
 	return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
 }
 
-func (r *Reader) shouldRangeRead(sstMeta SSTMeta) (bool, int64, error) {
+func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, int64, error) {
 	if r.blockCache == nil {
 		return false, 0, nil
 	}
@@ -868,7 +853,7 @@ func (r *Reader) shouldRangeRead(sstMeta SSTMeta) (bool, int64, error) {
 	return true, size, nil
 }
 
-func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta SSTMeta, path string, lower, upper []byte, size int64) (*sstable.Reader, sstable.Iterator, error) {
+func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path string, lower, upper []byte, size int64) (*sstable.Reader, sstable.Iterator, error) {
 	if size <= 0 {
 		var err error
 		size, err = r.sstPayloadSize(sstMeta)
@@ -880,7 +865,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta SSTMeta, path str
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil)
 }
 
-func (r *Reader) openSSTIterFromData(ctx context.Context, sstMeta SSTMeta, data []byte, lower, upper []byte, release func()) (*sstable.Reader, sstable.Iterator, error) {
+func (r *Reader) openSSTIterFromData(ctx context.Context, sstMeta sstMetadata, data []byte, lower, upper []byte, release func()) (*sstable.Reader, sstable.Iterator, error) {
 	trimmed, err := trimSSTData(sstMeta, data)
 	if err != nil {
 		if release != nil {
@@ -945,7 +930,7 @@ func (it *sstIterWithClose) Close() error {
 	return err
 }
 
-func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
+func (r *Reader) validateSSTData(meta sstMetadata, data []byte) error {
 	needHash := r.verifySST || r.verifier != nil
 	if !needHash {
 		return nil
@@ -961,7 +946,7 @@ func (r *Reader) validateSSTData(meta SSTMeta, data []byte) error {
 	return r.validateSSTHash(meta, sum)
 }
 
-func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
+func (r *Reader) validateSSTHash(meta sstMetadata, sum [32]byte) error {
 	if r.verifier != nil && meta.Signature == nil {
 		return fmt.Errorf("sst %s: missing signature", meta.ID)
 	}
@@ -990,7 +975,12 @@ func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
 		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
 			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
 		}
-		if err := r.verifier.VerifyHash(sum[:], *meta.Signature); err != nil {
+		if err := r.verifier.VerifyHash(sum[:], SSTSignature{
+			Algorithm: meta.Signature.Algorithm,
+			KeyID:     meta.Signature.KeyID,
+			Hash:      meta.Signature.Hash,
+			Signature: meta.Signature.Signature,
+		}); err != nil {
 			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
 		}
 	}
@@ -998,7 +988,7 @@ func (r *Reader) validateSSTHash(meta SSTMeta, sum [32]byte) error {
 	return nil
 }
 
-func trimSSTData(meta SSTMeta, data []byte) ([]byte, error) {
+func trimSSTData(meta sstMetadata, data []byte) ([]byte, error) {
 	if meta.Size <= 0 {
 		return nil, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
 	}
@@ -1008,7 +998,7 @@ func trimSSTData(meta SSTMeta, data []byte) ([]byte, error) {
 	return data[:meta.Size], nil
 }
 
-func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) (err error) {
+func (r *Reader) cacheSST(ctx context.Context, meta *sstMetadata, path string) (err error) {
 	if cache, ok := r.sstCache.(diskcache.FileBackedCache); ok {
 		return r.cacheSSTStream(ctx, cache, meta, path)
 	}
@@ -1042,7 +1032,7 @@ func (r *Reader) cacheSST(ctx context.Context, meta *SSTMeta, path string) (err 
 	return nil
 }
 
-func (r *Reader) ensureSSTCached(ctx context.Context, meta *SSTMeta, path string) error {
+func (r *Reader) ensureSSTCached(ctx context.Context, meta *sstMetadata, path string) error {
 	if _, ok := r.sstCache.Acquire(path); ok {
 		r.sstCache.Release(path)
 		return nil
@@ -1058,7 +1048,7 @@ func (r *Reader) ensureSSTCached(ctx context.Context, meta *SSTMeta, path string
 	return err
 }
 
-func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *SSTMeta, path string) (err error) {
+func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *sstMetadata, path string) (err error) {
 	start := time.Now()
 	var downloadedBytes int64
 	defer func() {
@@ -1128,11 +1118,17 @@ func (r *Reader) SSTCacheStats() SSTCacheStats {
 	return r.sstCache.Stats()
 }
 
-func (r *Reader) ManifestPageCacheStats() cachestore.ManifestPageCacheStats {
+func (r *Reader) ManifestPageCacheStats() ManifestPageCacheStats {
 	if cs, ok := r.manifestStore.Storage().(*cachestore.CachingStorage); ok {
-		return cs.CacheStats()
+		stats := cs.CacheStats()
+		return ManifestPageCacheStats{
+			Hits:       stats.Hits,
+			Misses:     stats.Misses,
+			EntryCount: stats.EntryCount,
+			MaxEntries: stats.MaxEntries,
+		}
 	}
-	return cachestore.ManifestPageCacheStats{}
+	return ManifestPageCacheStats{}
 }
 
 type sstReadable struct {
@@ -1212,7 +1208,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 	return it, nil
 }
 
-func (r *Reader) newIteratorWithManifest(ctx context.Context, m *Manifest, opts IteratorOptions, expiresAt time.Time) (*Iterator, error) {
+func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, opts IteratorOptions, expiresAt time.Time) (*Iterator, error) {
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}

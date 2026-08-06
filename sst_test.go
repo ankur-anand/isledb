@@ -340,7 +340,7 @@ func TestWriteSST_Signature(t *testing.T) {
 	}
 }
 
-func sstPayload(tb testing.TB, meta SSTMeta, data []byte) []byte {
+func sstPayload(tb testing.TB, meta sstMetadata, data []byte) []byte {
 	tb.Helper()
 	if meta.Size <= 0 {
 		tb.Fatalf("sst payload missing size for %s", meta.ID)

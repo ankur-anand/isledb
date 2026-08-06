@@ -18,7 +18,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -38,8 +38,15 @@ type CompactionJob struct {
 	SourceLevel      uint32
 	DestinationLevel uint32
 	InputSSTs        []string
-	OutputSSTs       []SSTMeta
+	OutputSSTs       []CompactionOutput
 	MetadataOnly     bool
+}
+
+// CompactionOutput describes one SST produced or repositioned by a compaction.
+type CompactionOutput struct {
+	ID    string
+	Bytes int64
+	Level uint32
 }
 
 // compactor moves and rewrites SSTs through non-overlapping levels.
@@ -51,7 +58,7 @@ type compactor struct {
 	stageCommand  maintenanceCommandStager
 
 	mu       sync.Mutex
-	manifest *Manifest
+	manifest *manifestState
 
 	lifecycleMu sync.Mutex
 	ticker      *time.Ticker
@@ -377,12 +384,12 @@ func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
 type levelCompactionPlan struct {
 	sourceLevel      uint32
 	destinationLevel uint32
-	sourceSSTs       []SSTMeta
-	destinationSSTs  []SSTMeta
+	sourceSSTs       []sstMetadata
+	destinationSSTs  []sstMetadata
 	metadataOnly     bool
 }
 
-func (c *compactor) planCompaction(m *Manifest) (*levelCompactionPlan, error) {
+func (c *compactor) planCompaction(m *manifestState) (*levelCompactionPlan, error) {
 	var levelPlan *levelCompactionPlan
 	for i := range m.Levels {
 		level := &m.Levels[i]
@@ -425,15 +432,15 @@ func (c *compactor) levelTargetBytes(level uint32) int64 {
 	return target
 }
 
-func (c *compactor) buildLevelPlan(m *Manifest, sourceLevel, destinationLevel uint32, candidates []SSTMeta) (*levelCompactionPlan, error) {
+func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLevel uint32, candidates []sstMetadata) (*levelCompactionPlan, error) {
 	for count := len(candidates); count > 0; count-- {
 		selected := candidates[:count]
 		if sourceLevel == 0 {
 			selected = candidates[len(candidates)-count:]
 		}
-		source := append([]SSTMeta(nil), selected...)
+		source := append([]sstMetadata(nil), selected...)
 		minKey, maxKey := sstBounds(source)
-		var destination []SSTMeta
+		var destination []sstMetadata
 		if level := m.Level(destinationLevel); level != nil {
 			destination = level.OverlappingSSTs(minKey, maxKey)
 		}
@@ -452,7 +459,7 @@ func (c *compactor) buildLevelPlan(m *Manifest, sourceLevel, destinationLevel ui
 	return nil, fmt.Errorf("compaction overlap exceeds max input SSTs=%d for L%d to L%d", c.opts.Trigger.MaxInputSSTs, sourceLevel, destinationLevel)
 }
 
-func sstBounds(ssts []SSTMeta) ([]byte, []byte) {
+func sstBounds(ssts []sstMetadata) ([]byte, []byte) {
 	var minKey, maxKey []byte
 	for i := range ssts {
 		if i == 0 || bytes.Compare(ssts[i].MinKey, minKey) < 0 {
@@ -465,11 +472,11 @@ func sstBounds(ssts []SSTMeta) ([]byte, []byte) {
 	return minKey, maxKey
 }
 
-func sstsDoNotOverlap(ssts []SSTMeta) bool {
+func sstsDoNotOverlap(ssts []sstMetadata) bool {
 	if len(ssts) < 2 {
 		return true
 	}
-	ordered := append([]SSTMeta(nil), ssts...)
+	ordered := append([]sstMetadata(nil), ssts...)
 	sort.Slice(ordered, func(i, j int) bool {
 		return bytes.Compare(ordered[i].MinKey, ordered[j].MinKey) < 0
 	})
@@ -481,7 +488,7 @@ func sstsDoNotOverlap(ssts []SSTMeta) bool {
 	return true
 }
 
-func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *levelCompactionPlan) (err error) {
+func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan) (err error) {
 	jobType := CompactionLevelToLevel
 	if plan.sourceLevel == 0 {
 		jobType = CompactionL0ToL1
@@ -509,7 +516,7 @@ func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *le
 
 	outputs := plan.sourceSSTs
 	if !plan.metadataOnly {
-		inputs := append(append([]SSTMeta(nil), plan.sourceSSTs...), plan.destinationSSTs...)
+		inputs := append(append([]sstMetadata(nil), plan.sourceSSTs...), plan.destinationSSTs...)
 		iters, readers, openErr := c.openSSTs(ctx, inputs)
 		if openErr != nil {
 			return openErr
@@ -523,7 +530,7 @@ func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *le
 		if writeErr != nil {
 			return writeErr
 		}
-		outputs = make([]SSTMeta, len(results))
+		outputs = make([]sstMetadata, len(results))
 		for i := range results {
 			outputs[i] = results[i].Meta
 		}
@@ -532,7 +539,13 @@ func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *le
 		outputs[i].Level = plan.destinationLevel
 	}
 
-	job.OutputSSTs = append(job.OutputSSTs, outputs...)
+	for _, output := range outputs {
+		job.OutputSSTs = append(job.OutputSSTs, CompactionOutput{
+			ID:    output.ID,
+			Bytes: output.Size,
+			Level: output.Level,
+		})
+	}
 	payload := manifest.CompactionLogPayload{
 		RemoveSSTableIDs: job.InputSSTs,
 		SourceLevel:      plan.sourceLevel,
@@ -542,7 +555,7 @@ func (c *compactor) executeCompaction(ctx context.Context, m *Manifest, plan *le
 	return c.appendCompaction(ctx, m, payload)
 }
 
-func (c *compactor) appendCompaction(ctx context.Context, m *Manifest, payload manifest.CompactionLogPayload) error {
+func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload) error {
 	added := make(map[string]struct{}, len(payload.AddSSTables))
 	for _, sst := range payload.AddSSTables {
 		added[sst.ID] = struct{}{}
@@ -591,7 +604,7 @@ type openSSTResult struct {
 	err    error
 }
 
-func (c *compactor) openSSTs(ctx context.Context, ssts []SSTMeta) ([]sstable.Iterator, []*sstable.Reader, error) {
+func (c *compactor) openSSTs(ctx context.Context, ssts []sstMetadata) ([]sstable.Iterator, []*sstable.Reader, error) {
 	if len(ssts) == 0 {
 		return nil, nil, nil
 	}
@@ -667,7 +680,7 @@ sendJobs:
 	return iters, readers, nil
 }
 
-func (c *compactor) openOneSST(ctx context.Context, sst SSTMeta) openSSTResult {
+func (c *compactor) openOneSST(ctx context.Context, sst sstMetadata) openSSTResult {
 	path := c.store.SSTPath(sst.ID)
 	var data []byte
 	var err error
@@ -713,7 +726,7 @@ func cleanupOpenResults(results []openSSTResult) {
 	}
 }
 
-func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifier SSTHashVerifier) error {
+func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool, verifier SSTHashVerifier) error {
 	if verifier != nil && meta.Signature == nil {
 		return fmt.Errorf("sst %s: missing signature", meta.ID)
 	}
@@ -749,7 +762,12 @@ func validateSSTDataForCompaction(meta SSTMeta, data []byte, verify bool, verifi
 		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
 			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
 		}
-		if err := verifier.VerifyHash(sum[:], *meta.Signature); err != nil {
+		if err := verifier.VerifyHash(sum[:], SSTSignature{
+			Algorithm: meta.Signature.Algorithm,
+			KeyID:     meta.Signature.KeyID,
+			Hash:      meta.Signature.Hash,
+			Signature: meta.Signature.Signature,
+		}); err != nil {
 			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
 		}
 	}

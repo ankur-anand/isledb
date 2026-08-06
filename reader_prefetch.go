@@ -159,13 +159,13 @@ func prefixUpperBound(prefix []byte) []byte {
 	return nil
 }
 
-func (r *Reader) selectPrefetchSSTs(m *Manifest, opts PrefetchOptions) ([]SSTMeta, PrefetchStats) {
-	var selected []SSTMeta
+func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]sstMetadata, PrefetchStats) {
+	var selected []sstMetadata
 	var stats PrefetchStats
 	seen := make(map[string]struct{})
 	var selectedBytes int64
 
-	visit := func(sst SSTMeta) {
+	visit := func(sst sstMetadata) {
 		if _, ok := seen[sst.ID]; ok {
 			return
 		}
@@ -208,7 +208,7 @@ func (r *Reader) selectPrefetchSSTs(m *Manifest, opts PrefetchOptions) ([]SSTMet
 	return selected, stats
 }
 
-func sstOverlapsPrefetchRange(sst SSTMeta, r KeyRange) bool {
+func sstOverlapsPrefetchRange(sst sstMetadata, r KeyRange) bool {
 	if len(sst.MinKey) == 0 || len(sst.MaxKey) == 0 {
 		return false
 	}
@@ -221,7 +221,7 @@ func sstOverlapsPrefetchRange(sst SSTMeta, r KeyRange) bool {
 	return true
 }
 
-func (r *Reader) prefetchSST(ctx context.Context, sst SSTMeta) error {
+func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) error {
 	path := r.store.SSTPath(sst.ID)
 	if _, ok := r.sstCache.Get(path); ok {
 		return nil

@@ -9,7 +9,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/manifest"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 func TestReaderSnapshotPinsLoadedState(t *testing.T) {
@@ -202,9 +202,6 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	}
 	if _, err := reader.Prefetch(ctx, PrefetchOptions{All: true}); err != ErrReaderClosed {
 		t.Fatalf("Prefetch after Reader.Close error=%v, want %v", err, ErrReaderClosed)
-	}
-	if got := reader.Manifest(); got != nil {
-		t.Fatalf("Manifest after Reader.Close = %#v, want nil", got)
 	}
 	if _, err := reader.Snapshot(ctx); err != ErrReaderClosed {
 		t.Fatalf("Snapshot after Reader.Close error=%v, want %v", err, ErrReaderClosed)

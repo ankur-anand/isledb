@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -30,7 +31,7 @@ type SSTIterator interface {
 }
 
 type writeSSTResult struct {
-	Meta    SSTMeta
+	Meta    sstMetadata
 	SSTData []byte
 }
 
@@ -134,7 +135,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 
 	result.SSTData = sstBuf.Bytes()
 
-	result.Meta = SSTMeta{
+	result.Meta = sstMetadata{
 		ID:       buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
 		Epoch:    epoch,
 		SeqLo:    state.seqLo,
@@ -143,7 +144,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		MaxKey:   state.maxKey,
 		Size:     sstSize,
 		Checksum: "sha256:" + hashStr,
-		Bloom: BloomMeta{
+		Bloom: bloomMetadata{
 			BitsPerKey: opts.BloomBitsPerKey,
 			K:          bloomK,
 			Offset:     sstSize,
@@ -157,7 +158,7 @@ func writeSST(ctx context.Context, it SSTIterator, opts SSTWriterOptions, epoch 
 		if err != nil {
 			return result, err
 		}
-		result.Meta.Signature = &SSTSignature{
+		result.Meta.Signature = &manifest.SSTSignature{
 			Algorithm: opts.Signer.Algorithm(),
 			KeyID:     opts.Signer.KeyID(),
 			Hash:      hashStr,
