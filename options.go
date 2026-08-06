@@ -4,9 +4,9 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/cachestore"
-	"github.com/ankur-anand/isledb/config"
 	"github.com/ankur-anand/isledb/diskcache"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/manifest"
 )
 

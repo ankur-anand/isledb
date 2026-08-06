@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ankur-anand/isledb/config"
+	"github.com/ankur-anand/isledb/internal/config"
 )
 
 var ErrInvalidReaderOptions = errors.New("invalid reader options")
