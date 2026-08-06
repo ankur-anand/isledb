@@ -1166,8 +1166,8 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	if err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
 		t.Fatalf("expected putWithTTL error for empty key")
 	}
-	if err := w.deleteWithTTL(ctx, []byte("k1"), time.Second); err != nil {
-		t.Fatalf("deleteWithTTL: %v", err)
+	if err := w.delete(ctx, []byte("k1")); err != nil {
+		t.Fatalf("delete: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)

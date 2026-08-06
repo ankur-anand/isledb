@@ -382,10 +382,6 @@ func (w *writer) putBlob(ctx context.Context, key, value []byte, expireAt int64)
 }
 
 func (w *writer) delete(ctx context.Context, key []byte) error {
-	return w.deleteWithTTL(ctx, key, 0)
-}
-
-func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
 	w.metrics.ObserveDelete()
 
 	if err := checkContext(ctx); err != nil {
@@ -402,11 +398,6 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
 	}
 
-	var expireAt int64
-	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixMilli()
-	}
-
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
@@ -414,7 +405,7 @@ func (w *writer) deleteWithTTL(ctx context.Context, key []byte, ttl time.Duratio
 	}
 	w.seq++
 	seq := w.seq
-	w.memtable.DeleteWithTTL(key, seq, expireAt)
+	w.memtable.Delete(key, seq)
 	w.mu.Unlock()
 
 	return nil

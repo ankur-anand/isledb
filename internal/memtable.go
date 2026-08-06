@@ -116,23 +116,10 @@ func (m *Memtable) PutBlobRefWithTTL(key []byte, blobID [32]byte, seq uint64, ex
 }
 
 func (m *Memtable) Delete(key []byte, seq uint64) {
-	m.DeleteWithTTL(key, seq, 0)
-}
-
-func (m *Memtable) DeleteWithTTL(key []byte, seq uint64, expireAt int64) {
 	ikey := y.KeyWithTs(key, seq)
 	m.updateSeqBounds(seq)
-
-	if expireAt > 0 {
-		encoded := make([]byte, 2+8)
-		encoded[0] = byte(OpDelete)
-		encoded[1] = memEntryTTLFlag
-		binary.BigEndian.PutUint64(encoded[2:10], uint64(expireAt))
-		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
-	} else {
-		encoded := []byte{byte(OpDelete), 0}
-		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
-	}
+	encoded := []byte{byte(OpDelete), 0}
+	m.sl.Put(ikey, y.ValueStruct{Value: encoded})
 }
 
 func (m *Memtable) ApproxSize() int64 {

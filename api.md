@@ -102,7 +102,6 @@ Visibility contract:
 
 - `Put` and `Delete` return after the mutation is buffered locally.
 - `PutWithTTL` stores an expiry with the value. `ttl <= 0` means no expiration.
-- `DeleteWithTTL` stores an expiring tombstone. `ttl <= 0` means the tombstone does not expire.
 - `Flush` is the synchronous publish boundary. It writes pending memtables as
   SST files and commits manifest entries.
 - A retry of an explicit `Flush` reuses the same uploaded SST, change batch,
@@ -116,7 +115,6 @@ Visibility contract:
 | Put | `(ctx context.Context, key, value []byte) error` | Buffer a key-value mutation |
 | PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Buffer a key-value mutation with time-to-live |
 | Delete | `(ctx context.Context, key []byte) error` | Buffer a tombstone |
-| DeleteWithTTL | `(ctx context.Context, key []byte, ttl time.Duration) error` | Buffer a tombstone with TTL |
 | Flush | `(ctx context.Context) error` | Publish all currently buffered writes |
 | Close | `(ctx context.Context) error` | Stop background flushing and publish pending writes |
 
@@ -199,7 +197,7 @@ if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
 if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), 30*time.Minute); err != nil {
     return err
 }
-if err := w.DeleteWithTTL(ctx, []byte("lock:1"), 5*time.Second); err != nil {
+if err := w.Delete(ctx, []byte("lock:1")); err != nil {
     return err
 }
 return w.Flush(ctx)

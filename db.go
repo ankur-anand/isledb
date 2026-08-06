@@ -64,13 +64,6 @@ func (w *Writer) Delete(ctx context.Context, key []byte) error {
 	return w.w.delete(ctx, key)
 }
 
-// DeleteWithTTL marks a key as deleted with a time-to-live duration.
-//
-// ttl <= 0 means the tombstone does not expire.
-func (w *Writer) DeleteWithTTL(ctx context.Context, key []byte, ttl time.Duration) error {
-	return w.w.deleteWithTTL(ctx, key, ttl)
-}
-
 // Flush synchronously publishes all currently buffered writes.
 //
 // Flush rotates the active memtable, writes all frozen memtables as SST files,
