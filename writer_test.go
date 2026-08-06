@@ -842,11 +842,37 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if normalized.Maintenance != defaults.Maintenance {
 		t.Fatalf("normalized maintenance options=%+v defaults=%+v", normalized.Maintenance, defaults.Maintenance)
 	}
+	if normalized.Values != defaults.Values {
+		t.Fatalf("normalized value options=%+v defaults=%+v", normalized.Values, defaults.Values)
+	}
 	if normalized.Flush.Interval != 0 {
 		t.Fatalf("zero-value flush interval=%s, want disabled", normalized.Flush.Interval)
 	}
 	if values.MaxKeySize <= 0 || values.BlobThreshold <= 0 || values.MaxValueSize <= 0 {
 		t.Fatalf("normalized value options=%+v", values.ValueOptions)
+	}
+}
+
+func TestWriterOptions_MapValueOptions(t *testing.T) {
+	opts := WriterOptions{
+		Values: ValueOptions{
+			MaxKeyBytes:      1024,
+			InlineValueBytes: 2048,
+			MaxValueBytes:    4096,
+		},
+	}
+
+	normalized, values, err := normalizeWriterOptions(opts)
+	if err != nil {
+		t.Fatalf("normalizeWriterOptions: %v", err)
+	}
+	if normalized.Values != opts.Values {
+		t.Fatalf("normalized values=%+v, want=%+v", normalized.Values, opts.Values)
+	}
+	if values.MaxKeySize != opts.Values.MaxKeyBytes ||
+		values.BlobThreshold != opts.Values.InlineValueBytes ||
+		values.MaxValueSize != opts.Values.MaxValueBytes {
+		t.Fatalf("internal values=%+v, public values=%+v", values.ValueOptions, opts.Values)
 	}
 }
 
@@ -863,14 +889,14 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative bloom bits", mutate: func(o *WriterOptions) { o.SST.BloomBitsPerKey = -1 }},
 		{name: "negative block bytes", mutate: func(o *WriterOptions) { o.SST.BlockBytes = -1 }},
 		{name: "unsupported compression", mutate: func(o *WriterOptions) { o.SST.Compression = "gzip" }},
-		{name: "negative blob threshold", mutate: func(o *WriterOptions) { o.Values.BlobThreshold = -1 }},
-		{name: "negative max key size", mutate: func(o *WriterOptions) { o.Values.MaxKeySize = -1 }},
-		{name: "negative max value size", mutate: func(o *WriterOptions) { o.Values.MaxValueSize = -1 }},
+		{name: "negative inline value bytes", mutate: func(o *WriterOptions) { o.Values.InlineValueBytes = -1 }},
+		{name: "negative max key bytes", mutate: func(o *WriterOptions) { o.Values.MaxKeyBytes = -1 }},
+		{name: "negative max value bytes", mutate: func(o *WriterOptions) { o.Values.MaxValueBytes = -1 }},
 		{name: "target exceeds arena", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = maxMemtableArenaBytes + 1 }},
 		{name: "inline entry exceeds arena", mutate: func(o *WriterOptions) {
-			o.Values.MaxKeySize = int(maxMemtableArenaBytes / 2)
-			o.Values.BlobThreshold = int(maxMemtableArenaBytes / 2)
-			o.Values.MaxValueSize = maxMemtableArenaBytes
+			o.Values.MaxKeyBytes = int(maxMemtableArenaBytes / 2)
+			o.Values.InlineValueBytes = int(maxMemtableArenaBytes / 2)
+			o.Values.MaxValueBytes = maxMemtableArenaBytes
 		}},
 	}
 
@@ -1024,7 +1050,7 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.BlobThreshold = 1
+	opts.Values.InlineValueBytes = 1
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
@@ -1124,7 +1150,7 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.BlobThreshold = 1
+	opts.Values.InlineValueBytes = 1
 	opts.Metrics = DefaultWriterMetrics(nil)
 
 	w, err := newWriter(ctx, store, manifestStore, opts)

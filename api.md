@@ -122,14 +122,15 @@ Visibility contract:
 
 ```go
 type WriterOptions struct {
-    OwnerID      string
-    Memtable    WriterMemtableOptions
-    Flush       WriterFlushOptions
-    SST         WriterSSTOptions
-    Values      config.ValueStorageConfig
-    ChangeFeed  ChangeFeedOptions
+    OwnerID       string
+    Memtable     WriterMemtableOptions
+    Flush        WriterFlushOptions
+    Maintenance  WriterMaintenanceOptions
+    SST          WriterSSTOptions
+    Values       ValueOptions
+    ChangeFeed   ChangeFeedOptions
     OnFlushError func(error)
-    Metrics     *WriterMetrics
+    Metrics      *WriterMetrics
 }
 
 type ChangeFeedOptions struct {
@@ -145,10 +146,20 @@ type WriterFlushOptions struct {
     Interval time.Duration // Background flush cadence. Zero disables auto-flush.
 }
 
+type WriterMaintenanceOptions struct {
+    PollInterval time.Duration // Minimum interval between maintenance mailbox reads.
+}
+
 type WriterSSTOptions struct {
     BloomBitsPerKey int    // Zero selects the default.
     BlockBytes      int    // Zero selects the default.
     Compression     string // "none", "snappy", or "zstd"; empty selects the default.
+}
+
+type ValueOptions struct {
+    MaxKeyBytes      int   // Largest accepted key size.
+    InlineValueBytes int   // Values at or above this size are stored outside the SST.
+    MaxValueBytes    int64 // Largest accepted value size.
 }
 
 func DefaultWriterOptions() WriterOptions
@@ -697,43 +708,6 @@ type Attributes struct {
 - `blobstore.ErrNotFound` - Object does not exist
 - `blobstore.ErrPreconditionFailed` - CAS condition not met
 - `blobstore.BatchDeleteError` - Partial batch delete failure (`.Failed` map)
-
----
-
-## Configuration
-
-### config.ValueStorageConfig
-
-Controls how values are stored (inline vs. blob storage).
-
-```go
-type ValueStorageConfig struct {
-    ValueOptions
-    BlobReadOptions
-    BlobGCOptions
-}
-
-func DefaultValueStorageConfig() ValueStorageConfig
-```
-
-```go
-type ValueOptions struct {
-    MaxKeySize    int   // Maximum key size
-    BlobThreshold int   // Values >= this size go to blob storage
-    MaxValueSize  int64 // Maximum value size
-}
-
-type BlobReadOptions struct {
-    VerifyBlobsOnRead bool // Re-hash blobs on read for integrity
-}
-
-// Note: Current Not Implemented Just Defined
-type BlobGCOptions struct {
-    Enabled  bool
-    Interval time.Duration
-    MinAge   time.Duration
-}
-```
 
 ---
 

@@ -639,7 +639,7 @@ func TestReader_MetricsBlobFetch(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	wOpts := DefaultWriterOptions()
 	wOpts.Flush.Interval = 0
-	wOpts.Values.BlobThreshold = 1
+	wOpts.Values.InlineValueBytes = 1
 
 	w, err := newWriter(ctx, store, manifestStore, wOpts)
 	if err != nil {

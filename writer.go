@@ -196,23 +196,29 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 			"%w: unsupported compression=%q", ErrInvalidWriterOptions, opts.SST.Compression)
 	}
 
-	vd := config.DefaultValueStorageConfig()
-	valueConfig := opts.Values
-	if valueConfig.BlobThreshold < 0 {
+	vd := defaultWriterValueOptions()
+	values := opts.Values
+	if values.InlineValueBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: blob_threshold=%d", ErrInvalidWriterOptions, valueConfig.BlobThreshold)
+			"%w: inline_value_bytes=%d", ErrInvalidWriterOptions, values.InlineValueBytes)
 	}
-	if valueConfig.MaxKeySize < 0 {
+	if values.MaxKeyBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: max_key_size=%d", ErrInvalidWriterOptions, valueConfig.MaxKeySize)
+			"%w: max_key_bytes=%d", ErrInvalidWriterOptions, values.MaxKeyBytes)
 	}
-	if valueConfig.MaxValueSize < 0 {
+	if values.MaxValueBytes < 0 {
 		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: max_value_size=%d", ErrInvalidWriterOptions, valueConfig.MaxValueSize)
+			"%w: max_value_bytes=%d", ErrInvalidWriterOptions, values.MaxValueBytes)
 	}
-	valueConfig.BlobThreshold = cmp.Or(valueConfig.BlobThreshold, vd.BlobThreshold)
-	valueConfig.MaxKeySize = cmp.Or(valueConfig.MaxKeySize, vd.MaxKeySize)
-	valueConfig.MaxValueSize = cmp.Or(valueConfig.MaxValueSize, vd.MaxValueSize)
+	values.InlineValueBytes = cmp.Or(values.InlineValueBytes, vd.InlineValueBytes)
+	values.MaxKeyBytes = cmp.Or(values.MaxKeyBytes, vd.MaxKeyBytes)
+	values.MaxValueBytes = cmp.Or(values.MaxValueBytes, vd.MaxValueBytes)
+	opts.Values = values
+
+	valueConfig := config.DefaultValueStorageConfig()
+	valueConfig.BlobThreshold = values.InlineValueBytes
+	valueConfig.MaxKeySize = values.MaxKeyBytes
+	valueConfig.MaxValueSize = values.MaxValueBytes
 	if err := validateMemtableArena(opts.Memtable.TargetBytes, valueConfig); err != nil {
 		return WriterOptions{}, config.ValueStorageConfig{}, err
 	}
