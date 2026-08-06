@@ -19,6 +19,8 @@ demo/p000/
       pending-sst/
         pending.json
       checkpoint.json
+  maintenance/
+    HEAD
   sstable/
     <bucket>/
       <sst-id>
@@ -32,13 +34,13 @@ demo/p000/
 
 ## Serialization Notes
 
-- `manifest/CURRENT`, `manifest/snapshots/*.manifest`, `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
+- `manifest/CURRENT`, `maintenance/HEAD`, `manifest/snapshots/*.manifest`,
+  `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
 - `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
 - `changes/*` objects are written only when `WriterOptions.ChangeFeed.Enabled` is true.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
-- Manifest log `role` is numeric:
-  - `0` = writer
-  - `1` = compactor
+- Manifest log `role` is `0` for writer-owned publication. Applied maintenance
+  entries are also writer-owned because only the writer updates `CURRENT`.
 - Top-level manifest fields use explicit `snake_case` JSON tags.
 - Nested `SSTMeta`, `BloomMeta`, and `SSTSignature` fields currently serialize with Go's default exported field names, so the on-disk JSON uses keys like `ID`, `SeqLo`, `MinKey`, `Bloom`, and `HasBlobRefs`. `Level` uses explicit `number` and `ssts` fields.
 
@@ -68,6 +70,9 @@ This is a representative JSON-style view of the object families under one prefix
         },
         "checkpoint.json": "{...json...}"
       }
+    },
+    "maintenance": {
+      "HEAD": "{...json...}"
     },
     "sstable": {
       "<bucket>": {
@@ -146,10 +151,12 @@ Example:
     "seq_hi": 9256,
     "committed_at": "2026-04-15T10:14:11Z"
   },
-  "compactor_fence": {
+  "maintenance_receipt": {
+    "command_id": "2YCueqzBfVBMErstfm3QxW8PbXQ",
     "epoch": 7,
-    "owner": "compactor-p000",
-    "claimed_at": "2026-04-15T10:13:11Z"
+    "generation": 42,
+    "status": "applied",
+    "applied_at": "2026-04-15T10:14:12Z"
   }
 }
 ```
@@ -158,7 +165,44 @@ Example:
 writer keeps one stable `commit_id` while retrying a memtable publication. If a
 `CURRENT` CAS succeeds but its response is lost, the retry compares the receipt
 and metadata fingerprint and returns the already committed entry instead of
-appending a duplicate. Compaction and fence updates preserve this receipt.
+appending a duplicate. Maintenance publication preserves this receipt.
+
+`maintenance_receipt` identifies the latest command applied from
+`maintenance/HEAD`. The command effect and receipt share one `CURRENT` CAS.
+
+## `maintenance/HEAD`
+
+Bounded maintenance mailbox. Maintenance owns this CAS object; the writer
+polls it on the flush path. It contains at most one pending command.
+
+```json
+{
+  "layout_version": 1,
+  "epoch": 7,
+  "owner_id": "maintenance-p000",
+  "claimed_at": "2026-04-15T10:13:11Z",
+  "generation": 42,
+  "pending": {
+    "id": "2YCueqzBfVBMErstfm3QxW8PbXQ",
+    "epoch": 7,
+    "generation": 42,
+    "kind": "compaction",
+    "created_at": "2026-04-15T10:14:12Z",
+    "compaction": {
+      "payload": {
+        "remove_sstable_ids": ["sst-a100", "sst-a101"],
+        "source_level": 0,
+        "destination_level": 1,
+        "add_sstables": []
+      }
+    }
+  }
+}
+```
+
+Readers never fetch this object. See
+[Maintenance Publication](maintenance-publication.md) for ownership and crash
+recovery.
 
 ## `manifest/snapshots/<id>.manifest`
 
@@ -181,11 +225,6 @@ Example:
     "epoch": 18,
     "owner": "writer-p000",
     "claimed_at": "2026-04-15T10:12:01Z"
-  },
-  "compactor_fence": {
-    "epoch": 7,
-    "owner": "compactor-p000",
-    "claimed_at": "2026-04-15T10:13:11Z"
   },
   "l0_ssts": [
     {

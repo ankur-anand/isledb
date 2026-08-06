@@ -69,6 +69,7 @@ type retentionCompactor struct {
 	manifestLog   *manifest.Store
 	gcCursorStore manifest.GCCursorStorage
 	opts          retentionCompactorOptions
+	stageCommand  maintenanceCommandStager
 
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
@@ -284,11 +285,13 @@ func (c *retentionCompactor) RunOnce(ctx context.Context) error {
 	if c.fenced.Load() {
 		return manifest.ErrFenced
 	}
-	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
-		if isFenceError(err) {
-			c.fenced.Store(true)
+	if c.stageCommand == nil {
+		if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+			if isFenceError(err) {
+				c.fenced.Store(true)
+			}
+			return err
 		}
-		return err
 	}
 
 	if err := c.refresh(ctx); err != nil {
@@ -377,10 +380,12 @@ func (c *retentionCompactor) releaseRun() {
 }
 
 func (c *retentionCompactor) runSSTSweeperBestEffort(ctx context.Context) {
-	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
-		return
+	if c.stageCommand == nil {
+		if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+			return
+		}
 	}
-	if _, err := runRetirementSweeper(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize); err != nil {
+	if _, err := runRetirementSweeperWithStager(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize, c.stageCommand); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -453,7 +458,17 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *Manifest) (int,
 	if err != nil {
 		return 0, 0, fmt.Errorf("build retirement records: %w", err)
 	}
-	_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
+	if c.stageCommand != nil {
+		err = c.stageCommand(ctx, manifest.MaintenanceCommand{
+			Kind: manifest.MaintenanceCommandRemoveSSTables,
+			RemoveSSTables: &manifest.RemoveSSTablesCommand{
+				SSTableIDs:     append([]string(nil), toDelete...),
+				RetiredObjects: retired,
+			},
+		})
+	} else {
+		_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
+	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}
@@ -546,7 +561,17 @@ segmentLoop:
 	if err != nil {
 		return 0, 0, fmt.Errorf("build retirement records: %w", err)
 	}
-	_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
+	if c.stageCommand != nil {
+		err = c.stageCommand(ctx, manifest.MaintenanceCommand{
+			Kind: manifest.MaintenanceCommandRemoveSSTables,
+			RemoveSSTables: &manifest.RemoveSSTablesCommand{
+				SSTableIDs:     append([]string(nil), toDelete...),
+				RetiredObjects: retired,
+			},
+		})
+	} else {
+		_, err = c.manifestLog.AppendRemoveSSTablesWithFence(ctx, toDelete, retired)
+	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("update manifest: %w", err)
 	}

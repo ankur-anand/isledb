@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,11 @@ import (
 )
 
 func TestMaintenanceRetentionDefaultsUseExplicitUnits(t *testing.T) {
+	maintenance := DefaultMaintenanceOptions()
+	if maintenance.Checkpoint.MaxReplayPages != DefaultCheckpointReplayPages {
+		t.Fatalf("MaxReplayPages=%d, want %d", maintenance.Checkpoint.MaxReplayPages, DefaultCheckpointReplayPages)
+	}
+
 	retention := DefaultRetentionPolicy()
 	if retention.KeepAtLeastSSTs != 10 {
 		t.Fatalf("KeepAtLeastSSTs=%d, want 10", retention.KeepAtLeastSSTs)
@@ -23,6 +29,90 @@ func TestMaintenanceRetentionDefaultsUseExplicitUnits(t *testing.T) {
 	changeFeed := DefaultChangeFeedRetentionPolicy()
 	if changeFeed.KeepAtLeastManifestEntries != 1024 {
 		t.Fatalf("KeepAtLeastManifestEntries=%d, want 1024", changeFeed.KeepAtLeastManifestEntries)
+	}
+}
+
+func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-checkpoint")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		if _, err := db.manifestStore.AppendAddSSTableWithFence(ctx, manifest.SSTMeta{
+			ID:    fmt.Sprintf("sst-%03d", i),
+			Level: 0,
+		}); err != nil {
+			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
+		}
+	}
+	beforeMaintenance, err := db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(before maintenance): %v", err)
+	}
+	if beforeMaintenance.StateReplayPages < 1 {
+		t.Fatalf("StateReplayPages before maintenance=%d, want at least 1", beforeMaintenance.StateReplayPages)
+	}
+
+	opts := DefaultMaintenanceOptions()
+	opts.Checkpoint.MaxReplayPages = 1
+	opts.Compaction.L0SSTCount = 10_000
+	maintenance, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+	beforeRun, err := db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(before run): %v", err)
+	}
+	if beforeRun.StateReplayPages < 1 {
+		t.Fatalf("StateReplayPages before run=%d, want at least 1", beforeRun.StateReplayPages)
+	}
+
+	var stats MaintenanceStats
+	for attempt := 0; attempt < 8; attempt++ {
+		stats, err = maintenance.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce(%d): %v", attempt, err)
+		}
+		head, _, err := db.manifestStore.ReadMaintenanceHead(ctx)
+		if err != nil {
+			t.Fatalf("ReadMaintenanceHead(%d): %v", attempt, err)
+		}
+		if head != nil && head.Pending != nil {
+			if _, err := db.manifestStore.ApplyPendingMaintenance(ctx); err != nil {
+				t.Fatalf("ApplyPendingMaintenance(%d): %v", attempt, err)
+			}
+		}
+		if stats.CheckpointStaged {
+			break
+		}
+	}
+	if !stats.CheckpointStaged {
+		t.Fatal("maintenance did not stage a checkpoint")
+	}
+	if stats.CheckpointReplayPages < 1 || stats.CheckpointReplayBytes == 0 {
+		t.Fatalf("checkpoint stats=(%d pages, %d bytes), want non-zero", stats.CheckpointReplayPages, stats.CheckpointReplayBytes)
+	}
+	current, err := db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.StateReplayPages != 0 || current.StateReplayBytes != 0 {
+		t.Fatalf("replay accounting after maintenance=(%d pages, %d bytes), want zero",
+			current.StateReplayPages, current.StateReplayBytes)
+	}
+	if current.Snapshot == "" {
+		t.Fatal("maintenance did not publish a snapshot")
 	}
 }
 
@@ -137,7 +227,7 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	}
 }
 
-func TestMaintenanceStagesShareOneFenceClaim(t *testing.T) {
+func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("maintenance-shared-fence")
 	defer store.Close()
@@ -166,11 +256,21 @@ func TestMaintenanceStagesShareOneFenceClaim(t *testing.T) {
 	assertFenceTokenEqual(t, maintenance.retention.fenceToken, want)
 	assertFenceTokenEqual(t, maintenance.changeFeed.fenceToken, want)
 
+	head, _, err := db.manifestStore.ReadMaintenanceHead(ctx)
+	if err != nil {
+		t.Fatalf("ReadMaintenanceHead: %v", err)
+	}
+	if head == nil || head.Epoch != want.Epoch || head.OwnerID != want.Owner || !head.ClaimedAt.Equal(want.ClaimedAt) {
+		t.Fatalf("maintenance HEAD=%+v, token=%+v", head, want)
+	}
+
 	current, err := db.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("ReadCurrentData: %v", err)
 	}
-	assertFenceTokenEqual(t, current.CompactorFence, want)
+	if current != nil && current.CompactorFence != nil {
+		t.Fatalf("CURRENT compactor fence=%+v, want nil", current.CompactorFence)
+	}
 
 	seqs, err := db.manifestStore.ListEntries(ctx)
 	if err != nil {
@@ -186,8 +286,130 @@ func TestMaintenanceStagesShareOneFenceClaim(t *testing.T) {
 			claims++
 		}
 	}
-	if claims != 1 {
-		t.Fatalf("compactor fence claims=%d, want 1", claims)
+	if claims != 0 {
+		t.Fatalf("compactor fence claims=%d, want 0", claims)
+	}
+}
+
+func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-writer-replacement")
+	defer store.Close()
+
+	firstDB, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB(first): %v", err)
+	}
+	defer firstDB.Close()
+	secondDB, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB(second): %v", err)
+	}
+	defer secondDB.Close()
+
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	firstWriter, err := firstDB.OpenWriter(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenWriter(first): %v", err)
+	}
+	maintenance, err := firstDB.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
+		Kind:            manifest.MaintenanceCommandRetirementFloor,
+		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}); err != nil {
+		t.Fatalf("stageCommand: %v", err)
+	}
+
+	secondWriter, err := secondDB.OpenWriter(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenWriter(second): %v", err)
+	}
+	defer secondWriter.Close(ctx)
+	if err := secondWriter.Flush(ctx); err != nil {
+		t.Fatalf("second writer Flush: %v", err)
+	}
+	waiting, err := maintenance.reconcilePendingCommand(ctx)
+	if err != nil {
+		t.Fatalf("reconcilePendingCommand: %v", err)
+	}
+	if waiting {
+		t.Fatal("maintenance still waiting after replacement writer applied command")
+	}
+	head, _, err := firstDB.manifestStore.ReadMaintenanceHead(ctx)
+	if err != nil {
+		t.Fatalf("ReadMaintenanceHead: %v", err)
+	}
+	if head.Pending != nil {
+		t.Fatalf("pending=%+v, want nil", head.Pending)
+	}
+	if err := firstWriter.Put(ctx, []byte("stale"), []byte("writer")); err != nil {
+		t.Fatalf("old writer Put: %v", err)
+	}
+	if err := firstWriter.Flush(ctx); !errors.Is(err, manifest.ErrFenced) {
+		t.Fatalf("old writer Flush error=%v, want %v", err, manifest.ErrFenced)
+	}
+}
+
+func TestNewMaintenanceOwnerClearsReceiptAfterPreviousOwnerStops(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-receipt-recovery")
+	defer store.Close()
+
+	db, err := OpenDB(ctx, store, DBOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	writer, err := db.OpenWriter(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer writer.Close(ctx)
+
+	first, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance(first): %v", err)
+	}
+	if err := first.stageCommand(ctx, manifest.MaintenanceCommand{
+		Kind:            manifest.MaintenanceCommandRetirementFloor,
+		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}); err != nil {
+		t.Fatalf("stageCommand: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("writer Flush: %v", err)
+	}
+	if err := first.Close(ctx); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	secondOpts := DefaultMaintenanceOptions()
+	secondOpts.OwnerID = "maintenance-replacement"
+	second, err := db.OpenMaintenance(ctx, secondOpts)
+	if err != nil {
+		t.Fatalf("OpenMaintenance(second): %v", err)
+	}
+	defer second.Close(ctx)
+	waiting, err := second.reconcilePendingCommand(ctx)
+	if err != nil {
+		t.Fatalf("reconcilePendingCommand: %v", err)
+	}
+	if waiting {
+		t.Fatal("replacement maintenance owner did not observe durable receipt")
+	}
+	head, _, err := db.manifestStore.ReadMaintenanceHead(ctx)
+	if err != nil {
+		t.Fatalf("ReadMaintenanceHead: %v", err)
+	}
+	if head.Pending != nil {
+		t.Fatalf("pending=%+v, want nil", head.Pending)
 	}
 }
 

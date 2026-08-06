@@ -16,6 +16,7 @@ import (
 
 type blockingSnapshotStorage struct {
 	Storage
+	PageStorage
 	block   chan struct{}
 	started chan struct{}
 	once    sync.Once
@@ -1114,9 +1115,10 @@ func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T
 
 	base := NewBlobStoreBackend(store)
 	blocking := &blockingSnapshotStorage{
-		Storage: base,
-		block:   make(chan struct{}),
-		started: make(chan struct{}),
+		Storage:     base,
+		PageStorage: base,
+		block:       make(chan struct{}),
+		started:     make(chan struct{}),
 	}
 	ms := NewStoreWithStorage(blocking)
 

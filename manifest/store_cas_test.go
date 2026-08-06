@@ -108,6 +108,14 @@ func (s *casInjectStorage) ReadCurrent(ctx context.Context) ([]byte, string, err
 	return s.base.ReadCurrent(ctx)
 }
 
+func (s *casInjectStorage) ReadMaintenanceHead(ctx context.Context) ([]byte, string, error) {
+	return s.base.ReadMaintenanceHead(ctx)
+}
+
+func (s *casInjectStorage) WriteMaintenanceHeadCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	return s.base.WriteMaintenanceHeadCAS(ctx, data, expectedETag)
+}
+
 func (s *casInjectStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	s.mu.Lock()
 	fail := s.failNextCAS
@@ -185,6 +193,14 @@ func (s *casInjectStorage) bumpWriterFenceEpoch(ctx context.Context) error {
 
 func (s *cancelCASStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
 	return s.base.ReadCurrent(ctx)
+}
+
+func (s *cancelCASStorage) ReadMaintenanceHead(ctx context.Context) ([]byte, string, error) {
+	return s.base.ReadMaintenanceHead(ctx)
+}
+
+func (s *cancelCASStorage) WriteMaintenanceHeadCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	return s.base.WriteMaintenanceHeadCAS(ctx, data, expectedETag)
 }
 
 func (s *cancelCASStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {

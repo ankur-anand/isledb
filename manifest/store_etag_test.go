@@ -8,12 +8,38 @@ import (
 )
 
 type etagStorage struct {
-	mu          sync.Mutex
-	current     []byte
-	etagCounter int
+	mu                     sync.Mutex
+	current                []byte
+	etagCounter            int
+	maintenance            []byte
+	maintenanceETagCounter int
 
 	casExpected []string
 	readCount   int
+}
+
+func (s *etagStorage) ReadMaintenanceHead(context.Context) ([]byte, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maintenance == nil {
+		return nil, "", ErrNotFound
+	}
+	return append([]byte(nil), s.maintenance...), fmt.Sprintf("m%d", s.maintenanceETagCounter), nil
+}
+
+func (s *etagStorage) WriteMaintenanceHeadCAS(_ context.Context, data []byte, expectedETag string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maintenance == nil {
+		if expectedETag != "" {
+			return "", ErrPreconditionFailed
+		}
+	} else if expectedETag != fmt.Sprintf("m%d", s.maintenanceETagCounter) {
+		return "", ErrPreconditionFailed
+	}
+	s.maintenance = append([]byte(nil), data...)
+	s.maintenanceETagCounter++
+	return fmt.Sprintf("m%d", s.maintenanceETagCounter), nil
 }
 
 func newETagStorage() *etagStorage {

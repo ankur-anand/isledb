@@ -11,6 +11,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/manifest"
+	"github.com/segmentio/ksuid"
 )
 
 var (
@@ -19,6 +20,10 @@ var (
 	ErrMaintenanceRunning        = errors.New("maintenance already running")
 	ErrInvalidMaintenanceOptions = errors.New("invalid maintenance options")
 )
+
+// DefaultCheckpointReplayPages bounds cold state replay to roughly 64
+// immutable page reads between snapshots.
+const DefaultCheckpointReplayPages uint64 = 64
 
 // RetentionMode selects how maintenance groups data for retention.
 type RetentionMode uint8
@@ -40,6 +45,9 @@ type MaintenanceOptions struct {
 
 	GarbageCollection GarbageCollectionPolicy
 
+	// Checkpoint bounds manifest state replay between snapshots.
+	Checkpoint CheckpointPolicy
+
 	// Retention is nil by default because enabling it removes historical data.
 	Retention *RetentionPolicy
 
@@ -48,6 +56,12 @@ type MaintenanceOptions struct {
 
 	OnCycle func(MaintenanceStats)
 	OnError func(error)
+}
+
+// CheckpointPolicy bounds the immutable manifest pages needed to rebuild the
+// current KV state. MaxReplayPages defaults to DefaultCheckpointReplayPages.
+type CheckpointPolicy struct {
+	MaxReplayPages uint64
 }
 
 // CompactionPolicy controls L0 and leveled compaction.
@@ -108,7 +122,8 @@ type ChangeFeedRetentionPolicy struct {
 	OnCleanup         func(ChangeFeedCleanupStats)
 }
 
-// MaintenanceStats describes work committed by one RunOnce cycle.
+// MaintenanceStats describes work performed by one bounded RunOnce cycle.
+// Command-producing work is not visible until the writer applies it.
 type MaintenanceStats struct {
 	CompactionJobs        int
 	CompactionInputSSTs   int
@@ -116,11 +131,18 @@ type MaintenanceStats struct {
 	CompactionOutputBytes int64
 	Retention             CleanupStats
 	ChangeFeed            ChangeFeedCleanupStats
+	CheckpointStaged      bool
+	CheckpointReplayPages uint64
+	CheckpointReplayBytes uint64
+	CommandPending        bool
+	WaitingForWriter      bool
+	CommandApplied        bool
+	CommandRejected       bool
 	Duration              time.Duration
 }
 
-// DefaultMaintenanceOptions returns safe defaults. Compaction and SST sweeping
-// are enabled; data and change-feed retention remain disabled.
+// DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
+// and SST sweeping are enabled; data and change-feed retention remain disabled.
 func DefaultMaintenanceOptions() MaintenanceOptions {
 	compaction := defaultCompactorOptions()
 	return MaintenanceOptions{
@@ -141,6 +163,7 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 			DeleteBatchSize: compaction.GCDeleteBatchSize,
 			GracePeriod:     compaction.GCGracePeriod,
 		},
+		Checkpoint: CheckpointPolicy{MaxReplayPages: DefaultCheckpointReplayPages},
 	}
 }
 
@@ -165,7 +188,8 @@ func DefaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
 	}
 }
 
-// Maintenance owns compaction, retention, and garbage collection for one DB.
+// Maintenance owns compaction, checkpoints, retention, and garbage collection
+// for one DB.
 // It is safe to call Close concurrently with Run or RunOnce.
 type Maintenance struct {
 	manifestLog *manifest.Store
@@ -183,8 +207,10 @@ type Maintenance struct {
 	runGate       chan struct{}
 	enginesClosed bool
 
-	statsMu      sync.Mutex
-	currentStats *MaintenanceStats
+	statsMu       sync.Mutex
+	currentStats  *MaintenanceStats
+	commandStaged bool
+	writerWake    chan<- struct{}
 
 	running atomic.Bool
 	closed  atomic.Bool
@@ -211,7 +237,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 	if ownerID == "" {
 		ownerID = fmt.Sprintf("maintenance-%d-%d", time.Now().UnixNano(), state.NextEpoch)
 	}
-	token, err := manifestLog.ClaimCompactor(ctx, ownerID)
+	token, err := manifestLog.ClaimMaintenance(ctx, ownerID)
 	if err != nil {
 		return nil, fmt.Errorf("claim maintenance fence: %w", err)
 	}
@@ -228,6 +254,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 	if err != nil {
 		return nil, fmt.Errorf("open compaction stage: %w", err)
 	}
+	m.compactor.stageCommand = m.stageCommand
 
 	if opts.Retention != nil {
 		retentionOpts := m.retentionOptions(gcCursor)
@@ -236,6 +263,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 			_ = m.compactor.Close(ctx)
 			return nil, fmt.Errorf("open retention stage: %w", err)
 		}
+		m.retention.stageCommand = m.stageCommand
 	}
 
 	if opts.ChangeFeedRetention != nil {
@@ -248,6 +276,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 			_ = m.compactor.Close(ctx)
 			return nil, fmt.Errorf("open change-feed retention stage: %w", err)
 		}
+		m.changeFeed.stageCommand = m.stageCommand
 	}
 
 	return m, nil
@@ -269,6 +298,9 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	}
 	if opts.GarbageCollection.GracePeriod == 0 {
 		opts.GarbageCollection.GracePeriod = defaults.GarbageCollection.GracePeriod
+	}
+	if opts.Checkpoint.MaxReplayPages == 0 {
+		opts.Checkpoint.MaxReplayPages = defaults.Checkpoint.MaxReplayPages
 	}
 	return opts, nil
 }
@@ -415,6 +447,7 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 	start := time.Now()
 	m.statsMu.Lock()
 	m.currentStats = &stats
+	m.commandStaged = false
 	m.statsMu.Unlock()
 	defer func() {
 		m.statsMu.Lock()
@@ -423,21 +456,155 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 		m.finishCycle()
 	}()
 
+	waiting, err := m.reconcilePendingCommand(ctx)
+	if err != nil {
+		return m.completeCycleStats(start), fmt.Errorf("reconcile maintenance command: %w", err)
+	}
+	if waiting {
+		return m.completeCycleStats(start), nil
+	}
+
 	if err := m.compactor.RunOnce(ctx); err != nil {
 		return m.completeCycleStats(start), fmt.Errorf("compaction: %w", err)
+	}
+	if m.hasStagedCommand() {
+		return m.completeCycleStats(start), nil
 	}
 	if m.retention != nil {
 		if err := m.retention.RunOnce(ctx); err != nil {
 			return m.completeCycleStats(start), fmt.Errorf("retention: %w", err)
+		}
+		if m.hasStagedCommand() {
+			return m.completeCycleStats(start), nil
 		}
 	}
 	if m.changeFeed != nil {
 		if err := m.changeFeed.RunOnce(ctx); err != nil {
 			return m.completeCycleStats(start), fmt.Errorf("change-feed retention: %w", err)
 		}
+		if m.hasStagedCommand() {
+			return m.completeCycleStats(start), nil
+		}
+	}
+	if err := m.checkpointIfNeeded(ctx); err != nil {
+		return m.completeCycleStats(start), fmt.Errorf("checkpoint: %w", err)
 	}
 
 	return m.completeCycleStats(start), nil
+}
+
+func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
+	current, err := m.manifestLog.ReadCurrentData(ctx)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.StateReplayPages < m.opts.Checkpoint.MaxReplayPages {
+		return nil
+	}
+
+	checkpoint, err := m.manifestLog.PrepareCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
+	if err := m.stageCommand(ctx, manifest.MaintenanceCommand{
+		Kind:       manifest.MaintenanceCommandCheckpoint,
+		Checkpoint: &checkpoint,
+	}); err != nil {
+		return err
+	}
+
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.CheckpointStaged = true
+		m.currentStats.CheckpointReplayPages = checkpoint.FoldedReplayPages
+		m.currentStats.CheckpointReplayBytes = checkpoint.FoldedReplayBytes
+	}
+	m.statsMu.Unlock()
+	return nil
+}
+
+func (m *Maintenance) stageCommand(ctx context.Context, command manifest.MaintenanceCommand) error {
+	m.statsMu.Lock()
+	if m.commandStaged {
+		m.statsMu.Unlock()
+		return manifest.ErrMaintenanceCommandPending
+	}
+	m.statsMu.Unlock()
+
+	if command.ID == "" {
+		command.ID = ksuid.New().String()
+	}
+	if _, err := m.manifestLog.StageMaintenance(ctx, command, m.fenceToken); err != nil {
+		return err
+	}
+	m.notifyWriter()
+	m.statsMu.Lock()
+	m.commandStaged = true
+	if m.currentStats != nil {
+		m.currentStats.CommandPending = true
+	}
+	m.statsMu.Unlock()
+	return nil
+}
+
+func (m *Maintenance) notifyWriter() {
+	select {
+	case m.writerWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Maintenance) hasStagedCommand() bool {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	return m.commandStaged
+}
+
+func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error) {
+	head, _, err := m.manifestLog.ReadMaintenanceHead(ctx)
+	if err != nil {
+		return false, err
+	}
+	if head == nil || m.fenceToken == nil ||
+		head.Epoch != m.fenceToken.Epoch ||
+		head.OwnerID != m.fenceToken.Owner ||
+		!head.ClaimedAt.Equal(m.fenceToken.ClaimedAt) {
+		return false, manifest.ErrFenced
+	}
+	if head.Pending == nil {
+		return false, nil
+	}
+
+	current, err := m.manifestLog.ReadCurrentData(ctx)
+	if err != nil {
+		return false, err
+	}
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.CommandPending = true
+	}
+	m.statsMu.Unlock()
+	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
+		m.statsMu.Lock()
+		if m.currentStats != nil {
+			m.currentStats.WaitingForWriter = true
+		}
+		m.statsMu.Unlock()
+		return true, nil
+	}
+
+	receipt := current.MaintenanceReceipt
+	if _, err := m.manifestLog.ClearMaintenance(ctx, head.Pending.ID, head.Pending.Epoch, head.Pending.Generation, m.fenceToken); err != nil {
+		return false, err
+	}
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.CommandPending = false
+		m.currentStats.CommandApplied = receipt.Status == manifest.MaintenanceStatusApplied
+		m.currentStats.CommandRejected = receipt.Status == manifest.MaintenanceStatusRejected
+	}
+	m.statsMu.Unlock()
+	return false, nil
 }
 
 func (m *Maintenance) completeCycleStats(start time.Time) MaintenanceStats {

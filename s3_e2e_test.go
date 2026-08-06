@@ -126,15 +126,9 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	if err := writer.Close(ctx); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
-
 	// Make the compaction boundary deterministic. Background maintenance is
-	// already running while writes happen; RunOnce drains any remaining L0 work.
-	if _, err := maintenance.RunOnce(ctx); err != nil {
-		t.Fatalf("maintenance run once: %v", err)
-	}
+	// already running while writes happen; drain any remaining staged work.
+	driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
 	}
@@ -164,8 +158,8 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	if currentBeforeRetention.WriterFence == nil {
 		t.Fatalf("current missing writer fence")
 	}
-	if currentBeforeRetention.CompactorFence == nil {
-		t.Fatalf("current missing compactor fence")
+	if currentBeforeRetention.CompactorFence != nil {
+		t.Fatalf("current contains obsolete compactor fence: %+v", currentBeforeRetention.CompactorFence)
 	}
 	if len(currentBeforeRetention.ActiveEntries) == 0 && len(currentBeforeRetention.IndexFrontier) == 0 {
 		t.Fatalf("current has neither active entries nor index frontier")
@@ -207,14 +201,15 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open retention maintenance: %v", err)
 	}
-	if _, err := retentionMaintenance.RunOnce(ctx); err != nil {
-		t.Fatalf("retention maintenance run once: %v", err)
-	}
+	driveMaintenanceToIdle(t, ctx, retentionMaintenance, writer)
 	if err := retentionMaintenance.Close(ctx); err != nil {
 		t.Fatalf("close retention maintenance: %v", err)
 	}
 	if cleanup.SSTsDeleted == 0 {
 		t.Fatalf("retention deleted no SSTs; live before=%d", len(liveSSTsBeforeRetention))
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
 	}
 
 	afterRetention := replayManifestForTest(t, ctx, store)
@@ -355,10 +350,6 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	if err := writer.Flush(ctx); err != nil {
 		t.Fatalf("flush updated state: %v", err)
 	}
-	if err := writer.Close(ctx); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
-
 	// Reader views are explicit snapshots of manifest state until Refresh.
 	assertReaderValue(t, ctx, reader, "updated", "version-1", true)
 	assertReaderValue(t, ctx, reader, "deleted", "delete-me", true)
@@ -395,15 +386,15 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	stats, err := maintenance.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("maintenance run once: %v", err)
-	}
+	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if stats.CompactionJobs == 0 {
 		t.Fatalf("compaction did not run: %+v", stats)
 	}
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
 	}
 
 	if err := reader.Refresh(ctx); err != nil {
@@ -500,10 +491,6 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	if err := writer.Flush(ctx); err != nil {
 		t.Fatalf("flush key:2: %v", err)
 	}
-	if err := writer.Close(ctx); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
-
 	before, err := store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
 	if err != nil {
 		t.Fatalf("list change batches before cleanup: %v", err)
@@ -515,9 +502,8 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	time.Sleep(2 * time.Millisecond)
 	changeFeed := DefaultChangeFeedRetentionPolicy()
 	changeFeed.KeepFor = time.Millisecond
-	// The newest retained entries are the maintenance fence claim and the
-	// newest add-SST entry, so the newest change batch remains available.
-	changeFeed.KeepAtLeastManifestEntries = 2
+	// Retain the newest writer commit and its change batch.
+	changeFeed.KeepAtLeastManifestEntries = 1
 	changeFeed.DeleteGracePeriod = -1
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "change-feed-e2e-maintenance"
@@ -527,12 +513,12 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	stats, err := maintenance.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("maintenance run once: %v", err)
-	}
+	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
 	}
 	if stats.ChangeFeed.EntriesRetired == 0 || stats.ChangeFeed.BatchesMarked != 1 || stats.ChangeFeed.BatchesDeleted != 1 {
 		t.Fatalf("unexpected change-feed cleanup stats: %+v", stats.ChangeFeed)
@@ -626,11 +612,9 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 			}
 		}
 	}
+	driveMaintenanceToIdle(b, ctx, maintenance, writer)
 	if err := writer.Close(ctx); err != nil {
 		b.Fatalf("close writer: %v", err)
-	}
-	if _, err := maintenance.RunOnce(ctx); err != nil {
-		b.Fatalf("maintenance run once: %v", err)
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "records/s")
@@ -645,6 +629,45 @@ func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.S
 		t.Fatalf("replay manifest: %v", err)
 	}
 	return m
+}
+
+func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Maintenance, writer *Writer) MaintenanceStats {
+	t.Helper()
+	var total MaintenanceStats
+	for attempt := 0; attempt < CompactionMaxIterations*4; attempt++ {
+		stats, err := maintenance.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("maintenance RunOnce(%d): %v", attempt, err)
+		}
+		total.CompactionJobs += stats.CompactionJobs
+		total.CompactionInputSSTs += stats.CompactionInputSSTs
+		total.CompactionOutputSSTs += stats.CompactionOutputSSTs
+		total.CompactionOutputBytes += stats.CompactionOutputBytes
+		total.Retention.SSTsDeleted += stats.Retention.SSTsDeleted
+		total.Retention.BytesReclaimed += stats.Retention.BytesReclaimed
+		total.ChangeFeed.EntriesRetired += stats.ChangeFeed.EntriesRetired
+		total.ChangeFeed.BatchesMarked += stats.ChangeFeed.BatchesMarked
+		total.ChangeFeed.BatchesDeleted += stats.ChangeFeed.BatchesDeleted
+		total.ChangeFeed.BlockedRetained += stats.ChangeFeed.BlockedRetained
+		total.ChangeFeed.FailedDeletes += stats.ChangeFeed.FailedDeletes
+		total.CheckpointStaged = total.CheckpointStaged || stats.CheckpointStaged
+
+		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)
+		if err != nil {
+			t.Fatalf("read maintenance HEAD(%d): %v", attempt, err)
+		}
+		if head != nil && head.Pending != nil {
+			if err := writer.Flush(ctx); err != nil {
+				t.Fatalf("writer apply maintenance(%d): %v", attempt, err)
+			}
+			continue
+		}
+		if !stats.CommandApplied && !stats.CommandRejected && !stats.CommandPending {
+			return total
+		}
+	}
+	t.Fatalf("maintenance did not become idle after %d cycles", CompactionMaxIterations*4)
+	return MaintenanceStats{}
 }
 
 func readCurrentForTest(t testing.TB, ctx context.Context, store *blobstore.Store) *manifest.Current {

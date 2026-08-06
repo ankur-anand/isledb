@@ -112,23 +112,27 @@ type Current struct {
 
 	ChangeFeedLogStart uint64 `json:"change_feed_log_start,omitempty"`
 	RetirementLogStart uint64 `json:"retirement_log_start"`
+	StateReplayPages   uint64 `json:"state_replay_pages,omitempty"`
+	StateReplayBytes   uint64 `json:"state_replay_bytes,omitempty"`
 
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
 
-	WriterFence      *FenceToken         `json:"writer_fence,omitempty"`
-	CompactorFence   *FenceToken         `json:"compactor_fence,omitempty"`
-	LastWriterCommit *WriterCommitMarker `json:"last_writer_commit,omitempty"`
+	WriterFence        *FenceToken         `json:"writer_fence,omitempty"`
+	CompactorFence     *FenceToken         `json:"compactor_fence,omitempty"`
+	LastWriterCommit   *WriterCommitMarker `json:"last_writer_commit,omitempty"`
+	MaintenanceReceipt *MaintenanceReceipt `json:"maintenance_receipt,omitempty"`
 }
 
 type PageRef struct {
-	Level     uint8     `json:"level"`
-	SeqLo     uint64    `json:"seq_lo"`
-	SeqHi     uint64    `json:"seq_hi"`
-	Path      string    `json:"path"`
-	Count     uint32    `json:"count"`
-	Checksum  string    `json:"checksum"`
-	CreatedAt time.Time `json:"created_at"`
+	Level        uint8     `json:"level"`
+	SeqLo        uint64    `json:"seq_lo"`
+	SeqHi        uint64    `json:"seq_hi"`
+	Path         string    `json:"path"`
+	Count        uint32    `json:"count"`
+	EncodedBytes uint64    `json:"encoded_bytes"`
+	Checksum     string    `json:"checksum"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type CommitPage struct {

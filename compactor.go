@@ -48,6 +48,7 @@ type compactor struct {
 	manifestLog   *manifest.Store
 	gcCursorStore manifest.GCCursorStorage
 	opts          compactorOptions
+	stageCommand  maintenanceCommandStager
 
 	mu       sync.Mutex
 	manifest *Manifest
@@ -303,6 +304,9 @@ func (c *compactor) RunOnce(ctx context.Context) error {
 			} else {
 				c.consecutiveL0Compactions = 0
 			}
+			if c.stageCommand != nil {
+				return nil
+			}
 			continue
 		}
 
@@ -357,10 +361,12 @@ func (c *compactor) releaseRun() {
 }
 
 func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
-	if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
-		return
+	if c.stageCommand == nil {
+		if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
+			return
+		}
 	}
-	if _, err := runRetirementSweeper(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize); err != nil {
+	if _, err := runRetirementSweeperWithStager(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize, c.stageCommand); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -550,6 +556,15 @@ func (c *compactor) appendCompaction(ctx context.Context, m *Manifest, payload m
 	retired, err := retiredSSTObjects(c.store, m, retiredIDs, c.opts.GCGracePeriod)
 	if err != nil {
 		return err
+	}
+	if c.stageCommand != nil {
+		return c.stageCommand(ctx, manifest.MaintenanceCommand{
+			Kind: manifest.MaintenanceCommandCompaction,
+			Compaction: &manifest.CompactionCommand{
+				Payload:        payload,
+				RetiredObjects: retired,
+			},
+		})
 	}
 	_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload, retired)
 	if err != nil && isFenceError(err) {

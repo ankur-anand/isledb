@@ -290,10 +290,6 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 		}
 		expected[key] = value
 	}
-	if err := writer.Close(ctx); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
-
 	maintenanceOpts := DefaultMaintenanceOptions()
 	maintenanceOpts.OwnerID = "operational-contention-maintenance"
 	maintenanceOpts.Compaction.L0SSTCount = 4
@@ -306,15 +302,15 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	stats, err := maintenance.RunOnce(ctx)
-	if err != nil {
-		t.Fatalf("run maintenance: %v", err)
-	}
+	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if stats.CompactionJobs == 0 {
 		t.Fatalf("maintenance performed no compaction: %+v", stats)
 	}
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
 	}
 	if got := faults.conflictCount(); got < 2*64 {
 		t.Fatalf("injected CAS conflicts=%d, want at least %d", got, 2*64)
@@ -489,10 +485,6 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 			}
 			expected[key] = value
 		}
-		if err := writer.Close(ctx); err != nil {
-			t.Fatalf("cycle %d close writer: %v", cycles, err)
-		}
-
 		maintenanceOpts := DefaultMaintenanceOptions()
 		maintenanceOpts.OwnerID = fmt.Sprintf("soak-maintenance-%06d", cycles)
 		maintenanceOpts.Compaction.L0SSTCount = 8
@@ -505,11 +497,12 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cycle %d open maintenance: %v", cycles, err)
 		}
-		if _, err := maintenance.RunOnce(ctx); err != nil {
-			t.Fatalf("cycle %d maintenance: %v", cycles, err)
-		}
+		driveMaintenanceToIdle(t, ctx, maintenance, writer)
 		if err := maintenance.Close(ctx); err != nil {
 			t.Fatalf("cycle %d close maintenance: %v", cycles, err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("cycle %d close writer: %v", cycles, err)
 		}
 
 		reader, err := OpenReader(ctx, store, DefaultReaderOpenOptions(cacheDir))
