@@ -1,6 +1,7 @@
 package diskcache
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -56,4 +57,22 @@ func TestBlobCache_ReturnsCopy(t *testing.T) {
 	got2, ok := cache.Get("key")
 	require.True(t, ok)
 	require.Equal(t, original, got2, "BlobCache should return copies, not shared data")
+}
+
+func TestBlobCache_RejectsTruncatedFile(t *testing.T) {
+	cacheValue, err := NewBlobCache(BlobCacheOptions{Dir: t.TempDir()})
+	require.NoError(t, err)
+	defer cacheValue.Close()
+
+	cache := cacheValue.(*blobCache)
+	require.NoError(t, cache.Set("key", []byte("complete value")))
+
+	cache.mu.RLock()
+	path := cache.index["key"].path
+	cache.mu.RUnlock()
+	require.NoError(t, os.WriteFile(path, []byte("short"), 0644))
+
+	_, ok := cache.Get("key")
+	require.False(t, ok)
+	require.Equal(t, 0, cache.Stats().EntryCount)
 }

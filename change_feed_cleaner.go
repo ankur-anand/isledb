@@ -183,6 +183,14 @@ func (c *changeFeedCleaner) cleanupLoop(ctx context.Context, ticker *time.Ticker
 				if errors.Is(err, context.Canceled) {
 					return
 				}
+				if isFenceError(err) {
+					if c.opts.OnCleanupError != nil {
+						c.opts.OnCleanupError(err)
+					} else {
+						slog.Error("isledb: change-feed cleaner fenced, stopping background cleanup", "error", err)
+					}
+					return
+				}
 				if errors.Is(err, manifest.ErrFenceConflict) {
 					slog.Debug("isledb: change-feed cleanup skipped after concurrent manifest update")
 					continue

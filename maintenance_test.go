@@ -227,6 +227,49 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	}
 }
 
+func TestDBOpenMaintenanceRejectsNegativeRetentionMinimums(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*RetentionPolicy)
+	}{
+		{
+			name: "ssts",
+			mutate: func(policy *RetentionPolicy) {
+				policy.KeepAtLeastSSTs = -1
+			},
+		},
+		{
+			name: "windows",
+			mutate: func(policy *RetentionPolicy) {
+				policy.KeepAtLeastWindows = -1
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := blobstore.NewMemory("maintenance-negative-retention-" + tt.name)
+			defer store.Close()
+
+			db, err := openDB(ctx, store, dbOpenOptions{})
+			if err != nil {
+				t.Fatalf("OpenDB: %v", err)
+			}
+			defer db.Close()
+
+			retention := DefaultRetentionPolicy()
+			tt.mutate(&retention)
+			opts := DefaultMaintenanceOptions()
+			opts.Retention = &retention
+
+			if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrInvalidMaintenanceOptions) {
+				t.Fatalf("OpenMaintenance error=%v, want %v", err, ErrInvalidMaintenanceOptions)
+			}
+		})
+	}
+}
+
 func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("maintenance-shared-fence")

@@ -508,6 +508,22 @@ func TestDefaultRetentionCompactorOptions(t *testing.T) {
 	}
 }
 
+func TestNewRetentionCompactorRejectsNegativeMinimums(t *testing.T) {
+	tests := []retentionCompactorOptions{
+		{KeepAtLeastSSTs: -1},
+		{KeepAtLeastWindows: -1},
+	}
+
+	for _, opts := range tests {
+		store := blobstore.NewMemory("negative-retention")
+		_, err := newRetentionCompactor(context.Background(), store, nil, opts)
+		_ = store.Close()
+		if !errors.Is(err, ErrInvalidMaintenanceOptions) {
+			t.Fatalf("newRetentionCompactor(%+v) error=%v, want %v", opts, err, ErrInvalidMaintenanceOptions)
+		}
+	}
+}
+
 func TestRetentionCompactor_BackgroundLoopStopsWhenFenced(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")

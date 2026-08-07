@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,6 +136,57 @@ func TestPendingChangeBatchSweeperDoesNotDeleteRetainedBatch(t *testing.T) {
 	}
 	if _, _, err := store.Read(ctx, meta.Path); !errors.Is(err, blobstore.ErrNotFound) {
 		t.Fatalf("change batch read error=%v, want ErrNotFound", err)
+	}
+}
+
+func TestChangeFeedCleanerBackgroundLoopStopsWhenFenced(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-feed-cleaner-fenced")
+	defer store.Close()
+
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+
+	var cleanupErrCount atomic.Int32
+	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, changeFeedCleanerOptions{
+		CheckInterval: 20 * time.Millisecond,
+		OnCleanupError: func(error) {
+			cleanupErrCount.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("new change feed cleaner: %v", err)
+	}
+	defer cleaner.Close(ctx)
+
+	competingStore := manifest.NewStore(store)
+	if _, err := competingStore.Replay(ctx); err != nil {
+		t.Fatalf("competing replay: %v", err)
+	}
+	if _, err := competingStore.ClaimCompactor(ctx, "change-feed-cleaner-other"); err != nil {
+		t.Fatalf("competing compactor claim: %v", err)
+	}
+
+	if err := cleaner.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for cleanupErrCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cleanupErrCount.Load() == 0 {
+		t.Fatal("expected the cleanup loop to report a fence error")
+	}
+
+	first := cleanupErrCount.Load()
+	time.Sleep(100 * time.Millisecond)
+	if after := cleanupErrCount.Load(); after != first {
+		t.Fatalf("cleanup loop continued after fence loss: before=%d after=%d", first, after)
+	}
+	if cleaner.running.Load() {
+		t.Fatal("cleanup loop still running after fence loss")
 	}
 }
 

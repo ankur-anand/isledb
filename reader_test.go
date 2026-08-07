@@ -3,11 +3,13 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -700,6 +702,67 @@ func TestReader_MetricsBlobFetch(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.BlobBytesTotal); got != float64(len(blobValue)*2) {
 		t.Fatalf("blob_bytes_total mismatch: got=%v want=%d", got, len(blobValue)*2)
+	}
+}
+
+func TestReader_VerifiesAndRepairsCorruptCachedBlob(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-verify-cached-blob")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	wOpts := DefaultWriterOptions()
+	wOpts.Flush.Interval = 0
+	wOpts.Values.InlineValueBytes = 1
+
+	w, err := newWriter(ctx, store, manifestStore, wOpts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	value := []byte("blob-value")
+	if err := w.put(ctx, []byte("blob-key"), value); err != nil {
+		t.Fatalf("put blob: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	valueConfig := config.DefaultValueStorageConfig()
+	valueConfig.VerifyBlobsOnRead = true
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:           t.TempDir(),
+		ValueStorageConfig: valueConfig,
+	})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	got, found, err := reader.Get(ctx, []byte("blob-key"))
+	if err != nil || !found || !bytes.Equal(got, value) {
+		t.Fatalf("initial Get: value=%q found=%v err=%v", got, found, err)
+	}
+
+	blobID := sha256.Sum256(value)
+	blobIDHex := internal.BlobIDToHex(blobID)
+	corrupt := bytes.Repeat([]byte("x"), len(value))
+	if err := reader.blobCache.Set(blobIDHex, corrupt); err != nil {
+		t.Fatalf("corrupt cache entry: %v", err)
+	}
+
+	got, found, err = reader.Get(ctx, []byte("blob-key"))
+	if err != nil || !found || !bytes.Equal(got, value) {
+		t.Fatalf("Get after cache corruption: value=%q found=%v err=%v", got, found, err)
+	}
+
+	cached, ok := reader.blobCache.Get(blobIDHex)
+	if !ok {
+		t.Fatal("repaired blob was not cached")
+	}
+	if err := internal.VerifyBlob(blobID, cached); err != nil {
+		t.Fatalf("repaired cache entry: %v", err)
 	}
 }
 
