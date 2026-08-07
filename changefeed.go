@@ -2,18 +2,13 @@ package isledb
 
 import (
 	"bytes"
-	"context"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 const (
@@ -53,103 +48,8 @@ type changeBatch struct {
 	Changes []changeRecord
 }
 
-type changeBatchBuildResult struct {
-	Meta manifest.ChangeBatchMeta
-	Data []byte
-}
-
 func buildChangeBatchIDWithTimestamp(epoch, seqLo, seqHi uint64, ts time.Time) string {
 	return fmt.Sprintf("%d-%d-%d-%d.chg", epoch, seqLo, seqHi, ts.UnixNano())
-}
-
-func buildChangeBatch(ctx context.Context, it sstIterator, epoch, seqLo, seqHi uint64, createdAt time.Time) (changeBatchBuildResult, error) {
-	defer it.Close()
-
-	changes := make([]changeRecord, 0)
-	for it.Next() {
-		if err := ctx.Err(); err != nil {
-			return changeBatchBuildResult{}, err
-		}
-		change, err := changeFromMemEntry(it.Entry())
-		if err != nil {
-			return changeBatchBuildResult{}, err
-		}
-		changes = append(changes, change)
-	}
-	if err := it.Err(); err != nil {
-		return changeBatchBuildResult{}, err
-	}
-	if len(changes) == 0 {
-		return changeBatchBuildResult{}, errEmptyIterator
-	}
-	if len(changes) > math.MaxUint32 {
-		return changeBatchBuildResult{}, fmt.Errorf("change batch too large: count=%d", len(changes))
-	}
-
-	sort.Slice(changes, func(i, j int) bool {
-		return changes[i].Seq < changes[j].Seq
-	})
-
-	if changes[0].Seq != seqLo || changes[len(changes)-1].Seq != seqHi {
-		return changeBatchBuildResult{}, fmt.Errorf("change batch seq range mismatch: got=%d-%d want=%d-%d",
-			changes[0].Seq, changes[len(changes)-1].Seq, seqLo, seqHi)
-	}
-
-	batch := &changeBatch{
-		Version: changeBatchVersion,
-		Epoch:   epoch,
-		SeqLo:   seqLo,
-		SeqHi:   seqHi,
-		Changes: changes,
-	}
-	data, err := encodeChangeBatch(batch)
-	if err != nil {
-		return changeBatchBuildResult{}, err
-	}
-
-	sum := sha256.Sum256(data)
-	id := buildChangeBatchIDWithTimestamp(epoch, seqLo, seqHi, createdAt)
-	return changeBatchBuildResult{
-		Meta: manifest.ChangeBatchMeta{
-			ID:        id,
-			Epoch:     epoch,
-			SeqLo:     seqLo,
-			SeqHi:     seqHi,
-			Count:     uint32(len(changes)),
-			Size:      int64(len(data)),
-			Checksum:  "sha256:" + hex.EncodeToString(sum[:]),
-			CreatedAt: createdAt,
-			Version:   changeBatchVersion,
-		},
-		Data: data,
-	}, nil
-}
-
-func changeFromMemEntry(e internal.MemEntry) (changeRecord, error) {
-	change := changeRecord{
-		Seq:      e.Seq,
-		Kind:     changeKind(e.Kind),
-		Key:      append([]byte(nil), e.Key...),
-		ExpireAt: e.ExpireAt,
-	}
-	switch e.Kind {
-	case internal.OpDelete:
-		return change, nil
-	case internal.OpPut:
-		if e.Inline {
-			change.Inline = true
-			change.Value = append([]byte(nil), e.Value...)
-			return change, nil
-		}
-		var zero [32]byte
-		if e.BlobID != zero {
-			change.BlobID = e.BlobID
-			return change, nil
-		}
-		return changeRecord{}, fmt.Errorf("corrupt change: non-inline, non-blob for key %q", e.Key)
-	default:
-		return changeRecord{}, fmt.Errorf("unsupported change kind %d", e.Kind)
-	}
 }
 
 func encodeChangeBatch(batch *changeBatch) ([]byte, error) {
@@ -199,6 +99,18 @@ func encodeChangeBatch(batch *changeBatch) ([]byte, error) {
 }
 
 func decodeChangeBatch(data []byte) (*changeBatch, error) {
+	return decodeChangeBatchWithRawSize(data, 0)
+}
+
+func decodeChangeBatchWithRawSize(data []byte, rawSize int64) (*changeBatch, error) {
+	decoded, err := decompressChangeBatchSized(data, rawSize)
+	if err != nil {
+		return nil, fmt.Errorf("decompress change batch: %w", err)
+	}
+	if rawSize > 0 && int64(len(decoded)) != rawSize {
+		return nil, fmt.Errorf("change batch raw size=%d want=%d", len(decoded), rawSize)
+	}
+	data = decoded
 	if len(data) < changeBatchHeaderSize {
 		return nil, errors.New("change batch too small")
 	}
@@ -303,7 +215,7 @@ func decodeChange(data []byte, off int) (changeRecord, int, error) {
 	if need > uint64(len(data)-off) {
 		return changeRecord{}, 0, errors.New("truncated change record body")
 	}
-	change.Key = append([]byte(nil), data[off:off+int(keyLen)]...)
+	change.Key = data[off : off+int(keyLen)]
 	off += int(keyLen)
 
 	switch kind {
@@ -315,7 +227,7 @@ func decodeChange(data []byte, off int) (changeRecord, int, error) {
 		switch flags {
 		case changeFlagInline:
 			change.Inline = true
-			change.Value = append([]byte(nil), data[off:off+int(valueLen)]...)
+			change.Value = data[off : off+int(valueLen)]
 			off += int(valueLen)
 		case changeFlagBlob:
 			if valueLen != 32 {

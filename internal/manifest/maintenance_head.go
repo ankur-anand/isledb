@@ -398,7 +398,7 @@ func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, c
 			return ErrMaintenanceCommandRejected
 		}
 		oldLogSeqStart := current.LogSeqStart
-		if current.ChangeFeedLogStart == oldLogSeqStart {
+		if !current.ChangeFeedEnabled && current.ChangeFeedLogStart == oldLogSeqStart {
 			current.ChangeFeedLogStart = checkpoint.SnapshotNextSeq
 		}
 		current.Snapshot = checkpoint.Snapshot

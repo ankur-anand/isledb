@@ -130,6 +130,47 @@ func TestAppendEntry_UsesCachedETagAndSingleRead(t *testing.T) {
 	}
 }
 
+func TestReadChangeEntriesFromViewDoesNotReadCurrent(t *testing.T) {
+	ctx := context.Background()
+	storage := newETagStorage()
+	current := &Current{
+		NextEpoch:          1,
+		NextSeq:            2,
+		LogSeqStart:        1,
+		ChangeFeedEnabled:  true,
+		ChangeFeedLogStart: 1,
+		ActiveEntries: []ManifestLogEntry{
+			{Seq: 1, Op: LogOpFenceClaim},
+		},
+	}
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode CURRENT: %v", err)
+	}
+	if _, err := storage.WriteCurrentCAS(ctx, data, ""); err != nil {
+		t.Fatalf("write CURRENT: %v", err)
+	}
+
+	ms := NewStoreWithStorage(storage)
+	view, err := ms.LoadChangeFeedView(ctx)
+	if err != nil {
+		t.Fatalf("load change-feed view: %v", err)
+	}
+	storage.resetCounts()
+
+	entries, err := ms.ReadChangeEntriesFromView(ctx, view, 1, false, 1)
+	if err != nil {
+		t.Fatalf("read entries from view: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Seq != 1 {
+		t.Fatalf("entries=%+v want seq 1", entries)
+	}
+	readCount, _ := storage.snapshotCounts()
+	if readCount != 0 {
+		t.Fatalf("ReadCurrent calls=%d want 0", readCount)
+	}
+}
+
 func TestAppendEntry_UsesUpdatedETagAcrossAppends(t *testing.T) {
 	ctx := context.Background()
 	storage := newETagStorage()

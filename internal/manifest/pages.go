@@ -37,7 +37,7 @@ func normalizeCurrent(c *Current) {
 	if c.NextEpoch == 0 {
 		c.NextEpoch = 1
 	}
-	if c.ChangeFeedLogStart == 0 {
+	if !c.ChangeFeedEnabled && c.ChangeFeedLogStart == 0 {
 		c.ChangeFeedLogStart = c.LogSeqStart
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/segmentio/ksuid"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -44,6 +45,7 @@ type writer struct {
 
 	mu                      sync.Mutex
 	memtable                *internal.Memtable
+	changeBuffer            *changeBatchBuffer
 	immQueue                []*pendingFlush
 	pendingMemtables        int
 	memtableInlineThreshold int
@@ -79,6 +81,7 @@ type pendingFlush struct {
 	memtable    *internal.Memtable
 	sstable     *manifest.SSTMeta
 	changeBatch *manifest.ChangeBatchMeta
+	changes     *changeBatchBuffer
 }
 
 func (p *pendingFlush) SeqLo() uint64 {
@@ -283,7 +286,9 @@ func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlus
 		commitID: ksuid.New().String(),
 		epoch:    w.epoch,
 		memtable: memtable,
+		changes:  w.changeBuffer,
 	}
+	w.changeBuffer = nil
 	w.epoch++
 	return pending
 }
@@ -344,8 +349,17 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 		w.mu.Unlock()
 		return err
 	}
-	w.seq++
-	seq := w.seq
+	seq := w.seq + 1
+	if w.changeFeedEnabled {
+		if w.changeBuffer == nil {
+			w.changeBuffer = &changeBatchBuffer{}
+		}
+		if err := w.changeBuffer.appendPut(seq, key, value, expireAt); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	w.seq = seq
 	w.memtable.PutWithTTL(key, value, seq, expireAt)
 	w.mu.Unlock()
 	return nil
@@ -374,8 +388,17 @@ func (w *writer) putBlob(ctx context.Context, key, value []byte, expireAt int64)
 		w.mu.Unlock()
 		return err
 	}
-	w.seq++
-	seq := w.seq
+	seq := w.seq + 1
+	if w.changeFeedEnabled {
+		if w.changeBuffer == nil {
+			w.changeBuffer = &changeBatchBuffer{}
+		}
+		if err := w.changeBuffer.appendPut(seq, key, value, expireAt); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	w.seq = seq
 	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
 	w.mu.Unlock()
 	return nil
@@ -403,8 +426,17 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 		w.mu.Unlock()
 		return err
 	}
-	w.seq++
-	seq := w.seq
+	seq := w.seq + 1
+	if w.changeFeedEnabled {
+		if w.changeBuffer == nil {
+			w.changeBuffer = &changeBatchBuffer{}
+		}
+		if err := w.changeBuffer.appendDelete(seq, key); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	w.seq = seq
 	w.memtable.Delete(key, seq)
 	w.mu.Unlock()
 
@@ -415,7 +447,12 @@ func (w *writer) ensureCapacityLocked() error {
 	if err := w.ensureWritable(); err != nil {
 		return err
 	}
-	if w.memtable.ApproxSize() < w.opts.Memtable.TargetBytes {
+	memtableBytes := w.memtable.ApproxSize()
+	changeBytes := int64(0)
+	if w.changeBuffer != nil {
+		changeBytes = w.changeBuffer.bodySize
+	}
+	if memtableBytes < w.opts.Memtable.TargetBytes && changeBytes < w.opts.Memtable.TargetBytes {
 		return nil
 	}
 	if w.pendingMemtables >= w.opts.Memtable.MaxPendingMemtables {
@@ -582,26 +619,69 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	}
 
 	seqLo, seqHi := pending.memtable.SeqLo(), pending.memtable.SeqHi()
-	if pending.sstable == nil {
-		result, err := writeSSTStreaming(ctx, pending.memtable.Iterator(), sstOpts,
+	buildSST := func(uploadCtx context.Context) (streamSSTResult, error) {
+		result, err := writeSSTStreaming(uploadCtx, pending.memtable.Iterator(), sstOpts,
 			pending.epoch, seqLo, seqHi, uploadFn)
 		if err != nil {
-			return fmt.Errorf("stream sst: %w", err)
+			return streamSSTResult{}, fmt.Errorf("stream sst: %w", err)
 		}
-		pending.sstable = &result.Meta
+		return result, nil
+	}
+	buildChangeBatch := func(uploadCtx context.Context) (changeBatchStreamResult, error) {
+		result, err := writeChangeBatchStreaming(uploadCtx, pending.changes, pending.epoch, time.Now().UTC(),
+			func(ctx context.Context, id string, reader io.Reader) error {
+				_, err := w.store.WriteReader(ctx, w.store.ChangeBatchPath(id), reader, nil)
+				return err
+			})
+		if err != nil {
+			return changeBatchStreamResult{}, fmt.Errorf("stream change batch: %w", err)
+		}
+		result.Meta.Path = w.store.ChangeBatchPath(result.Meta.ID)
+		return result, nil
 	}
 
-	if w.changeFeedEnabled && pending.changeBatch == nil {
-		changeBatch, err := buildChangeBatch(ctx, pending.memtable.Iterator(), pending.epoch,
-			seqLo, seqHi, pending.sstable.CreatedAt)
-		if err != nil {
-			return fmt.Errorf("build change batch: %w", err)
+	needSST := pending.sstable == nil
+	needChangeBatch := pending.changes != nil && pending.changeBatch == nil
+	if needSST && needChangeBatch {
+		group, uploadCtx := errgroup.WithContext(ctx)
+		var sstResult streamSSTResult
+		var changeResult changeBatchStreamResult
+		var sstErr, changeErr error
+		group.Go(func() error {
+			sstResult, sstErr = buildSST(uploadCtx)
+			return sstErr
+		})
+		group.Go(func() error {
+			changeResult, changeErr = buildChangeBatch(uploadCtx)
+			return changeErr
+		})
+		groupErr := group.Wait()
+		if sstErr == nil {
+			pending.sstable = &sstResult.Meta
 		}
-		changeBatch.Meta.Path = w.store.ChangeBatchPath(changeBatch.Meta.ID)
-		if _, err := w.store.Write(ctx, changeBatch.Meta.Path, changeBatch.Data); err != nil {
-			return fmt.Errorf("write change batch: %w", err)
+		if changeErr == nil {
+			pending.changeBatch = &changeResult.Meta
+			pending.changes = nil
 		}
-		pending.changeBatch = &changeBatch.Meta
+		if groupErr != nil {
+			return groupErr
+		}
+	} else {
+		if needSST {
+			result, err := buildSST(ctx)
+			if err != nil {
+				return err
+			}
+			pending.sstable = &result.Meta
+		}
+		if needChangeBatch {
+			result, err := buildChangeBatch(ctx)
+			if err != nil {
+				return err
+			}
+			pending.changeBatch = &result.Meta
+			pending.changes = nil
+		}
 	}
 
 	_, appendErr := w.manifestLog.AppendWriterCommit(ctx, manifest.WriterCommit{

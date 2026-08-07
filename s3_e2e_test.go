@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -31,11 +32,23 @@ func setupFakeS3StoreWithPrefix(t testing.TB, prefix string) *blobstore.Store {
 }
 
 func setupFakeS3BucketURL(t testing.TB) string {
+	return setupFakeS3BucketURLWithObserver(t, nil)
+}
+
+func setupFakeS3BucketURLWithObserver(t testing.TB, observe func(*http.Request)) string {
 	t.Helper()
 
 	backend := s3mem.New()
 	fake := gofakes3.New(backend)
-	server := httptest.NewServer(fake.Server())
+	baseHandler := fake.Server()
+	handler := baseHandler
+	if observe != nil {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			observe(r)
+			baseHandler.ServeHTTP(w, r)
+		})
+	}
+	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
 	t.Setenv("AWS_ACCESS_KEY_ID", fakeS3AccessKey)
@@ -273,6 +286,56 @@ func TestS3E2E_ChangeFeedRetentionPreservesKVState(t *testing.T) {
 	runChangeFeedRetentionE2E(t, ctx, store)
 }
 
+func TestS3E2E_ChangeReaderPaging(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("change-reader-e2e-%d", time.Now().UnixNano()))
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	defer db.Close()
+	writer, err := db.OpenWriter(ctx, testChangeWriterOptions())
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	for i := 0; i < 257; i++ {
+		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%04d", i)), []byte(fmt.Sprintf("value-%04d", i))); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	cursor := ChangeCursor{}
+	total := 0
+	for {
+		page, err := reader.Read(ctx, cursor, ChangeReadOptions{MaxChanges: 31, MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatalf("read page: %v", err)
+		}
+		total += len(page.Changes)
+		cursor = page.Next
+		if page.CaughtUp() {
+			break
+		}
+	}
+	if total != 257 {
+		t.Fatalf("changes=%d want=257", total)
+	}
+}
+
 func TestS3E2E_KVLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -462,7 +525,9 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	db.changeFeedEnabled = true
+	if err := db.manifestStore.EnableChangeFeed(ctx); err != nil {
+		t.Fatalf("enable change feed: %v", err)
+	}
 
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "change-feed-e2e-writer"

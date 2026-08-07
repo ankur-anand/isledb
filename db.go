@@ -17,6 +17,10 @@ var ErrWriterAlreadyOpen = errors.New("writer already open")
 // ErrReaderAlreadyOpen is returned when a DB already owns an active reader.
 var ErrReaderAlreadyOpen = errors.New("reader already open")
 
+// ErrChangeFeedDisabled is returned when a change reader is opened for a
+// database whose change feed has not been enabled.
+var ErrChangeFeedDisabled = errors.New("change feed disabled")
+
 // Writer provides write access to the database.
 //
 // A Writer owns one fenced write session for a DB bucket/prefix. It buffers
@@ -101,7 +105,8 @@ func (w *Writer) releaseWriter() {
 }
 
 // DB encapsulates manifest state for one bucket/prefix. It permits one active
-// Writer, one active Reader, and one active Maintenance handle.
+// Writer, one active KV Reader, one active Maintenance handle, and any number
+// of independent ChangeReaders.
 type DB struct {
 	store           *blobstore.Store
 	closeStore      bool
@@ -109,7 +114,6 @@ type DB struct {
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
 
-	changeFeedEnabled   bool
 	changeFeedRetention *changeFeedRetentionPolicy
 	mu                  sync.Mutex
 	closers             []dbCloser
@@ -127,6 +131,10 @@ type dbCloser interface {
 type DBOptions struct {
 	// Prefix is the database's root path inside the bucket or container.
 	Prefix string
+
+	// EnableChangeFeed emits a durable ordered mutation feed for all future
+	// writer commits. Once enabled for a prefix, it remains enabled.
+	EnableChangeFeed bool
 }
 
 type dbOpenOptions struct {
@@ -146,13 +154,16 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 	if _, err := manifestStore.Replay(ctx); err != nil {
 		return nil, err
 	}
-
+	if opts.changeFeedEnabled {
+		if err := manifestStore.EnableChangeFeed(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return &DB{
 		store:               store,
 		manifestStore:       manifestStore,
 		gcCursorStorage:     gcCursorStorage,
 		maintenanceWake:     make(chan struct{}, 1),
-		changeFeedEnabled:   opts.changeFeedEnabled,
 		changeFeedRetention: opts.changeFeedRetention,
 	}, nil
 }
@@ -164,12 +175,17 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		return nil, err
 	}
 
+	changeFeedEnabled, _, _, err := db.manifestStore.ChangeFeedBounds(ctx)
+	if err != nil {
+		db.releaseWriter(nil)
+		return nil, err
+	}
 	w, err := newWriterWithMaintenanceWake(ctx, db.store, db.manifestStore, opts, db.maintenanceWake)
 	if err != nil {
 		db.releaseWriter(nil)
 		return nil, err
 	}
-	w.changeFeedEnabled = db.changeFeedEnabled
+	w.changeFeedEnabled = changeFeedEnabled
 
 	writer := &Writer{w: w}
 	writer.release = func() { db.releaseWriter(writer) }
@@ -250,6 +266,39 @@ func (db *DB) releaseReader(reader *Reader) {
 		db.removeCloserLocked(reader)
 	}
 	db.mu.Unlock()
+}
+
+// OpenChangeReader opens an independent cursor-based reader over the durable
+// mutation feed. Change readers do not reserve the DB's shared KV reader slot.
+func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if db.closed.Load() {
+		return nil, errors.New("db closed")
+	}
+	view, err := db.manifestStore.LoadChangeFeedView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !view.Enabled() {
+		return nil, ErrChangeFeedDisabled
+	}
+
+	reader := &ChangeReader{
+		store:       db.store,
+		manifestLog: db.manifestStore,
+		view:        view,
+	}
+	reader.release = func() {
+		db.mu.Lock()
+		db.removeCloserLocked(reader)
+		db.mu.Unlock()
+	}
+	if err := db.registerCloser(reader); err != nil {
+		return nil, err
+	}
+	return reader, nil
 }
 
 // OpenMaintenance opens the DB's single fenced maintenance owner.

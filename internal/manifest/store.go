@@ -22,6 +22,9 @@ var (
 	ErrCurrentTooLarge      = errors.New("manifest CURRENT exceeds size limit")
 	ErrInvalidWriterCommit  = errors.New("invalid writer commit")
 	ErrWriterCommitConflict = errors.New("writer commit identity conflict")
+	ErrChangeFeedRequired   = errors.New("change feed batch required")
+	ErrChangeFeedHistory    = errors.New("change feed history unavailable")
+	ErrChangeFeedPosition   = errors.New("invalid change feed position")
 	ErrInvalidRetirement    = errors.New("invalid retired object batch")
 	ErrRetirementHistory    = errors.New("retirement history unavailable")
 	ErrInvalidManifest      = errors.New("invalid manifest topology")
@@ -392,6 +395,10 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
 			return err
 		}
+		if role == FenceRoleWriter && current.ChangeFeedEnabled &&
+			entry.Op == LogOpAddSSTable && entry.ChangeBatch == nil {
+			return ErrChangeFeedRequired
+		}
 
 		if err := s.checkFenceWithCurrent(role, current); err != nil {
 			return err
@@ -431,7 +438,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if updated.LogSeqStart == updated.NextSeq {
 			updated.LogSeqStart = nextEntry.Seq
 		}
-		if updated.ChangeFeedLogStart == 0 {
+		if !updated.ChangeFeedEnabled && updated.ChangeFeedLogStart == 0 {
 			updated.ChangeFeedLogStart = updated.LogSeqStart
 		}
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
@@ -1252,6 +1259,155 @@ func (s *Store) ListEntries(ctx context.Context) ([]uint64, error) {
 	return seqs, nil
 }
 
+// EnableChangeFeed permanently enables change batches for subsequent writer
+// commits. Existing history is excluded by advancing the retained floor to the
+// current manifest head.
+func (s *Store) EnableChangeFeed(ctx context.Context) error {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
+	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
+		current, etag, err := s.readCurrentWithETag(ctx)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			current = &Current{NextEpoch: 1}
+		}
+		normalizeCurrent(current)
+		if current.ChangeFeedEnabled {
+			return nil
+		}
+
+		updated := current.Clone()
+		updated.ChangeFeedEnabled = true
+		updated.ChangeFeedLogStart = updated.NextSeq
+		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
+			if errors.Is(err, ErrPreconditionFailed) && attempt+1 < currentCASMaxRetries {
+				if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
+					return err
+				}
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return ErrFenceConflict
+}
+
+// ChangeFeedView is an immutable view of the manifest metadata required to
+// locate retained change-feed entries.
+type ChangeFeedView struct {
+	current *Current
+}
+
+func (v *ChangeFeedView) Enabled() bool {
+	return v != nil && v.current != nil && v.current.ChangeFeedEnabled
+}
+
+func (v *ChangeFeedView) RetainedFrom() uint64 {
+	if v == nil || v.current == nil {
+		return 0
+	}
+	return v.current.ChangeFeedLogStart
+}
+
+func (v *ChangeFeedView) Head() uint64 {
+	if v == nil || v.current == nil {
+		return 0
+	}
+	return v.current.NextSeq
+}
+
+// LoadChangeFeedView reads CURRENT once and returns an immutable change-feed
+// view that can serve multiple bounded reads.
+func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error) {
+	current, err := s.readCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if current != nil {
+		current = current.Clone()
+	}
+	return &ChangeFeedView{current: current}, nil
+}
+
+// ChangeFeedBounds returns whether the feed is enabled, the oldest retained
+// manifest sequence, and the first uncommitted manifest sequence.
+func (s *Store) ChangeFeedBounds(ctx context.Context) (enabled bool, retainedFrom, head uint64, err error) {
+	view, err := s.LoadChangeFeedView(ctx)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	return view.Enabled(), view.RetainedFrom(), view.Head(), nil
+}
+
+// ReadChangeEntries returns a bounded contiguous manifest range. When
+// fromOldest is true, start is ignored and reading begins at the retained
+// change-feed floor.
+func (s *Store) ReadChangeEntries(
+	ctx context.Context,
+	start uint64,
+	fromOldest bool,
+	limit int,
+) (entries []*ManifestLogEntry, enabled bool, retainedFrom, head uint64, err error) {
+	view, err := s.LoadChangeFeedView(ctx)
+	if err != nil {
+		return nil, false, 0, 0, err
+	}
+	entries, err = s.ReadChangeEntriesFromView(ctx, view, start, fromOldest, limit)
+	return entries, view.Enabled(), view.RetainedFrom(), view.Head(), err
+}
+
+// ReadChangeEntriesFromView returns a bounded contiguous manifest range from
+// an immutable view without reading CURRENT again.
+func (s *Store) ReadChangeEntriesFromView(
+	ctx context.Context,
+	view *ChangeFeedView,
+	start uint64,
+	fromOldest bool,
+	limit int,
+) ([]*ManifestLogEntry, error) {
+	if limit <= 0 {
+		limit = 128
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+
+	if view == nil || view.current == nil {
+		return nil, nil
+	}
+	current := view.current
+	retainedFrom := view.RetainedFrom()
+	head := view.Head()
+	if fromOldest {
+		start = retainedFrom
+	}
+	if start < retainedFrom {
+		return nil, fmt.Errorf(
+			"%w: start=%d retained_from=%d", ErrChangeFeedHistory, start, retainedFrom)
+	}
+	if start > head {
+		return nil, fmt.Errorf(
+			"%w: start=%d head=%d", ErrChangeFeedPosition, start, head)
+	}
+	if start == head {
+		return nil, nil
+	}
+
+	end := start + uint64(limit)
+	if end < start || end > head {
+		end = head
+	}
+	entries, err := s.entriesInRange(ctx, current, start, end)
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 func (s *Store) ReadEntry(ctx context.Context, seq uint64) (*ManifestLogEntry, error) {
 	current, err := s.readCurrent(ctx)
 	if err != nil {
@@ -1454,7 +1610,7 @@ func (s *Store) publishCheckpoint(ctx context.Context, path string, base checkpo
 
 		updated := current.Clone()
 		oldLogSeqStart := updated.LogSeqStart
-		if updated.ChangeFeedLogStart == oldLogSeqStart {
+		if !updated.ChangeFeedEnabled && updated.ChangeFeedLogStart == oldLogSeqStart {
 			updated.ChangeFeedLogStart = base.nextSeq
 		}
 		updated.Snapshot = path
@@ -1564,7 +1720,7 @@ func (s *Store) writeSnapshot(ctx context.Context, m *Manifest, token *FenceToke
 	}
 	normalizeCurrent(current)
 	oldLogSeqStart := current.LogSeqStart
-	if current.ChangeFeedLogStart == oldLogSeqStart {
+	if !current.ChangeFeedEnabled && current.ChangeFeedLogStart == oldLogSeqStart {
 		current.ChangeFeedLogStart = nextSeq
 	}
 	current.Snapshot = path

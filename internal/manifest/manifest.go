@@ -69,16 +69,18 @@ type SSTMeta struct {
 // alongside a memtable flush. The object is visible only after the manifest
 // entry that references it is committed.
 type ChangeBatchMeta struct {
-	ID        string    `json:"id"`
-	Path      string    `json:"path"`
-	Epoch     uint64    `json:"epoch"`
-	SeqLo     uint64    `json:"seq_lo"`
-	SeqHi     uint64    `json:"seq_hi"`
-	Count     uint32    `json:"count"`
-	Size      int64     `json:"size"`
-	Checksum  string    `json:"checksum"`
-	CreatedAt time.Time `json:"created_at"`
-	Version   int       `json:"version,omitempty"`
+	ID          string    `json:"id"`
+	Path        string    `json:"path"`
+	Epoch       uint64    `json:"epoch"`
+	SeqLo       uint64    `json:"seq_lo"`
+	SeqHi       uint64    `json:"seq_hi"`
+	Count       uint32    `json:"count"`
+	Size        int64     `json:"size"`
+	RawSize     int64     `json:"raw_size"`
+	Checksum    string    `json:"checksum"`
+	CreatedAt   time.Time `json:"created_at"`
+	Version     int       `json:"version,omitempty"`
+	Compression string    `json:"compression,omitempty"`
 }
 
 // WriterCommit is one logical memtable publication. ID remains unchanged when
@@ -110,6 +112,7 @@ type Current struct {
 	NextSeq       uint64 `json:"next_seq"`
 	NextEpoch     uint64 `json:"next_epoch"`
 
+	ChangeFeedEnabled  bool   `json:"change_feed_enabled,omitempty"`
 	ChangeFeedLogStart uint64 `json:"change_feed_log_start,omitempty"`
 	RetirementLogStart uint64 `json:"retirement_log_start"`
 	StateReplayPages   uint64 `json:"state_replay_pages,omitempty"`

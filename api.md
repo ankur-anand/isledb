@@ -62,7 +62,8 @@ _ = err
 ### DB
 
 Entry point for database operations. Manages one writer, one shared concurrent
-reader, one maintenance owner, and shared manifest state.
+KV reader, one maintenance owner, any number of change readers, and shared
+manifest state.
 
 ```go
 func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error)
@@ -73,17 +74,21 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 |--------|-----------|
 | OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
 | OpenReader | `(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)` |
+| OpenChangeReader | `(ctx context.Context) (*ChangeReader, error)` |
 | OpenMaintenance | `(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)` |
 | Close | `() error` |
 
 ```go
 type DBOptions struct {
-    Prefix string
+    Prefix           string
+    EnableChangeFeed bool
 }
 ```
 
 `Open` owns the bucket connection and closes it from `DB.Close`. `OpenBucket`
 borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
+`EnableChangeFeed` is persisted in the manifest and cannot be disabled. Enabling
+an existing database starts the feed at its current manifest head.
 
 ---
 
@@ -389,6 +394,64 @@ type IteratorOptions struct {
     MaxKey []byte // Inclusive upper bound
 }
 ```
+
+### ChangeReader
+
+Reads the optional durable mutation feed without object-store listing. Open it
+after `DBOptions.EnableChangeFeed` has been persisted for the database prefix.
+Any number of independent change readers may be opened from one `DB`.
+
+```go
+func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error)
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Bounds | `(ctx context.Context) (ChangeBounds, error)` | Return oldest retained and current head cursors |
+| Read | `(ctx context.Context, from ChangeCursor, opts ChangeReadOptions) (ChangePage, error)` | Return a bounded ordered page |
+| Close | `() error` | Release this reader |
+
+```go
+type Change struct {
+    Sequence  uint64
+    Operation ChangeOperation // ChangePut or ChangeDelete
+    Key       []byte
+    Value     []byte          // empty for deletes
+    ExpiresAt time.Time       // zero when no TTL applies
+}
+
+type ChangeBounds struct {
+    Oldest ChangeCursor
+    Head   ChangeCursor
+}
+
+type ChangeReadOptions struct {
+    MaxChanges int
+    MaxBytes   int64
+}
+
+func DefaultChangeReadOptions() ChangeReadOptions
+func ParseChangeCursor(value string) (ChangeCursor, error)
+func (c ChangeCursor) String() string
+func (p ChangePage) CaughtUp() bool
+```
+
+The cursor points to the next change, including a position inside a large flush
+batch. Save `page.Next.String()` only after processing the returned changes.
+Use `bounds.Oldest` for retained replay or `bounds.Head` for future commits.
+A zero cursor also starts at the oldest retained change.
+
+`Read` performs no polling. An empty page can still advance `Next` over
+manifest entries that contain no user mutations; continue until `CaughtUp`
+returns true. When retention has passed a saved cursor, `Read` returns
+`ErrChangeCursorExpired`.
+
+Each `ChangeReader` owns its manifest view. A `Read` beginning at a manifest
+entry boundary refreshes `manifest/CURRENT`, then reads from that immutable
+view. If a returned page stops inside a change batch, continuation reads reuse
+that decoded batch and its observed head without another `CURRENT` or
+manifest-page read. The next call beginning at an entry boundary refreshes the
+view and revalidates the retention floor.
 
 ### Maintenance
 

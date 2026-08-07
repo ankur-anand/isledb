@@ -969,6 +969,41 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	}
 }
 
+func TestWriteSnapshotPreservesEnabledChangeFeedFloor(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-feed-checkpoint")
+	defer store.Close()
+
+	backend := NewBlobStoreBackend(store)
+	writeCurrentForTest(t, ctx, backend, &Current{
+		NextEpoch:          1,
+		LogSeqStart:        0,
+		ChangeFeedEnabled:  true,
+		ChangeFeedLogStart: 0,
+		RetirementLogStart: 2,
+		NextSeq:            2,
+		ActiveEntries: []ManifestLogEntry{
+			testManifestEntry(0),
+			testManifestEntry(1),
+		},
+	})
+
+	ms := NewStoreWithStorage(backend)
+	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	current, err := ms.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if current.ChangeFeedLogStart != 0 {
+		t.Fatalf("enabled change-feed floor=%d want=0", current.ChangeFeedLogStart)
+	}
+	if len(current.ActiveEntries) != 2 {
+		t.Fatalf("retained active entries=%d want=2", len(current.ActiveEntries))
+	}
+}
+
 func TestWriteSnapshotKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")

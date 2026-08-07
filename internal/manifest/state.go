@@ -48,6 +48,7 @@ func (c *Current) Clone() *Current {
 		LogSeqStart:        c.LogSeqStart,
 		NextSeq:            c.NextSeq,
 		NextEpoch:          c.NextEpoch,
+		ChangeFeedEnabled:  c.ChangeFeedEnabled,
 		ChangeFeedLogStart: c.ChangeFeedLogStart,
 		RetirementLogStart: c.RetirementLogStart,
 		StateReplayPages:   c.StateReplayPages,
