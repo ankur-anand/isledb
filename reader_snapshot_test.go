@@ -177,6 +177,13 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot(): %v", err)
 	}
+	iter, err := reader.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewIterator(): %v", err)
+	}
+	if !iter.Next() {
+		t.Fatalf("Iterator.Next() before close: %v", iter.Err())
+	}
 
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -208,6 +215,18 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 	}
 	if _, _, err := snap.Get(ctx, []byte("a")); err != ErrReaderClosed {
 		t.Fatalf("Snapshot.Get after Reader.Close error=%v, want %v", err, ErrReaderClosed)
+	}
+	if iter.Next() {
+		t.Fatal("Iterator.Next succeeded after Reader.Close")
+	}
+	if iter.SeekGE([]byte("a")) {
+		t.Fatal("Iterator.SeekGE succeeded after Reader.Close")
+	}
+	if !errors.Is(iter.Err(), ErrReaderClosed) {
+		t.Fatalf("Iterator.Err after Reader.Close=%v, want %v", iter.Err(), ErrReaderClosed)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("Iterator.Close after Reader.Close: %v", err)
 	}
 }
 

@@ -498,22 +498,27 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 		t.Fatalf("openSSTIterBounded: %v", err)
 	}
 
-	if _, ok := reader.sstCache.Get(path); !ok {
+	if _, ok := reader.sstCache.Acquire(path); !ok {
 		iter.Close()
 		t.Fatalf("expected sst cache entry after iterator open")
+	} else {
+		reader.sstCache.Release(path)
 	}
 
 	reader.sstCache.Remove(path)
-	if _, ok := reader.sstCache.Get(path); !ok {
+	if _, ok := reader.sstCache.Acquire(path); !ok {
 		iter.Close()
 		t.Fatalf("expected sst cache entry to remain while iterator open")
+	} else {
+		reader.sstCache.Release(path)
 	}
 
 	if err := iter.Close(); err != nil {
 		t.Fatalf("iter close: %v", err)
 	}
 
-	if _, ok := reader.sstCache.Get(path); ok {
+	if _, ok := reader.sstCache.Acquire(path); ok {
+		reader.sstCache.Release(path)
 		t.Fatalf("expected sst cache entry removed after iterator close")
 	}
 }

@@ -46,9 +46,10 @@ func TestReader_cacheSST_StreamedToFileBackedCache(t *testing.T) {
 	err := reader.cacheSST(ctx, &meta, path)
 	require.NoError(t, err)
 
-	got, ok := reader.sstCache.Get(path)
+	got, ok := reader.sstCache.Acquire(path)
 	require.True(t, ok)
 	require.Equal(t, data, got)
+	reader.sstCache.Release(path)
 
 	fb, ok := reader.sstCache.(diskcache.FileBackedCache)
 	require.True(t, ok)
@@ -68,7 +69,7 @@ func TestReader_cacheSSTStream_ChecksumMismatch(t *testing.T) {
 	err = reader.cacheSST(ctx, &meta, path)
 	require.Error(t, err)
 
-	_, ok := reader.sstCache.Get(path)
+	_, ok := reader.sstCache.Acquire(path)
 	require.False(t, ok)
 
 	fb, ok := reader.sstCache.(diskcache.FileBackedCache)

@@ -177,7 +177,8 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		stats.MatchedSSTs++
 
 		path := r.store.SSTPath(sst.ID)
-		if _, ok := r.sstCache.Get(path); ok {
+		if _, ok := r.sstCache.Acquire(path); ok {
+			r.sstCache.Release(path)
 			stats.SkippedSSTs++
 			return
 		}
@@ -223,7 +224,8 @@ func sstOverlapsPrefetchRange(sst sstMetadata, r KeyRange) bool {
 
 func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) error {
 	path := r.store.SSTPath(sst.ID)
-	if _, ok := r.sstCache.Get(path); ok {
+	if _, ok := r.sstCache.Acquire(path); ok {
+		r.sstCache.Release(path)
 		return nil
 	}
 
