@@ -18,10 +18,18 @@ type Stats struct {
 	EntryCount int
 }
 
-// RefCountedCache extends Cache with reference counting.
+// RefCountedCache provides pinned access to memory-mapped cache entries.
 // Reference counting prevents entries from being evicted while in use.
 type RefCountedCache interface {
-	Cache
+	Set(key string, data []byte) error
+	Remove(key string)
+	// Clear removes unpinned entries and removes pinned entries after their last
+	// Release. The cache remains usable.
+	Clear() error
+	Stats() Stats
+	// Close rejects new acquisitions and removes pinned entries after their last
+	// Release.
+	Close() error
 
 	// Acquire retrieves data and increments its reference count.
 	// The entry will not be evicted until Release is called.

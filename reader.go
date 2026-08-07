@@ -54,6 +54,8 @@ type Reader struct {
 	cacheDir       string
 
 	lifecycleMu sync.RWMutex
+	iteratorsMu sync.Mutex
+	iterators   map[*Iterator]struct{}
 	mu          sync.RWMutex
 	manifest    *manifestState
 	version     Version
@@ -313,6 +315,7 @@ func (r *Reader) Close() error {
 	}
 	defer r.releaseReader()
 	r.stopManifestExpiry()
+	r.closeOpenIterators()
 
 	var firstErr error
 
@@ -343,6 +346,35 @@ func (r *Reader) releaseReader() {
 		return
 	}
 	r.releaseOnce.Do(r.release)
+}
+
+func (r *Reader) registerIterator(it *Iterator) {
+	r.iteratorsMu.Lock()
+	defer r.iteratorsMu.Unlock()
+	if r.iterators == nil {
+		r.iterators = make(map[*Iterator]struct{})
+	}
+	r.iterators[it] = struct{}{}
+}
+
+func (r *Reader) unregisterIterator(it *Iterator) {
+	r.iteratorsMu.Lock()
+	delete(r.iterators, it)
+	r.iteratorsMu.Unlock()
+}
+
+func (r *Reader) closeOpenIterators() {
+	r.iteratorsMu.Lock()
+	iters := make([]*Iterator, 0, len(r.iterators))
+	for it := range r.iterators {
+		iters = append(iters, it)
+	}
+	clear(r.iterators)
+	r.iteratorsMu.Unlock()
+
+	for _, it := range iters {
+		_ = it.close(ErrReaderClosed)
+	}
 }
 
 func (r *Reader) beginRead() (func(), error) {
@@ -1180,6 +1212,7 @@ func (m *sstReadable) Size() int64 {
 }
 
 type Iterator struct {
+	mu        sync.Mutex
 	reader    *Reader
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -1232,7 +1265,7 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 
 	if len(allIters) == 0 {
 
-		return &Iterator{
+		it := &Iterator{
 			reader:    r,
 			ctx:       iterCtx,
 			cancel:    cancel,
@@ -1241,10 +1274,12 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 			maxKey:    opts.MaxKey,
 			nowMs:     time.Now().UnixMilli(),
 			closed:    false,
-		}, nil
+		}
+		r.registerIterator(it)
+		return it, nil
 	}
 
-	return &Iterator{
+	it := &Iterator{
 		reader:    r,
 		ctx:       iterCtx,
 		cancel:    cancel,
@@ -1255,15 +1290,27 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 		mergeIter: newMergeIterator(allIters),
 		sstIters:  allIters,
 		closed:    false,
-	}, nil
+	}
+	r.registerIterator(it)
+	return it, nil
 }
 
 func (it *Iterator) Next() bool {
-	if it.closed || it.err != nil {
+	done, err := it.beginReaderOperation()
+	if err != nil {
+		it.mu.Lock()
+		it.err = err
+		it.mu.Unlock()
 		return false
 	}
-	if it.reader != nil && it.reader.closed.Load() {
-		it.err = ErrReaderClosed
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	return it.next()
+}
+
+func (it *Iterator) next() bool {
+	if it.closed || it.err != nil {
 		return false
 	}
 	if err := it.contextErr(); err != nil {
@@ -1321,6 +1368,10 @@ func (it *Iterator) Next() bool {
 }
 
 func (it *Iterator) Key() []byte {
+	done := it.lockReaderLifecycle()
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
 	if it.current == nil {
 		return nil
 	}
@@ -1328,6 +1379,10 @@ func (it *Iterator) Key() []byte {
 }
 
 func (it *Iterator) Value() []byte {
+	done := it.lockReaderLifecycle()
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
 	if it.current == nil {
 		return nil
 	}
@@ -1335,10 +1390,18 @@ func (it *Iterator) Value() []byte {
 }
 
 func (it *Iterator) Valid() bool {
+	done := it.lockReaderLifecycle()
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
 	return it.current != nil && !it.closed && it.err == nil
 }
 
 func (it *Iterator) Err() error {
+	done := it.lockReaderLifecycle()
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
 	if it.err != nil {
 		return it.err
 	}
@@ -1355,8 +1418,19 @@ func (it *Iterator) Err() error {
 }
 
 func (it *Iterator) Close() error {
+	done := it.lockReaderLifecycle()
+	defer done()
+	return it.close(nil)
+}
+
+func (it *Iterator) close(cause error) error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
 	if it.closed {
 		return nil
+	}
+	if cause != nil && it.err == nil {
+		it.err = cause
 	}
 	it.closed = true
 	it.current = nil
@@ -1370,11 +1444,25 @@ func (it *Iterator) Close() error {
 		it.cancel()
 		it.cancel = nil
 	}
+	if it.reader != nil {
+		it.reader.unregisterIterator(it)
+	}
 
 	return nil
 }
 
 func (it *Iterator) SeekGE(target []byte) bool {
+	done, err := it.beginReaderOperation()
+	if err != nil {
+		it.mu.Lock()
+		it.err = err
+		it.mu.Unlock()
+		return false
+	}
+	defer done()
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	if it.closed || it.err != nil {
 		return false
 	}
@@ -1391,7 +1479,22 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	if it.mergeIter.err != nil {
 		return false
 	}
-	return it.Next()
+	return it.next()
+}
+
+func (it *Iterator) beginReaderOperation() (func(), error) {
+	if it == nil || it.reader == nil {
+		return func() {}, nil
+	}
+	return it.reader.beginRead()
+}
+
+func (it *Iterator) lockReaderLifecycle() func() {
+	if it == nil || it.reader == nil {
+		return func() {}
+	}
+	it.reader.lifecycleMu.RLock()
+	return it.reader.lifecycleMu.RUnlock
 }
 
 func (it *Iterator) contextErr() error {

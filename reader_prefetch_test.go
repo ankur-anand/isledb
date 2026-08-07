@@ -217,7 +217,8 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 {
 		t.Fatalf("stats after error = %+v, want matched=1 cached=0", stats)
 	}
-	if _, ok := reader.sstCache.Get(path); ok {
+	if _, ok := reader.sstCache.Acquire(path); ok {
+		reader.sstCache.Release(path)
 		t.Fatal("corrupted SST was cached")
 	}
 }

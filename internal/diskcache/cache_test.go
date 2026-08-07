@@ -32,19 +32,6 @@ var cacheFactories = []cacheFactory{
 			return cache
 		},
 	},
-	{
-		name: "SSTCache",
-		newFunc: func(t *testing.T, maxSize int64) Cache {
-			opts := SSTCacheOptions{Dir: t.TempDir()}
-			if maxSize > 0 {
-				opts.MaxSize = maxSize
-			}
-			cache, err := NewSSTCache(opts)
-			require.NoError(t, err)
-			t.Cleanup(func() { cache.Close() })
-			return cache
-		},
-	},
 }
 
 var cacheBenchFactories = []cacheBenchFactory{
@@ -56,21 +43,6 @@ var cacheBenchFactories = []cacheBenchFactory{
 				opts.MaxSize = maxSize
 			}
 			cache, err := NewBlobCache(opts)
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() { cache.Close() })
-			return cache
-		},
-	},
-	{
-		name: "SSTCache",
-		newFunc: func(b *testing.B, maxSize int64) Cache {
-			opts := SSTCacheOptions{Dir: b.TempDir()}
-			if maxSize > 0 {
-				opts.MaxSize = maxSize
-			}
-			cache, err := NewSSTCache(opts)
 			if err != nil {
 				b.Fatal(err)
 			}

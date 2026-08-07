@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -34,14 +35,114 @@ func TestSSTCache_RefCounting(t *testing.T) {
 		cache.Set(key, newData)
 	}
 
-	_, ok = cache.Get("protected")
+	_, ok = cache.Acquire("protected")
 	require.True(t, ok, "protected entry should not be evicted while acquired")
+	cache.Release("protected")
 
 	cache.Release("protected")
 	cache.Set("final", make([]byte, 80))
 
 	stats := cache.Stats()
 	require.LessOrEqual(t, stats.Size, int64(100))
+}
+
+func TestSSTCache_CloseDefersPinnedEntryRemoval(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewSSTCache(SSTCacheOptions{Dir: dir})
+	require.NoError(t, err)
+
+	data := []byte("pinned-sst-data")
+	require.NoError(t, cache.Set("pinned", data))
+	pinned, ok := cache.Acquire("pinned")
+	require.True(t, ok)
+
+	require.NoError(t, cache.Close())
+	require.Equal(t, data, pinned)
+	_, ok = cache.Acquire("pinned")
+	require.False(t, ok, "closed cache must reject new pins")
+	require.Error(t, cache.Set("new", data))
+	require.Equal(t, 1, cache.Stats().EntryCount)
+
+	cache.Release("pinned")
+	require.Equal(t, 0, cache.Stats().EntryCount)
+	require.Equal(t, int64(0), cache.Stats().Size)
+}
+
+func TestSSTCache_ClearDefersPinnedEntryRemoval(t *testing.T) {
+	cache, err := NewSSTCache(SSTCacheOptions{Dir: t.TempDir()})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	data := []byte("pinned-sst-data")
+	require.NoError(t, cache.Set("pinned", data))
+	pinned, ok := cache.Acquire("pinned")
+	require.True(t, ok)
+
+	require.NoError(t, cache.Clear())
+	require.Equal(t, data, pinned)
+	require.Equal(t, 1, cache.Stats().EntryCount)
+
+	cache.Release("pinned")
+	require.Equal(t, 0, cache.Stats().EntryCount)
+	require.NoError(t, cache.Set("after-clear", data))
+}
+
+func TestSSTCache_PendingEntryWaitsForEveryPin(t *testing.T) {
+	cache, err := NewSSTCache(SSTCacheOptions{Dir: t.TempDir()})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	data := []byte("shared-sst-data")
+	require.NoError(t, cache.Set("shared", data))
+	first, ok := cache.Acquire("shared")
+	require.True(t, ok)
+	cache.Remove("shared")
+
+	second, ok := cache.Acquire("shared")
+	require.True(t, ok)
+	cache.Release("shared")
+	require.Equal(t, data, first)
+	require.Equal(t, data, second)
+	require.Equal(t, 1, cache.Stats().EntryCount)
+
+	cache.Release("shared")
+	require.Equal(t, 0, cache.Stats().EntryCount)
+}
+
+func TestSSTCache_ConcurrentPinsOnPendingEntry(t *testing.T) {
+	cache, err := NewSSTCache(SSTCacheOptions{Dir: t.TempDir()})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	data := []byte("shared-sst-data")
+	require.NoError(t, cache.Set("shared", data))
+	_, ok := cache.Acquire("shared")
+	require.True(t, ok)
+	cache.Remove("shared")
+
+	const workers = 32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			got, acquired := cache.Acquire("shared")
+			if !acquired {
+				t.Error("pending entry disappeared while guard pin was held")
+				return
+			}
+			if string(got) != string(data) {
+				t.Errorf("acquired data=%q, want %q", got, data)
+			}
+			runtime.Gosched()
+			cache.Release("shared")
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, 1, cache.Stats().EntryCount)
+	cache.Release("shared")
+	require.Equal(t, 0, cache.Stats().EntryCount)
 }
 
 func TestSSTCache_MemoryUsage(t *testing.T) {
@@ -107,9 +208,10 @@ func TestSSTCache_SetFromFile(t *testing.T) {
 	_, err = os.Stat(tmpPath)
 	require.ErrorIs(t, err, os.ErrNotExist)
 
-	got, ok := cache.Get("sst-key")
+	got, ok := cache.Acquire("sst-key")
 	require.True(t, ok)
 	require.Equal(t, data, got)
+	cache.Release("sst-key")
 
 	localPath := filepath.Join(dir, cacheFileName("sst-key"))
 	_, err = os.Stat(localPath)
@@ -139,6 +241,7 @@ func TestSSTCache_EvictOldest_SkipsStaleListNode(t *testing.T) {
 	stats := cache.Stats()
 	require.LessOrEqual(t, stats.Size, int64(60), "cache should still respect max size")
 
-	_, ok := cache.Get("k3")
+	_, ok := cache.Acquire("k3")
 	require.True(t, ok, "newly inserted key should exist")
+	cache.Release("k3")
 }

@@ -25,7 +25,7 @@ type sstEntry struct {
 	size      int64
 	mmap      []byte
 	file      *os.File
-	refs      atomic.Int32
+	refs      int32
 	elem      *list.Element
 }
 
@@ -39,6 +39,7 @@ type sstCache struct {
 	order *list.List
 
 	pending map[string]struct{}
+	closed  bool
 
 	hits   atomic.Int64
 	misses atomic.Int64
@@ -72,30 +73,15 @@ func (c *sstCache) CacheDir() string {
 	return c.dir
 }
 
-func (c *sstCache) Get(key string) ([]byte, bool) {
-	c.mu.RLock()
-	entry, ok := c.index[key]
-	c.mu.RUnlock()
-
-	if !ok {
-		c.misses.Add(1)
-		return nil, false
-	}
-
-	c.hits.Add(1)
-	c.mu.Lock()
-	c.moveToEnd(key)
-	c.mu.Unlock()
-
-	return entry.mmap, true
-}
-
 func (c *sstCache) Set(key string, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errors.New("diskcache: sst cache closed")
+	}
 
 	if entry, exists := c.index[key]; exists {
-		if entry.refs.Load() > 0 {
+		if entry.refs > 0 {
 			return nil
 		}
 		c.removeLocked(key)
@@ -145,9 +131,12 @@ func (c *sstCache) Set(key string, data []byte) error {
 func (c *sstCache) SetFromFile(key, tempPath string, size int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errors.New("diskcache: sst cache closed")
+	}
 
 	if entry, exists := c.index[key]; exists {
-		if entry.refs.Load() > 0 {
+		if entry.refs > 0 {
 			_ = os.Remove(tempPath)
 			return nil
 		}
@@ -210,7 +199,7 @@ func (c *sstCache) Remove(key string) {
 	if !ok {
 		return
 	}
-	if entry.refs.Load() > 0 {
+	if entry.refs > 0 {
 		c.pending[key] = struct{}{}
 		return
 	}
@@ -220,6 +209,10 @@ func (c *sstCache) Remove(key string) {
 func (c *sstCache) removeLocked(key string) {
 	entry, ok := c.index[key]
 	if !ok {
+		return
+	}
+	if entry.refs > 0 {
+		c.pending[key] = struct{}{}
 		return
 	}
 
@@ -246,20 +239,13 @@ func (c *sstCache) Clear() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, entry := range c.index {
-		if entry.mmap != nil {
-			Munmap(entry.mmap)
+	for key, entry := range c.index {
+		if entry.refs > 0 {
+			c.pending[key] = struct{}{}
+			continue
 		}
-		if entry.file != nil {
-			entry.file.Close()
-		}
-		os.Remove(entry.localPath)
+		c.removeLocked(key)
 	}
-
-	c.index = make(map[string]*sstEntry)
-	c.order.Init()
-	c.pending = make(map[string]struct{})
-	c.currentSize = 0
 
 	return nil
 }
@@ -278,12 +264,30 @@ func (c *sstCache) Stats() Stats {
 }
 
 func (c *sstCache) Close() error {
-	return c.Clear()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+
+	for key, entry := range c.index {
+		if entry.refs > 0 {
+			c.pending[key] = struct{}{}
+			continue
+		}
+		c.removeLocked(key)
+	}
+	return nil
 }
 
 func (c *sstCache) Acquire(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		c.misses.Add(1)
+		return nil, false
+	}
 
 	entry, ok := c.index[key]
 
@@ -292,7 +296,7 @@ func (c *sstCache) Acquire(key string) ([]byte, bool) {
 		return nil, false
 	}
 
-	entry.refs.Add(1)
+	entry.refs++
 	c.moveToEnd(key)
 	c.hits.Add(1)
 
@@ -300,23 +304,22 @@ func (c *sstCache) Acquire(key string) ([]byte, bool) {
 }
 
 func (c *sstCache) Release(key string) {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.index[key]
-	c.mu.RUnlock()
-
 	if !ok {
 		return
 	}
-
-	if entry.refs.Add(-1) != 0 {
+	if entry.refs == 0 {
 		return
 	}
-
-	c.mu.Lock()
-	if _, pending := c.pending[key]; pending {
-		c.removeLocked(key)
+	entry.refs--
+	if entry.refs == 0 {
+		_, pending := c.pending[key]
+		if pending || c.closed {
+			c.removeLocked(key)
+		}
 	}
-	c.mu.Unlock()
 }
 
 func (c *sstCache) evictOldest() bool {
@@ -335,7 +338,7 @@ func (c *sstCache) evictOldest() bool {
 			continue
 		}
 
-		if entry.refs.Load() == 0 {
+		if entry.refs == 0 {
 			c.removeLocked(key)
 			return true
 		}
