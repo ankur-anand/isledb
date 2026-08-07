@@ -113,6 +113,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := testWriterOptions(1<<20, 0)
+	opts.Values.InlineValueBytes = 1
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
@@ -153,6 +154,9 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	}
 	if meta.SeqLo != 1 || meta.SeqHi != 3 || meta.Count != 3 || meta.Path == "" {
 		t.Fatalf("change batch meta mismatch: %+v", *meta)
+	}
+	if meta.Compression != changeBatchCompressionZstd {
+		t.Fatalf("change batch compression=%q want=%q", meta.Compression, changeBatchCompressionZstd)
 	}
 
 	data, attrs, err := store.Read(ctx, meta.Path)
@@ -222,6 +226,37 @@ func TestWriter_ChangeFeedDisabledByDefault(t *testing.T) {
 	}
 	if len(result.Objects) != 0 {
 		t.Fatalf("expected no change batch objects when disabled, got %d", len(result.Objects))
+	}
+}
+
+func TestWriter_ChangeFeedBufferTriggersRotationForBlobValues(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-change-feed-rotation")
+	defer store.Close()
+
+	opts := testWriterOptions(1<<10, 0)
+	opts.Values.InlineValueBytes = 1
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	w.changeFeedEnabled = true
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("large"), make([]byte, 2<<10)); err != nil {
+		t.Fatalf("put large value: %v", err)
+	}
+	if err := w.put(ctx, []byte("next"), []byte("v")); err != nil {
+		t.Fatalf("put next value: %v", err)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.immQueue) != 1 {
+		t.Fatalf("immutable queue length=%d want=1", len(w.immQueue))
+	}
+	if w.immQueue[0].changes == nil || w.immQueue[0].changes.bodySize < opts.Memtable.TargetBytes {
+		t.Fatalf("rotated change buffer=%+v", w.immQueue[0].changes)
 	}
 }
 

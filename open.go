@@ -23,7 +23,9 @@ func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error) {
 		return nil, err
 	}
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{
+		changeFeedEnabled: opts.EnableChangeFeed,
+	})
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -43,5 +45,7 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 	}
 
 	store := blobstore.New(bucket, bucketName, opts.Prefix)
-	return openDB(ctx, store, dbOpenOptions{})
+	return openDB(ctx, store, dbOpenOptions{
+		changeFeedEnabled: opts.EnableChangeFeed,
+	})
 }

@@ -104,6 +104,39 @@ func TestMaintenanceCommandRejectsMultiplePayloads(t *testing.T) {
 	}
 }
 
+func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
+	current := &Current{
+		Snapshot:           "old-snapshot",
+		LogSeqStart:        0,
+		NextSeq:            10,
+		ChangeFeedEnabled:  true,
+		ChangeFeedLogStart: 0,
+		StateReplayPages:   2,
+		StateReplayBytes:   1024,
+	}
+	command := &MaintenanceCommand{
+		Kind: MaintenanceCommandCheckpoint,
+		Checkpoint: &CheckpointCommand{
+			Snapshot:          "new-snapshot",
+			BaseSnapshot:      "old-snapshot",
+			BaseLogSeqStart:   0,
+			SnapshotNextSeq:   8,
+			FoldedReplayPages: 2,
+			FoldedReplayBytes: 1024,
+		},
+	}
+
+	if err := (&Store{}).applyMaintenanceCommand(context.Background(), current, command); err != nil {
+		t.Fatalf("apply checkpoint: %v", err)
+	}
+	if current.ChangeFeedLogStart != 0 {
+		t.Fatalf("enabled change-feed floor=%d want=0", current.ChangeFeedLogStart)
+	}
+	if current.LogSeqStart != 8 {
+		t.Fatalf("state replay floor=%d want=8", current.LogSeqStart)
+	}
+}
+
 func TestWriterAppliesPendingCompactionAndReceiptAtomically(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("maintenance-apply-compaction")

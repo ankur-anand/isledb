@@ -15,6 +15,7 @@ require (
 	github.com/dgraph-io/badger/v4 v4.9.0
 	github.com/fsouza/fake-gcs-server v1.53.1
 	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3
+	github.com/klauspost/compress v1.18.3
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.19.0
@@ -128,7 +129,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/klauspost/compress v1.18.3 // indirect
 	github.com/segmentio/ksuid v1.0.4
 	gocloud.dev v0.44.0
 	golang.org/x/net v0.49.0 // indirect

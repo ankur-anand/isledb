@@ -1,39 +1,49 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"testing"
 	"time"
-
-	"github.com/ankur-anand/isledb/internal"
 )
 
-func TestBuildChangeBatchOrdersBySeq(t *testing.T) {
-	var blobID [32]byte
-	copy(blobID[:], []byte("blob-id"))
+func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
+	buffer := &changeBatchBuffer{}
+	if err := buffer.appendPut(1, []byte("a"), []byte("va"), 0); err != nil {
+		t.Fatalf("append first put: %v", err)
+	}
+	if err := buffer.appendPut(2, []byte("c"), []byte("external-value"), 1234); err != nil {
+		t.Fatalf("append second put: %v", err)
+	}
+	if err := buffer.appendDelete(3, []byte("b")); err != nil {
+		t.Fatalf("append delete: %v", err)
+	}
 
-	it := &sliceSSTIter{entries: []internal.MemEntry{
-		{Key: []byte("b"), Seq: 3, Kind: internal.OpDelete},
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
-		{Key: []byte("c"), Seq: 2, Kind: internal.OpPut, BlobID: blobID, ExpireAt: 1234},
-	}}
-
-	result, err := buildChangeBatch(context.Background(), it, 7, 1, 3, time.Unix(10, 0).UTC())
+	var object bytes.Buffer
+	result, err := writeChangeBatchStreaming(context.Background(), buffer, 7, time.Unix(10, 0).UTC(),
+		func(_ context.Context, _ string, reader io.Reader) error {
+			_, copyErr := io.Copy(&object, reader)
+			return copyErr
+		})
 	if err != nil {
-		t.Fatalf("buildChangeBatch: %v", err)
+		t.Fatalf("writeChangeBatchStreaming: %v", err)
 	}
 	if result.Meta.Epoch != 7 || result.Meta.SeqLo != 1 || result.Meta.SeqHi != 3 || result.Meta.Count != 3 {
 		t.Fatalf("meta mismatch: %+v", result.Meta)
 	}
-	if result.Meta.Size != int64(len(result.Data)) {
-		t.Fatalf("meta size=%d data=%d", result.Meta.Size, len(result.Data))
+	if result.Meta.Size != int64(object.Len()) {
+		t.Fatalf("meta size=%d data=%d", result.Meta.Size, object.Len())
 	}
-	if result.Meta.Checksum == "" {
-		t.Fatal("expected checksum")
+	if got, want := result.Meta.RawSize, int64(changeBatchHeaderSize)+buffer.bodySize; got != want {
+		t.Fatalf("meta raw size=%d want=%d", got, want)
+	}
+	if result.Meta.Checksum == "" || result.Meta.Compression != changeBatchCompressionZstd {
+		t.Fatalf("incomplete change batch metadata: %+v", result.Meta)
 	}
 
-	batch, err := decodeChangeBatch(result.Data)
+	batch, err := decodeChangeBatch(object.Bytes())
 	if err != nil {
 		t.Fatalf("DecodeChangeBatch: %v", err)
 	}
@@ -47,8 +57,8 @@ func TestBuildChangeBatchOrdersBySeq(t *testing.T) {
 	if batch.Changes[0].Kind != changePut || !batch.Changes[0].Inline || string(batch.Changes[0].Value) != "va" {
 		t.Fatalf("inline put mismatch: %+v", batch.Changes[0])
 	}
-	if batch.Changes[1].Kind != changePut || batch.Changes[1].Inline || batch.Changes[1].BlobID != blobID || batch.Changes[1].ExpireAt != 1234 {
-		t.Fatalf("blob put mismatch: %+v", batch.Changes[1])
+	if batch.Changes[1].Kind != changePut || !batch.Changes[1].Inline || string(batch.Changes[1].Value) != "external-value" || batch.Changes[1].ExpireAt != 1234 {
+		t.Fatalf("second put mismatch: %+v", batch.Changes[1])
 	}
 	if batch.Changes[2].Kind != changeDelete {
 		t.Fatalf("delete mismatch: %+v", batch.Changes[2])

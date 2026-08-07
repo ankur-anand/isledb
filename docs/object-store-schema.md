@@ -37,8 +37,7 @@ demo/p000/
 - `manifest/CURRENT`, `maintenance/HEAD`, `manifest/snapshots/*.manifest`,
   `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
 - `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
-- `changes/*` is reserved for the internal change-feed implementation and is
-  not part of the stable public API.
+- `changes/*` stores mutation batches opened by the public `ChangeReader`.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
 - Manifest log `role` is `0` for writer-owned publication. Applied maintenance
   entries are also writer-owned because only the writer updates `CURRENT`.
@@ -112,6 +111,7 @@ Example:
   "format": "isledb-manifest-v1",
   "snapshot": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest",
   "log_seq_start": 412,
+  "change_feed_enabled": true,
   "change_feed_log_start": 412,
   "next_seq": 428,
   "next_epoch": 19,
@@ -134,7 +134,20 @@ Example:
       "role": 0,
       "epoch": 18,
       "ts": "2026-04-15T10:14:11Z",
-      "op": "add_sstable"
+      "op": "add_sstable",
+      "change_batch": {
+        "id": "18-9001-9256-1776257651000000000.chg",
+        "path": "demo/p000/changes/9f3/18-9001-9256-1776257651000000000.chg",
+        "epoch": 18,
+        "seq_lo": 9001,
+        "seq_hi": 9256,
+        "count": 256,
+        "size": 118420,
+        "raw_size": 276520,
+        "checksum": "sha256:def",
+        "version": 1,
+        "compression": "zstd"
+      }
     }
   ],
   "writer_fence": {
@@ -456,13 +469,15 @@ JSON-style descriptor:
 
 ## `changes/<bucket>/<change-batch-id>`
 
-Immutable, seq-ordered mutation batch used by internal change-feed tests. This
-object is binary, not JSON. It preserves puts, deletes, TTL metadata, inline
-values, and blob references in row-sequence order.
+Immutable, seq-ordered mutation batch opened by `ChangeReader`. This object is
+a zstd-compressed binary stream, not JSON. It
+preserves puts, deletes, TTL metadata, and complete values in mutation order.
+External values are embedded so retained change history does not depend on the
+lifetime of a separate blob object.
 
-The bucket is deterministically derived from the change-batch ID using
-the internal change-batch bucket function. It is not discoverable through the
-public reader API.
+The bucket is deterministically derived from the change-batch ID. Readers use
+the exact path committed in the manifest; normal feed reads never list this
+prefix.
 
 Path:
 
@@ -473,7 +488,7 @@ demo/p000/changes/9f3/18-412-417-1776257651000000000.chg
 Visibility rule:
 
 ```text
-SST object + change batch object may exist before commit.
+The SST and change batch upload concurrently and may exist before commit.
 They become visible only when manifest/CURRENT commits the add_sstable entry.
 ```
 
