@@ -186,15 +186,15 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 			stats.SkippedSSTs++
 			return
 		}
-		if opts.MaxBytes > 0 && sst.Size > 0 && selectedBytes+sst.Size > opts.MaxBytes {
-			stats.SkippedSSTs++
-			return
+		if opts.MaxBytes > 0 {
+			if sst.Size <= 0 || sst.Size > opts.MaxBytes-selectedBytes {
+				stats.SkippedSSTs++
+				return
+			}
 		}
 
 		selected = append(selected, sst)
-		if sst.Size > 0 {
-			selectedBytes += sst.Size
-		}
+		selectedBytes += sst.Size
 	}
 
 	for _, sst := range m.L0SSTs {

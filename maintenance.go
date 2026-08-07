@@ -287,6 +287,9 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	if opts.Retention != nil && opts.Retention.Mode != RetentionByAge && opts.Retention.Mode != RetentionByTimeWindow {
 		return MaintenanceOptions{}, fmt.Errorf("%w: retention mode=%d", ErrInvalidMaintenanceOptions, opts.Retention.Mode)
 	}
+	if opts.Retention != nil && (opts.Retention.KeepAtLeastSSTs < 0 || opts.Retention.KeepAtLeastWindows < 0) {
+		return MaintenanceOptions{}, fmt.Errorf("%w: retention minimums must not be negative", ErrInvalidMaintenanceOptions)
+	}
 	if opts.GarbageCollection.DeleteBatchSize < 0 || opts.GarbageCollection.GracePeriod < 0 {
 		return MaintenanceOptions{}, fmt.Errorf("%w: invalid garbage collection policy", ErrInvalidMaintenanceOptions)
 	}

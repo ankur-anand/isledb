@@ -775,7 +775,7 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, 
 	blobIDHex := internal.BlobIDToHex(blobID)
 
 	if r.blobCache != nil {
-		if data, ok := r.blobCache.Get(blobIDHex); ok {
+		if data, ok := r.getCachedBlob(blobIDHex, blobID); ok {
 			cacheHit = true
 			return data, nil
 		}
@@ -784,7 +784,7 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, 
 	var sfValue interface{}
 	sfValue, err, _ = r.blobLoads.Do(blobIDHex, func() (interface{}, error) {
 		if r.blobCache != nil {
-			if data, ok := r.blobCache.Get(blobIDHex); ok {
+			if data, ok := r.getCachedBlob(blobIDHex, blobID); ok {
 				return blobFetchResult{data: data, cacheHit: true}, nil
 			}
 		}
@@ -807,6 +807,20 @@ func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, 
 	}
 	cacheHit = result.cacheHit
 	return result.data, nil
+}
+
+func (r *Reader) getCachedBlob(blobIDHex string, blobID [32]byte) ([]byte, bool) {
+	data, ok := r.blobCache.Get(blobIDHex)
+	if !ok {
+		return nil, false
+	}
+	if r.valueConfig.VerifyBlobsOnRead {
+		if err := internal.VerifyBlob(blobID, data); err != nil {
+			r.blobCache.Remove(blobIDHex)
+			return nil, false
+		}
+	}
+	return data, true
 }
 
 func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {

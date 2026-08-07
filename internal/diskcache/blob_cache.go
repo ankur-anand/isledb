@@ -76,10 +76,12 @@ func (c *blobCache) Get(key string) ([]byte, bool) {
 	}
 
 	data, err := os.ReadFile(entry.path)
-	if err != nil {
+	if err != nil || int64(len(data)) != entry.size {
 		c.misses.Add(1)
 		c.mu.Lock()
-		c.removeLocked(key)
+		if c.index[key] == entry {
+			c.removeLocked(key)
+		}
 		c.mu.Unlock()
 		return nil, false
 	}
@@ -87,7 +89,9 @@ func (c *blobCache) Get(key string) ([]byte, bool) {
 	c.hits.Add(1)
 
 	c.mu.Lock()
-	c.moveToEnd(key)
+	if c.index[key] == entry {
+		c.moveToEnd(key)
+	}
 	c.mu.Unlock()
 
 	return data, true
@@ -103,19 +107,17 @@ func (c *blobCache) Set(key string, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.index[key]; exists {
-		c.removeLocked(key)
-	}
-
-	for c.currentSize+dataSize > c.maxSize && len(c.order) > 0 {
-		c.evictOldest()
-	}
-
 	filename := cacheFileName(key)
 	localPath := filepath.Join(c.dir, filename)
 
-	if err := os.WriteFile(localPath, data, 0644); err != nil {
+	if err := writeFileAtomic(c.dir, localPath, data); err != nil {
 		return err
+	}
+
+	if existing, ok := c.index[key]; ok {
+		c.currentSize -= existing.size
+		delete(c.index, key)
+		c.removeFromOrder(key)
 	}
 
 	entry := &blobEntry{
@@ -126,8 +128,33 @@ func (c *blobCache) Set(key string, data []byte) error {
 	c.index[key] = entry
 	c.order = append(c.order, key)
 	c.currentSize += dataSize
+	for c.currentSize > c.maxSize && len(c.order) > 0 {
+		c.evictOldest()
+	}
 
 	return nil
+}
+
+func writeFileAtomic(dir, target string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, ".blob-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, target)
 }
 
 func (c *blobCache) Remove(key string) {

@@ -179,6 +179,34 @@ func TestReader_PrefetchRespectsMaxSSTs(t *testing.T) {
 	}
 }
 
+func TestReader_PrefetchByteBudgetSkipsUnknownSize(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	manifestStore := newManifestStore(store, nil)
+	writer := newPrefetchTestWriter(t, ctx, store, manifestStore)
+	defer writer.close(ctx)
+
+	writePrefetchBatch(t, ctx, writer, "unknown-size", 0, 2)
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{})
+	defer reader.Close()
+
+	reader.mu.Lock()
+	if len(reader.manifest.L0SSTs) != 1 {
+		reader.mu.Unlock()
+		t.Fatalf("L0 SST count = %d, want 1", len(reader.manifest.L0SSTs))
+	}
+	reader.manifest.L0SSTs[0].Size = 0
+	reader.mu.Unlock()
+
+	stats, err := reader.Prefetch(ctx, PrefetchOptions{All: true, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
+	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 || stats.SkippedSSTs != 1 || stats.BytesRead != 0 {
+		t.Fatalf("stats = %+v, want unknown-size SST skipped", stats)
+	}
+}
+
 func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")

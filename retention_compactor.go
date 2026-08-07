@@ -95,6 +95,9 @@ func newRetentionCompactorWithFence(ctx context.Context, store *blobstore.Store,
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	if opts.KeepAtLeastSSTs < 0 || opts.KeepAtLeastWindows < 0 {
+		return nil, fmt.Errorf("%w: retention minimums must not be negative", ErrInvalidMaintenanceOptions)
+	}
 
 	defaults := defaultRetentionCompactorOptions()
 	if opts.RetentionPeriod <= 0 {

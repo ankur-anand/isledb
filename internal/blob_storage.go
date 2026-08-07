@@ -54,14 +54,22 @@ func (b *BlobStorage) Read(ctx context.Context, blobID [32]byte) ([]byte, error)
 	}
 
 	if b.config.VerifyBlobsOnRead {
-		hash := sha256.Sum256(data)
-		if hash != blobID {
-			return nil, fmt.Errorf("blob integrity check failed: expected %s, got %s",
-				blobIDHex[:8], hex.EncodeToString(hash[:])[:8])
+		if err := VerifyBlob(blobID, data); err != nil {
+			return nil, err
 		}
 	}
 
 	return data, nil
+}
+
+// VerifyBlob checks that data matches its content-addressed blob ID.
+func VerifyBlob(blobID [32]byte, data []byte) error {
+	hash := sha256.Sum256(data)
+	if hash != blobID {
+		return fmt.Errorf("blob integrity check failed: expected %s, got %s",
+			hex.EncodeToString(blobID[:])[:8], hex.EncodeToString(hash[:])[:8])
+	}
+	return nil
 }
 
 func (b *BlobStorage) Exists(ctx context.Context, blobID [32]byte) (bool, error) {

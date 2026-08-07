@@ -62,6 +62,8 @@ func newMergeIterator(iters []sstable.Iterator) *kMergeIterator {
 		if kv != nil {
 			mi.loadState(i, &kv.K, kv.InPlaceValue())
 			mi.tree[size+i] = i
+		} else if err := iter.Error(); err != nil && mi.err == nil {
+			mi.err = err
 		}
 	}
 
