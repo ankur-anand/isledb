@@ -1,11 +1,11 @@
 package isledb
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -19,9 +19,12 @@ import (
 
 const changeBatchCompressionZstd = "zstd"
 
-const changeBatchChunkBytes = 256 << 10
-
-const changeBatchInitialChunkBytes = 4 << 10
+const (
+	changeBatchChunkBytes           = 256 << 10
+	changeBatchInitialChunkBytes    = 4 << 10
+	defaultChangeBatchBlockRecords  = 512
+	defaultChangeBatchBlockRawBytes = 1 << 20
+)
 
 var changeBatchEncoderPool = sync.Pool{New: func() any {
 	encoder, err := zstd.NewWriter(nil,
@@ -45,11 +48,13 @@ var changeBatchDecoderPool = sync.Pool{New: func() any {
 }}
 
 type changeBatchBuffer struct {
-	chunks   [][]byte
-	bodySize int64
-	count    uint32
-	seqLo    uint64
-	seqHi    uint64
+	chunks        [][]byte
+	recordOffsets []int64
+	recordSeqs    []uint64
+	bodySize      int64
+	count         uint32
+	seqLo         uint64
+	seqHi         uint64
 }
 
 func (b *changeBatchBuffer) appendPut(seq uint64, key, value []byte, expireAt int64) error {
@@ -93,6 +98,8 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 		return fmt.Errorf("change value too large: %d", valueLen)
 	}
 
+	b.recordOffsets = append(b.recordOffsets, b.bodySize)
+	b.recordSeqs = append(b.recordSeqs, change.Seq)
 	var header [changeRecordHeaderSize]byte
 	header[0] = byte(change.Kind)
 	if change.Kind == changePut {
@@ -139,32 +146,101 @@ func (b *changeBatchBuffer) appendBytes(data []byte) {
 	}
 }
 
-func (b *changeBatchBuffer) writeBodyTo(writer io.Writer) error {
-	for _, chunk := range b.chunks {
-		n, err := writer.Write(chunk)
-		if err != nil {
-			return err
-		}
-		if n != len(chunk) {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
-}
-
-func (b *changeBatchBuffer) header(epoch uint64) []byte {
-	header := make([]byte, changeBatchHeaderSize)
-	copy(header[:4], changeBatchMagic)
-	binary.BigEndian.PutUint16(header[4:6], changeBatchVersion)
-	binary.BigEndian.PutUint64(header[8:16], epoch)
-	binary.BigEndian.PutUint64(header[16:24], b.seqLo)
-	binary.BigEndian.PutUint64(header[24:32], b.seqHi)
-	binary.BigEndian.PutUint32(header[32:36], b.count)
-	return header
-}
-
 func errorsChangeBatchTooLarge(count uint32) error {
 	return fmt.Errorf("change batch too large: count=%d", count)
+}
+
+type changeBatchBlockOptions struct {
+	MaxRecords     int
+	TargetRawBytes int64
+}
+
+func defaultChangeBatchBlockOptions() changeBatchBlockOptions {
+	return changeBatchBlockOptions{
+		MaxRecords:     defaultChangeBatchBlockRecords,
+		TargetRawBytes: defaultChangeBatchBlockRawBytes,
+	}
+}
+
+func normalizeChangeBatchBlockOptions(opts changeBatchBlockOptions) changeBatchBlockOptions {
+	defaults := defaultChangeBatchBlockOptions()
+	if opts.MaxRecords <= 0 {
+		opts.MaxRecords = defaults.MaxRecords
+	}
+	if opts.TargetRawBytes <= 0 {
+		opts.TargetRawBytes = defaults.TargetRawBytes
+	}
+	return opts
+}
+
+type changeBatchBlockRange struct {
+	first    int
+	count    int
+	rawStart int64
+	rawEnd   int64
+}
+
+func (b *changeBatchBuffer) blockRanges(opts changeBatchBlockOptions) ([]changeBatchBlockRange, error) {
+	opts = normalizeChangeBatchBlockOptions(opts)
+	if b == nil || b.count == 0 || len(b.recordOffsets) != int(b.count) || len(b.recordSeqs) != int(b.count) {
+		return nil, errors.New("invalid empty change batch buffer")
+	}
+	ranges := make([]changeBatchBlockRange, 0, (int(b.count)+opts.MaxRecords-1)/opts.MaxRecords)
+	for first := 0; first < int(b.count); {
+		rawStart := b.recordOffsets[first]
+		end := first
+		for end < int(b.count) {
+			nextRawEnd := b.bodySize
+			if end+1 < int(b.count) {
+				nextRawEnd = b.recordOffsets[end+1]
+			}
+			if end > first && (end-first >= opts.MaxRecords || nextRawEnd-rawStart > opts.TargetRawBytes) {
+				break
+			}
+			end++
+			if end-first >= opts.MaxRecords {
+				break
+			}
+		}
+		rawEnd := b.bodySize
+		if end < int(b.count) {
+			rawEnd = b.recordOffsets[end]
+		}
+		if end == first || rawEnd <= rawStart {
+			return nil, fmt.Errorf("invalid change block range first=%d end=%d", first, end)
+		}
+		ranges = append(ranges, changeBatchBlockRange{
+			first: first, count: end - first, rawStart: rawStart, rawEnd: rawEnd,
+		})
+		first = end
+	}
+	return ranges, nil
+}
+
+func (b *changeBatchBuffer) bytesRange(start, end int64) ([]byte, error) {
+	if b == nil || start < 0 || end <= start || end > b.bodySize || end-start > int64(maxInt()) {
+		return nil, fmt.Errorf("invalid change batch byte range [%d,%d)", start, end)
+	}
+	result := make([]byte, 0, int(end-start))
+	var chunkStart int64
+	for _, chunk := range b.chunks {
+		chunkEnd := chunkStart + int64(len(chunk))
+		if chunkEnd <= start {
+			chunkStart = chunkEnd
+			continue
+		}
+		if chunkStart >= end {
+			break
+		}
+		lo := max(start, chunkStart) - chunkStart
+		hi := min(end, chunkEnd) - chunkStart
+		result = append(result, chunk[lo:hi]...)
+		chunkStart = chunkEnd
+	}
+	if int64(len(result)) != end-start {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return result, nil
 }
 
 type changeBatchStreamResult struct {
@@ -178,8 +254,24 @@ func writeChangeBatchStreaming(
 	createdAt time.Time,
 	uploadFn func(context.Context, string, io.Reader) error,
 ) (changeBatchStreamResult, error) {
+	return writeChangeBatchStreamingWithOptions(
+		ctx, buffer, epoch, createdAt, defaultChangeBatchBlockOptions(), uploadFn)
+}
+
+func writeChangeBatchStreamingWithOptions(
+	ctx context.Context,
+	buffer *changeBatchBuffer,
+	epoch uint64,
+	createdAt time.Time,
+	blockOpts changeBatchBlockOptions,
+	uploadFn func(context.Context, string, io.Reader) error,
+) (changeBatchStreamResult, error) {
 	if buffer == nil || buffer.count == 0 {
 		return changeBatchStreamResult{}, errEmptyIterator
+	}
+	blockRanges, err := buffer.blockRanges(blockOpts)
+	if err != nil {
+		return changeBatchStreamResult{}, err
 	}
 
 	id := buildChangeBatchIDWithTimestamp(epoch, buffer.seqLo, buffer.seqHi, createdAt)
@@ -187,21 +279,57 @@ func writeChangeBatchStreaming(
 	hasher := sha256.New()
 	destination := &changeBatchHashWriter{writer: writer, hash: hasher}
 	producerDone := make(chan error, 1)
+	blocks := make([]changeBatchBlock, 0, len(blockRanges))
+	var indexChecksum [sha256.Size]byte
 
 	go func() {
 		encoder := changeBatchEncoderPool.Get().(*zstd.Encoder)
-		encoder.Reset(destination)
-		_, err := encoder.Write(buffer.header(epoch))
-		if err == nil {
-			err = buffer.writeBodyTo(encoder)
+		defer changeBatchEncoderPool.Put(encoder)
+
+		var produceErr error
+		for _, blockRange := range blockRanges {
+			if err := ctx.Err(); err != nil {
+				produceErr = err
+				break
+			}
+			raw, err := buffer.bytesRange(blockRange.rawStart, blockRange.rawEnd)
+			if err != nil {
+				produceErr = err
+				break
+			}
+			compressed := encoder.EncodeAll(raw, nil)
+			if len(compressed) > math.MaxUint32 || len(raw) > math.MaxUint32 {
+				produceErr = fmt.Errorf("change block too large: compressed=%d raw=%d", len(compressed), len(raw))
+				break
+			}
+			block := changeBatchBlock{
+				FirstIndex:     uint32(blockRange.first),
+				Count:          uint32(blockRange.count),
+				SeqLo:          buffer.recordSeqs[blockRange.first],
+				Offset:         uint64(destination.size),
+				CompressedSize: uint32(len(compressed)),
+				RawSize:        uint32(len(raw)),
+				Checksum:       sha256.Sum256(raw),
+			}
+			if err := writeChangeBatchBytes(destination, compressed); err != nil {
+				produceErr = err
+				break
+			}
+			blocks = append(blocks, block)
 		}
-		if closeErr := encoder.Close(); err == nil {
-			err = closeErr
+		if produceErr == nil {
+			indexData := encodeChangeBatchBlockIndex(blocks)
+			indexChecksum = sha256.Sum256(indexData)
+			indexOffset := uint64(destination.size)
+			if err := writeChangeBatchBytes(destination, indexData); err != nil {
+				produceErr = err
+			} else {
+				trailer := encodeChangeBatchTrailer(buffer, epoch, indexOffset, indexData, blocks)
+				produceErr = writeChangeBatchBytes(destination, trailer)
+			}
 		}
-		encoder.Reset(io.Discard)
-		changeBatchEncoderPool.Put(encoder)
-		_ = writer.CloseWithError(err)
-		producerDone <- err
+		_ = writer.CloseWithError(produceErr)
+		producerDone <- produceErr
 	}()
 
 	uploadErr := uploadFn(ctx, id, reader)
@@ -217,18 +345,70 @@ func writeChangeBatchStreaming(
 	}
 
 	return changeBatchStreamResult{Meta: manifest.ChangeBatchMeta{
-		ID:          id,
-		Epoch:       epoch,
-		SeqLo:       buffer.seqLo,
-		SeqHi:       buffer.seqHi,
-		Count:       buffer.count,
-		Size:        destination.size,
-		RawSize:     int64(changeBatchHeaderSize) + buffer.bodySize,
-		Checksum:    "sha256:" + hex.EncodeToString(hasher.Sum(nil)),
-		CreatedAt:   createdAt,
-		Version:     changeBatchVersion,
-		Compression: changeBatchCompressionZstd,
+		ID:            id,
+		Epoch:         epoch,
+		SeqLo:         buffer.seqLo,
+		SeqHi:         buffer.seqHi,
+		Count:         buffer.count,
+		BlockCount:    uint32(len(blocks)),
+		Size:          destination.size,
+		RawSize:       buffer.bodySize,
+		Checksum:      "sha256:" + hex.EncodeToString(hasher.Sum(nil)),
+		IndexChecksum: "sha256:" + hex.EncodeToString(indexChecksum[:]),
+		CreatedAt:     createdAt,
+		Version:       changeBatchVersion,
+		Compression:   changeBatchCompressionZstd,
 	}}, nil
+}
+
+func encodeChangeBatchBlockIndex(blocks []changeBatchBlock) []byte {
+	data := make([]byte, len(blocks)*changeBatchIndexEntrySize)
+	for i := range blocks {
+		off := i * changeBatchIndexEntrySize
+		block := blocks[i]
+		binary.BigEndian.PutUint32(data[off:off+4], block.FirstIndex)
+		binary.BigEndian.PutUint32(data[off+4:off+8], block.Count)
+		binary.BigEndian.PutUint64(data[off+8:off+16], block.SeqLo)
+		binary.BigEndian.PutUint64(data[off+16:off+24], block.Offset)
+		binary.BigEndian.PutUint32(data[off+24:off+28], block.CompressedSize)
+		binary.BigEndian.PutUint32(data[off+28:off+32], block.RawSize)
+		copy(data[off+32:off+64], block.Checksum[:])
+	}
+	return data
+}
+
+func encodeChangeBatchTrailer(
+	buffer *changeBatchBuffer,
+	epoch uint64,
+	indexOffset uint64,
+	indexData []byte,
+	blocks []changeBatchBlock,
+) []byte {
+	trailer := make([]byte, changeBatchTrailerSize)
+	copy(trailer[:4], changeBatchMagic)
+	binary.BigEndian.PutUint16(trailer[4:6], changeBatchVersion)
+	binary.BigEndian.PutUint64(trailer[8:16], epoch)
+	binary.BigEndian.PutUint64(trailer[16:24], buffer.seqLo)
+	binary.BigEndian.PutUint64(trailer[24:32], buffer.seqHi)
+	binary.BigEndian.PutUint32(trailer[32:36], buffer.count)
+	binary.BigEndian.PutUint32(trailer[36:40], uint32(len(blocks)))
+	binary.BigEndian.PutUint64(trailer[40:48], indexOffset)
+	binary.BigEndian.PutUint64(trailer[48:56], uint64(len(indexData)))
+	binary.BigEndian.PutUint64(trailer[56:64], uint64(buffer.bodySize))
+	indexSum := sha256.Sum256(indexData)
+	copy(trailer[64:96], indexSum[:])
+	return trailer
+}
+
+func writeChangeBatchBytes(writer io.Writer, data []byte) error {
+	n, err := writer.Write(data)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 type changeBatchHashWriter struct {
@@ -246,15 +426,9 @@ func (w *changeBatchHashWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func decompressChangeBatchSized(data []byte, rawSize int64) ([]byte, error) {
-	if len(data) < 4 || !bytes.Equal(data[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}) {
-		return data, nil
-	}
+func decompressChangeBatchBlock(data []byte, rawSize int) ([]byte, error) {
 	decoder := changeBatchDecoderPool.Get().(*zstd.Decoder)
-	var destination []byte
-	if rawSize > 0 && rawSize <= int64(maxInt()) {
-		destination = make([]byte, 0, int(rawSize))
-	}
+	destination := make([]byte, 0, rawSize)
 	decoded, err := decoder.DecodeAll(data, destination)
 	changeBatchDecoderPool.Put(decoder)
 	return decoded, err

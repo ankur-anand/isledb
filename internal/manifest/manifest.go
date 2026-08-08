@@ -66,22 +66,24 @@ type SSTMeta struct {
 	HasBlobRefs bool   `json:"has_blob_refs"`
 }
 
-// ChangeBatchMeta describes one committed, seq-ordered mutation batch emitted
-// alongside a memtable flush. The object is visible only after the manifest
-// entry that references it is committed.
+// ChangeBatchMeta describes one committed, block-indexed, seq-ordered mutation
+// batch emitted alongside a memtable flush. The object is visible only after
+// the manifest entry that references it is committed.
 type ChangeBatchMeta struct {
-	ID          string    `json:"id"`
-	Path        string    `json:"path"`
-	Epoch       uint64    `json:"epoch"`
-	SeqLo       uint64    `json:"seq_lo"`
-	SeqHi       uint64    `json:"seq_hi"`
-	Count       uint32    `json:"count"`
-	Size        int64     `json:"size"`
-	RawSize     int64     `json:"raw_size"`
-	Checksum    string    `json:"checksum"`
-	CreatedAt   time.Time `json:"created_at"`
-	Version     int       `json:"version,omitempty"`
-	Compression string    `json:"compression,omitempty"`
+	ID            string    `json:"id"`
+	Path          string    `json:"path"`
+	Epoch         uint64    `json:"epoch"`
+	SeqLo         uint64    `json:"seq_lo"`
+	SeqHi         uint64    `json:"seq_hi"`
+	Count         uint32    `json:"count"`
+	BlockCount    uint32    `json:"block_count"`
+	Size          int64     `json:"size"`
+	RawSize       int64     `json:"raw_size"`
+	Checksum      string    `json:"checksum"`
+	IndexChecksum string    `json:"index_checksum"`
+	CreatedAt     time.Time `json:"created_at"`
+	Version       int       `json:"version,omitempty"`
+	Compression   string    `json:"compression,omitempty"`
 }
 
 // WriterCommit is one logical memtable publication. ID remains unchanged when

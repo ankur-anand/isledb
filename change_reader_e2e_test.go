@@ -120,8 +120,9 @@ func TestS3E2E_ChangeReaderLargeBatchGETBudget(t *testing.T) {
 	}
 
 	got := counts.snapshot()
-	if got.current != 1 || got.changeBatches != 1 || got.manifestPages != 0 || got.lists != 0 {
-		t.Fatalf("object GETs=%+v want current=1 change_batches=1 manifest_pages=0 lists=0", got)
+	wantChangeGETs := int64(1 + (records+defaultChangeBatchBlockRecords-1)/defaultChangeBatchBlockRecords)
+	if got.current != 1 || got.changeBatches != wantChangeGETs || got.manifestPages != 0 || got.lists != 0 {
+		t.Fatalf("object GETs=%+v want current=1 change_batches=%d manifest_pages=0 lists=0", got, wantChangeGETs)
 	}
 }
 
@@ -249,8 +250,8 @@ func TestS3E2E_ChangeReaderManifestRotationAndRestart(t *testing.T) {
 	if got.manifestPages == 0 {
 		t.Fatalf("manifest page GETs=%d want >0", got.manifestPages)
 	}
-	if got.changeBatches != flushes {
-		t.Fatalf("change-batch GETs=%d want=%d", got.changeBatches, flushes)
+	if got.changeBatches != 2*flushes {
+		t.Fatalf("change-batch GETs=%d want=%d", got.changeBatches, 2*flushes)
 	}
 	if got.lists != 0 {
 		t.Fatalf("LIST requests=%d want=0", got.lists)
@@ -405,5 +406,9 @@ func clearChangeReaderBatchCache(reader *ChangeReader) {
 	reader.batch = nil
 	reader.batchEntry = 0
 	reader.batchView = nil
+	clear(reader.blockCache)
+	reader.blockCache = nil
+	reader.blockCacheBytes = 0
+	reader.blockCacheClock = 0
 	reader.batchMu.Unlock()
 }
