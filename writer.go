@@ -76,12 +76,13 @@ type writerFailure struct {
 // commit ID survive manifest retries, so publication never creates a second
 // visible commit for the same sequence range.
 type pendingFlush struct {
-	commitID    string
-	epoch       uint64
-	memtable    *internal.Memtable
-	sstable     *manifest.SSTMeta
-	changeBatch *manifest.ChangeBatchMeta
-	changes     *changeBatchBuffer
+	commitID             string
+	epoch                uint64
+	memtable             *internal.Memtable
+	sstable              *manifest.SSTMeta
+	changeBatch          *manifest.ChangeBatchMeta
+	changes              *changeBatchBuffer
+	changeBatchCreatedAt time.Time
 }
 
 func (p *pendingFlush) SeqLo() uint64 {
@@ -287,6 +288,9 @@ func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlus
 		epoch:    w.epoch,
 		memtable: memtable,
 		changes:  w.changeBuffer,
+	}
+	if pending.changes != nil {
+		pending.changeBatchCreatedAt = time.Now().UTC()
 	}
 	w.changeBuffer = nil
 	w.epoch++
@@ -628,7 +632,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		return result, nil
 	}
 	buildChangeBatch := func(uploadCtx context.Context) (changeBatchStreamResult, error) {
-		result, err := writeChangeBatchStreaming(uploadCtx, pending.changes, pending.epoch, time.Now().UTC(),
+		result, err := writePendingChangeBatch(uploadCtx, pending,
 			func(ctx context.Context, id string, reader io.Reader) error {
 				_, err := w.store.WriteReader(ctx, w.store.ChangeBatchPath(id), reader, nil)
 				return err
@@ -700,6 +704,20 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
 		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
 	return nil
+}
+
+func writePendingChangeBatch(
+	ctx context.Context,
+	pending *pendingFlush,
+	uploadFn func(context.Context, string, io.Reader) error,
+) (changeBatchStreamResult, error) {
+	return writeChangeBatchStreaming(
+		ctx,
+		pending.changes,
+		pending.epoch,
+		pending.changeBatchCreatedAt,
+		uploadFn,
+	)
 }
 
 func (w *writer) flushLoop() {
