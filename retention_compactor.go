@@ -42,7 +42,6 @@ type retentionCompactorOptions struct {
 	OnCleanupError    func(error)
 	GCCursorStorage   manifest.GCCursorStorage
 	GCDeleteBatchSize int
-	GCGracePeriod     time.Duration
 }
 
 type CleanupStats struct {
@@ -60,7 +59,6 @@ func defaultRetentionCompactorOptions() retentionCompactorOptions {
 		CheckInterval:      time.Minute,
 		SegmentDuration:    time.Hour,
 		GCDeleteBatchSize:  defaultSSTSweepBatchSize,
-		GCGracePeriod:      defaultSSTSweepGracePeriod,
 	}
 }
 
@@ -120,9 +118,6 @@ func newRetentionCompactorWithFence(ctx context.Context, store *blobstore.Store,
 	}
 	if opts.GCDeleteBatchSize <= 0 {
 		opts.GCDeleteBatchSize = defaults.GCDeleteBatchSize
-	}
-	if opts.GCGracePeriod == 0 {
-		opts.GCGracePeriod = defaults.GCGracePeriod
 	}
 
 	m, err := manifestLog.Replay(ctx)
@@ -457,7 +452,7 @@ func (c *retentionCompactor) cleanupFIFO(ctx context.Context, m *manifestState) 
 		return 0, 0, nil
 	}
 
-	retired, err := retiredSSTObjects(c.store, m, toDelete, c.opts.GCGracePeriod)
+	retired, err := retiredSSTObjects(c.store, m, toDelete)
 	if err != nil {
 		return 0, 0, fmt.Errorf("build retirement records: %w", err)
 	}
@@ -560,7 +555,7 @@ segmentLoop:
 		return 0, 0, nil
 	}
 
-	retired, err := retiredSSTObjects(c.store, m, toDelete, c.opts.GCGracePeriod)
+	retired, err := retiredSSTObjects(c.store, m, toDelete)
 	if err != nil {
 		return 0, 0, fmt.Errorf("build retirement records: %w", err)
 	}

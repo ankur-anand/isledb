@@ -11,25 +11,15 @@ import (
 var ErrInvalidReaderOptions = errors.New("invalid reader options")
 
 const (
-	defaultReaderRefreshAfter   = time.Minute
-	defaultReaderSnapshotMaxAge = 5 * time.Minute
-	defaultReaderIteratorMaxAge = 2 * time.Minute
+	defaultReaderRefreshAfter = time.Minute
 )
 
-// ReaderViewPolicy bounds how long a Reader may retain one manifest view.
+// ReaderViewPolicy controls when a Reader refreshes its manifest view.
 type ReaderViewPolicy struct {
 	// RefreshAfter is the maximum age of the Reader's loaded manifest before a
 	// read refreshes it. Concurrent refreshes are coalesced. Zero selects the
 	// default.
 	RefreshAfter time.Duration
-
-	// SnapshotMaxAge is the maximum lifetime of an explicit Snapshot. Zero
-	// selects the default.
-	SnapshotMaxAge time.Duration
-
-	// IteratorMaxAge is the maximum lifetime of an Iterator. Zero selects the
-	// default. Snapshot iterators also cannot outlive their Snapshot.
-	IteratorMaxAge time.Duration
 }
 
 // CacheStats reports one reader cache's occupancy and lookup activity. Byte
@@ -78,7 +68,8 @@ type ReaderOpenOptions struct {
 	// If provided and the SST has a signature, verification is enforced.
 	SSTHashVerifier SSTHashVerifier
 
-	// Views controls manifest refresh and the lifetime of retained read views.
+	// Views controls manifest freshness. Read-view lifetime is a store policy
+	// loaded from the manifest and cannot be extended by a reader.
 	Views ReaderViewPolicy
 
 	Metrics *ReaderMetrics
@@ -131,21 +122,8 @@ func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error
 	if policy.RefreshAfter < 0 {
 		return ReaderViewPolicy{}, fmt.Errorf("%w: refresh_after=%s", ErrInvalidReaderOptions, policy.RefreshAfter)
 	}
-	if policy.SnapshotMaxAge < 0 {
-		return ReaderViewPolicy{}, fmt.Errorf("%w: snapshot_max_age=%s", ErrInvalidReaderOptions, policy.SnapshotMaxAge)
-	}
-	if policy.IteratorMaxAge < 0 {
-		return ReaderViewPolicy{}, fmt.Errorf("%w: iterator_max_age=%s", ErrInvalidReaderOptions, policy.IteratorMaxAge)
-	}
-
 	if policy.RefreshAfter == 0 {
 		policy.RefreshAfter = defaultReaderRefreshAfter
-	}
-	if policy.SnapshotMaxAge == 0 {
-		policy.SnapshotMaxAge = defaultReaderSnapshotMaxAge
-	}
-	if policy.IteratorMaxAge == 0 {
-		policy.IteratorMaxAge = defaultReaderIteratorMaxAge
 	}
 	return policy, nil
 }

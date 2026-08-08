@@ -28,6 +28,7 @@ var (
 	ErrInvalidRetirement    = errors.New("invalid retired object batch")
 	ErrRetirementHistory    = errors.New("retirement history unavailable")
 	ErrInvalidManifest      = errors.New("invalid manifest topology")
+	ErrStorePolicyMismatch  = errors.New("store policy mismatch")
 )
 
 const (
@@ -117,7 +118,20 @@ func (s *Store) CurrentData() *Current {
 }
 
 func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, error) {
-	token, err := s.claimFence(ctx, FenceRoleWriter, ownerID)
+	return s.claimWriter(ctx, ownerID, nil)
+}
+
+// ClaimWriterWithPolicy claims the writer fence and establishes the store's
+// immutable pinned-view lifetime. Later writer claims must use the same value.
+func (s *Store) ClaimWriterWithPolicy(ctx context.Context, ownerID string, maxPinnedViewAge time.Duration) (*FenceToken, error) {
+	if maxPinnedViewAge <= 0 {
+		return nil, fmt.Errorf("%w: max_pinned_view_age=%s", ErrStorePolicyMismatch, maxPinnedViewAge)
+	}
+	return s.claimWriter(ctx, ownerID, &maxPinnedViewAge)
+}
+
+func (s *Store) claimWriter(ctx context.Context, ownerID string, maxPinnedViewAge *time.Duration) (*FenceToken, error) {
+	token, err := s.claimFence(ctx, FenceRoleWriter, ownerID, maxPinnedViewAge)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +144,7 @@ func (s *Store) ClaimWriter(ctx context.Context, ownerID string) (*FenceToken, e
 }
 
 func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken, error) {
-	token, err := s.claimFence(ctx, FenceRoleCompactor, ownerID)
+	token, err := s.claimFence(ctx, FenceRoleCompactor, ownerID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +156,7 @@ func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken
 	return token, nil
 }
 
-func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) (*FenceToken, error) {
+func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, maxPinnedViewAge *time.Duration) (*FenceToken, error) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 
@@ -158,6 +172,16 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string) 
 		}
 		if current == nil {
 			current = &Current{NextEpoch: 1}
+		}
+		normalizeCurrent(current)
+
+		if role == FenceRoleWriter && maxPinnedViewAge != nil {
+			if current.WriterFence == nil {
+				current.MaxPinnedViewAge = *maxPinnedViewAge
+			} else if current.MaxPinnedViewAge != *maxPinnedViewAge {
+				return nil, fmt.Errorf("%w: stored=%s requested=%s",
+					ErrStorePolicyMismatch, current.MaxPinnedViewAge, *maxPinnedViewAge)
+			}
 		}
 
 		var existingFence *FenceToken
@@ -367,10 +391,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 
-	if err := validateRetiredObjects(entry); err != nil {
-		return err
-	}
-
 	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		var current *Current
 		var etag string
@@ -423,6 +443,9 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		}
 		if nextEntry.Timestamp.IsZero() {
 			nextEntry.Timestamp = time.Now().UTC()
+		}
+		if err := stampRetiredObjects(&nextEntry, current); err != nil {
+			return err
 		}
 
 		updated := current.Clone()
@@ -751,6 +774,23 @@ func validateRetiredObjects(entry *ManifestLogEntry) error {
 		}
 	}
 	return nil
+}
+
+func stampRetiredObjects(entry *ManifestLogEntry, current *Current) error {
+	if entry == nil {
+		return fmt.Errorf("%w: nil manifest entry", ErrInvalidRetirement)
+	}
+	if len(entry.RetiredObjects) == 0 {
+		return validateRetiredObjects(entry)
+	}
+	entry.RetiredObjects = append([]RetiredObject(nil), entry.RetiredObjects...)
+	notBefore := entry.Timestamp.Add(current.PinnedViewAge()).Add(retirementSafetyMargin)
+	for i := range entry.RetiredObjects {
+		if entry.RetiredObjects[i].NotBefore.IsZero() || entry.RetiredObjects[i].NotBefore.Before(notBefore) {
+			entry.RetiredObjects[i].NotBefore = notBefore
+		}
+	}
+	return validateRetiredObjects(entry)
 }
 
 func (s *Store) activeLimit() int {

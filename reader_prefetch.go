@@ -73,7 +73,7 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		return PrefetchStats{}, err
 	}
 
-	m := r.currentManifest()
+	m, _, expiresAt := r.currentManifestState()
 	if m != nil {
 		m = m.Clone()
 	}
@@ -92,9 +92,12 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		concurrency = defaultPrefetchConcurrency
 	}
 
+	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
+	defer cancel()
+
 	var cached atomic.Int64
 	var bytesRead atomic.Int64
-	g, gctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(readCtx)
 	g.SetLimit(concurrency)
 	for _, sst := range selected {
 		sst := sst
@@ -113,7 +116,7 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	if err := g.Wait(); err != nil {
 		stats.CachedSSTs = int(cached.Load())
 		stats.BytesRead = bytesRead.Load()
-		return stats, err
+		return stats, readViewError(readCtx, err)
 	}
 
 	stats.CachedSSTs = int(cached.Load())

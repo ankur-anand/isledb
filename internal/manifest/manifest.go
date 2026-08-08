@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/segmentio/ksuid"
@@ -112,11 +113,12 @@ type Current struct {
 	NextSeq       uint64 `json:"next_seq"`
 	NextEpoch     uint64 `json:"next_epoch"`
 
-	ChangeFeedEnabled  bool   `json:"change_feed_enabled,omitempty"`
-	ChangeFeedLogStart uint64 `json:"change_feed_log_start,omitempty"`
-	RetirementLogStart uint64 `json:"retirement_log_start"`
-	StateReplayPages   uint64 `json:"state_replay_pages,omitempty"`
-	StateReplayBytes   uint64 `json:"state_replay_bytes,omitempty"`
+	ChangeFeedEnabled  bool          `json:"change_feed_enabled,omitempty"`
+	ChangeFeedLogStart uint64        `json:"change_feed_log_start,omitempty"`
+	RetirementLogStart uint64        `json:"retirement_log_start"`
+	StateReplayPages   uint64        `json:"state_replay_pages,omitempty"`
+	StateReplayBytes   uint64        `json:"state_replay_bytes,omitempty"`
+	MaxPinnedViewAge   time.Duration `json:"max_pinned_view_age_nanos"`
 
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
@@ -163,6 +165,9 @@ func DecodeSnapshot(data []byte) (*Manifest, error) {
 }
 
 func EncodeCurrent(c *Current) ([]byte, error) {
+	if c != nil && c.MaxPinnedViewAge < 0 {
+		return nil, fmt.Errorf("%w: max_pinned_view_age=%s", ErrInvalidManifest, c.MaxPinnedViewAge)
+	}
 	return json.Marshal(c)
 }
 
@@ -170,6 +175,9 @@ func DecodeCurrent(data []byte) (*Current, error) {
 	var c Current
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, err
+	}
+	if c.MaxPinnedViewAge < 0 {
+		return nil, fmt.Errorf("%w: max_pinned_view_age=%s", ErrInvalidManifest, c.MaxPinnedViewAge)
 	}
 	return &c, nil
 }

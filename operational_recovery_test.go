@@ -290,7 +290,6 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
 	maintenanceOpts.Compaction.Compression = "none"
-	maintenanceOpts.GarbageCollection.GracePeriod = time.Nanosecond
 	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -479,7 +478,6 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 		maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
 		maintenanceOpts.Compaction.Compression = "none"
-		maintenanceOpts.GarbageCollection.GracePeriod = time.Nanosecond
 		maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {

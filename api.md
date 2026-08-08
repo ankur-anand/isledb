@@ -82,6 +82,11 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 type DBOptions struct {
     Prefix           string
     EnableChangeFeed bool
+    Policy           StorePolicy
+}
+
+type StorePolicy struct {
+    MaxPinnedViewAge time.Duration // Default: 1 hour
 }
 ```
 
@@ -89,6 +94,9 @@ type DBOptions struct {
 borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
 `EnableChangeFeed` is persisted in the manifest and cannot be disabled. Enabling
 an existing database starts the feed at its current manifest head.
+`MaxPinnedViewAge` is persisted by the first writer. Later writers must present
+the same value. Readers and SST garbage collection both derive their safety
+deadline from this one store policy.
 
 ---
 
@@ -214,9 +222,9 @@ return w.Flush(ctx)
 
 Immutable read handle over one loaded reader state. A snapshot does not refresh.
 It keeps reading the same visible state even if its parent `Reader` is refreshed
-later. Snapshots expire after `ReaderOpenOptions.Views.SnapshotMaxAge`; their
-iterators expire after the smaller of the snapshot deadline and
-`IteratorMaxAge`.
+later. A snapshot and every iterator created from it inherit the absolute
+deadline of the loaded manifest view. Creating a handle does not extend that
+deadline.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -270,7 +278,7 @@ type ReaderOpenOptions struct {
     RangeReadMinSSTSize      int64                // Minimum SST size for range-read optimization
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
-    Views                    ReaderViewPolicy     // Refresh and retained-view lifetime policy
+    Views                    ReaderViewPolicy     // Manifest freshness policy
     VerifyBlobsOnRead        bool
 }
 
@@ -286,9 +294,7 @@ type CacheStats struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 
 type ReaderViewPolicy struct {
-    RefreshAfter   time.Duration // Default: 1 minute
-    SnapshotMaxAge time.Duration // Default: 5 minutes
-    IteratorMaxAge time.Duration // Default: 2 minutes
+    RefreshAfter time.Duration // Default: 1 minute
 }
 ```
 
@@ -496,7 +502,6 @@ type CompactionPolicy struct {
 
 type GarbageCollectionPolicy struct {
     DeleteBatchSize int
-    GracePeriod     time.Duration
 }
 
 type CompactionJob struct {

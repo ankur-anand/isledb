@@ -18,6 +18,10 @@ var ErrInvalidDBOptions = errors.New("invalid database options")
 // Open opens a database rooted at opts.Prefix in bucketURL. The returned DB
 // owns the bucket connection and closes it from DB.Close.
 func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error) {
+	policy, err := normalizeStorePolicy(opts.Policy)
+	if err != nil {
+		return nil, err
+	}
 	store, err := blobstore.Open(ctx, bucketURL, opts.Prefix)
 	if err != nil {
 		return nil, err
@@ -25,6 +29,7 @@ func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error) {
 
 	db, err := openDB(ctx, store, dbOpenOptions{
 		changeFeedEnabled: opts.EnableChangeFeed,
+		storePolicy:       policy,
 	})
 	if err != nil {
 		_ = store.Close()
@@ -43,9 +48,24 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 	if bucketName == "" {
 		return nil, fmt.Errorf("%w: bucket name is required", ErrInvalidDBOptions)
 	}
+	policy, err := normalizeStorePolicy(opts.Policy)
+	if err != nil {
+		return nil, err
+	}
 
 	store := blobstore.New(bucket, bucketName, opts.Prefix)
 	return openDB(ctx, store, dbOpenOptions{
 		changeFeedEnabled: opts.EnableChangeFeed,
+		storePolicy:       policy,
 	})
+}
+
+func normalizeStorePolicy(policy StorePolicy) (StorePolicy, error) {
+	if policy.MaxPinnedViewAge < 0 {
+		return StorePolicy{}, fmt.Errorf("%w: max_pinned_view_age=%s", ErrInvalidDBOptions, policy.MaxPinnedViewAge)
+	}
+	if policy.MaxPinnedViewAge == 0 {
+		policy.MaxPinnedViewAge = DefaultMaxPinnedViewAge
+	}
+	return policy, nil
 }

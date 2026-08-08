@@ -418,9 +418,6 @@ func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, c
 		if err := validateCompactionPayload(command.Compaction.Payload); err != nil {
 			return fmt.Errorf("%w: %v", ErrMaintenanceCommandRejected, err)
 		}
-		if err := validateRetiredObjects(entry); err != nil {
-			return fmt.Errorf("%w: %v", ErrMaintenanceCommandRejected, err)
-		}
 		return s.appendWriterOwnedMaintenanceEntry(ctx, current, entry)
 
 	case MaintenanceCommandRemoveSSTables:
@@ -429,9 +426,6 @@ func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, c
 			Op:                   LogOpRemoveSSTable,
 			RemoveSSTableIDs:     append([]string(nil), command.RemoveSSTables.SSTableIDs...),
 			RetiredObjects:       append([]RetiredObject(nil), command.RemoveSSTables.RetiredObjects...),
-		}
-		if err := validateRetiredObjects(entry); err != nil {
-			return fmt.Errorf("%w: %v", ErrMaintenanceCommandRejected, err)
 		}
 		return s.appendWriterOwnedMaintenanceEntry(ctx, current, entry)
 
@@ -464,9 +458,6 @@ func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, c
 }
 
 func (s *Store) appendWriterOwnedMaintenanceEntry(ctx context.Context, current *Current, entry *ManifestLogEntry) error {
-	if err := validateRetiredObjects(entry); err != nil {
-		return err
-	}
 	if len(current.ActiveEntries) >= s.activeLimit() {
 		if err := s.rotateActiveEntries(ctx, current); err != nil {
 			return err
@@ -477,6 +468,9 @@ func (s *Store) appendWriterOwnedMaintenanceEntry(ctx context.Context, current *
 	entry.Role = FenceRoleWriter
 	entry.Epoch = current.WriterFence.Epoch
 	entry.Timestamp = time.Now().UTC()
+	if err := stampRetiredObjects(entry, current); err != nil {
+		return err
+	}
 	if current.LogSeqStart == current.NextSeq {
 		current.LogSeqStart = entry.Seq
 	}

@@ -12,7 +12,6 @@ import (
 
 const (
 	defaultSSTSweepBatchSize   = 128
-	defaultSSTSweepGracePeriod = 10 * time.Minute
 	defaultRetirementReadLimit = 128
 )
 

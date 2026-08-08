@@ -89,10 +89,10 @@ func (p *pendingFlush) SeqLo() uint64 {
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
-	return newWriterWithMaintenanceWake(ctx, store, manifestLog, opts, nil)
+	return newWriterWithMaintenanceWake(ctx, store, manifestLog, opts, nil, StorePolicy{MaxPinnedViewAge: DefaultMaxPinnedViewAge})
 }
 
-func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions, maintenanceWake <-chan struct{}) (*writer, error) {
+func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions, maintenanceWake <-chan struct{}, storePolicy StorePolicy) (*writer, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, m
 	if ownerID == "" {
 		ownerID = fmt.Sprintf("writer-%d-%d", time.Now().UnixNano(), m.NextEpoch)
 	}
-	token, err := manifestLog.ClaimWriter(ctx, ownerID)
+	token, err := manifestLog.ClaimWriterWithPolicy(ctx, ownerID, storePolicy.MaxPinnedViewAge)
 	if err != nil {
 		return nil, fmt.Errorf("claim writer fence: %w", err)
 	}

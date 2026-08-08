@@ -183,9 +183,7 @@ func defaultReaderOptions() readerOptions {
 		SSTCacheSize:  defaultSSTCacheSize,
 		BlobCacheSize: defaultBlobCacheSize,
 		ViewPolicy: ReaderViewPolicy{
-			RefreshAfter:   defaultReaderRefreshAfter,
-			SnapshotMaxAge: defaultReaderSnapshotMaxAge,
-			IteratorMaxAge: defaultReaderIteratorMaxAge,
+			RefreshAfter: defaultReaderRefreshAfter,
 		},
 	}
 }
@@ -212,7 +210,6 @@ type compactorOptions struct {
 
 	GCCursorStorage   manifest.GCCursorStorage
 	GCDeleteBatchSize int
-	GCGracePeriod     time.Duration
 }
 
 type compactionTriggerOptions struct {
@@ -263,7 +260,6 @@ func defaultCompactorOptions() compactorOptions {
 	return compactorOptions{
 		InputReadParallelism: 4,
 		GCDeleteBatchSize:    defaultSSTSweepBatchSize,
-		GCGracePeriod:        defaultSSTSweepGracePeriod,
 		Trigger: compactionTriggerOptions{
 			CheckInterval:               5 * time.Second,
 			L0SSTCount:                  8,

@@ -221,7 +221,6 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 	opts.Compaction.TargetSSTBytes = 32 << 10
 	opts.Compaction.BlockBytes = 1024
 	opts.Compaction.Compression = "none"
-	opts.GarbageCollection.GracePeriod = time.Nanosecond
 	opts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(parent, opts)
 	if err != nil {
@@ -265,7 +264,6 @@ func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blob
 	maintenanceOpts.Compaction.TargetSSTBytes = 32 << 10
 	maintenanceOpts.Compaction.BlockBytes = 1024
 	maintenanceOpts.Compaction.Compression = "none"
-	maintenanceOpts.GarbageCollection.GracePeriod = time.Nanosecond
 	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {

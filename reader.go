@@ -53,21 +53,23 @@ type Reader struct {
 	ownsBlobCache  bool
 	cacheDir       string
 
-	lifecycleMu sync.RWMutex
-	iteratorsMu sync.Mutex
-	iterators   map[*Iterator]struct{}
-	mu          sync.RWMutex
-	manifest    *manifestState
-	version     Version
-	viewPolicy  ReaderViewPolicy
-	viewExpired atomic.Bool
-	viewTimerMu sync.Mutex
-	viewTimer   *time.Timer
-	viewTimerID atomic.Uint64
-	metrics     *ReaderMetrics
-	closed      atomic.Bool
-	releaseOnce sync.Once
-	release     func()
+	lifecycleMu   sync.RWMutex
+	iteratorsMu   sync.Mutex
+	iterators     map[*Iterator]struct{}
+	mu            sync.RWMutex
+	manifest      *manifestState
+	version       Version
+	viewPolicy    ReaderViewPolicy
+	viewRefreshAt time.Time
+	viewExpiresAt time.Time
+	viewExpired   atomic.Bool
+	viewTimerMu   sync.Mutex
+	viewTimer     *time.Timer
+	viewTimerID   atomic.Uint64
+	metrics       *ReaderMetrics
+	closed        atomic.Bool
+	releaseOnce   sync.Once
+	release       func()
 }
 
 type KV struct {
@@ -82,6 +84,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	}
 
 	ms := newManifestStoreWithCache(store, &opts)
+	viewLoadedAt := time.Now()
 	m, err := ms.Replay(ctx)
 	if err != nil {
 		return nil, err
@@ -125,12 +128,16 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		valueConfig = config.DefaultValueStorageConfig()
 	}
 
+	viewRefreshAt := viewLoadedAt.Add(viewPolicy.RefreshAfter)
+	viewExpiresAt := viewLoadedAt.Add(ms.CurrentData().PinnedViewAge())
 	reader := &Reader{
 		store:                    store,
 		manifestStore:            ms,
 		manifest:                 m,
 		version:                  versionFromCurrent(ms.CurrentData()),
 		viewPolicy:               viewPolicy,
+		viewRefreshAt:            viewRefreshAt,
+		viewExpiresAt:            viewExpiresAt,
 		sstCache:                 sstCache,
 		blockCache:               blockCache,
 		blobStorage:              internal.NewBlobStorage(store, valueConfig),
@@ -146,7 +153,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:                 opts.CacheDir,
 		metrics:                  opts.Metrics,
 	}
-	reader.armManifestExpiry()
+	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
 	cleanupSSTCache = false
 	cleanupBlockCache = false
 	cleanupBlobCache = false
@@ -211,7 +218,7 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 }
 
 func (r *Reader) ensureFreshManifest(ctx context.Context) error {
-	if !r.viewExpired.Load() {
+	if !r.manifestViewExpired() {
 		return nil
 	}
 	return r.refreshManifest(ctx, false)
@@ -219,7 +226,7 @@ func (r *Reader) ensureFreshManifest(ctx context.Context) error {
 
 func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 	_, err, _ := r.manifestLoads.Do("manifest", func() (any, error) {
-		if !force && !r.viewExpired.Load() {
+		if !force && !r.manifestViewExpired() {
 			return nil, nil
 		}
 		return nil, r.reloadManifest(ctx)
@@ -228,7 +235,8 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 }
 
 func (r *Reader) reloadManifest(ctx context.Context) (err error) {
-	start := time.Now()
+	viewLoadedAt := time.Now()
+	start := viewLoadedAt
 	defer func() {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
@@ -250,14 +258,21 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	// the previous manifest as an immutable snapshot.
 	r.manifest = m
 	r.version = versionFromCurrent(r.manifestStore.CurrentData())
-	r.armManifestExpiry()
+	r.viewRefreshAt = viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
+	r.viewExpiresAt = viewLoadedAt.Add(r.manifestStore.CurrentData().PinnedViewAge())
+	r.armManifestExpiry(r.viewRefreshAt, r.viewExpiresAt)
 	return nil
 }
 
-func (r *Reader) armManifestExpiry() {
+func (r *Reader) armManifestExpiry(refreshAt, expiresAt time.Time) {
 	timerID := r.viewTimerID.Add(1)
 	r.viewExpired.Store(false)
-	timer := time.AfterFunc(r.viewPolicy.RefreshAfter, func() {
+	wakeAt := minTime(refreshAt, expiresAt)
+	delay := time.Until(wakeAt)
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.AfterFunc(delay, func() {
 		if r.viewTimerID.Load() == timerID && !r.closed.Load() {
 			r.viewExpired.Store(true)
 		}
@@ -270,6 +285,20 @@ func (r *Reader) armManifestExpiry() {
 	if previous != nil {
 		previous.Stop()
 	}
+}
+
+func (r *Reader) manifestViewExpired() bool {
+	if r.viewExpired.Load() {
+		return true
+	}
+	r.mu.RLock()
+	wakeAt := minTime(r.viewRefreshAt, r.viewExpiresAt)
+	r.mu.RUnlock()
+	if !wakeAt.IsZero() && !time.Now().Before(wakeAt) {
+		r.viewExpired.Store(true)
+		return true
+	}
+	return false
 }
 
 func (r *Reader) stopManifestExpiry() {
@@ -401,14 +430,14 @@ func (r *Reader) currentManifest() *manifestState {
 	return r.manifest
 }
 
-func (r *Reader) currentManifestState() (*manifestState, Version) {
+func (r *Reader) currentManifestState() (*manifestState, Version, time.Time) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.manifest, r.version
+	return r.manifest, r.version, r.viewExpiresAt
 }
 
 // Snapshot returns an immutable read handle over a fresh manifest state. The
-// returned snapshot does not refresh and expires according to Views.
+// returned snapshot does not refresh and inherits that view's store deadline.
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 	done, err := r.beginRead()
 	if err != nil {
@@ -419,11 +448,14 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err := r.ensureFreshManifest(ctx); err != nil {
 		return nil, err
 	}
-	m, version := r.currentManifestState()
+	m, version, expiresAt := r.currentManifestState()
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
-	return newSnapshot(r, m, version, time.Now().Add(r.viewPolicy.SnapshotMaxAge)), nil
+	if !time.Now().Before(expiresAt) {
+		return nil, ErrReadViewExpired
+	}
+	return newSnapshot(r, m, version, expiresAt), nil
 }
 
 // Get returns the value for key if present and not deleted/expired.
@@ -446,7 +478,11 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 		return nil, false, err
 	}
 
-	return r.getWithManifest(ctx, r.currentManifest(), key)
+	m, _, expiresAt := r.currentManifestState()
+	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
+	defer cancel()
+	value, found, err = r.getWithManifest(readCtx, m, key)
+	return value, found, readViewError(readCtx, err)
 }
 
 func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []byte) ([]byte, bool, error) {
@@ -507,7 +543,11 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		return nil, err
 	}
 
-	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, 0)
+	m, _, expiresAt := r.currentManifestState()
+	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
+	defer cancel()
+	out, err = r.scanInternalWithManifest(readCtx, m, minKey, maxKey, 0)
+	return out, readViewError(readCtx, err)
 }
 
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
@@ -525,7 +565,11 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		return nil, err
 	}
 
-	return r.scanInternalWithManifest(ctx, r.currentManifest(), minKey, maxKey, limit)
+	m, _, expiresAt := r.currentManifestState()
+	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
+	defer cancel()
+	out, err = r.scanInternalWithManifest(readCtx, m, minKey, maxKey, limit)
+	return out, readViewError(readCtx, err)
 }
 
 func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState, minKey, maxKey []byte, limit int) (out []KV, err error) {
@@ -1257,8 +1301,11 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		return nil, err
 	}
 
-	expiresAt := time.Now().Add(r.viewPolicy.IteratorMaxAge)
-	it, err := r.newIteratorWithManifest(ctx, r.currentManifest(), opts, expiresAt)
+	m, _, expiresAt := r.currentManifestState()
+	if !time.Now().Before(expiresAt) {
+		return nil, ErrReadViewExpired
+	}
+	it, err := r.newIteratorWithManifest(ctx, m, opts, expiresAt)
 	if err != nil {
 		return nil, err
 	}
