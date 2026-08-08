@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -539,6 +540,65 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	}
 	if len(sstsAfterRetry) != 1 {
 		t.Fatalf("SSTs after manifest retry=%d, want=1", len(sstsAfterRetry))
+	}
+}
+
+func TestWriter_ChangeBatchUploadRetryReusesObjectIdentity(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-change-batch-upload-retry")
+	defer store.Close()
+
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	w.changeFeedPayload = ChangeFeedFullValues
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	w.mu.Lock()
+	pending := w.newPendingFlushLocked(w.memtable)
+	w.memtable = w.newMemtable()
+	w.mu.Unlock()
+	if pending.changeBatchCreatedAt.IsZero() {
+		t.Fatal("pending change batch has no stable creation time")
+	}
+
+	lostResponse := errors.New("lost change-batch upload response")
+	objects := make(map[string][]byte)
+	var uploadedIDs []string
+	uploads := 0
+	uploadFn := func(_ context.Context, id string, reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		uploadedIDs = append(uploadedIDs, id)
+		objects[id] = data
+		uploads++
+		if uploads == 1 {
+			return lostResponse
+		}
+		return nil
+	}
+
+	if _, err := writePendingChangeBatch(ctx, pending, uploadFn); !errors.Is(err, lostResponse) {
+		t.Fatalf("first upload error=%v want=%v", err, lostResponse)
+	}
+	result, err := writePendingChangeBatch(ctx, pending, uploadFn)
+	if err != nil {
+		t.Fatalf("retry upload: %v", err)
+	}
+	if len(uploadedIDs) != 2 || uploadedIDs[0] != uploadedIDs[1] {
+		t.Fatalf("uploaded IDs=%v want the same identity on retry", uploadedIDs)
+	}
+	if result.Meta.ID != uploadedIDs[0] {
+		t.Fatalf("result ID=%q want=%q", result.Meta.ID, uploadedIDs[0])
+	}
+	if len(objects) != 1 {
+		t.Fatalf("uploaded objects=%d want=1", len(objects))
 	}
 }
 
