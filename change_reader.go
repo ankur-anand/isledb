@@ -398,7 +398,7 @@ func (r *ChangeReader) Read(
 					pageBytes += changeBytes
 					next = changeCursorAt(entry.Seq, globalIndex+1)
 					page.Next = next
-					if len(page.Changes) >= opts.MaxChanges {
+					if len(page.Changes) >= opts.MaxChanges || pageBytes >= opts.MaxBytes {
 						if globalIndex+1 == uint64(batch.Count) {
 							page.Next = changeCursorAt(entry.Seq+1, 0)
 						}
