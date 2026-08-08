@@ -165,7 +165,7 @@ func TestOperationalRecovery_MultiProcessWorker(t *testing.T) {
 
 func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := openDB(parent, store, dbOpenOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
 	if err != nil {
 		t.Fatalf("writer OpenDB: %v", err)
 	}
@@ -176,8 +176,6 @@ func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstor
 	opts.Flush.Interval = 0
 	opts.Maintenance.PollInterval = 5 * time.Millisecond
 	opts.Memtable.TargetBytes = 4 << 10
-	opts.SST.BlockBytes = 1024
-	opts.SST.Compression = "none"
 	writer, err := db.OpenWriter(parent, opts)
 	if err != nil {
 		t.Fatalf("writer OpenWriter: %v", err)
@@ -207,7 +205,7 @@ func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstor
 
 func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blobstore.Store, duration time.Duration) {
 	t.Helper()
-	db, err := openDB(parent, store, dbOpenOptions{})
+	db, err := openDB(parent, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
 	if err != nil {
 		t.Fatalf("maintenance OpenDB: %v", err)
 	}
@@ -219,8 +217,6 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 	opts.Compaction.L0SSTCount = 4
 	opts.Compaction.BaseLevelBytes = 1 << 60
 	opts.Compaction.TargetSSTBytes = 32 << 10
-	opts.Compaction.BlockBytes = 1024
-	opts.Compaction.Compression = "none"
 	opts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(parent, opts)
 	if err != nil {
@@ -242,7 +238,7 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 
 func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
 	if err != nil {
 		t.Fatalf("drain OpenDB: %v", err)
 	}
@@ -251,7 +247,6 @@ func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blob
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "multiprocess-drain-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.Compression = "none"
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
 		t.Fatalf("drain OpenWriter: %v", err)
@@ -262,8 +257,6 @@ func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blob
 	maintenanceOpts.Compaction.L0SSTCount = 4
 	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 32 << 10
-	maintenanceOpts.Compaction.BlockBytes = 1024
-	maintenanceOpts.Compaction.Compression = "none"
 	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {

@@ -30,9 +30,6 @@ type WriterOptions struct {
 	// process using the same object-store prefix.
 	Maintenance WriterMaintenanceOptions
 
-	// SST controls SST file encoding.
-	SST WriterSSTOptions
-
 	// Values controls inline-vs-external value storage and key/value limits.
 	Values ValueOptions
 
@@ -70,18 +67,6 @@ type WriterMaintenanceOptions struct {
 	PollInterval time.Duration
 }
 
-type WriterSSTOptions struct {
-	// BloomBitsPerKey controls SST bloom filter size. Zero selects the default.
-	BloomBitsPerKey int
-
-	// BlockBytes is the target SST data block size. Zero selects the default.
-	BlockBytes int
-
-	// Compression is one of "none", "snappy", or "zstd". Empty selects the
-	// default.
-	Compression string
-}
-
 // ValueOptions controls writer key/value limits and external value storage.
 // Zero fields select defaults.
 type ValueOptions struct {
@@ -107,11 +92,6 @@ func DefaultWriterOptions() WriterOptions {
 		},
 		Maintenance: WriterMaintenanceOptions{
 			PollInterval: time.Second,
-		},
-		SST: WriterSSTOptions{
-			BloomBitsPerKey: 10,
-			BlockBytes:      4096,
-			Compression:     "snappy",
 		},
 		Values: defaultWriterValueOptions(),
 	}

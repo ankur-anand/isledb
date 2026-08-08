@@ -22,11 +22,16 @@ func testWriterOptions(memtableBytes int64, maxPendingMemtables int) WriterOptio
 			TargetBytes:         memtableBytes,
 			MaxPendingMemtables: maxPendingMemtables,
 		},
-		SST: WriterSSTOptions{
-			BlockBytes:  4096,
-			Compression: "none",
-		},
 	}
+}
+
+func testSSTOutput(compression string, blockBytes int) SSTOutputOptions {
+	encoding := SSTEncodingOptions{
+		Compression:     compression,
+		BlockBytes:      blockBytes,
+		BloomBitsPerKey: 10,
+	}
+	return SSTOutputOptions{L0: encoding, Compacted: encoding}
 }
 
 func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
@@ -937,7 +942,7 @@ func TestWriterOptions_Defaults(t *testing.T) {
 		t.Fatalf("normalizeWriterOptions: %v", err)
 	}
 	defaults := DefaultWriterOptions()
-	if normalized.Memtable != defaults.Memtable || normalized.SST != defaults.SST {
+	if normalized.Memtable != defaults.Memtable {
 		t.Fatalf("normalized options=%+v defaults=%+v", normalized, defaults)
 	}
 	if normalized.Maintenance != defaults.Maintenance {
@@ -987,9 +992,6 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative pending memtables", mutate: func(o *WriterOptions) { o.Memtable.MaxPendingMemtables = -1 }},
 		{name: "negative flush interval", mutate: func(o *WriterOptions) { o.Flush.Interval = -time.Nanosecond }},
 		{name: "negative maintenance poll interval", mutate: func(o *WriterOptions) { o.Maintenance.PollInterval = -time.Nanosecond }},
-		{name: "negative bloom bits", mutate: func(o *WriterOptions) { o.SST.BloomBitsPerKey = -1 }},
-		{name: "negative block bytes", mutate: func(o *WriterOptions) { o.SST.BlockBytes = -1 }},
-		{name: "unsupported compression", mutate: func(o *WriterOptions) { o.SST.Compression = "gzip" }},
 		{name: "negative inline value bytes", mutate: func(o *WriterOptions) { o.Values.InlineValueBytes = -1 }},
 		{name: "negative max key bytes", mutate: func(o *WriterOptions) { o.Values.MaxKeyBytes = -1 }},
 		{name: "negative max value bytes", mutate: func(o *WriterOptions) { o.Values.MaxValueBytes = -1 }},
@@ -1101,15 +1103,15 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	}
 }
 
-func TestWriterOptions_NormalizeCompression(t *testing.T) {
-	opts := DefaultWriterOptions()
-	opts.SST.Compression = " ZSTD "
-	normalized, _, err := normalizeWriterOptions(opts)
+func TestSSTOutputOptionsNormalizeCompression(t *testing.T) {
+	opts := DefaultSSTOutputOptions()
+	opts.L0.Compression = " ZSTD "
+	normalized, err := normalizeSSTOutputOptions(opts)
 	if err != nil {
-		t.Fatalf("normalizeWriterOptions: %v", err)
+		t.Fatalf("normalizeSSTOutputOptions: %v", err)
 	}
-	if normalized.SST.Compression != "zstd" {
-		t.Fatalf("compression=%q, want zstd", normalized.SST.Compression)
+	if normalized.L0.Compression != "zstd" {
+		t.Fatalf("compression=%q, want zstd", normalized.L0.Compression)
 	}
 }
 

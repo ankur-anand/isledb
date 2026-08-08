@@ -26,9 +26,38 @@ func TestMaintenanceRetentionDefaultsUseExplicitUnits(t *testing.T) {
 		t.Fatalf("KeepAtLeastWindows=%d, want 1", retention.KeepAtLeastWindows)
 	}
 
-	changeFeed := defaultChangeFeedRetentionPolicy()
+	changeFeed := DefaultChangeFeedRetentionPolicy()
 	if changeFeed.KeepAtLeastManifestEntries != 1024 {
 		t.Fatalf("KeepAtLeastManifestEntries=%d, want 1024", changeFeed.KeepAtLeastManifestEntries)
+	}
+}
+
+func TestMaintenanceRecordsPublicChangeFeedCleanupStats(t *testing.T) {
+	var callbackStats ChangeFeedCleanupStats
+	policy := DefaultChangeFeedRetentionPolicy()
+	policy.OnCleanup = func(stats ChangeFeedCleanupStats) {
+		callbackStats = stats
+	}
+	cycle := MaintenanceStats{}
+	maintenance := &Maintenance{
+		currentStats:        &cycle,
+		changeFeedRetention: &policy,
+	}
+	want := ChangeFeedCleanupStats{
+		EntriesRetired:  7,
+		BatchesMarked:   6,
+		BatchesDeleted:  5,
+		BlockedRetained: 4,
+		FailedDeletes:   3,
+		Duration:        time.Second,
+	}
+
+	maintenance.recordChangeFeed(want)
+	if cycle.ChangeFeedRetention != want {
+		t.Fatalf("cycle stats=%+v want=%+v", cycle.ChangeFeedRetention, want)
+	}
+	if callbackStats != want {
+		t.Fatalf("callback stats=%+v want=%+v", callbackStats, want)
 	}
 }
 
@@ -276,7 +305,7 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	defer store.Close()
 
 	changeFeed := defaultChangeFeedRetentionPolicy()
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedRetention: &changeFeed})
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -286,6 +315,7 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "maintenance-owner"
 	opts.Retention = &retention
+	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
@@ -500,7 +530,7 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-stale-fence")
 	defer store.Close()
 
-	firstDB, err := openDB(ctx, store, dbOpenOptions{})
+	firstDB, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("OpenDB(first): %v", err)
 	}
@@ -512,9 +542,9 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	defer secondDB.Close()
 
 	changeFeed := defaultChangeFeedRetentionPolicy()
-	firstDB.changeFeedRetention = &changeFeed
 	firstOpts := DefaultMaintenanceOptions()
 	firstOpts.OwnerID = "maintenance-first"
+	firstOpts.ChangeFeedRetention = &changeFeed
 	first, err := firstDB.OpenMaintenance(ctx, firstOpts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance(first): %v", err)

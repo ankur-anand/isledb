@@ -51,6 +51,11 @@ type MaintenanceOptions struct {
 	// Retention is nil by default because enabling it removes historical data.
 	Retention *RetentionPolicy
 
+	// ChangeFeedRetention is nil by default, preserving change-feed history
+	// indefinitely. When configured, maintenance retires and deletes old feed
+	// batches without affecting KV state.
+	ChangeFeedRetention *ChangeFeedRetentionPolicy
+
 	OnCycle func(MaintenanceStats)
 	OnError func(error)
 }
@@ -70,9 +75,6 @@ type CompactionPolicy struct {
 	LevelSizeMultiplier         int
 	MaxInputSSTs                int
 	TargetSSTBytes              int64
-	BloomBitsPerKey             int
-	BlockBytes                  int
-	Compression                 string
 	ValidateSSTChecksum         bool
 	SSTHashVerifier             SSTHashVerifier
 	OnCompactionStart           func(CompactionJob)
@@ -104,16 +106,37 @@ type RetentionPolicy struct {
 	OnCleanup func(CleanupStats)
 }
 
-type changeFeedRetentionPolicy struct {
+// ChangeFeedRetentionPolicy controls removal of old change-feed history. It is
+// enabled only when MaintenanceOptions.ChangeFeedRetention is non-nil.
+type ChangeFeedRetentionPolicy struct {
+	// KeepFor is the minimum age retained. Zero selects the default.
 	KeepFor time.Duration
 
 	// KeepAtLeastManifestEntries is the minimum number of newest manifest
-	// entries retained, including entries that do not contain a change batch.
+	// entries retained for cursor replay, including entries that do not contain
+	// a change batch. Zero selects the default.
 	KeepAtLeastManifestEntries uint64
 
-	DeleteBatchSize   int
+	// DeleteBatchSize limits physical change-batch deletes per maintenance
+	// cycle. Zero selects the default.
+	DeleteBatchSize int
+
+	// DeleteGracePeriod delays physical deletion after history is retired from
+	// the manifest. Zero selects the default.
 	DeleteGracePeriod time.Duration
-	OnCleanup         func(changeFeedCleanupStats)
+
+	OnCleanup func(ChangeFeedCleanupStats)
+}
+
+// ChangeFeedCleanupStats describes change-feed retention work completed in one
+// cleanup pass.
+type ChangeFeedCleanupStats struct {
+	EntriesRetired  int
+	BatchesMarked   int
+	BatchesDeleted  int
+	BlockedRetained int
+	FailedDeletes   int
+	Duration        time.Duration
 }
 
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
@@ -124,6 +147,7 @@ type MaintenanceStats struct {
 	CompactionOutputSSTs  int
 	CompactionOutputBytes int64
 	Retention             CleanupStats
+	ChangeFeedRetention   ChangeFeedCleanupStats
 	CheckpointStaged      bool
 	CheckpointReplayPages uint64
 	CheckpointReplayBytes uint64
@@ -135,7 +159,7 @@ type MaintenanceStats struct {
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
-// and SST sweeping are enabled; data retention remains disabled.
+// and SST sweeping are enabled; KV and change-feed retention remain disabled.
 func DefaultMaintenanceOptions() MaintenanceOptions {
 	compaction := defaultCompactorOptions()
 	return MaintenanceOptions{
@@ -148,9 +172,6 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 			LevelSizeMultiplier:         compaction.Trigger.LevelSizeMultiplier,
 			MaxInputSSTs:                compaction.Trigger.MaxInputSSTs,
 			TargetSSTBytes:              compaction.Output.TargetSSTBytes,
-			BloomBitsPerKey:             compaction.Output.BloomBitsPerKey,
-			BlockBytes:                  compaction.Output.BlockBytes,
-			Compression:                 compaction.Output.Compression,
 		},
 		GarbageCollection: GarbageCollectionPolicy{
 			DeleteBatchSize: compaction.GCDeleteBatchSize,
@@ -170,14 +191,21 @@ func DefaultRetentionPolicy() RetentionPolicy {
 	}
 }
 
-func defaultChangeFeedRetentionPolicy() changeFeedRetentionPolicy {
+// DefaultChangeFeedRetentionPolicy returns conservative change-feed retention
+// defaults. Assigning this policy to MaintenanceOptions.ChangeFeedRetention
+// opts into cleanup; merely enabling a feed does not delete history.
+func DefaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
 	opts := defaultChangeFeedCleanerOptions()
-	return changeFeedRetentionPolicy{
+	return ChangeFeedRetentionPolicy{
 		KeepFor:                    opts.RetentionPeriod,
 		KeepAtLeastManifestEntries: opts.KeepAtLeastManifestEntries,
 		DeleteBatchSize:            opts.SweepBatchSize,
 		DeleteGracePeriod:          opts.SweepGracePeriod,
 	}
+}
+
+func defaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
+	return DefaultChangeFeedRetentionPolicy()
 }
 
 // Maintenance owns compaction, checkpoints, retention, and garbage collection
@@ -210,10 +238,18 @@ type Maintenance struct {
 	releaseOnce sync.Once
 	release     func()
 
-	changeFeedRetention *changeFeedRetentionPolicy
+	changeFeedRetention *ChangeFeedRetentionPolicy
+	sstOutput           SSTEncodingOptions
 }
 
-func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, gcCursor manifest.GCCursorStorage, opts MaintenanceOptions, changeFeedRetention *changeFeedRetentionPolicy) (*Maintenance, error) {
+func newMaintenance(
+	ctx context.Context,
+	store *blobstore.Store,
+	manifestLog *manifest.Store,
+	gcCursor manifest.GCCursorStorage,
+	opts MaintenanceOptions,
+	sstOutput SSTEncodingOptions,
+) (*Maintenance, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -226,6 +262,15 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 	state, err := manifestLog.Replay(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)
+	}
+	if opts.ChangeFeedRetention != nil {
+		view, err := manifestLog.LoadChangeFeedView(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load change-feed configuration: %w", err)
+		}
+		if !view.Enabled() {
+			return nil, ErrChangeFeedDisabled
+		}
 	}
 	ownerID := opts.OwnerID
 	if ownerID == "" {
@@ -241,7 +286,8 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 		opts:                opts,
 		fenceToken:          token,
 		runGate:             make(chan struct{}, 1),
-		changeFeedRetention: changeFeedRetention,
+		changeFeedRetention: opts.ChangeFeedRetention,
+		sstOutput:           sstOutput,
 	}
 
 	compactorOpts := m.compactorOptions(gcCursor)
@@ -261,7 +307,7 @@ func newMaintenance(ctx context.Context, store *blobstore.Store, manifestLog *ma
 		m.retention.stageCommand = m.stageCommand
 	}
 
-	if changeFeedRetention != nil {
+	if opts.ChangeFeedRetention != nil {
 		changeFeedOpts := m.changeFeedOptions()
 		m.changeFeed, err = newChangeFeedCleanerWithFence(ctx, store, manifestLog, changeFeedOpts, token)
 		if err != nil {
@@ -288,6 +334,13 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	if opts.Retention != nil && (opts.Retention.KeepAtLeastSSTs < 0 || opts.Retention.KeepAtLeastWindows < 0) {
 		return MaintenanceOptions{}, fmt.Errorf("%w: retention minimums must not be negative", ErrInvalidMaintenanceOptions)
 	}
+	if opts.ChangeFeedRetention != nil {
+		policy, err := normalizeChangeFeedRetentionPolicy(*opts.ChangeFeedRetention)
+		if err != nil {
+			return MaintenanceOptions{}, err
+		}
+		opts.ChangeFeedRetention = &policy
+	}
 	if opts.GarbageCollection.DeleteBatchSize < 0 {
 		return MaintenanceOptions{}, fmt.Errorf("%w: invalid garbage collection policy", ErrInvalidMaintenanceOptions)
 	}
@@ -298,6 +351,32 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 		opts.Checkpoint.MaxReplayPages = defaults.Checkpoint.MaxReplayPages
 	}
 	return opts, nil
+}
+
+func normalizeChangeFeedRetentionPolicy(policy ChangeFeedRetentionPolicy) (ChangeFeedRetentionPolicy, error) {
+	if policy.KeepFor < 0 {
+		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed retention period", ErrInvalidMaintenanceOptions)
+	}
+	if policy.DeleteBatchSize < 0 {
+		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed delete batch size", ErrInvalidMaintenanceOptions)
+	}
+	if policy.DeleteGracePeriod < 0 {
+		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed delete grace period", ErrInvalidMaintenanceOptions)
+	}
+	defaults := DefaultChangeFeedRetentionPolicy()
+	if policy.KeepFor == 0 {
+		policy.KeepFor = defaults.KeepFor
+	}
+	if policy.KeepAtLeastManifestEntries == 0 {
+		policy.KeepAtLeastManifestEntries = defaults.KeepAtLeastManifestEntries
+	}
+	if policy.DeleteBatchSize == 0 {
+		policy.DeleteBatchSize = defaults.DeleteBatchSize
+	}
+	if policy.DeleteGracePeriod == 0 {
+		policy.DeleteGracePeriod = defaults.DeleteGracePeriod
+	}
+	return policy, nil
 }
 
 func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compactorOptions {
@@ -315,9 +394,9 @@ func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compac
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  p.TargetSSTBytes,
-			BloomBitsPerKey: p.BloomBitsPerKey,
-			BlockBytes:      p.BlockBytes,
-			Compression:     p.Compression,
+			BloomBitsPerKey: m.sstOutput.BloomBitsPerKey,
+			BlockBytes:      m.sstOutput.BlockBytes,
+			Compression:     m.sstOutput.Compression,
 		},
 		Safety: compactionSafetyOptions{
 			ValidateSSTChecksum: p.ValidateSSTChecksum,
@@ -733,8 +812,11 @@ func (m *Maintenance) recordRetention(stats CleanupStats) {
 	}
 }
 
-func (m *Maintenance) recordChangeFeed(stats changeFeedCleanupStats) {
+func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
 	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.ChangeFeedRetention = stats
+	}
 	m.statsMu.Unlock()
 	if callback := m.changeFeedRetention.OnCleanup; callback != nil {
 		callback(stats)
