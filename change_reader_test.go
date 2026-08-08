@@ -419,6 +419,117 @@ func TestChangeReaderPagesDoNotAliasDecodedCache(t *testing.T) {
 	}
 }
 
+func TestChangeReaderRangeDecodesOnlyRequestedBlock(t *testing.T) {
+	const records = 4096
+	ctx := context.Background()
+	_, db, writer := openChangeReaderTestDB(t, "change-reader-bounded-range")
+	values := benchmarkChangeFeedValues(records, 256, true)
+	for i := 0; i < records; i++ {
+		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	bounds, err := reader.Bounds(ctx)
+	if err != nil {
+		t.Fatalf("bounds: %v", err)
+	}
+
+	reader.work.reset()
+	first, err := reader.Read(ctx, bounds.Oldest, ChangeReadOptions{MaxChanges: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("cold range read: %v", err)
+	}
+	if len(first.Changes) != 1 {
+		t.Fatalf("cold range changes=%d want=1", len(first.Changes))
+	}
+	firstWork := reader.work.snapshot()
+	if firstWork.RangeGETs != 2 {
+		t.Fatalf("cold range GETs=%d want=2 (index + block)", firstWork.RangeGETs)
+	}
+
+	reader.batchMu.Lock()
+	index := reader.batch
+	meta := reader.batchMeta
+	reader.batchMu.Unlock()
+	if index == nil || len(index.Blocks) < 4 {
+		t.Fatalf("indexed blocks=%v want at least 4", index)
+	}
+	if got, want := firstWork.DecompressedBytes, uint64(index.Blocks[0].RawSize); got != want {
+		t.Fatalf("decompressed bytes=%d want first block=%d", got, want)
+	}
+	if firstWork.DecompressedBytes >= uint64(meta.RawSize) {
+		t.Fatalf("decompressed whole batch: got=%d batch=%d", firstWork.DecompressedBytes, meta.RawSize)
+	}
+	if firstWork.DownloadedBytes >= uint64(meta.Size) {
+		t.Fatalf("downloaded whole batch: got=%d batch=%d", firstWork.DownloadedBytes, meta.Size)
+	}
+
+	reader.work.reset()
+	second, err := reader.Read(ctx, first.Next, ChangeReadOptions{MaxChanges: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("warm block read: %v", err)
+	}
+	if len(second.Changes) != 1 || second.Changes[0].Sequence != 2 {
+		t.Fatalf("warm block page=%+v", second)
+	}
+	if got := reader.work.snapshot(); got != (changeReaderWorkSnapshot{}) {
+		t.Fatalf("warm block performed I/O: %+v", got)
+	}
+
+	clearChangeReaderBatchCache(reader)
+	reader.work.reset()
+	middle := changeCursorAt(first.Next.entry, 2048)
+	middlePage, err := reader.Read(ctx, middle, ChangeReadOptions{MaxChanges: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("cold middle read: %v", err)
+	}
+	if len(middlePage.Changes) != 1 || middlePage.Changes[0].Sequence != 2049 {
+		t.Fatalf("middle page=%+v", middlePage)
+	}
+	middleWork := reader.work.snapshot()
+	middleOrdinal, _, ok := changeBatchBlockForRecord(index, 2048)
+	if !ok {
+		t.Fatal("middle record is not indexed")
+	}
+	if middleWork.RangeGETs != 2 || middleWork.DecompressedBytes != uint64(index.Blocks[middleOrdinal].RawSize) {
+		t.Fatalf("middle work=%+v want index + block %d", middleWork, middleOrdinal)
+	}
+}
+
+func TestChangeReaderDecodedBlockCacheIsBounded(t *testing.T) {
+	reader := &ChangeReader{}
+	meta := &manifest.ChangeBatchMeta{Path: "changes/batch", Size: 1}
+	const blockBytes = uint64(512 << 10)
+	for ordinal := 0; ordinal < 40; ordinal++ {
+		reader.cacheBlock(meta, ordinal, blockBytes, []changeRecord{{Seq: uint64(ordinal + 1)}})
+	}
+	reader.batchMu.Lock()
+	gotBytes := reader.blockCacheBytes
+	gotBlocks := len(reader.blockCache)
+	reader.batchMu.Unlock()
+	if gotBytes > maxChangeReaderBlockCacheBytes {
+		t.Fatalf("cache bytes=%d max=%d", gotBytes, maxChangeReaderBlockCacheBytes)
+	}
+	if gotBlocks == 0 || gotBlocks >= 40 {
+		t.Fatalf("cached blocks=%d want a bounded non-empty subset", gotBlocks)
+	}
+	if changes, err := reader.cachedBlock(meta, 0); err != nil || changes != nil {
+		t.Fatalf("oldest block retained: changes=%v err=%v", changes, err)
+	}
+	if changes, err := reader.cachedBlock(meta, 39); err != nil || len(changes) != 1 {
+		t.Fatalf("newest block missing: changes=%v err=%v", changes, err)
+	}
+}
+
 func TestChangeFeedEnablementFencesCommitWithoutBatch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("change-feed-required")

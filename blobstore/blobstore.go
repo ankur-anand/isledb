@@ -246,11 +246,16 @@ func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64)
 	}
 	defer r.Close()
 
-	data, err := io.ReadAll(r)
-	if err != nil {
+	if length < 0 {
+		return io.ReadAll(r)
+	}
+	if uint64(length) > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("range length too large: %d", length)
+	}
+	data := make([]byte, int(length))
+	if _, err := io.ReadFull(r, data); err != nil {
 		return nil, err
 	}
-
 	return data, nil
 }
 

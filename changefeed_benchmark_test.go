@@ -32,7 +32,7 @@ func BenchmarkChangeBatchAppend(b *testing.B) {
 					}
 				}
 			}
-			b.ReportMetric(float64(buffer.bodySize+changeBatchHeaderSize), "batch_B")
+			b.ReportMetric(float64(buffer.bodySize), "raw_B")
 		})
 	}
 }
@@ -56,7 +56,7 @@ func BenchmarkChangeBatchStream(b *testing.B) {
 				}
 			}
 
-			b.SetBytes(buffer.bodySize + changeBatchHeaderSize)
+			b.SetBytes(buffer.bodySize)
 			b.ReportAllocs()
 			b.ResetTimer()
 

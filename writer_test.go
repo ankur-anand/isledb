@@ -158,6 +158,9 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if meta.Compression != changeBatchCompressionZstd {
 		t.Fatalf("change batch compression=%q want=%q", meta.Compression, changeBatchCompressionZstd)
 	}
+	if meta.Version != changeBatchVersion || meta.BlockCount == 0 || meta.RawSize <= 0 || meta.IndexChecksum == "" {
+		t.Fatalf("incomplete indexed change batch metadata: %+v", *meta)
+	}
 
 	data, attrs, err := store.Read(ctx, meta.Path)
 	if err != nil {

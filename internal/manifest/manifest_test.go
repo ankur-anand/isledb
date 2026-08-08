@@ -63,6 +63,40 @@ func TestSSTMetaJSONOmitsAbsentSignature(t *testing.T) {
 	}
 }
 
+func TestChangeBatchMetaJSONSchema(t *testing.T) {
+	meta := ChangeBatchMeta{
+		ID:            "change-001",
+		Path:          "changes/abc/change-001",
+		Epoch:         2,
+		SeqLo:         10,
+		SeqHi:         20,
+		Count:         11,
+		BlockCount:    2,
+		Size:          4096,
+		RawSize:       8192,
+		Checksum:      "sha256:whole",
+		IndexChecksum: "sha256:index",
+		CreatedAt:     time.Date(2026, time.August, 8, 10, 30, 0, 0, time.UTC),
+		Version:       1,
+		Compression:   "zstd",
+	}
+	body, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"id":"change-001","path":"changes/abc/change-001","epoch":2,"seq_lo":10,"seq_hi":20,"count":11,"block_count":2,"size":4096,"raw_size":8192,"checksum":"sha256:whole","index_checksum":"sha256:index","created_at":"2026-08-08T10:30:00Z","version":1,"compression":"zstd"}`
+	if string(body) != want {
+		t.Fatalf("ChangeBatchMeta JSON schema changed\n got: %s\nwant: %s", body, want)
+	}
+	var got ChangeBatchMeta
+	if err := json.Unmarshal([]byte(want), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, meta) {
+		t.Fatalf("decode schema fixture\n got=%+v\nwant=%+v", got, meta)
+	}
+}
+
 func TestManifestSnapshotRoundTrip(t *testing.T) {
 	m := &Manifest{
 		Version:   2,

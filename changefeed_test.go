@@ -36,10 +36,14 @@ func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
 	if result.Meta.Size != int64(object.Len()) {
 		t.Fatalf("meta size=%d data=%d", result.Meta.Size, object.Len())
 	}
-	if got, want := result.Meta.RawSize, int64(changeBatchHeaderSize)+buffer.bodySize; got != want {
+	if got, want := result.Meta.RawSize, buffer.bodySize; got != want {
 		t.Fatalf("meta raw size=%d want=%d", got, want)
 	}
-	if result.Meta.Checksum == "" || result.Meta.Compression != changeBatchCompressionZstd {
+	if got, want := result.Meta.BlockCount, uint32(1); got != want {
+		t.Fatalf("meta block count=%d want=%d", got, want)
+	}
+	if result.Meta.Checksum == "" || result.Meta.IndexChecksum == "" ||
+		result.Meta.Compression != changeBatchCompressionZstd {
 		t.Fatalf("incomplete change batch metadata: %+v", result.Meta)
 	}
 
@@ -81,7 +85,7 @@ func TestEncodeChangeBatchRejectsOutOfOrderChanges(t *testing.T) {
 	}
 }
 
-func TestDecodeChangeBatchRejectsOutOfOrderChanges(t *testing.T) {
+func TestDecodeChangeBatchRejectsCorruptBlock(t *testing.T) {
 	data, err := encodeChangeBatch(&changeBatch{
 		Version: changeBatchVersion,
 		Epoch:   1,
@@ -97,10 +101,77 @@ func TestDecodeChangeBatchRejectsOutOfOrderChanges(t *testing.T) {
 		t.Fatalf("EncodeChangeBatch: %v", err)
 	}
 
-	secondRecord := changeBatchHeaderSize + changeRecordHeaderSize + len("a") + len("va")
-	binary.BigEndian.PutUint64(data[secondRecord+16:secondRecord+24], 1)
+	data[0] ^= 0xff
 
 	if _, err := decodeChangeBatch(data); err == nil {
-		t.Fatal("expected out-of-order decode error")
+		t.Fatal("expected corrupt block decode error")
+	}
+}
+
+func TestDecodeChangeBatchRejectsOtherFormatVersions(t *testing.T) {
+	data, err := encodeChangeBatch(&changeBatch{
+		Version: changeBatchVersion,
+		Epoch:   1,
+		SeqLo:   1,
+		SeqHi:   1,
+		Changes: []changeRecord{
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("value")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	trailer := data[len(data)-changeBatchTrailerSize:]
+	binary.BigEndian.PutUint16(trailer[4:6], changeBatchVersion-1)
+	if _, err := decodeChangeBatch(data); err == nil {
+		t.Fatal("expected unsupported format version error")
+	}
+}
+
+func TestChangeBatchUsesIndependentRecordBlocks(t *testing.T) {
+	buffer := &changeBatchBuffer{}
+	for i := 0; i < 5; i++ {
+		if err := buffer.appendPut(uint64(i+1), []byte{byte('a' + i)}, []byte("value"), 0); err != nil {
+			t.Fatalf("append change %d: %v", i, err)
+		}
+	}
+
+	var object bytes.Buffer
+	result, err := writeChangeBatchStreamingWithOptions(
+		context.Background(), buffer, 9, time.Unix(20, 0).UTC(),
+		changeBatchBlockOptions{MaxRecords: 2, TargetRawBytes: 1 << 20},
+		func(_ context.Context, _ string, reader io.Reader) error {
+			_, copyErr := io.Copy(&object, reader)
+			return copyErr
+		})
+	if err != nil {
+		t.Fatalf("write indexed batch: %v", err)
+	}
+	if got, want := result.Meta.BlockCount, uint32(3); got != want {
+		t.Fatalf("block count=%d want=%d", got, want)
+	}
+
+	data := object.Bytes()
+	trailer := data[len(data)-changeBatchTrailerSize:]
+	indexOffset, indexSize, err := changeBatchIndexLocation(trailer, int64(len(data)))
+	if err != nil {
+		t.Fatalf("locate index: %v", err)
+	}
+	index, err := decodeChangeBatchIndex(data[indexOffset:indexOffset+indexSize], trailer, int64(len(data)))
+	if err != nil {
+		t.Fatalf("decode index: %v", err)
+	}
+	for i, want := range []uint32{2, 2, 1} {
+		if index.Blocks[i].Count != want {
+			t.Fatalf("block[%d] count=%d want=%d", i, index.Blocks[i].Count, want)
+		}
+	}
+
+	batch, err := decodeChangeBatch(data)
+	if err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	if len(batch.Changes) != 5 || batch.Changes[4].Seq != 5 {
+		t.Fatalf("decoded changes=%+v", batch.Changes)
 	}
 }

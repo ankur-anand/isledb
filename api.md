@@ -454,10 +454,12 @@ returns true. When retention has passed a saved cursor, `Read` returns
 
 Each `ChangeReader` owns its manifest view. A `Read` beginning at a manifest
 entry boundary refreshes `manifest/CURRENT`, then reads from that immutable
-view. If a returned page stops inside a change batch, continuation reads reuse
-that decoded batch and its observed head without another `CURRENT` or
-manifest-page read. The next call beginning at an entry boundary refreshes the
-view and revalidates the retention floor.
+view. Change batches are indexed collections of independently compressed and
+checksummed blocks. `Read` range-fetches only the blocks needed by
+`MaxChanges` and `MaxBytes`; continuation reads can reuse decoded blocks from a
+bounded 16 MiB cache without another `CURRENT` or manifest-page read. The next
+call beginning at an entry boundary refreshes the view and revalidates the
+retention floor.
 
 ### Maintenance
 

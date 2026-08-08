@@ -142,9 +142,11 @@ Example:
         "seq_lo": 9001,
         "seq_hi": 9256,
         "count": 256,
+        "block_count": 1,
         "size": 118420,
         "raw_size": 276520,
         "checksum": "sha256:def",
+        "index_checksum": "sha256:abc",
         "version": 1,
         "compression": "zstd"
       }
@@ -470,10 +472,31 @@ JSON-style descriptor:
 ## `changes/<bucket>/<change-batch-id>`
 
 Immutable, seq-ordered mutation batch opened by `ChangeReader`. This object is
-a zstd-compressed binary stream, not JSON. It
-preserves puts, deletes, TTL metadata, and complete values in mutation order.
-External values are embedded so retained change history does not depend on the
-lifetime of a separate blob object.
+an indexed binary file, not JSON. It preserves puts, deletes, TTL metadata, and
+complete values in mutation order. External values are embedded so retained
+change history does not depend on the lifetime of a separate blob object.
+
+Indexed format version 1 layout:
+
+```text
+independent zstd frame: records 0-511
+independent zstd frame: records 512-1023
+...
+fixed-size block index entries
+96-byte trailer
+```
+
+A block closes at 512 records or 1 MiB of uncompressed record data, whichever
+comes first; one oversized record remains independently decodable. Each index
+entry stores the first record index, record count, first sequence, object
+offset, compressed size, raw size, and SHA-256 of the raw block. The trailer
+stores the batch identity and a SHA-256 of the complete block index; the same
+index checksum is anchored in the committed manifest metadata.
+
+`ChangeReader` first range-reads the index and trailer, then coalesces the
+contiguous block frames needed by `MaxChanges` and `MaxBytes` into a range GET.
+It verifies the index and every decompressed block without downloading or
+decoding unrelated blocks.
 
 The bucket is deterministically derived from the change-batch ID. Readers use
 the exact path committed in the manifest; normal feed reads never list this

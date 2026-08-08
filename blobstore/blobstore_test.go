@@ -475,6 +475,23 @@ func TestReadStream(t *testing.T) {
 	})
 }
 
+func TestReadRangeReturnsExactRequestedBytes(t *testing.T) {
+	forEachStore(t, "range-read", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		key := h.store.path("object")
+		if _, err := h.store.Write(ctx, key, []byte("0123456789")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		data, err := h.store.ReadRange(ctx, key, 2, 4)
+		if err != nil {
+			t.Fatalf("read range: %v", err)
+		}
+		if got, want := string(data), "2345"; got != want {
+			t.Fatalf("range=%q want=%q", got, want)
+		}
+	})
+}
+
 func TestListFunctions(t *testing.T) {
 	forEachStore(t, "list", func(t *testing.T, h storeHarness) {
 		ctx := context.Background()
