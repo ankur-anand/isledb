@@ -40,7 +40,10 @@ var changeBatchEncoderPool = sync.Pool{New: func() any {
 }}
 
 var changeBatchDecoderPool = sync.Pool{New: func() any {
-	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	decoder, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecodeAllCapLimit(true),
+	)
 	if err != nil {
 		panic(fmt.Errorf("change feed zstd decoder: %w", err))
 	}
