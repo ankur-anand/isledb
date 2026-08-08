@@ -305,8 +305,8 @@ func TestChangeFeedEnablementPersistsAcrossDBInstances(t *testing.T) {
 	defer bucket.Close()
 
 	first, err := OpenBucket(ctx, bucket, "memory", DBOptions{
-		Prefix:           "change-feed-persist",
-		EnableChangeFeed: true,
+		Prefix:     "change-feed-persist",
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
 	})
 	if err != nil {
 		t.Fatalf("open first DB: %v", err)
@@ -344,6 +344,127 @@ func TestChangeFeedEnablementPersistsAcrossDBInstances(t *testing.T) {
 	}
 	if len(page.Changes) != 1 {
 		t.Fatalf("changes=%d want=1", len(page.Changes))
+	}
+	if !page.Changes[0].HasValue || string(page.Changes[0].Value) != "value" {
+		t.Fatalf("persisted full-value change=%+v", page.Changes[0])
+	}
+}
+
+func TestChangeFeedKeysOnlyPreservesKVAndOmitsFeedValues(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	db, err := OpenBucket(ctx, bucket, "memory", DBOptions{
+		Prefix:     "change-feed-keys-only",
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedKeysOnly},
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	defer db.Close()
+
+	writerOpts := testChangeWriterOptions()
+	writerOpts.Values.InlineValueBytes = 1 // Exercise a blob-backed KV value.
+	writer, err := db.OpenWriter(ctx, writerOpts)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close(ctx)
+	if err := writer.PutWithTTL(ctx, []byte("stored"), []byte("complete-value"), time.Hour); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	changes, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer changes.Close()
+	bounds, err := changes.Bounds(ctx)
+	if err != nil {
+		t.Fatalf("bounds: %v", err)
+	}
+	if bounds.Payload != ChangeFeedKeysOnly {
+		t.Fatalf("bounds payload=%s want=%s", bounds.Payload, ChangeFeedKeysOnly)
+	}
+	page, err := changes.Read(ctx, bounds.Oldest, ChangeReadOptions{})
+	if err != nil {
+		t.Fatalf("read changes: %v", err)
+	}
+	if len(page.Changes) != 2 {
+		t.Fatalf("changes=%d want=2", len(page.Changes))
+	}
+	put := page.Changes[0]
+	if put.Operation != ChangePut || put.HasValue || put.Value != nil || string(put.Key) != "stored" || put.ExpiresAt.IsZero() {
+		t.Fatalf("keys-only PUT=%+v", put)
+	}
+	deleted := page.Changes[1]
+	if deleted.Operation != ChangeDelete || deleted.HasValue || deleted.Value != nil {
+		t.Fatalf("keys-only DELETE=%+v", deleted)
+	}
+
+	kv, err := db.OpenReader(ctx, ReaderOpenOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open KV reader: %v", err)
+	}
+	defer kv.Close()
+	value, found, err := kv.Get(ctx, []byte("stored"))
+	if err != nil || !found || string(value) != "complete-value" {
+		t.Fatalf("KV Get value=%q found=%v err=%v", value, found, err)
+	}
+}
+
+func TestChangeFeedPayloadConfigurationIsExplicitAndImmutable(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	if _, err := OpenBucket(ctx, bucket, "memory", DBOptions{
+		Prefix:     "change-feed-invalid-payload",
+		ChangeFeed: &ChangeFeedOptions{},
+	}); !errors.Is(err, ErrInvalidDBOptions) {
+		t.Fatalf("invalid payload error=%v want=%v", err, ErrInvalidDBOptions)
+	}
+
+	first, err := OpenBucket(ctx, bucket, "memory", DBOptions{
+		Prefix:     "change-feed-payload-mismatch",
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedKeysOnly},
+	})
+	if err != nil {
+		t.Fatalf("enable keys-only feed: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first DB: %v", err)
+	}
+
+	if _, err := OpenBucket(ctx, bucket, "memory", DBOptions{
+		Prefix:     "change-feed-payload-mismatch",
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
+	}); !errors.Is(err, ErrChangeFeedPayloadMismatch) {
+		t.Fatalf("payload mismatch error=%v want=%v", err, ErrChangeFeedPayloadMismatch)
+	}
+}
+
+func TestPublicChangeDistinguishesEmptyFromOmittedValue(t *testing.T) {
+	var pageData []byte
+	full := publicChange(changeRecord{
+		Seq: 1, Kind: changePut, Key: []byte("full"), Inline: true, Value: []byte{},
+	}, &pageData)
+	if !full.HasValue || full.Value == nil || len(full.Value) != 0 {
+		t.Fatalf("full empty value=%+v", full)
+	}
+
+	omitted := publicChange(changeRecord{
+		Seq: 2, Kind: changePut, Key: []byte("omitted"), ValueOmitted: true,
+	}, &pageData)
+	if omitted.HasValue || omitted.Value != nil {
+		t.Fatalf("omitted value=%+v", omitted)
 	}
 }
 
@@ -549,7 +670,7 @@ func TestChangeFeedEnablementFencesCommitWithoutBatch(t *testing.T) {
 		t.Fatalf("put before enable: %v", err)
 	}
 
-	newDB, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	newDB, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("enable feed from second DB: %v", err)
 	}
@@ -576,7 +697,7 @@ func TestChangeReaderLifecycleAndValidation(t *testing.T) {
 		t.Fatalf("close disabled DB: %v", err)
 	}
 
-	enabled, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	enabled, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("open enabled DB: %v", err)
 	}
@@ -615,7 +736,7 @@ func openChangeReaderTestDB(t *testing.T, prefix string) (*blobstore.Store, *DB,
 	t.Helper()
 	ctx := context.Background()
 	store := blobstore.NewMemory(prefix)
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		store.Close()
 		t.Fatalf("open DB: %v", err)

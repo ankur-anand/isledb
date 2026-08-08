@@ -12,104 +12,119 @@ import (
 
 func BenchmarkChangeBatchAppend(b *testing.B) {
 	for _, records := range []int{1_024, 16_384} {
-		b.Run(fmt.Sprintf("records=%d/value=256B", records), func(b *testing.B) {
-			keys := make([][]byte, records)
-			for i := 0; i < records; i++ {
-				keys[i] = []byte(fmt.Sprintf("key-%08d", i))
-			}
-			values := benchmarkChangeFeedValues(records, 256, true)
+		for _, feed := range benchmarkReadableChangeFeedPayloads() {
+			b.Run(fmt.Sprintf("records=%d/value=256B/changefeed=%s", records, feed.name), func(b *testing.B) {
+				keys := make([][]byte, records)
+				for i := 0; i < records; i++ {
+					keys[i] = []byte(fmt.Sprintf("key-%08d", i))
+				}
+				values := benchmarkChangeFeedValues(records, 256, true)
 
-			b.SetBytes(int64(records * (len("key-00000000") + 256)))
-			b.ReportAllocs()
-			b.ResetTimer()
+				b.SetBytes(int64(records * (len("key-00000000") + 256)))
+				b.ReportAllocs()
+				b.ResetTimer()
 
-			var buffer *changeBatchBuffer
-			for i := 0; i < b.N; i++ {
-				buffer = &changeBatchBuffer{}
-				for j := 0; j < records; j++ {
-					if err := buffer.appendPut(uint64(j+1), keys[j], values[j], 0); err != nil {
-						b.Fatalf("append change: %v", err)
+				var buffer *changeBatchBuffer
+				for i := 0; i < b.N; i++ {
+					buffer = &changeBatchBuffer{payload: feed.payload}
+					for j := 0; j < records; j++ {
+						if err := buffer.appendPutForPayload(
+							uint64(j+1), keys[j], values[j], 0, feed.payload,
+						); err != nil {
+							b.Fatalf("append change: %v", err)
+						}
 					}
 				}
-			}
-			b.ReportMetric(float64(buffer.bodySize), "raw_B")
-		})
+				b.ReportMetric(float64(buffer.bodySize), "raw_B")
+			})
+		}
 	}
 }
 
 func BenchmarkChangeBatchStream(b *testing.B) {
 	const records = 16_384
-	for _, payload := range []struct {
+	for _, values := range []struct {
 		name   string
 		unique bool
 	}{
 		{name: "compressible"},
 		{name: "unique", unique: true},
 	} {
-		b.Run("payload="+payload.name, func(b *testing.B) {
-			values := benchmarkChangeFeedValues(records, 256, payload.unique)
-			buffer := &changeBatchBuffer{}
-			for i := 0; i < records; i++ {
-				key := []byte(fmt.Sprintf("key-%08d", i))
-				if err := buffer.appendPut(uint64(i+1), key, values[i], 0); err != nil {
-					b.Fatalf("append change: %v", err)
+		for _, feed := range benchmarkReadableChangeFeedPayloads() {
+			b.Run("values="+values.name+"/changefeed="+feed.name, func(b *testing.B) {
+				feedValues := benchmarkChangeFeedValues(records, 256, values.unique)
+				buffer := &changeBatchBuffer{payload: feed.payload}
+				for i := 0; i < records; i++ {
+					key := []byte(fmt.Sprintf("key-%08d", i))
+					if err := buffer.appendPutForPayload(
+						uint64(i+1), key, feedValues[i], 0, feed.payload,
+					); err != nil {
+						b.Fatalf("append change: %v", err)
+					}
 				}
-			}
 
-			b.SetBytes(buffer.bodySize)
-			b.ReportAllocs()
-			b.ResetTimer()
+				b.SetBytes(int64(records * (len("key-00000000") + 256)))
+				b.ReportAllocs()
+				b.ResetTimer()
 
-			var result changeBatchStreamResult
-			for i := 0; i < b.N; i++ {
-				var err error
-				result, err = writeChangeBatchStreaming(context.Background(), buffer, 1, time.Unix(int64(i+1), 0),
-					func(_ context.Context, _ string, reader io.Reader) error {
-						_, copyErr := io.Copy(io.Discard, reader)
-						return copyErr
-					})
-				if err != nil {
-					b.Fatalf("stream change batch: %v", err)
+				var result changeBatchStreamResult
+				for i := 0; i < b.N; i++ {
+					var err error
+					result, err = writeChangeBatchStreaming(context.Background(), buffer, 1, time.Unix(int64(i+1), 0),
+						func(_ context.Context, _ string, reader io.Reader) error {
+							_, copyErr := io.Copy(io.Discard, reader)
+							return copyErr
+						})
+					if err != nil {
+						b.Fatalf("stream change batch: %v", err)
+					}
 				}
-			}
-			b.ReportMetric(float64(result.Meta.Size), "compressed_B")
-		})
+				b.ReportMetric(float64(buffer.bodySize), "raw_B")
+				b.ReportMetric(float64(result.Meta.Size), "compressed_B")
+			})
+		}
 	}
 }
 
 func BenchmarkWriterFlushChangeFeed(b *testing.B) {
-	for _, payload := range []struct {
+	for _, values := range []struct {
 		name   string
 		unique bool
 	}{
 		{name: "compressible"},
 		{name: "unique", unique: true},
 	} {
-		for _, enabled := range []bool{false, true} {
-			name := "disabled"
-			if enabled {
-				name = "enabled"
-			}
-			b.Run("payload="+payload.name+"/changefeed="+name, func(b *testing.B) {
-				benchmarkWriterChangeFeed(b, enabled, payload.unique, false, 16_384, 256)
+		for _, feed := range benchmarkChangeFeedPayloads() {
+			b.Run("payload="+values.name+"/changefeed="+feed.name, func(b *testing.B) {
+				benchmarkWriterChangeFeed(b, feed.payload, values.unique, false, 16_384, 256)
 			})
 		}
 	}
 }
 
 func BenchmarkWriterWriteFlushChangeFeed(b *testing.B) {
-	for _, enabled := range []bool{false, true} {
-		name := "disabled"
-		if enabled {
-			name = "enabled"
-		}
-		b.Run(name, func(b *testing.B) {
-			benchmarkWriterChangeFeed(b, enabled, true, true, 16_384, 256)
+	for _, feed := range benchmarkChangeFeedPayloads() {
+		b.Run(feed.name, func(b *testing.B) {
+			benchmarkWriterChangeFeed(b, feed.payload, true, true, 16_384, 256)
 		})
 	}
 }
 
-func benchmarkWriterChangeFeed(b *testing.B, enabled, uniqueValues, timePuts bool, records, valueBytes int) {
+func benchmarkChangeFeedPayloads() []struct {
+	name    string
+	payload ChangeFeedPayload
+} {
+	return []struct {
+		name    string
+		payload ChangeFeedPayload
+	}{
+		{name: "disabled"},
+		{name: "keys_only", payload: ChangeFeedKeysOnly},
+		{name: "full_values", payload: ChangeFeedFullValues},
+	}
+}
+
+func benchmarkWriterChangeFeed(b *testing.B, payload ChangeFeedPayload, uniqueValues, timePuts bool, records, valueBytes int) {
 	b.Helper()
 	b.StopTimer()
 
@@ -119,8 +134,15 @@ func benchmarkWriterChangeFeed(b *testing.B, enabled, uniqueValues, timePuts boo
 	opts.Flush.Interval = 0
 	opts.Memtable.TargetBytes = 64 << 20
 
-	db, writer := openBenchWriter(b, ctx, store, opts)
-	writer.w.changeFeedEnabled = enabled
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifestChangeFeedPayload(payload)})
+	if err != nil {
+		b.Fatalf("open DB: %v", err)
+	}
+	writer, err := db.OpenWriter(ctx, opts)
+	if err != nil {
+		_ = db.Close()
+		b.Fatalf("open writer: %v", err)
+	}
 	values := benchmarkChangeFeedValues(records, valueBytes, uniqueValues)
 
 	b.SetBytes(int64(records * (len("key-00000000-00000000") + valueBytes)))

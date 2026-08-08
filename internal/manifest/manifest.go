@@ -66,24 +66,39 @@ type SSTMeta struct {
 	HasBlobRefs bool   `json:"has_blob_refs"`
 }
 
+// ChangeFeedPayload identifies which PUT payload is retained in committed
+// change batches. The feed itself remains optional; an empty value means it is
+// disabled in CURRENT.
+type ChangeFeedPayload string
+
+const (
+	ChangeFeedPayloadKeysOnly   ChangeFeedPayload = "keys_only"
+	ChangeFeedPayloadFullValues ChangeFeedPayload = "full_values"
+)
+
+func (p ChangeFeedPayload) Valid() bool {
+	return p == ChangeFeedPayloadKeysOnly || p == ChangeFeedPayloadFullValues
+}
+
 // ChangeBatchMeta describes one committed, block-indexed, seq-ordered mutation
 // batch emitted alongside a memtable flush. The object is visible only after
 // the manifest entry that references it is committed.
 type ChangeBatchMeta struct {
-	ID            string    `json:"id"`
-	Path          string    `json:"path"`
-	Epoch         uint64    `json:"epoch"`
-	SeqLo         uint64    `json:"seq_lo"`
-	SeqHi         uint64    `json:"seq_hi"`
-	Count         uint32    `json:"count"`
-	BlockCount    uint32    `json:"block_count"`
-	Size          int64     `json:"size"`
-	RawSize       int64     `json:"raw_size"`
-	Checksum      string    `json:"checksum"`
-	IndexChecksum string    `json:"index_checksum"`
-	CreatedAt     time.Time `json:"created_at"`
-	Version       int       `json:"version,omitempty"`
-	Compression   string    `json:"compression,omitempty"`
+	ID            string            `json:"id"`
+	Path          string            `json:"path"`
+	Epoch         uint64            `json:"epoch"`
+	SeqLo         uint64            `json:"seq_lo"`
+	SeqHi         uint64            `json:"seq_hi"`
+	Count         uint32            `json:"count"`
+	BlockCount    uint32            `json:"block_count"`
+	Size          int64             `json:"size"`
+	RawSize       int64             `json:"raw_size"`
+	Checksum      string            `json:"checksum"`
+	IndexChecksum string            `json:"index_checksum"`
+	CreatedAt     time.Time         `json:"created_at"`
+	Version       int               `json:"version,omitempty"`
+	Compression   string            `json:"compression,omitempty"`
+	Payload       ChangeFeedPayload `json:"payload"`
 }
 
 // WriterCommit is one logical memtable publication. ID remains unchanged when
@@ -115,12 +130,13 @@ type Current struct {
 	NextSeq       uint64 `json:"next_seq"`
 	NextEpoch     uint64 `json:"next_epoch"`
 
-	ChangeFeedEnabled  bool          `json:"change_feed_enabled,omitempty"`
-	ChangeFeedLogStart uint64        `json:"change_feed_log_start,omitempty"`
-	RetirementLogStart uint64        `json:"retirement_log_start"`
-	StateReplayPages   uint64        `json:"state_replay_pages,omitempty"`
-	StateReplayBytes   uint64        `json:"state_replay_bytes,omitempty"`
-	MaxPinnedViewAge   time.Duration `json:"max_pinned_view_age_nanos"`
+	ChangeFeedEnabled  bool              `json:"change_feed_enabled,omitempty"`
+	ChangeFeedPayload  ChangeFeedPayload `json:"change_feed_payload,omitempty"`
+	ChangeFeedLogStart uint64            `json:"change_feed_log_start,omitempty"`
+	RetirementLogStart uint64            `json:"retirement_log_start"`
+	StateReplayPages   uint64            `json:"state_replay_pages,omitempty"`
+	StateReplayBytes   uint64            `json:"state_replay_bytes,omitempty"`
+	MaxPinnedViewAge   time.Duration     `json:"max_pinned_view_age_nanos"`
 
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`

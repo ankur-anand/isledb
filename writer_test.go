@@ -118,7 +118,7 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	w.changeFeedEnabled = true
+	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
@@ -157,6 +157,9 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	}
 	if meta.Compression != changeBatchCompressionZstd {
 		t.Fatalf("change batch compression=%q want=%q", meta.Compression, changeBatchCompressionZstd)
+	}
+	if meta.Payload != manifest.ChangeFeedPayloadFullValues {
+		t.Fatalf("change batch payload=%q want=%q", meta.Payload, manifest.ChangeFeedPayloadFullValues)
 	}
 	if meta.Version != changeBatchVersion || meta.BlockCount == 0 || meta.RawSize <= 0 || meta.IndexChecksum == "" {
 		t.Fatalf("incomplete indexed change batch metadata: %+v", *meta)
@@ -243,7 +246,7 @@ func TestWriter_ChangeFeedBufferTriggersRotationForBlobValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	w.changeFeedEnabled = true
+	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("large"), make([]byte, 2<<10)); err != nil {
@@ -556,7 +559,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	w.changeFeedEnabled = true
+	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
 	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {

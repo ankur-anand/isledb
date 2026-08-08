@@ -43,7 +43,8 @@ func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
 		t.Fatalf("meta block count=%d want=%d", got, want)
 	}
 	if result.Meta.Checksum == "" || result.Meta.IndexChecksum == "" ||
-		result.Meta.Compression != changeBatchCompressionZstd {
+		result.Meta.Compression != changeBatchCompressionZstd ||
+		result.Meta.Payload != "full_values" {
 		t.Fatalf("incomplete change batch metadata: %+v", result.Meta)
 	}
 
@@ -66,6 +67,49 @@ func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
 	}
 	if batch.Changes[2].Kind != changeDelete {
 		t.Fatalf("delete mismatch: %+v", batch.Changes[2])
+	}
+}
+
+func TestChangeBatchKeysOnlyOmitsPutValues(t *testing.T) {
+	buffer := &changeBatchBuffer{payload: ChangeFeedKeysOnly}
+	if err := buffer.appendPutForPayload(
+		1, []byte("key"), []byte("value-that-must-not-be-encoded"), 1234, ChangeFeedKeysOnly,
+	); err != nil {
+		t.Fatalf("append keys-only put: %v", err)
+	}
+	if err := buffer.appendDelete(2, []byte("deleted")); err != nil {
+		t.Fatalf("append delete: %v", err)
+	}
+
+	var object bytes.Buffer
+	result, err := writeChangeBatchStreaming(
+		context.Background(), buffer, 3, time.Unix(10, 0).UTC(),
+		func(_ context.Context, _ string, reader io.Reader) error {
+			_, copyErr := io.Copy(&object, reader)
+			return copyErr
+		},
+	)
+	if err != nil {
+		t.Fatalf("write keys-only batch: %v", err)
+	}
+	if got, want := string(result.Meta.Payload), "keys_only"; got != want {
+		t.Fatalf("metadata payload=%q want=%q", got, want)
+	}
+	if got, want := result.Meta.RawSize, int64(32+len("key")+32+len("deleted")); got != want {
+		t.Fatalf("raw bytes=%d want=%d", got, want)
+	}
+
+	batch, err := decodeChangeBatch(object.Bytes())
+	if err != nil {
+		t.Fatalf("decode keys-only batch: %v", err)
+	}
+	if batch.Payload != ChangeFeedKeysOnly {
+		t.Fatalf("batch payload=%s want=%s", batch.Payload, ChangeFeedKeysOnly)
+	}
+	put := batch.Changes[0]
+	if put.Kind != changePut || !put.ValueOmitted || put.Inline || put.Value != nil ||
+		string(put.Key) != "key" || put.ExpireAt != 1234 {
+		t.Fatalf("keys-only put mismatch: %+v", put)
 	}
 }
 
@@ -125,6 +169,26 @@ func TestDecodeChangeBatchRejectsOtherFormatVersions(t *testing.T) {
 	binary.BigEndian.PutUint16(trailer[4:6], changeBatchVersion-1)
 	if _, err := decodeChangeBatch(data); err == nil {
 		t.Fatal("expected unsupported format version error")
+	}
+}
+
+func TestDecodeChangeBatchRejectsPayloadModeThatDoesNotMatchRecords(t *testing.T) {
+	data, err := encodeChangeBatch(&changeBatch{
+		Version: changeBatchVersion,
+		Payload: ChangeFeedFullValues,
+		Epoch:   1,
+		SeqLo:   1,
+		SeqHi:   1,
+		Changes: []changeRecord{
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("value")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	data[len(data)-changeBatchTrailerSize+6] = byte(ChangeFeedKeysOnly)
+	if _, err := decodeChangeBatch(data); err == nil {
+		t.Fatal("expected payload/record mismatch")
 	}
 }
 

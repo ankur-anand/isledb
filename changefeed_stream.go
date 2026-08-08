@@ -55,16 +55,27 @@ type changeBatchBuffer struct {
 	count         uint32
 	seqLo         uint64
 	seqHi         uint64
+	payload       ChangeFeedPayload
 }
 
 func (b *changeBatchBuffer) appendPut(seq uint64, key, value []byte, expireAt int64) error {
+	return b.appendPutForPayload(seq, key, value, expireAt, ChangeFeedFullValues)
+}
+
+func (b *changeBatchBuffer) appendPutForPayload(
+	seq uint64,
+	key, value []byte,
+	expireAt int64,
+	payload ChangeFeedPayload,
+) error {
 	return b.appendRecord(changeRecord{
-		Seq:      seq,
-		Kind:     changePut,
-		Key:      key,
-		Inline:   true,
-		Value:    value,
-		ExpireAt: expireAt,
+		Seq:          seq,
+		Kind:         changePut,
+		Key:          key,
+		Inline:       payload == ChangeFeedFullValues,
+		Value:        value,
+		ValueOmitted: payload == ChangeFeedKeysOnly,
+		ExpireAt:     expireAt,
 	})
 }
 
@@ -73,6 +84,16 @@ func (b *changeBatchBuffer) appendDelete(seq uint64, key []byte) error {
 }
 
 func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
+	if b.payload == 0 {
+		if change.Kind == changePut && change.ValueOmitted {
+			b.payload = ChangeFeedKeysOnly
+		} else {
+			b.payload = ChangeFeedFullValues
+		}
+	}
+	if b.payload != ChangeFeedKeysOnly && b.payload != ChangeFeedFullValues {
+		return fmt.Errorf("unsupported change feed payload %d", b.payload)
+	}
 	if b.count == math.MaxUint32 {
 		return errorsChangeBatchTooLarge(b.count)
 	}
@@ -87,10 +108,17 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	switch change.Kind {
 	case changeDelete:
 	case changePut:
-		if !change.Inline {
-			return fmt.Errorf("change put must contain an inline value")
+		switch b.payload {
+		case ChangeFeedKeysOnly:
+			if !change.ValueOmitted || change.Inline {
+				return errors.New("keys-only change put must omit its value")
+			}
+		case ChangeFeedFullValues:
+			if change.ValueOmitted || !change.Inline {
+				return errors.New("full-value change put must contain an inline value")
+			}
+			valueLen = len(change.Value)
 		}
-		valueLen = len(change.Value)
 	default:
 		return fmt.Errorf("unsupported change kind %d", change.Kind)
 	}
@@ -103,7 +131,11 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	var header [changeRecordHeaderSize]byte
 	header[0] = byte(change.Kind)
 	if change.Kind == changePut {
-		header[1] = changeFlagInline
+		if change.ValueOmitted {
+			header[1] = changeFlagValueOmitted
+		} else {
+			header[1] = changeFlagInline
+		}
 	}
 	binary.BigEndian.PutUint32(header[4:8], uint32(len(change.Key)))
 	binary.BigEndian.PutUint32(header[8:12], uint32(valueLen))
@@ -111,7 +143,7 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	binary.BigEndian.PutUint64(header[24:32], uint64(change.ExpireAt))
 	b.appendBytes(header[:])
 	b.appendBytes(change.Key)
-	if change.Kind == changePut {
+	if change.Kind == changePut && !change.ValueOmitted {
 		b.appendBytes(change.Value)
 	}
 
@@ -269,6 +301,9 @@ func writeChangeBatchStreamingWithOptions(
 	if buffer == nil || buffer.count == 0 {
 		return changeBatchStreamResult{}, errEmptyIterator
 	}
+	if buffer.payload != ChangeFeedKeysOnly && buffer.payload != ChangeFeedFullValues {
+		return changeBatchStreamResult{}, fmt.Errorf("unsupported change feed payload %d", buffer.payload)
+	}
 	blockRanges, err := buffer.blockRanges(blockOpts)
 	if err != nil {
 		return changeBatchStreamResult{}, err
@@ -358,6 +393,7 @@ func writeChangeBatchStreamingWithOptions(
 		CreatedAt:     createdAt,
 		Version:       changeBatchVersion,
 		Compression:   changeBatchCompressionZstd,
+		Payload:       manifestChangeFeedPayload(buffer.payload),
 	}}, nil
 }
 
@@ -387,6 +423,7 @@ func encodeChangeBatchTrailer(
 	trailer := make([]byte, changeBatchTrailerSize)
 	copy(trailer[:4], changeBatchMagic)
 	binary.BigEndian.PutUint16(trailer[4:6], changeBatchVersion)
+	trailer[6] = byte(buffer.payload)
 	binary.BigEndian.PutUint64(trailer[8:16], epoch)
 	binary.BigEndian.PutUint64(trailer[16:24], buffer.seqLo)
 	binary.BigEndian.PutUint64(trailer[24:32], buffer.seqHi)
@@ -398,6 +435,17 @@ func encodeChangeBatchTrailer(
 	indexSum := sha256.Sum256(indexData)
 	copy(trailer[64:96], indexSum[:])
 	return trailer
+}
+
+func manifestChangeFeedPayload(payload ChangeFeedPayload) manifest.ChangeFeedPayload {
+	switch payload {
+	case ChangeFeedKeysOnly:
+		return manifest.ChangeFeedPayloadKeysOnly
+	case ChangeFeedFullValues:
+		return manifest.ChangeFeedPayloadFullValues
+	default:
+		return ""
+	}
 }
 
 func writeChangeBatchBytes(writer io.Writer, data []byte) error {

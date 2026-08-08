@@ -80,9 +80,20 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 
 ```go
 type DBOptions struct {
-    Prefix           string
-    EnableChangeFeed bool
-    Policy           StorePolicy
+    Prefix     string
+    ChangeFeed *ChangeFeedOptions // nil leaves a new feed disabled
+    Policy     StorePolicy
+}
+
+type ChangeFeedPayload uint8
+
+const (
+    ChangeFeedKeysOnly ChangeFeedPayload = iota + 1
+    ChangeFeedFullValues
+)
+
+type ChangeFeedOptions struct {
+    Payload ChangeFeedPayload
 }
 
 type StorePolicy struct {
@@ -92,8 +103,11 @@ type StorePolicy struct {
 
 `Open` owns the bucket connection and closes it from `DB.Close`. `OpenBucket`
 borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
-`EnableChangeFeed` is persisted in the manifest and cannot be disabled. Enabling
-an existing database starts the feed at its current manifest head.
+The change-feed payload is explicit, persisted in the manifest, and cannot be
+changed or disabled after enablement. `ChangeFeedKeysOnly` is an invalidation
+feed; `ChangeFeedFullValues` is replayable CDC. Enabling an existing database
+starts the feed at its current manifest head. Reopening with `ChangeFeed == nil`
+adopts an already-persisted configuration.
 `MaxPinnedViewAge` is persisted by the first writer. Later writers must present
 the same value. Readers and SST garbage collection both derive their safety
 deadline from this one store policy.
@@ -404,7 +418,7 @@ type IteratorOptions struct {
 ### ChangeReader
 
 Reads the optional durable mutation feed without object-store listing. Open it
-after `DBOptions.EnableChangeFeed` has been persisted for the database prefix.
+after `DBOptions.ChangeFeed` has been persisted for the database prefix.
 Any number of independent change readers may be opened from one `DB`.
 
 ```go
@@ -422,13 +436,15 @@ type Change struct {
     Sequence  uint64
     Operation ChangeOperation // ChangePut or ChangeDelete
     Key       []byte
-    Value     []byte          // empty for deletes
+    Value     []byte          // nil when omitted or for deletes
+    HasValue  bool            // true for full-value PUTs, including empty values
     ExpiresAt time.Time       // zero when no TTL applies
 }
 
 type ChangeBounds struct {
     Oldest ChangeCursor
     Head   ChangeCursor
+    Payload ChangeFeedPayload
 }
 
 type ChangeReadOptions struct {
@@ -446,6 +462,8 @@ The cursor points to the next change, including a position inside a large flush
 batch. Save `page.Next.String()` only after processing the returned changes.
 Use `bounds.Oldest` for retained replay or `bounds.Head` for future commits.
 A zero cursor also starts at the oldest retained change.
+In keys-only mode, PUT records have `HasValue == false`; a later KV `Get` returns
+current state and is not a historical reconstruction of that mutation.
 
 `Read` performs no polling. An empty page can still advance `Next` over
 manifest entries that contain no user mutations; continue until `CaughtUp`

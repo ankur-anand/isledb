@@ -112,6 +112,7 @@ Example:
   "snapshot": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest",
   "log_seq_start": 412,
   "change_feed_enabled": true,
+  "change_feed_payload": "full_values",
   "change_feed_log_start": 412,
   "next_seq": 428,
   "next_epoch": 19,
@@ -148,7 +149,8 @@ Example:
         "checksum": "sha256:def",
         "index_checksum": "sha256:abc",
         "version": 1,
-        "compression": "zstd"
+        "compression": "zstd",
+        "payload": "full_values"
       }
     }
   ],
@@ -473,8 +475,9 @@ JSON-style descriptor:
 
 Immutable, seq-ordered mutation batch opened by `ChangeReader`. This object is
 an indexed binary file, not JSON. It preserves puts, deletes, TTL metadata, and
-complete values in mutation order. External values are embedded so retained
-change history does not depend on the lifetime of a separate blob object.
+mutation order. A `full_values` feed embeds complete values, including values
+stored externally by the KV path. A `keys_only` feed stores PUT keys and
+operation metadata with an explicit value-omitted flag.
 
 Indexed format version 1 layout:
 
@@ -490,8 +493,9 @@ A block closes at 512 records or 1 MiB of uncompressed record data, whichever
 comes first; one oversized record remains independently decodable. Each index
 entry stores the first record index, record count, first sequence, object
 offset, compressed size, raw size, and SHA-256 of the raw block. The trailer
-stores the batch identity and a SHA-256 of the complete block index; the same
-index checksum is anchored in the committed manifest metadata.
+stores the batch identity, payload policy, and a SHA-256 of the complete block
+index; the same payload policy and index checksum are anchored in the committed
+manifest metadata.
 
 `ChangeReader` first range-reads the index and trailer, then coalesces the
 contiguous block frames needed by `MaxChanges` and `MaxBytes` into a range GET.

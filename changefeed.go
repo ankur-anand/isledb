@@ -25,6 +25,7 @@ const (
 const (
 	changeFlagInline byte = 1 << iota
 	changeFlagBlob
+	changeFlagValueOmitted
 )
 
 type changeKind byte
@@ -35,13 +36,14 @@ const (
 )
 
 type changeRecord struct {
-	Seq      uint64
-	Kind     changeKind
-	Key      []byte
-	Inline   bool
-	Value    []byte
-	BlobID   [32]byte
-	ExpireAt int64
+	Seq          uint64
+	Kind         changeKind
+	Key          []byte
+	Inline       bool
+	Value        []byte
+	BlobID       [32]byte
+	ValueOmitted bool
+	ExpireAt     int64
 }
 
 type changeBatch struct {
@@ -49,6 +51,7 @@ type changeBatch struct {
 	Epoch   uint64
 	SeqLo   uint64
 	SeqHi   uint64
+	Payload ChangeFeedPayload
 	Changes []changeRecord
 }
 
@@ -72,6 +75,7 @@ type changeBatchIndex struct {
 	SeqHi   uint64
 	Count   uint32
 	RawSize uint64
+	Payload ChangeFeedPayload
 	Blocks  []changeBatchBlock
 }
 
@@ -93,6 +97,13 @@ func encodeChangeBatch(batch *changeBatch) ([]byte, error) {
 	if version != changeBatchVersion {
 		return nil, fmt.Errorf("unsupported change batch version %d", batch.Version)
 	}
+	payload := batch.Payload
+	if payload == 0 {
+		payload = ChangeFeedFullValues
+	}
+	if payload != ChangeFeedKeysOnly && payload != ChangeFeedFullValues {
+		return nil, fmt.Errorf("unsupported change feed payload %d", payload)
+	}
 	if len(batch.Changes) == 0 {
 		return nil, errEmptyIterator
 	}
@@ -100,7 +111,7 @@ func encodeChangeBatch(batch *changeBatch) ([]byte, error) {
 		return nil, fmt.Errorf("change batch too large: count=%d", len(batch.Changes))
 	}
 
-	buffer := &changeBatchBuffer{}
+	buffer := &changeBatchBuffer{payload: payload}
 	for _, change := range batch.Changes {
 		if err := buffer.appendRecord(change); err != nil {
 			return nil, err
@@ -149,6 +160,7 @@ func decodeChangeBatch(data []byte) (*changeBatch, error) {
 		Epoch:   index.Epoch,
 		SeqLo:   index.SeqLo,
 		SeqHi:   index.SeqHi,
+		Payload: index.Payload,
 		Changes: make([]changeRecord, 0, index.Count),
 	}
 	for i := range index.Blocks {
@@ -157,7 +169,7 @@ func decodeChangeBatch(data []byte) (*changeBatch, error) {
 		if end > uint64(len(data)) {
 			return nil, errors.New("change block extends past object")
 		}
-		changes, err := decodeChangeBatchBlock(data[block.Offset:end], block)
+		changes, err := decodeChangeBatchBlock(data[block.Offset:end], block, index.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("decode change block %d: %w", i, err)
 		}
@@ -217,12 +229,16 @@ func decodeChangeBatchIndex(indexData, trailer []byte, objectSize int64) (*chang
 
 	result := &changeBatchIndex{
 		Version: int(binary.BigEndian.Uint16(trailer[4:6])),
+		Payload: ChangeFeedPayload(trailer[6]),
 		Epoch:   binary.BigEndian.Uint64(trailer[8:16]),
 		SeqLo:   binary.BigEndian.Uint64(trailer[16:24]),
 		SeqHi:   binary.BigEndian.Uint64(trailer[24:32]),
 		Count:   binary.BigEndian.Uint32(trailer[32:36]),
 		RawSize: binary.BigEndian.Uint64(trailer[56:64]),
 		Blocks:  make([]changeBatchBlock, 0, blockCount),
+	}
+	if result.Payload != ChangeFeedKeysOnly && result.Payload != ChangeFeedFullValues {
+		return nil, fmt.Errorf("unsupported change feed payload %d", result.Payload)
 	}
 	if result.Count == 0 || result.SeqHi < result.SeqLo {
 		return nil, errors.New("invalid empty change batch")
@@ -279,7 +295,7 @@ func decodeChangeBatchIndex(indexData, trailer []byte, objectSize int64) (*chang
 	return result, nil
 }
 
-func decodeChangeBatchBlock(data []byte, block changeBatchBlock) ([]changeRecord, error) {
+func decodeChangeBatchBlock(data []byte, block changeBatchBlock, payload ChangeFeedPayload) ([]changeRecord, error) {
 	if uint64(len(data)) != uint64(block.CompressedSize) {
 		return nil, fmt.Errorf("compressed block bytes=%d want=%d", len(data), block.CompressedSize)
 	}
@@ -305,6 +321,11 @@ func decodeChangeBatchBlock(data []byte, block changeBatchBlock) ([]changeRecord
 		change, next, err := decodeChange(raw, off)
 		if err != nil {
 			return nil, err
+		}
+		if change.Kind == changePut &&
+			((payload == ChangeFeedKeysOnly && (!change.ValueOmitted || change.Inline)) ||
+				(payload == ChangeFeedFullValues && (change.ValueOmitted || !change.Inline))) {
+			return nil, fmt.Errorf("change payload does not match batch mode %s", payload)
 		}
 		if i == 0 {
 			if change.Seq != block.SeqLo {
@@ -349,7 +370,9 @@ func encodeChange(buf *bytes.Buffer, change changeRecord) error {
 	switch change.Kind {
 	case changeDelete:
 	case changePut:
-		if change.Inline {
+		if change.ValueOmitted {
+			flags |= changeFlagValueOmitted
+		} else if change.Inline {
 			flags |= changeFlagInline
 			valueLen = len(change.Value)
 		} else {
@@ -420,6 +443,11 @@ func decodeChange(data []byte, off int) (changeRecord, int, error) {
 			}
 			copy(change.BlobID[:], data[off:off+32])
 			off += 32
+		case changeFlagValueOmitted:
+			if valueLen != 0 {
+				return changeRecord{}, 0, errors.New("invalid omitted change payload")
+			}
+			change.ValueOmitted = true
 		default:
 			return changeRecord{}, 0, errors.New("invalid put change flags")
 		}
