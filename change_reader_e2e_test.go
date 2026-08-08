@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +14,222 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
+
+func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	bucketURL := setupFakeS3BucketURL(t)
+
+	t.Run("default_disabled_keeps_kv", func(t *testing.T) {
+		prefix := fmt.Sprintf("e2e/change-default-%d", time.Now().UnixNano())
+		db, err := Open(ctx, bucketURL, DBOptions{Prefix: prefix})
+		if err != nil {
+			t.Fatalf("open DB: %v", err)
+		}
+		defer db.Close()
+
+		writerOpts := testChangeWriterOptions()
+		writerOpts.OwnerID = "change-default-writer"
+		writer, err := db.OpenWriter(ctx, writerOpts)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+
+		if _, err := db.OpenChangeReader(ctx); !errors.Is(err, ErrChangeFeedDisabled) {
+			t.Fatalf("open change reader error=%v want=%v", err, ErrChangeFeedDisabled)
+		}
+		objects, err := db.store.List(ctx, blobstore.ListOptions{Prefix: "changes/"})
+		if err != nil {
+			t.Fatalf("list change objects: %v", err)
+		}
+		if len(objects.Objects) != 0 {
+			t.Fatalf("change objects=%d want=0", len(objects.Objects))
+		}
+
+		reader, err := db.OpenReader(ctx, ReaderOpenOptions{CacheDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("open KV reader: %v", err)
+		}
+		defer reader.Close()
+		value, found, err := reader.Get(ctx, []byte("key"))
+		if err != nil || !found || string(value) != "value" {
+			t.Fatalf("KV Get value=%q found=%v err=%v", value, found, err)
+		}
+	})
+
+	t.Run("keys_only_persists_and_omits_values", func(t *testing.T) {
+		prefix := fmt.Sprintf("e2e/change-keys-%d", time.Now().UnixNano())
+		db, err := Open(ctx, bucketURL, DBOptions{
+			Prefix:     prefix,
+			ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedKeysOnly},
+		})
+		if err != nil {
+			t.Fatalf("open DB: %v", err)
+		}
+		defer db.Close()
+
+		writerOpts := testChangeWriterOptions()
+		writerOpts.OwnerID = "change-keys-writer-1"
+		writerOpts.Values.InlineValueBytes = 1
+		writer, err := db.OpenWriter(ctx, writerOpts)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		largeValue := benchmarkChangeFeedValues(1, 4<<10, true)[0]
+		if err := writer.PutWithTTL(ctx, []byte("stored"), largeValue, time.Hour); err != nil {
+			t.Fatalf("put blob-backed value: %v", err)
+		}
+		if err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
+			t.Fatalf("put empty value: %v", err)
+		}
+		if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+
+		kv, err := db.OpenReader(ctx, ReaderOpenOptions{CacheDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("open KV reader: %v", err)
+		}
+		value, found, err := kv.Get(ctx, []byte("stored"))
+		if err != nil || !found || string(value) != string(largeValue) {
+			t.Fatalf("blob-backed KV Get bytes=%d found=%v err=%v", len(value), found, err)
+		}
+		if err := kv.Close(); err != nil {
+			t.Fatalf("close KV reader: %v", err)
+		}
+
+		entries, err := db.manifestStore.ListEntries(ctx)
+		if err != nil {
+			t.Fatalf("list manifest entries: %v", err)
+		}
+		var firstBatch *manifest.ChangeBatchMeta
+		for _, seq := range entries {
+			entry, readErr := db.manifestStore.ReadEntry(ctx, seq)
+			if readErr != nil {
+				t.Fatalf("read manifest entry %d: %v", seq, readErr)
+			}
+			if entry.ChangeBatch != nil {
+				firstBatch = entry.ChangeBatch
+				break
+			}
+		}
+		if firstBatch == nil {
+			t.Fatal("missing committed change batch")
+		}
+		if firstBatch.Payload != manifest.ChangeFeedPayloadKeysOnly {
+			t.Fatalf("batch payload=%q want=%q", firstBatch.Payload, manifest.ChangeFeedPayloadKeysOnly)
+		}
+		if got, want := firstBatch.RawSize, int64(32+len("stored")+32+len("empty")+32+len("deleted")); got != want {
+			t.Fatalf("keys-only raw bytes=%d want=%d", got, want)
+		}
+		encoded, _, err := db.store.Read(ctx, firstBatch.Path)
+		if err != nil {
+			t.Fatalf("read change object: %v", err)
+		}
+		decoded, err := decodeChangeBatch(encoded)
+		if err != nil {
+			t.Fatalf("decode change object: %v", err)
+		}
+		for i, change := range decoded.Changes {
+			if change.Kind == changePut && (!change.ValueOmitted || change.Value != nil) {
+				t.Fatalf("decoded change[%d] retained a value: %+v", i, change)
+			}
+		}
+
+		changes, err := db.OpenChangeReader(ctx)
+		if err != nil {
+			t.Fatalf("open change reader: %v", err)
+		}
+		bounds, err := changes.Bounds(ctx)
+		if err != nil {
+			t.Fatalf("bounds: %v", err)
+		}
+		if bounds.Payload != ChangeFeedKeysOnly {
+			t.Fatalf("bounds payload=%s want=%s", bounds.Payload, ChangeFeedKeysOnly)
+		}
+		page, err := changes.Read(ctx, bounds.Oldest, ChangeReadOptions{})
+		if err != nil {
+			t.Fatalf("read change page: %v", err)
+		}
+		if len(page.Changes) != 3 {
+			t.Fatalf("changes=%d want=3", len(page.Changes))
+		}
+		for i, change := range page.Changes {
+			if change.HasValue || change.Value != nil {
+				t.Fatalf("public change[%d] exposed a value: %+v", i, change)
+			}
+		}
+		if page.Changes[0].Operation != ChangePut || page.Changes[0].ExpiresAt.IsZero() ||
+			page.Changes[1].Operation != ChangePut || page.Changes[2].Operation != ChangeDelete {
+			t.Fatalf("unexpected ordered changes: %+v", page.Changes)
+		}
+		if err := changes.Close(); err != nil {
+			t.Fatalf("close change reader: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close first DB: %v", err)
+		}
+
+		reopened, err := Open(ctx, bucketURL, DBOptions{Prefix: prefix})
+		if err != nil {
+			t.Fatalf("reopen without feed options: %v", err)
+		}
+		defer reopened.Close()
+		writerOpts.OwnerID = "change-keys-writer-2"
+		writer, err = reopened.OpenWriter(ctx, writerOpts)
+		if err != nil {
+			t.Fatalf("open reopened writer: %v", err)
+		}
+		if err := writer.Put(ctx, []byte("after-reopen"), []byte("still-omitted")); err != nil {
+			t.Fatalf("put after reopen: %v", err)
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatalf("flush after reopen: %v", err)
+		}
+		if err := writer.Close(ctx); err != nil {
+			t.Fatalf("close reopened writer: %v", err)
+		}
+		reopenedChanges, err := reopened.OpenChangeReader(ctx)
+		if err != nil {
+			t.Fatalf("open reopened change reader: %v", err)
+		}
+		reopenedBounds, err := reopenedChanges.Bounds(ctx)
+		if err != nil {
+			t.Fatalf("reopened bounds: %v", err)
+		}
+		if reopenedBounds.Payload != ChangeFeedKeysOnly {
+			t.Fatalf("reopened payload=%s want=%s", reopenedBounds.Payload, ChangeFeedKeysOnly)
+		}
+		if err := reopenedChanges.Close(); err != nil {
+			t.Fatalf("close reopened change reader: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened DB: %v", err)
+		}
+
+		if _, err := Open(ctx, bucketURL, DBOptions{
+			Prefix:     prefix,
+			ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
+		}); !errors.Is(err, ErrChangeFeedPayloadMismatch) {
+			t.Fatalf("payload mismatch error=%v want=%v", err, ErrChangeFeedPayloadMismatch)
+		}
+	})
+}
 
 type s3ReadCounts struct {
 	current       atomic.Int64
@@ -75,8 +292,8 @@ func TestS3E2E_ChangeReaderLargeBatchGETBudget(t *testing.T) {
 	counts := &s3ReadCounts{}
 	bucketURL := setupFakeS3BucketURLWithObserver(t, counts.observe)
 	db, err := Open(ctx, bucketURL, DBOptions{
-		Prefix:           fmt.Sprintf("e2e/change-get-budget-%d", time.Now().UnixNano()),
-		EnableChangeFeed: true,
+		Prefix:     fmt.Sprintf("e2e/change-get-budget-%d", time.Now().UnixNano()),
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
 	})
 	if err != nil {
 		t.Fatalf("open DB: %v", err)
@@ -143,7 +360,7 @@ func TestS3E2E_ChangeReaderManifestRotationAndRestart(t *testing.T) {
 	}
 	defer store.Close()
 
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("open DB: %v", err)
 	}
@@ -270,8 +487,8 @@ func BenchmarkFakeS3_ChangeReaderReplay_16384x256B(b *testing.B) {
 	counts := &s3ReadCounts{}
 	bucketURL := setupFakeS3BucketURLWithObserver(b, counts.observe)
 	db, err := Open(ctx, bucketURL, DBOptions{
-		Prefix:           fmt.Sprintf("bench/change-reader-%d", time.Now().UnixNano()),
-		EnableChangeFeed: true,
+		Prefix:     fmt.Sprintf("bench/change-reader-%d", time.Now().UnixNano()),
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
 	})
 	if err != nil {
 		b.Fatalf("open DB: %v", err)

@@ -138,6 +138,7 @@ func TestReadChangeEntriesFromViewDoesNotReadCurrent(t *testing.T) {
 		NextSeq:            2,
 		LogSeqStart:        1,
 		ChangeFeedEnabled:  true,
+		ChangeFeedPayload:  ChangeFeedPayloadFullValues,
 		ChangeFeedLogStart: 1,
 		ActiveEntries: []ManifestLogEntry{
 			{Seq: 1, Op: LogOpFenceClaim},

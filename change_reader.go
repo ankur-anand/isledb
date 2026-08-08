@@ -61,6 +61,7 @@ type Change struct {
 	Operation ChangeOperation
 	Key       []byte
 	Value     []byte
+	HasValue  bool
 	ExpiresAt time.Time
 }
 
@@ -127,8 +128,9 @@ func changeCursorAt(entry, index uint64) ChangeCursor {
 // ChangeBounds describes the currently retained feed interval. Oldest starts
 // at the first retained mutation; Head starts after the latest committed one.
 type ChangeBounds struct {
-	Oldest ChangeCursor
-	Head   ChangeCursor
+	Oldest  ChangeCursor
+	Head    ChangeCursor
+	Payload ChangeFeedPayload
 }
 
 // ChangeReadOptions bounds one Read call. A single change larger than MaxBytes
@@ -256,8 +258,9 @@ func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error) {
 		return ChangeBounds{}, ErrChangeFeedDisabled
 	}
 	return ChangeBounds{
-		Oldest: changeCursorAt(view.RetainedFrom(), 0),
-		Head:   changeCursorAt(view.Head(), 0),
+		Oldest:  changeCursorAt(view.RetainedFrom(), 0),
+		Head:    changeCursorAt(view.Head(), 0),
+		Payload: publicChangeFeedPayload(view.Payload()),
 	}, nil
 }
 
@@ -476,7 +479,6 @@ func (r *ChangeReader) readBatch(ctx context.Context, meta *manifest.ChangeBatch
 	if err := validateChangeBatchMeta(meta); err != nil {
 		return nil, err
 	}
-
 	r.batchMu.Lock()
 	if r.batchPath == meta.Path && r.batch != nil {
 		if r.batchMeta != *meta {
@@ -551,6 +553,9 @@ func validateChangeBatchMeta(meta *manifest.ChangeBatchMeta) error {
 		return fmt.Errorf(
 			"%w: unsupported compression=%q", ErrCorruptChangeBatch, meta.Compression)
 	}
+	if !meta.Payload.Valid() {
+		return fmt.Errorf("%w: unsupported payload=%q", ErrCorruptChangeBatch, meta.Payload)
+	}
 	suffixSize := int64(meta.BlockCount)*changeBatchIndexEntrySize + changeBatchTrailerSize
 	if suffixSize >= meta.Size {
 		return fmt.Errorf(
@@ -581,7 +586,8 @@ func (r *ChangeReader) loadBatchIndex(ctx context.Context, meta *manifest.Change
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptChangeBatch, err)
 	}
-	if index.Version != meta.Version || index.Epoch != meta.Epoch || index.SeqLo != meta.SeqLo ||
+	if index.Version != meta.Version || manifestChangeFeedPayload(index.Payload) != meta.Payload ||
+		index.Epoch != meta.Epoch || index.SeqLo != meta.SeqLo ||
 		index.SeqHi != meta.SeqHi || index.Count != meta.Count || len(index.Blocks) != int(meta.BlockCount) ||
 		index.RawSize != uint64(meta.RawSize) {
 		return nil, fmt.Errorf("%w: metadata mismatch", ErrCorruptChangeBatch)
@@ -716,7 +722,7 @@ func (r *ChangeReader) loadBlockSpan(
 		block := index.Blocks[ordinal]
 		lo := block.Offset - first.Offset
 		hi := lo + uint64(block.CompressedSize)
-		changes, err := decodeChangeBatchBlock(data[lo:hi], block)
+		changes, err := decodeChangeBatchBlock(data[lo:hi], block, index.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
 		}
@@ -857,7 +863,7 @@ func (r *ChangeReader) loadBlock(
 	}
 	r.work.rangeGETs.Add(1)
 	r.work.downloadedBytes.Add(uint64(len(data)))
-	changes, err := decodeChangeBatchBlock(data, block)
+	changes, err := decodeChangeBatchBlock(data, block, index.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
 	}
@@ -916,13 +922,21 @@ func publicChange(change changeRecord, pageData *[]byte) Change {
 	keyStart := len(*pageData)
 	*pageData = append(*pageData, change.Key...)
 	key := (*pageData)[keyStart:len(*pageData)]
-	valueStart := len(*pageData)
-	*pageData = append(*pageData, change.Value...)
-	value := (*pageData)[valueStart:len(*pageData)]
+	var value []byte
+	hasValue := change.Kind == changePut && change.Inline && !change.ValueOmitted
+	if hasValue {
+		valueStart := len(*pageData)
+		*pageData = append(*pageData, change.Value...)
+		value = (*pageData)[valueStart:len(*pageData)]
+		if value == nil {
+			value = []byte{}
+		}
+	}
 	result := Change{
 		Sequence: change.Seq,
 		Key:      key,
 		Value:    value,
+		HasValue: hasValue,
 	}
 	switch change.Kind {
 	case changePut:

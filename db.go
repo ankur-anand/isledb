@@ -21,6 +21,36 @@ var ErrReaderAlreadyOpen = errors.New("reader already open")
 // database whose change feed has not been enabled.
 var ErrChangeFeedDisabled = errors.New("change feed disabled")
 
+// ErrChangeFeedPayloadMismatch is returned when an open request attempts to
+// change the payload policy of an already-enabled feed.
+var ErrChangeFeedPayloadMismatch = manifest.ErrChangeFeedPayloadMismatch
+
+// ChangeFeedPayload controls whether committed PUT records retain their value.
+// A zero value is invalid when ChangeFeedOptions is present.
+type ChangeFeedPayload uint8
+
+const (
+	ChangeFeedKeysOnly ChangeFeedPayload = iota + 1
+	ChangeFeedFullValues
+)
+
+func (p ChangeFeedPayload) String() string {
+	switch p {
+	case ChangeFeedKeysOnly:
+		return string(manifest.ChangeFeedPayloadKeysOnly)
+	case ChangeFeedFullValues:
+		return string(manifest.ChangeFeedPayloadFullValues)
+	default:
+		return "unknown"
+	}
+}
+
+// ChangeFeedOptions enables the durable ordered mutation feed and selects its
+// immutable PUT payload policy.
+type ChangeFeedOptions struct {
+	Payload ChangeFeedPayload
+}
+
 // Writer provides write access to the database.
 //
 // A Writer owns one fenced write session for a DB bucket/prefix. It buffers
@@ -133,9 +163,10 @@ type DBOptions struct {
 	// Prefix is the database's root path inside the bucket or container.
 	Prefix string
 
-	// EnableChangeFeed emits a durable ordered mutation feed for all future
-	// writer commits. Once enabled for a prefix, it remains enabled.
-	EnableChangeFeed bool
+	// ChangeFeed enables a durable ordered mutation feed for all future writer
+	// commits. Nil leaves a new feed disabled and adopts an already-persisted
+	// configuration when reopening a prefix.
+	ChangeFeed *ChangeFeedOptions
 
 	// Policy contains store-wide safety settings persisted by the first writer.
 	Policy StorePolicy
@@ -156,7 +187,7 @@ var ErrStorePolicyMismatch = manifest.ErrStorePolicyMismatch
 type dbOpenOptions struct {
 	manifestStorage     manifest.Storage
 	gcCursorStorage     manifest.GCCursorStorage
-	changeFeedEnabled   bool
+	changeFeedPayload   manifest.ChangeFeedPayload
 	changeFeedRetention *changeFeedRetentionPolicy
 	storePolicy         StorePolicy
 }
@@ -175,8 +206,8 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 	if _, err := manifestStore.Replay(ctx); err != nil {
 		return nil, err
 	}
-	if opts.changeFeedEnabled {
-		if err := manifestStore.EnableChangeFeed(ctx); err != nil {
+	if opts.changeFeedPayload != "" {
+		if err := manifestStore.EnableChangeFeed(ctx, opts.changeFeedPayload); err != nil {
 			return nil, err
 		}
 	}
@@ -197,7 +228,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		return nil, err
 	}
 
-	changeFeedEnabled, _, _, err := db.manifestStore.ChangeFeedBounds(ctx)
+	changeFeedView, err := db.manifestStore.LoadChangeFeedView(ctx)
 	if err != nil {
 		db.releaseWriter(nil)
 		return nil, err
@@ -207,7 +238,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.releaseWriter(nil)
 		return nil, err
 	}
-	w.changeFeedEnabled = changeFeedEnabled
+	w.changeFeedPayload = publicChangeFeedPayload(changeFeedView.Payload())
 
 	writer := &Writer{w: w}
 	writer.release = func() { db.releaseWriter(writer) }

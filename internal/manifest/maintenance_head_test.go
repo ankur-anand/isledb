@@ -110,6 +110,7 @@ func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 		LogSeqStart:        0,
 		NextSeq:            10,
 		ChangeFeedEnabled:  true,
+		ChangeFeedPayload:  ChangeFeedPayloadFullValues,
 		ChangeFeedLogStart: 0,
 		StateReplayPages:   2,
 		StateReplayBytes:   1024,

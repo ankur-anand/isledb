@@ -979,6 +979,7 @@ func TestWriteSnapshotPreservesEnabledChangeFeedFloor(t *testing.T) {
 		NextEpoch:          1,
 		LogSeqStart:        0,
 		ChangeFeedEnabled:  true,
+		ChangeFeedPayload:  ChangeFeedPayloadFullValues,
 		ChangeFeedLogStart: 0,
 		RetirementLogStart: 2,
 		NextSeq:            2,

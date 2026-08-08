@@ -17,7 +17,7 @@ func TestDBWriterPublishesStorePolicy(t *testing.T) {
 
 	const age = 30 * time.Minute
 	db, err := openDB(ctx, store, dbOpenOptions{
-		changeFeedEnabled: true,
+		changeFeedPayload: manifest.ChangeFeedPayloadFullValues,
 		storePolicy:       StorePolicy{MaxPinnedViewAge: age},
 	})
 	if err != nil {

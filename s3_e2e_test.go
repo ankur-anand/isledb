@@ -291,7 +291,7 @@ func TestS3E2E_ChangeReaderPaging(t *testing.T) {
 
 	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("change-reader-e2e-%d", time.Now().UnixNano()))
 	defer store.Close()
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("open DB: %v", err)
 	}
@@ -523,7 +523,7 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	if err := db.manifestStore.EnableChangeFeed(ctx); err != nil {
+	if err := db.manifestStore.EnableChangeFeed(ctx, manifest.ChangeFeedPayloadFullValues); err != nil {
 		t.Fatalf("enable change feed: %v", err)
 	}
 

@@ -121,7 +121,7 @@ func TestChangeFeedCleanerPlansInPageBatchesFromOneView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim writer: %v", err)
 	}
-	if err := manifestStore.EnableChangeFeed(ctx); err != nil {
+	if err := manifestStore.EnableChangeFeed(ctx, manifest.ChangeFeedPayloadFullValues); err != nil {
 		t.Fatalf("enable change feed: %v", err)
 	}
 
@@ -284,6 +284,7 @@ func writeChangeBatchForCleanerTest(t *testing.T, ctx context.Context, store *bl
 		Checksum:  "sha256:test",
 		CreatedAt: createdAt,
 		Version:   1,
+		Payload:   manifest.ChangeFeedPayloadFullValues,
 	}
 }
 
@@ -308,6 +309,7 @@ func appendChangeFeedCleanerManifestEntry(
 		RawSize:   256,
 		Checksum:  "sha256:test",
 		CreatedAt: createdAt,
+		Payload:   manifest.ChangeFeedPayloadFullValues,
 	}
 	entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{
 		ID:        fmt.Sprintf("sst-%03d", index),

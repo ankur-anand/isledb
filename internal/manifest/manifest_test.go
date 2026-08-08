@@ -79,12 +79,13 @@ func TestChangeBatchMetaJSONSchema(t *testing.T) {
 		CreatedAt:     time.Date(2026, time.August, 8, 10, 30, 0, 0, time.UTC),
 		Version:       1,
 		Compression:   "zstd",
+		Payload:       ChangeFeedPayloadFullValues,
 	}
 	body, err := json.Marshal(meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"id":"change-001","path":"changes/abc/change-001","epoch":2,"seq_lo":10,"seq_hi":20,"count":11,"block_count":2,"size":4096,"raw_size":8192,"checksum":"sha256:whole","index_checksum":"sha256:index","created_at":"2026-08-08T10:30:00Z","version":1,"compression":"zstd"}`
+	const want = `{"id":"change-001","path":"changes/abc/change-001","epoch":2,"seq_lo":10,"seq_hi":20,"count":11,"block_count":2,"size":4096,"raw_size":8192,"checksum":"sha256:whole","index_checksum":"sha256:index","created_at":"2026-08-08T10:30:00Z","version":1,"compression":"zstd","payload":"full_values"}`
 	if string(body) != want {
 		t.Fatalf("ChangeBatchMeta JSON schema changed\n got: %s\nwant: %s", body, want)
 	}

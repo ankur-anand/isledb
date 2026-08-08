@@ -245,10 +245,11 @@ func TestAppendWriterCommitReconcilesAppliedCASAfterLostResponse(t *testing.T) {
 			Level: 0,
 		},
 		ChangeBatch: &ChangeBatchMeta{
-			ID:    "change-1",
-			Path:  "changes/change-1",
-			SeqLo: 10,
-			SeqHi: 20,
+			ID:      "change-1",
+			Path:    "changes/change-1",
+			SeqLo:   10,
+			SeqHi:   20,
+			Payload: ChangeFeedPayloadFullValues,
 		},
 	}
 	lostResponse := errors.New("lost CURRENT response")
@@ -327,6 +328,7 @@ func TestAppendWriterCommitRejectsInvalidIdentity(t *testing.T) {
 			SSTable: SSTMeta{ID: "sst", SeqLo: 1, SeqHi: 2},
 			ChangeBatch: &ChangeBatchMeta{
 				ID: "change", Path: "changes/change", SeqLo: 1, SeqHi: 3,
+				Payload: ChangeFeedPayloadFullValues,
 			},
 		},
 	}

@@ -16,80 +16,49 @@ import (
 
 func BenchmarkChangeReaderRead(b *testing.B) {
 	const records = 16_384
-	ctx := context.Background()
-	store := blobstore.NewMemory("change-reader-benchmark")
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
-	if err != nil {
-		b.Fatalf("open DB: %v", err)
-	}
-	writer, err := db.OpenWriter(ctx, testChangeWriterOptions())
-	if err != nil {
-		b.Fatalf("open writer: %v", err)
-	}
-	values := benchmarkChangeFeedValues(records, 256, true)
-	for i := 0; i < records; i++ {
-		key := []byte(fmt.Sprintf("key-%08d", i))
-		if err := writer.Put(ctx, key, values[i]); err != nil {
-			b.Fatalf("put: %v", err)
-		}
-	}
-	if err := writer.Flush(ctx); err != nil {
-		b.Fatalf("flush: %v", err)
-	}
-	if err := writer.Close(ctx); err != nil {
-		b.Fatalf("close writer: %v", err)
-	}
-	reader, err := db.OpenChangeReader(ctx)
-	if err != nil {
-		b.Fatalf("open change reader: %v", err)
-	}
-	bounds, err := reader.Bounds(ctx)
-	if err != nil {
-		b.Fatalf("bounds: %v", err)
-	}
-	b.Cleanup(func() {
-		_ = reader.Close()
-		_ = db.Close()
-		_ = store.Close()
-	})
-
-	for _, maxChanges := range []int{1, 64, 1024, records} {
-		for _, cache := range []string{"cold", "warm"} {
-			b.Run(fmt.Sprintf("max_changes=%d/cache=%s", maxChanges, cache), func(b *testing.B) {
-				b.ReportAllocs()
-				b.SetBytes(int64(maxChanges * (len("key-00000000") + 256)))
-				opts := ChangeReadOptions{
-					MaxChanges: maxChanges,
-					MaxBytes:   64 << 20,
-				}
-				if cache == "warm" {
-					if _, err := reader.Read(ctx, bounds.Oldest, opts); err != nil {
-						b.Fatalf("warm cache: %v", err)
-					}
-				}
-				reader.work.reset()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					if cache == "cold" {
+	for _, feed := range benchmarkReadableChangeFeedPayloads() {
+		b.Run("payload="+feed.name, func(b *testing.B) {
+			dataset := prepareChangeReaderBenchmark(b, feed.payload, records, 256)
+			for _, maxChanges := range []int{1, 64, 1024, records} {
+				for _, cache := range []string{"cold", "warm"} {
+					b.Run(fmt.Sprintf("max_changes=%d/cache=%s", maxChanges, cache), func(b *testing.B) {
+						b.ReportAllocs()
+						b.SetBytes(int64(maxChanges) * dataset.returnedRecordBytes)
+						opts := ChangeReadOptions{MaxChanges: maxChanges, MaxBytes: 64 << 20}
+						page, err := dataset.reader.Read(dataset.ctx, dataset.bounds.Oldest, opts)
+						if err != nil {
+							b.Fatalf("prepare cache: %v", err)
+						}
+						validateChangeReaderBenchmarkPage(b, page, maxChanges, feed.payload, 256)
+						if cache == "cold" {
+							clearChangeReaderBatchCache(dataset.reader)
+						}
+						dataset.reader.work.reset()
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							if cache == "cold" {
+								b.StopTimer()
+								clearChangeReaderBatchCache(dataset.reader)
+								b.StartTimer()
+							}
+							page, err := dataset.reader.Read(dataset.ctx, dataset.bounds.Oldest, opts)
+							if err != nil {
+								b.Fatalf("read: %v", err)
+							}
+							if len(page.Changes) != maxChanges {
+								b.Fatalf("changes=%d want=%d", len(page.Changes), maxChanges)
+							}
+						}
 						b.StopTimer()
-						clearChangeReaderBatchCache(reader)
-						b.StartTimer()
-					}
-					page, err := reader.Read(ctx, bounds.Oldest, opts)
-					if err != nil {
-						b.Fatalf("read: %v", err)
-					}
-					if len(page.Changes) != maxChanges {
-						b.Fatalf("changes=%d want=%d", len(page.Changes), maxChanges)
-					}
+						work := dataset.reader.work.snapshot()
+						b.ReportMetric(float64(work.RangeGETs)/float64(b.N), "range_GETs/op")
+						b.ReportMetric(float64(work.DownloadedBytes)/float64(b.N), "downloaded_B/op")
+						b.ReportMetric(float64(work.DecompressedBytes)/float64(b.N), "decompressed_B/op")
+						b.ReportMetric(float64(b.N*maxChanges)/b.Elapsed().Seconds(), "records/s")
+					})
 				}
-				b.StopTimer()
-				work := reader.work.snapshot()
-				b.ReportMetric(float64(work.RangeGETs)/float64(b.N), "range_GETs/op")
-				b.ReportMetric(float64(work.DownloadedBytes)/float64(b.N), "downloaded_B/op")
-				b.ReportMetric(float64(work.DecompressedBytes)/float64(b.N), "decompressed_B/op")
-			})
-		}
+			}
+		})
 	}
 }
 
@@ -98,9 +67,70 @@ func BenchmarkChangeReaderSequentialPaging(b *testing.B) {
 		records  = 16_384
 		pageSize = 1024
 	)
+	for _, feed := range benchmarkReadableChangeFeedPayloads() {
+		b.Run("payload="+feed.name, func(b *testing.B) {
+			dataset := prepareChangeReaderBenchmark(b, feed.payload, records, 256)
+			for _, cache := range []string{"cold", "warm"} {
+				b.Run("cache="+cache, func(b *testing.B) {
+					if cache == "warm" {
+						replayAllChanges(b, dataset.ctx, dataset.reader, records, pageSize)
+					} else {
+						clearChangeReaderBatchCache(dataset.reader)
+					}
+					b.ReportAllocs()
+					b.SetBytes(int64(records) * dataset.returnedRecordBytes)
+					dataset.reader.work.reset()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if cache == "cold" {
+							b.StopTimer()
+							clearChangeReaderBatchCache(dataset.reader)
+							b.StartTimer()
+						}
+						replayAllChanges(b, dataset.ctx, dataset.reader, records, pageSize)
+					}
+					b.StopTimer()
+					work := dataset.reader.work.snapshot()
+					b.ReportMetric(float64(work.RangeGETs)/float64(b.N), "range_GETs/op")
+					b.ReportMetric(float64(work.DownloadedBytes)/float64(b.N), "downloaded_B/op")
+					b.ReportMetric(float64(work.DecompressedBytes)/float64(b.N), "decompressed_B/op")
+					b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "records/s")
+				})
+			}
+		})
+	}
+}
+
+type changeReaderBenchmarkDataset struct {
+	ctx                 context.Context
+	reader              *ChangeReader
+	bounds              ChangeBounds
+	returnedRecordBytes int64
+}
+
+func benchmarkReadableChangeFeedPayloads() []struct {
+	name    string
+	payload ChangeFeedPayload
+} {
+	return []struct {
+		name    string
+		payload ChangeFeedPayload
+	}{
+		{name: "keys_only", payload: ChangeFeedKeysOnly},
+		{name: "full_values", payload: ChangeFeedFullValues},
+	}
+}
+
+func prepareChangeReaderBenchmark(
+	b *testing.B,
+	payload ChangeFeedPayload,
+	records int,
+	valueBytes int,
+) changeReaderBenchmarkDataset {
+	b.Helper()
 	ctx := context.Background()
-	store := blobstore.NewMemory("change-reader-paging-benchmark")
-	db, err := openDB(ctx, store, dbOpenOptions{changeFeedEnabled: true})
+	store := blobstore.NewMemory("change-reader-benchmark-" + payload.String())
+	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifestChangeFeedPayload(payload)})
 	if err != nil {
 		b.Fatalf("open DB: %v", err)
 	}
@@ -108,7 +138,7 @@ func BenchmarkChangeReaderSequentialPaging(b *testing.B) {
 	if err != nil {
 		b.Fatalf("open writer: %v", err)
 	}
-	values := benchmarkChangeFeedValues(records, 256, true)
+	values := benchmarkChangeFeedValues(records, valueBytes, true)
 	for i := 0; i < records; i++ {
 		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
 			b.Fatalf("put: %v", err)
@@ -128,41 +158,44 @@ func BenchmarkChangeReaderSequentialPaging(b *testing.B) {
 	if err != nil {
 		b.Fatalf("bounds: %v", err)
 	}
+	if bounds.Payload != payload {
+		b.Fatalf("bounds payload=%s want=%s", bounds.Payload, payload)
+	}
 	b.Cleanup(func() {
 		_ = reader.Close()
 		_ = db.Close()
 		_ = store.Close()
 	})
+	returnedRecordBytes := int64(len("key-00000000"))
+	if payload == ChangeFeedFullValues {
+		returnedRecordBytes += int64(valueBytes)
+	}
+	return changeReaderBenchmarkDataset{
+		ctx: ctx, reader: reader, bounds: bounds, returnedRecordBytes: returnedRecordBytes,
+	}
+}
 
-	opts := ChangeReadOptions{MaxChanges: pageSize, MaxBytes: 64 << 20}
-	b.ReportAllocs()
-	b.SetBytes(int64(records * (len("key-00000000") + 256)))
-	reader.work.reset()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		cursor := bounds.Oldest
-		read := 0
-		for !cursor.IsZero() {
-			page, err := reader.Read(ctx, cursor, opts)
-			if err != nil {
-				b.Fatalf("read: %v", err)
+func validateChangeReaderBenchmarkPage(
+	b *testing.B,
+	page ChangePage,
+	want int,
+	payload ChangeFeedPayload,
+	valueBytes int,
+) {
+	b.Helper()
+	if len(page.Changes) != want {
+		b.Fatalf("changes=%d want=%d", len(page.Changes), want)
+	}
+	for i := range page.Changes {
+		change := page.Changes[i]
+		if payload == ChangeFeedKeysOnly {
+			if change.HasValue || change.Value != nil {
+				b.Fatalf("keys-only change[%d] retained value bytes=%d", i, len(change.Value))
 			}
-			read += len(page.Changes)
-			cursor = page.Next
-			if page.CaughtUp() {
-				break
-			}
-		}
-		if read != records {
-			b.Fatalf("changes=%d want=%d", read, records)
+		} else if !change.HasValue || len(change.Value) != valueBytes {
+			b.Fatalf("full-value change[%d] has_value=%v value_bytes=%d", i, change.HasValue, len(change.Value))
 		}
 	}
-	b.StopTimer()
-	work := reader.work.snapshot()
-	b.ReportMetric(float64(work.RangeGETs)/float64(b.N), "range_GETs/op")
-	b.ReportMetric(float64(work.DownloadedBytes)/float64(b.N), "downloaded_B/op")
-	b.ReportMetric(float64(work.DecompressedBytes)/float64(b.N), "decompressed_B/op")
-	b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "records/s")
 }
 
 func BenchmarkChangeBatchReadStrategies(b *testing.B) {
@@ -350,7 +383,7 @@ func benchmarkIndexedBatchRead(
 	for blockOrdinal := ordinal; blockOrdinal < endOrdinal; blockOrdinal++ {
 		block := index.Blocks[blockOrdinal]
 		changes, err := decodeChangeBatchBlock(
-			data[block.Offset:block.Offset+uint64(block.CompressedSize)], block)
+			data[block.Offset:block.Offset+uint64(block.CompressedSize)], block, index.Payload)
 		if err != nil {
 			return nil, work, err
 		}

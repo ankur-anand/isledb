@@ -39,7 +39,7 @@ type writer struct {
 	opts        WriterOptions
 	valueConfig config.ValueStorageConfig
 
-	changeFeedEnabled bool
+	changeFeedPayload ChangeFeedPayload
 	ctx               context.Context
 	cancel            context.CancelFunc
 
@@ -350,11 +350,11 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 		return err
 	}
 	seq := w.seq + 1
-	if w.changeFeedEnabled {
+	if w.changeFeedPayload != 0 {
 		if w.changeBuffer == nil {
-			w.changeBuffer = &changeBatchBuffer{}
+			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
 		}
-		if err := w.changeBuffer.appendPut(seq, key, value, expireAt); err != nil {
+		if err := w.changeBuffer.appendPutForPayload(seq, key, value, expireAt, w.changeFeedPayload); err != nil {
 			w.mu.Unlock()
 			return err
 		}
@@ -389,11 +389,11 @@ func (w *writer) putBlob(ctx context.Context, key, value []byte, expireAt int64)
 		return err
 	}
 	seq := w.seq + 1
-	if w.changeFeedEnabled {
+	if w.changeFeedPayload != 0 {
 		if w.changeBuffer == nil {
-			w.changeBuffer = &changeBatchBuffer{}
+			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
 		}
-		if err := w.changeBuffer.appendPut(seq, key, value, expireAt); err != nil {
+		if err := w.changeBuffer.appendPutForPayload(seq, key, value, expireAt, w.changeFeedPayload); err != nil {
 			w.mu.Unlock()
 			return err
 		}
@@ -427,9 +427,9 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 		return err
 	}
 	seq := w.seq + 1
-	if w.changeFeedEnabled {
+	if w.changeFeedPayload != 0 {
 		if w.changeBuffer == nil {
-			w.changeBuffer = &changeBatchBuffer{}
+			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
 		}
 		if err := w.changeBuffer.appendDelete(seq, key); err != nil {
 			w.mu.Unlock()

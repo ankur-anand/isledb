@@ -17,18 +17,20 @@ import (
 )
 
 var (
-	ErrFenced               = errors.New("fenced: epoch superseded by newer owner")
-	ErrFenceConflict        = errors.New("fence conflict: concurrent claim detected")
-	ErrCurrentTooLarge      = errors.New("manifest CURRENT exceeds size limit")
-	ErrInvalidWriterCommit  = errors.New("invalid writer commit")
-	ErrWriterCommitConflict = errors.New("writer commit identity conflict")
-	ErrChangeFeedRequired   = errors.New("change feed batch required")
-	ErrChangeFeedHistory    = errors.New("change feed history unavailable")
-	ErrChangeFeedPosition   = errors.New("invalid change feed position")
-	ErrInvalidRetirement    = errors.New("invalid retired object batch")
-	ErrRetirementHistory    = errors.New("retirement history unavailable")
-	ErrInvalidManifest      = errors.New("invalid manifest topology")
-	ErrStorePolicyMismatch  = errors.New("store policy mismatch")
+	ErrFenced                    = errors.New("fenced: epoch superseded by newer owner")
+	ErrFenceConflict             = errors.New("fence conflict: concurrent claim detected")
+	ErrCurrentTooLarge           = errors.New("manifest CURRENT exceeds size limit")
+	ErrInvalidWriterCommit       = errors.New("invalid writer commit")
+	ErrWriterCommitConflict      = errors.New("writer commit identity conflict")
+	ErrChangeFeedRequired        = errors.New("change feed batch required")
+	ErrInvalidChangeFeedPayload  = errors.New("invalid change feed payload")
+	ErrChangeFeedPayloadMismatch = errors.New("change feed payload mismatch")
+	ErrChangeFeedHistory         = errors.New("change feed history unavailable")
+	ErrChangeFeedPosition        = errors.New("invalid change feed position")
+	ErrInvalidRetirement         = errors.New("invalid retired object batch")
+	ErrRetirementHistory         = errors.New("retirement history unavailable")
+	ErrInvalidManifest           = errors.New("invalid manifest topology")
+	ErrStorePolicyMismatch       = errors.New("store policy mismatch")
 )
 
 const (
@@ -415,9 +417,14 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
 			return err
 		}
-		if role == FenceRoleWriter && current.ChangeFeedEnabled &&
-			entry.Op == LogOpAddSSTable && entry.ChangeBatch == nil {
-			return ErrChangeFeedRequired
+		if role == FenceRoleWriter && current.ChangeFeedEnabled && entry.Op == LogOpAddSSTable {
+			if entry.ChangeBatch == nil {
+				return ErrChangeFeedRequired
+			}
+			if entry.ChangeBatch.Payload != current.ChangeFeedPayload {
+				return fmt.Errorf("%w: batch=%q configured=%q",
+					ErrChangeFeedPayloadMismatch, entry.ChangeBatch.Payload, current.ChangeFeedPayload)
+			}
 		}
 
 		if err := s.checkFenceWithCurrent(role, current); err != nil {
@@ -557,6 +564,9 @@ func validateWriterCommit(commit WriterCommit) error {
 	if change := commit.ChangeBatch; change != nil {
 		if change.ID == "" || change.Path == "" {
 			return fmt.Errorf("%w: incomplete change batch", ErrInvalidWriterCommit)
+		}
+		if !change.Payload.Valid() {
+			return fmt.Errorf("%w: change batch payload=%q", ErrInvalidWriterCommit, change.Payload)
 		}
 		if change.Epoch != commit.SSTable.Epoch {
 			return fmt.Errorf("%w: change batch epoch=%d does not match sstable epoch=%d",
@@ -1299,10 +1309,13 @@ func (s *Store) ListEntries(ctx context.Context) ([]uint64, error) {
 	return seqs, nil
 }
 
-// EnableChangeFeed permanently enables change batches for subsequent writer
-// commits. Existing history is excluded by advancing the retained floor to the
-// current manifest head.
-func (s *Store) EnableChangeFeed(ctx context.Context) error {
+// EnableChangeFeed permanently enables change batches with one payload policy
+// for subsequent writer commits. Existing history is excluded by advancing
+// the retained floor to the current manifest head.
+func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload) error {
+	if !payload.Valid() {
+		return fmt.Errorf("%w: %q", ErrInvalidChangeFeedPayload, payload)
+	}
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 
@@ -1316,11 +1329,19 @@ func (s *Store) EnableChangeFeed(ctx context.Context) error {
 		}
 		normalizeCurrent(current)
 		if current.ChangeFeedEnabled {
+			if !current.ChangeFeedPayload.Valid() {
+				return fmt.Errorf("%w: change feed payload=%q", ErrInvalidManifest, current.ChangeFeedPayload)
+			}
+			if current.ChangeFeedPayload != payload {
+				return fmt.Errorf("%w: configured=%q requested=%q",
+					ErrChangeFeedPayloadMismatch, current.ChangeFeedPayload, payload)
+			}
 			return nil
 		}
 
 		updated := current.Clone()
 		updated.ChangeFeedEnabled = true
+		updated.ChangeFeedPayload = payload
 		updated.ChangeFeedLogStart = updated.NextSeq
 		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) && attempt+1 < currentCASMaxRetries {
@@ -1346,6 +1367,13 @@ func (v *ChangeFeedView) Enabled() bool {
 	return v != nil && v.current != nil && v.current.ChangeFeedEnabled
 }
 
+func (v *ChangeFeedView) Payload() ChangeFeedPayload {
+	if v == nil || v.current == nil || !v.current.ChangeFeedEnabled {
+		return ""
+	}
+	return v.current.ChangeFeedPayload
+}
+
 func (v *ChangeFeedView) RetainedFrom() uint64 {
 	if v == nil || v.current == nil {
 		return 0
@@ -1366,6 +1394,9 @@ func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error)
 	current, err := s.readCurrent(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if current != nil && current.ChangeFeedEnabled && !current.ChangeFeedPayload.Valid() {
+		return nil, fmt.Errorf("%w: change feed payload=%q", ErrInvalidManifest, current.ChangeFeedPayload)
 	}
 	return &ChangeFeedView{current: current}, nil
 }
