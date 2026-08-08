@@ -626,6 +626,65 @@ func TestChangeReaderRangeDecodesOnlyRequestedBlock(t *testing.T) {
 	}
 }
 
+func TestChangeReaderMaxBytesExactBoundaryDoesNotReadNextBlock(t *testing.T) {
+	const (
+		records   = 2 * defaultChangeBatchBlockRecords
+		valueSize = 256
+		keySize   = len("key-00000000")
+	)
+	ctx := context.Background()
+	_, db, writer := openChangeReaderTestDB(t, "change-reader-max-bytes-boundary")
+	values := benchmarkChangeFeedValues(records, valueSize, true)
+	for i := 0; i < records; i++ {
+		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	bounds, err := reader.Bounds(ctx)
+	if err != nil {
+		t.Fatalf("bounds: %v", err)
+	}
+
+	reader.work.reset()
+	maxBytes := int64(defaultChangeBatchBlockRecords * (keySize + valueSize))
+	page, err := reader.Read(ctx, bounds.Oldest, ChangeReadOptions{
+		MaxChanges: records,
+		MaxBytes:   maxBytes,
+	})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := len(page.Changes); got != defaultChangeBatchBlockRecords {
+		t.Fatalf("changes=%d want=%d", got, defaultChangeBatchBlockRecords)
+	}
+	if got := page.Next.index; got != defaultChangeBatchBlockRecords {
+		t.Fatalf("next index=%d want=%d", got, defaultChangeBatchBlockRecords)
+	}
+
+	reader.batchMu.Lock()
+	index := reader.batch
+	reader.batchMu.Unlock()
+	if index == nil || len(index.Blocks) != 2 {
+		t.Fatalf("indexed blocks=%v want=2", index)
+	}
+	work := reader.work.snapshot()
+	if work.RangeGETs != 2 {
+		t.Fatalf("range GETs=%d want=2 (index + first block)", work.RangeGETs)
+	}
+	if got, want := work.DecompressedBytes, uint64(index.Blocks[0].RawSize); got != want {
+		t.Fatalf("decompressed bytes=%d want first block=%d", got, want)
+	}
+}
+
 func TestChangeReaderDecodedBlockCacheIsBounded(t *testing.T) {
 	reader := &ChangeReader{}
 	meta := &manifest.ChangeBatchMeta{Path: "changes/batch", Size: 1}
