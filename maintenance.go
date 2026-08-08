@@ -25,14 +25,6 @@ var (
 // immutable page reads between snapshots.
 const DefaultCheckpointReplayPages uint64 = 64
 
-// RetentionMode selects how maintenance groups data for retention.
-type RetentionMode uint8
-
-const (
-	RetentionByAge RetentionMode = iota
-	RetentionByTimeWindow
-)
-
 // MaintenanceOptions configures one fenced maintenance owner for a DB.
 type MaintenanceOptions struct {
 	// OwnerID is stored in the maintenance fence. Empty generates a process-local ID.
@@ -47,9 +39,6 @@ type MaintenanceOptions struct {
 
 	// Checkpoint bounds manifest state replay between snapshots.
 	Checkpoint CheckpointPolicy
-
-	// Retention is nil by default because enabling it removes historical data.
-	Retention *RetentionPolicy
 
 	// ChangeFeedRetention is nil by default, preserving change-feed history
 	// indefinitely. When configured, maintenance retires and deletes old feed
@@ -85,25 +74,6 @@ type CompactionPolicy struct {
 // by committed manifest entries.
 type GarbageCollectionPolicy struct {
 	DeleteBatchSize int
-}
-
-// RetentionPolicy controls removal of old SSTs. It is enabled only when the
-// containing MaintenanceOptions.Retention pointer is non-nil.
-type RetentionPolicy struct {
-	Mode RetentionMode
-
-	KeepFor time.Duration
-
-	// KeepAtLeastSSTs is the minimum number of newest SSTs retained in
-	// RetentionByAge mode.
-	KeepAtLeastSSTs int
-
-	// KeepAtLeastWindows is the minimum number of newest windows retained in
-	// RetentionByTimeWindow mode.
-	KeepAtLeastWindows int
-
-	Window    time.Duration
-	OnCleanup func(CleanupStats)
 }
 
 // ChangeFeedRetentionPolicy controls removal of old change-feed history. It is
@@ -146,7 +116,6 @@ type MaintenanceStats struct {
 	CompactionInputSSTs   int
 	CompactionOutputSSTs  int
 	CompactionOutputBytes int64
-	Retention             CleanupStats
 	ChangeFeedRetention   ChangeFeedCleanupStats
 	CheckpointStaged      bool
 	CheckpointReplayPages uint64
@@ -159,7 +128,7 @@ type MaintenanceStats struct {
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
-// and SST sweeping are enabled; KV and change-feed retention remain disabled.
+// and SST sweeping are enabled; change-feed retention remains disabled.
 func DefaultMaintenanceOptions() MaintenanceOptions {
 	compaction := defaultCompactorOptions()
 	return MaintenanceOptions{
@@ -180,17 +149,6 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 	}
 }
 
-func DefaultRetentionPolicy() RetentionPolicy {
-	opts := defaultRetentionCompactorOptions()
-	return RetentionPolicy{
-		Mode:               RetentionByAge,
-		KeepFor:            opts.RetentionPeriod,
-		KeepAtLeastSSTs:    opts.KeepAtLeastSSTs,
-		KeepAtLeastWindows: opts.KeepAtLeastWindows,
-		Window:             opts.SegmentDuration,
-	}
-}
-
 // DefaultChangeFeedRetentionPolicy returns conservative change-feed retention
 // defaults. Assigning this policy to MaintenanceOptions.ChangeFeedRetention
 // opts into cleanup; merely enabling a feed does not delete history.
@@ -208,14 +166,13 @@ func defaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
 	return DefaultChangeFeedRetentionPolicy()
 }
 
-// Maintenance owns compaction, checkpoints, retention, and garbage collection
-// for one DB.
+// Maintenance owns compaction, checkpoints, optional change-feed retention,
+// and garbage collection for one DB.
 // It is safe to call Close concurrently with Run or RunOnce.
 type Maintenance struct {
 	manifestLog *manifest.Store
 	opts        MaintenanceOptions
 	compactor   *compactor
-	retention   *retentionCompactor
 	changeFeed  *changeFeedCleaner
 	fenceToken  *manifest.FenceToken
 
@@ -297,23 +254,10 @@ func newMaintenance(
 	}
 	m.compactor.stageCommand = m.stageCommand
 
-	if opts.Retention != nil {
-		retentionOpts := m.retentionOptions(gcCursor)
-		m.retention, err = newRetentionCompactorWithFence(ctx, store, manifestLog, retentionOpts, token)
-		if err != nil {
-			_ = m.compactor.Close(ctx)
-			return nil, fmt.Errorf("open retention stage: %w", err)
-		}
-		m.retention.stageCommand = m.stageCommand
-	}
-
 	if opts.ChangeFeedRetention != nil {
 		changeFeedOpts := m.changeFeedOptions()
 		m.changeFeed, err = newChangeFeedCleanerWithFence(ctx, store, manifestLog, changeFeedOpts, token)
 		if err != nil {
-			if m.retention != nil {
-				_ = m.retention.Close(ctx)
-			}
 			_ = m.compactor.Close(ctx)
 			return nil, fmt.Errorf("open change-feed retention stage: %w", err)
 		}
@@ -327,12 +271,6 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	defaults := DefaultMaintenanceOptions()
 	if opts.Every <= 0 {
 		opts.Every = defaults.Every
-	}
-	if opts.Retention != nil && opts.Retention.Mode != RetentionByAge && opts.Retention.Mode != RetentionByTimeWindow {
-		return MaintenanceOptions{}, fmt.Errorf("%w: retention mode=%d", ErrInvalidMaintenanceOptions, opts.Retention.Mode)
-	}
-	if opts.Retention != nil && (opts.Retention.KeepAtLeastSSTs < 0 || opts.Retention.KeepAtLeastWindows < 0) {
-		return MaintenanceOptions{}, fmt.Errorf("%w: retention minimums must not be negative", ErrInvalidMaintenanceOptions)
 	}
 	if opts.ChangeFeedRetention != nil {
 		policy, err := normalizeChangeFeedRetentionPolicy(*opts.ChangeFeedRetention)
@@ -406,25 +344,6 @@ func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compac
 		OnCompactionEnd:   m.recordCompaction,
 		GCCursorStorage:   gcCursor,
 		GCDeleteBatchSize: m.opts.GarbageCollection.DeleteBatchSize,
-	}
-}
-
-func (m *Maintenance) retentionOptions(gcCursor manifest.GCCursorStorage) retentionCompactorOptions {
-	p := m.opts.Retention
-	mode := compactByAge
-	if p.Mode == RetentionByTimeWindow {
-		mode = compactByTimeWindow
-	}
-	return retentionCompactorOptions{
-		Mode:               mode,
-		RetentionPeriod:    p.KeepFor,
-		KeepAtLeastSSTs:    p.KeepAtLeastSSTs,
-		KeepAtLeastWindows: p.KeepAtLeastWindows,
-		CheckInterval:      m.opts.Every,
-		SegmentDuration:    p.Window,
-		OnCleanup:          m.recordRetention,
-		GCCursorStorage:    gcCursor,
-		GCDeleteBatchSize:  m.opts.GarbageCollection.DeleteBatchSize,
 	}
 }
 
@@ -541,14 +460,6 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 	}
 	if m.hasStagedCommand() {
 		return m.completeCycleStats(start), nil
-	}
-	if m.retention != nil {
-		if err := m.retention.RunOnce(ctx); err != nil {
-			return m.completeCycleStats(start), fmt.Errorf("retention: %w", err)
-		}
-		if m.hasStagedCommand() {
-			return m.completeCycleStats(start), nil
-		}
 	}
 	if m.changeFeed != nil {
 		if err := m.changeFeed.RunOnce(ctx); err != nil {
@@ -747,11 +658,6 @@ func (m *Maintenance) Close(ctx context.Context) error {
 			return err
 		}
 	}
-	if m.retention != nil {
-		if err := m.retention.Close(ctx); err != nil {
-			return err
-		}
-	}
 	if err := m.compactor.Close(ctx); err != nil {
 		return err
 	}
@@ -798,17 +704,6 @@ func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
 	}
 	if callback := m.opts.Compaction.OnCompactionEnd; callback != nil {
 		callback(job, err)
-	}
-}
-
-func (m *Maintenance) recordRetention(stats CleanupStats) {
-	m.statsMu.Lock()
-	if m.currentStats != nil {
-		m.currentStats.Retention = stats
-	}
-	m.statsMu.Unlock()
-	if callback := m.opts.Retention.OnCleanup; callback != nil {
-		callback(stats)
 	}
 }
 

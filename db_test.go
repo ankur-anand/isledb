@@ -415,8 +415,7 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	}
 	defer writer.Close(ctx)
 
-	retention := DefaultRetentionPolicy()
-	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
@@ -428,8 +427,8 @@ func TestOpenDBSharesManifestStore(t *testing.T) {
 	if maintenance.manifestLog != db.manifestStore {
 		t.Fatal("maintenance does not share manifest store with db")
 	}
-	if maintenance.compactor.manifestLog != db.manifestStore || maintenance.retention.manifestLog != db.manifestStore {
-		t.Fatal("maintenance stages do not share manifest store with db")
+	if maintenance.compactor.manifestLog != db.manifestStore {
+		t.Fatal("maintenance compactor does not share manifest store with db")
 	}
 }
 
@@ -472,8 +471,7 @@ func TestDBCloseClosesHandles(t *testing.T) {
 		t.Fatalf("OpenWriter: %v", err)
 	}
 
-	retention := DefaultRetentionPolicy()
-	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
@@ -488,8 +486,8 @@ func TestDBCloseClosesHandles(t *testing.T) {
 	if !maintenance.closed.Load() {
 		t.Fatal("expected maintenance to be closed by DB.Close")
 	}
-	if !maintenance.compactor.closed.Load() || !maintenance.retention.closed.Load() {
-		t.Fatal("expected maintenance stages to be closed by DB.Close")
+	if !maintenance.compactor.closed.Load() {
+		t.Fatal("expected maintenance compactor to be closed by DB.Close")
 	}
 }
 
@@ -505,8 +503,7 @@ func TestOpenDBPropagatesGCCursorStorageToMaintenance(t *testing.T) {
 	}
 	defer db.Close()
 
-	retention := DefaultRetentionPolicy()
-	maintenance, err := db.OpenMaintenance(ctx, MaintenanceOptions{Retention: &retention})
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
@@ -514,8 +511,5 @@ func TestOpenDBPropagatesGCCursorStorageToMaintenance(t *testing.T) {
 
 	if maintenance.compactor.gcCursorStore != custom {
 		t.Fatal("compactor did not inherit db gc cursor storage")
-	}
-	if maintenance.retention.gcCursorStore != custom {
-		t.Fatal("retention compactor did not inherit db gc cursor storage")
 	}
 }

@@ -12,18 +12,10 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
-func TestMaintenanceRetentionDefaultsUseExplicitUnits(t *testing.T) {
+func TestMaintenanceDefaultsUseExplicitUnits(t *testing.T) {
 	maintenance := DefaultMaintenanceOptions()
 	if maintenance.Checkpoint.MaxReplayPages != DefaultCheckpointReplayPages {
 		t.Fatalf("MaxReplayPages=%d, want %d", maintenance.Checkpoint.MaxReplayPages, DefaultCheckpointReplayPages)
-	}
-
-	retention := DefaultRetentionPolicy()
-	if retention.KeepAtLeastSSTs != 10 {
-		t.Fatalf("KeepAtLeastSSTs=%d, want 10", retention.KeepAtLeastSSTs)
-	}
-	if retention.KeepAtLeastWindows != 1 {
-		t.Fatalf("KeepAtLeastWindows=%d, want 1", retention.KeepAtLeastWindows)
 	}
 
 	changeFeed := DefaultChangeFeedRetentionPolicy()
@@ -239,10 +231,8 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	}
 	defer db.Close()
 
-	retention := DefaultRetentionPolicy()
-	retention.Mode = RetentionMode(255)
 	opts := DefaultMaintenanceOptions()
-	opts.Retention = &retention
+	opts.GarbageCollection.DeleteBatchSize = -1
 	if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrInvalidMaintenanceOptions) {
 		t.Fatalf("OpenMaintenance(invalid) error=%v, want %v", err, ErrInvalidMaintenanceOptions)
 	}
@@ -253,49 +243,6 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	}
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
-	}
-}
-
-func TestDBOpenMaintenanceRejectsNegativeRetentionMinimums(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*RetentionPolicy)
-	}{
-		{
-			name: "ssts",
-			mutate: func(policy *RetentionPolicy) {
-				policy.KeepAtLeastSSTs = -1
-			},
-		},
-		{
-			name: "windows",
-			mutate: func(policy *RetentionPolicy) {
-				policy.KeepAtLeastWindows = -1
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := blobstore.NewMemory("maintenance-negative-retention-" + tt.name)
-			defer store.Close()
-
-			db, err := openDB(ctx, store, dbOpenOptions{})
-			if err != nil {
-				t.Fatalf("OpenDB: %v", err)
-			}
-			defer db.Close()
-
-			retention := DefaultRetentionPolicy()
-			tt.mutate(&retention)
-			opts := DefaultMaintenanceOptions()
-			opts.Retention = &retention
-
-			if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrInvalidMaintenanceOptions) {
-				t.Fatalf("OpenMaintenance error=%v, want %v", err, ErrInvalidMaintenanceOptions)
-			}
-		})
 	}
 }
 
@@ -311,10 +258,8 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	}
 	defer db.Close()
 
-	retention := DefaultRetentionPolicy()
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "maintenance-owner"
-	opts.Retention = &retention
 	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
@@ -325,7 +270,6 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 
 	want := maintenance.fenceToken
 	assertFenceTokenEqual(t, maintenance.compactor.fenceToken, want)
-	assertFenceTokenEqual(t, maintenance.retention.fenceToken, want)
 	assertFenceTokenEqual(t, maintenance.changeFeed.fenceToken, want)
 
 	head, _, err := db.manifestStore.ReadMaintenanceHead(ctx)

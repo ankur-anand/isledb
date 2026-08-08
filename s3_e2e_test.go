@@ -80,7 +80,7 @@ func setupFakeS3BucketURLWithObserver(t testing.TB, observe func(*http.Request))
 	return s3BucketURL(server.URL)
 }
 
-func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
+func TestS3E2E_WriteCompactRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
@@ -155,28 +155,28 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	if len(compacted.Levels) == 0 {
 		t.Fatalf("expected compaction to create a level, got l0=%d levels=0", compacted.L0SSTCount())
 	}
-	liveSSTsBeforeRetention := compacted.AllSSTIDs()
-	if len(liveSSTsBeforeRetention) < 2 {
-		t.Fatalf("expected multiple live SSTs before retention, got %d", len(liveSSTsBeforeRetention))
+	liveSSTs := compacted.AllSSTIDs()
+	if len(liveSSTs) < 2 {
+		t.Fatalf("expected multiple live SSTs after compaction, got %d", len(liveSSTs))
 	}
 
-	currentBeforeRetention := readCurrentForTest(t, ctx, store)
-	if currentBeforeRetention.LayoutVersion != manifest.LayoutVersion {
-		t.Fatalf("current layout_version=%d, want %d", currentBeforeRetention.LayoutVersion, manifest.LayoutVersion)
+	current := readCurrentForTest(t, ctx, store)
+	if current.LayoutVersion != manifest.LayoutVersion {
+		t.Fatalf("current layout_version=%d, want %d", current.LayoutVersion, manifest.LayoutVersion)
 	}
-	if currentBeforeRetention.Format != manifest.CurrentFormat {
-		t.Fatalf("current format=%q, want %q", currentBeforeRetention.Format, manifest.CurrentFormat)
+	if current.Format != manifest.CurrentFormat {
+		t.Fatalf("current format=%q, want %q", current.Format, manifest.CurrentFormat)
 	}
-	if currentBeforeRetention.NextSeq == 0 {
+	if current.NextSeq == 0 {
 		t.Fatalf("current next_seq was not advanced")
 	}
-	if currentBeforeRetention.WriterFence == nil {
+	if current.WriterFence == nil {
 		t.Fatalf("current missing writer fence")
 	}
-	if currentBeforeRetention.CompactorFence != nil {
-		t.Fatalf("current contains obsolete compactor fence: %+v", currentBeforeRetention.CompactorFence)
+	if current.CompactorFence != nil {
+		t.Fatalf("current contains obsolete compactor fence: %+v", current.CompactorFence)
 	}
-	if len(currentBeforeRetention.ActiveEntries) == 0 && len(currentBeforeRetention.IndexFrontier) == 0 {
+	if len(current.ActiveEntries) == 0 && len(current.IndexFrontier) == 0 {
 		t.Fatalf("current has neither active entries nor index frontier")
 	}
 
@@ -195,81 +195,16 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 		t.Fatalf("scan count=%d, want %d", len(scanned), len(expected))
 	}
 
-	time.Sleep(2 * time.Millisecond)
-	var cleanup CleanupStats
-	retentionPolicy := DefaultRetentionPolicy()
-	retentionPolicy.Mode = RetentionByAge
-	retentionPolicy.KeepFor = time.Nanosecond
-	retentionPolicy.KeepAtLeastSSTs = 1
-	retentionPolicy.OnCleanup = func(stats CleanupStats) {
-		cleanup = stats
-	}
-	retentionMaintenanceOpts := DefaultMaintenanceOptions()
-	retentionMaintenanceOpts.Compaction.L0SSTCount = 1 << 20
-	retentionMaintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-	retentionMaintenanceOpts.Retention = &retentionPolicy
-
-	retentionMaintenance, err := db.OpenMaintenance(ctx, retentionMaintenanceOpts)
-	if err != nil {
-		t.Fatalf("open retention maintenance: %v", err)
-	}
-	driveMaintenanceToIdle(t, ctx, retentionMaintenance, writer)
-	if err := retentionMaintenance.Close(ctx); err != nil {
-		t.Fatalf("close retention maintenance: %v", err)
-	}
-	if cleanup.SSTsDeleted == 0 {
-		t.Fatalf("retention deleted no SSTs; live before=%d", len(liveSSTsBeforeRetention))
-	}
 	if err := writer.Close(ctx); err != nil {
 		t.Fatalf("close writer: %v", err)
-	}
-
-	afterRetention := replayManifestForTest(t, ctx, store)
-	liveSSTsAfterRetention := afterRetention.AllSSTIDs()
-	if len(liveSSTsAfterRetention) == 0 {
-		t.Fatalf("retention removed every live SST")
-	}
-	if len(liveSSTsAfterRetention) >= len(liveSSTsBeforeRetention) {
-		t.Fatalf("retention did not shrink live set: before=%d after=%d", len(liveSSTsBeforeRetention), len(liveSSTsAfterRetention))
-	}
-
-	currentAfterRetention := readCurrentForTest(t, ctx, store)
-	if currentAfterRetention.NextSeq <= currentBeforeRetention.NextSeq {
-		t.Fatalf("current next_seq did not advance after retention: before=%d after=%d", currentBeforeRetention.NextSeq, currentAfterRetention.NextSeq)
-	}
-
-	retainedReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
-		CacheDir:       t.TempDir(),
-		BlockCacheSize: 64 << 10,
-	})
-	defer retainedReader.Close()
-
-	retained, err := retainedReader.Scan(ctx, []byte("key:"), []byte("key;"))
-	if err != nil {
-		t.Fatalf("retained reader scan: %v", err)
-	}
-	if len(retained) == 0 {
-		t.Fatalf("retained reader returned no keys")
-	}
-	if len(retained) > len(expected) {
-		t.Fatalf("retained reader returned too many keys: got=%d total=%d", len(retained), len(expected))
-	}
-	for _, kv := range retained {
-		want, ok := expected[string(kv.Key)]
-		if !ok {
-			t.Fatalf("retained reader returned unexpected key %q", kv.Key)
-		}
-		if !bytes.Equal(kv.Value, want) {
-			t.Fatalf("retained value mismatch for %q: got %q want %q", kv.Key, kv.Value, want)
-		}
 	}
 
 	objects, err := store.ListSSTFiles(ctx)
 	if err != nil {
 		t.Fatalf("list sst files: %v", err)
 	}
-	t.Logf("fake-s3 e2e records=%d flushes=%d live_ssts_before_retention=%d live_ssts_after_retention=%d physical_sst_objects=%d elapsed=%s",
-		len(expected), batches, len(liveSSTsBeforeRetention), len(liveSSTsAfterRetention), len(objects), time.Since(start))
+	t.Logf("fake-s3 e2e records=%d flushes=%d live_ssts=%d physical_sst_objects=%d elapsed=%s",
+		len(expected), batches, len(liveSSTs), len(objects), time.Since(start))
 }
 
 func TestS3E2E_ChangeFeedRetentionPreservesKVState(t *testing.T) {
@@ -683,8 +618,6 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 		total.CompactionInputSSTs += stats.CompactionInputSSTs
 		total.CompactionOutputSSTs += stats.CompactionOutputSSTs
 		total.CompactionOutputBytes += stats.CompactionOutputBytes
-		total.Retention.SSTsDeleted += stats.Retention.SSTsDeleted
-		total.Retention.BytesReclaimed += stats.Retention.BytesReclaimed
 		total.CheckpointStaged = total.CheckpointStaged || stats.CheckpointStaged
 
 		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)

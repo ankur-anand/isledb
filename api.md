@@ -514,8 +514,8 @@ retention floor.
 ### Maintenance
 
 Owns one fenced maintenance session for a database prefix. It runs compaction,
-optional SST retention, optional change-feed retention, and garbage collection
-in a fixed serialized order. `DB.OpenMaintenance` rejects a second active
+optional change-feed retention, checkpoints, and garbage collection in a fixed
+serialized order. `DB.OpenMaintenance` rejects a second active
 maintenance handle opened from the same `DB`.
 
 | Method | Signature | Description |
@@ -531,7 +531,6 @@ type MaintenanceOptions struct {
     Compaction          CompactionPolicy
     GarbageCollection   GarbageCollectionPolicy
     Checkpoint          CheckpointPolicy
-    Retention           *RetentionPolicy
     ChangeFeedRetention *ChangeFeedRetentionPolicy
     OnCycle             func(MaintenanceStats)
     OnError             func(error)
@@ -587,30 +586,16 @@ type CompactionOutput struct {
     Level uint32
 }
 
-type RetentionPolicy struct {
-    Mode               RetentionMode
-    KeepFor            time.Duration
-    KeepAtLeastSSTs    int
-    KeepAtLeastWindows int
-    Window             time.Duration
-    OnCleanup          func(CleanupStats)
-}
-
 ```
 
-`DefaultMaintenanceOptions` enables compaction and leaves both KV and
-change-feed retention disabled. Use `DefaultRetentionPolicy` or
-`DefaultChangeFeedRetentionPolicy` before enabling destructive cleanup.
+`DefaultMaintenanceOptions` enables compaction, checkpoints, and retired-SST
+garbage collection. Change-feed retention remains disabled. Use
+`DefaultChangeFeedRetentionPolicy` before enabling feed-history cleanup.
 
 Change-feed retention requires an enabled feed and runs only while maintenance
 runs. The policy is runtime maintenance configuration, not part of the
 persisted immutable payload choice. Omitting it preserves feed history
 indefinitely.
-
-In `RetentionByAge` mode, `KeepAtLeastSSTs` protects the newest SSTs. In
-`RetentionByTimeWindow` mode, `Window` defines the grouping interval and
-`KeepAtLeastWindows` protects the newest groups. The two limits are independent;
-there is no conversion between SST counts and window counts.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()
@@ -618,11 +603,6 @@ opts.Every = 5 * time.Second
 opts.Compaction.L0SSTCount = 8
 opts.Compaction.InputReadParallelism = 4
 opts.Compaction.TargetSSTBytes = 64 << 20
-
-retention := isledb.DefaultRetentionPolicy()
-retention.KeepFor = 7 * 24 * time.Hour
-retention.KeepAtLeastSSTs = 10
-opts.Retention = &retention
 
 feedRetention := isledb.DefaultChangeFeedRetentionPolicy()
 feedRetention.KeepFor = 24 * time.Hour
