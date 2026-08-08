@@ -3,7 +3,6 @@ package isledb
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -441,7 +440,6 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	opts.Compaction.TargetSSTBytes = 1 << 20
 	opts.Compaction.BlockBytes = 1024
 	opts.Compaction.Compression = "none"
-	opts.GarbageCollection.GracePeriod = time.Nanosecond
 	opts.GarbageCollection.DeleteBatchSize = len(oldSSTs)
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
@@ -474,8 +472,8 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	}
 
 	for id := range oldSSTs {
-		if _, _, err := store.Read(ctx, store.SSTPath(id)); !errors.Is(err, blobstore.ErrNotFound) {
-			t.Fatalf("old SST %q read error=%v, want %v", id, err, blobstore.ErrNotFound)
+		if _, _, err := store.Read(ctx, store.SSTPath(id)); err != nil {
+			t.Fatalf("old SST %q must remain readable during the pinned-view window: %v", id, err)
 		}
 	}
 	assertCurrentKVState(t, ctx, reader)

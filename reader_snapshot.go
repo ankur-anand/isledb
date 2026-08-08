@@ -13,6 +13,7 @@ import (
 var ErrSnapshotClosed = errors.New("snapshot closed")
 var ErrSnapshotExpired = errors.New("snapshot expired")
 var ErrIteratorExpired = errors.New("iterator expired")
+var ErrReadViewExpired = errors.New("read view expired")
 var ErrReaderClosed = errors.New("reader closed")
 
 // Version is an opaque identifier for one loaded visible state.
@@ -65,7 +66,8 @@ func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 
 	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
 	defer cancel()
-	return s.reader.getWithManifest(readCtx, s.manifest, key)
+	value, found, err := s.reader.getWithManifest(readCtx, s.manifest, key)
+	return value, found, readViewError(readCtx, err)
 }
 
 func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
@@ -75,8 +77,7 @@ func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iter
 	}
 	defer done()
 
-	expiresAt := minTime(s.expiresAt, time.Now().Add(s.reader.viewPolicy.IteratorMaxAge))
-	it, err := s.reader.newIteratorWithManifest(ctx, s.manifest, opts, expiresAt)
+	it, err := s.reader.newIteratorWithManifest(ctx, s.manifest, opts, s.expiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +93,8 @@ func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit i
 
 	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
 	defer cancel()
-	return s.reader.scanInternalWithManifest(readCtx, s.manifest, minKey, maxKey, limit)
+	values, err := s.reader.scanInternalWithManifest(readCtx, s.manifest, minKey, maxKey, limit)
+	return values, readViewError(readCtx, err)
 }
 
 func (s *Snapshot) Close() error {
@@ -136,6 +138,14 @@ func minTime(left, right time.Time) time.Time {
 		return left
 	}
 	return right
+}
+
+func readViewError(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); cause != nil &&
+		(errors.Is(cause, ErrReadViewExpired) || errors.Is(cause, ErrSnapshotExpired) || errors.Is(cause, ErrIteratorExpired)) {
+		return cause
+	}
+	return err
 }
 
 func versionFromCurrent(current *manifest.Current) Version {

@@ -113,6 +113,7 @@ type DB struct {
 	manifestStore   *manifest.Store
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
+	storePolicy     StorePolicy
 
 	changeFeedRetention *changeFeedRetentionPolicy
 	mu                  sync.Mutex
@@ -135,16 +136,36 @@ type DBOptions struct {
 	// EnableChangeFeed emits a durable ordered mutation feed for all future
 	// writer commits. Once enabled for a prefix, it remains enabled.
 	EnableChangeFeed bool
+
+	// Policy contains store-wide safety settings persisted by the first writer.
+	Policy StorePolicy
 }
+
+// StorePolicy defines the read-view lifetime shared by readers and garbage
+// collection for one database prefix.
+type StorePolicy struct {
+	// MaxPinnedViewAge is the longest time a loaded manifest view may remain
+	// readable. Zero selects DefaultMaxPinnedViewAge.
+	MaxPinnedViewAge time.Duration
+}
+
+const DefaultMaxPinnedViewAge = manifest.DefaultMaxPinnedViewAge
+
+var ErrStorePolicyMismatch = manifest.ErrStorePolicyMismatch
 
 type dbOpenOptions struct {
 	manifestStorage     manifest.Storage
 	gcCursorStorage     manifest.GCCursorStorage
 	changeFeedEnabled   bool
 	changeFeedRetention *changeFeedRetentionPolicy
+	storePolicy         StorePolicy
 }
 
 func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*DB, error) {
+	storePolicy, err := normalizeStorePolicy(opts.storePolicy)
+	if err != nil {
+		return nil, err
+	}
 	manifestStore := newManifestStore(store, opts.manifestStorage)
 	gcCursorStorage := opts.gcCursorStorage
 	if gcCursorStorage == nil {
@@ -164,6 +185,7 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		manifestStore:       manifestStore,
 		gcCursorStorage:     gcCursorStorage,
 		maintenanceWake:     make(chan struct{}, 1),
+		storePolicy:         storePolicy,
 		changeFeedRetention: opts.changeFeedRetention,
 	}, nil
 }
@@ -180,7 +202,7 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.releaseWriter(nil)
 		return nil, err
 	}
-	w, err := newWriterWithMaintenanceWake(ctx, db.store, db.manifestStore, opts, db.maintenanceWake)
+	w, err := newWriterWithMaintenanceWake(ctx, db.store, db.manifestStore, opts, db.maintenanceWake, db.storePolicy)
 	if err != nil {
 		db.releaseWriter(nil)
 		return nil, err

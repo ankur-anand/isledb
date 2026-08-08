@@ -178,5 +178,45 @@ func seedRetiredSSTs(t *testing.T, ctx context.Context, count int, notBefore tim
 	if err != nil {
 		t.Fatalf("append removal: %v", err)
 	}
+	if !notBefore.IsZero() {
+		rewriteRetirementNotBefore(t, ctx, manifestStore, entry.Seq, notBefore.UTC())
+		for i := range entry.RetiredObjects {
+			entry.RetiredObjects[i].NotBefore = notBefore.UTC()
+		}
+	}
 	return store, manifestStore, fence, entry
+}
+
+func rewriteRetirementNotBefore(t *testing.T, ctx context.Context, manifestStore *manifest.Store, seq uint64, notBefore time.Time) {
+	t.Helper()
+	storage := manifestStore.Storage()
+	data, etag, err := storage.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read current for retirement fixture: %v", err)
+	}
+	current, err := manifest.DecodeCurrent(data)
+	if err != nil {
+		t.Fatalf("decode current for retirement fixture: %v", err)
+	}
+	found := false
+	for i := range current.ActiveEntries {
+		if current.ActiveEntries[i].Seq != seq {
+			continue
+		}
+		for j := range current.ActiveEntries[i].RetiredObjects {
+			current.ActiveEntries[i].RetiredObjects[j].NotBefore = notBefore
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("retirement entry seq=%d not active", seq)
+	}
+	data, err = manifest.EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode current for retirement fixture: %v", err)
+	}
+	if _, err := storage.WriteCurrentCAS(ctx, data, etag); err != nil {
+		t.Fatalf("rewrite current for retirement fixture: %v", err)
+	}
 }

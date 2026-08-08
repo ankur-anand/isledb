@@ -155,9 +155,6 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	if opts.GCDeleteBatchSize <= 0 {
 		opts.GCDeleteBatchSize = d.GCDeleteBatchSize
 	}
-	if opts.GCGracePeriod == 0 {
-		opts.GCGracePeriod = d.GCGracePeriod
-	}
 	return opts
 }
 
@@ -566,7 +563,7 @@ func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payl
 			retiredIDs = append(retiredIDs, id)
 		}
 	}
-	retired, err := retiredSSTObjects(c.store, m, retiredIDs, c.opts.GCGracePeriod)
+	retired, err := retiredSSTObjects(c.store, m, retiredIDs)
 	if err != nil {
 		return err
 	}

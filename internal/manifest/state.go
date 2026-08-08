@@ -53,6 +53,7 @@ func (c *Current) Clone() *Current {
 		RetirementLogStart: c.RetirementLogStart,
 		StateReplayPages:   c.StateReplayPages,
 		StateReplayBytes:   c.StateReplayBytes,
+		MaxPinnedViewAge:   c.MaxPinnedViewAge,
 		WriterFence:        c.WriterFence.Clone(),
 		CompactorFence:     c.CompactorFence.Clone(),
 		LastWriterCommit:   c.LastWriterCommit.Clone(),

@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"time"
 )
 
 const (
@@ -10,6 +11,9 @@ const (
 
 	CommitPageTypeLeaf  = "commit_l00"
 	CommitPageTypeIndex = "commit_index"
+
+	DefaultMaxPinnedViewAge = time.Hour
+	retirementSafetyMargin  = time.Minute
 )
 
 func EncodeCommitPage(p *CommitPage) ([]byte, error) {
@@ -37,7 +41,17 @@ func normalizeCurrent(c *Current) {
 	if c.NextEpoch == 0 {
 		c.NextEpoch = 1
 	}
+	if c.MaxPinnedViewAge == 0 {
+		c.MaxPinnedViewAge = DefaultMaxPinnedViewAge
+	}
 	if !c.ChangeFeedEnabled && c.ChangeFeedLogStart == 0 {
 		c.ChangeFeedLogStart = c.LogSeqStart
 	}
+}
+
+func (c *Current) PinnedViewAge() time.Duration {
+	if c == nil || c.MaxPinnedViewAge == 0 {
+		return DefaultMaxPinnedViewAge
+	}
+	return c.MaxPinnedViewAge
 }

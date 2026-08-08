@@ -83,7 +83,6 @@ type CompactionPolicy struct {
 // by committed manifest entries.
 type GarbageCollectionPolicy struct {
 	DeleteBatchSize int
-	GracePeriod     time.Duration
 }
 
 // RetentionPolicy controls removal of old SSTs. It is enabled only when the
@@ -155,7 +154,6 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 		},
 		GarbageCollection: GarbageCollectionPolicy{
 			DeleteBatchSize: compaction.GCDeleteBatchSize,
-			GracePeriod:     compaction.GCGracePeriod,
 		},
 		Checkpoint: CheckpointPolicy{MaxReplayPages: DefaultCheckpointReplayPages},
 	}
@@ -290,14 +288,11 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, e
 	if opts.Retention != nil && (opts.Retention.KeepAtLeastSSTs < 0 || opts.Retention.KeepAtLeastWindows < 0) {
 		return MaintenanceOptions{}, fmt.Errorf("%w: retention minimums must not be negative", ErrInvalidMaintenanceOptions)
 	}
-	if opts.GarbageCollection.DeleteBatchSize < 0 || opts.GarbageCollection.GracePeriod < 0 {
+	if opts.GarbageCollection.DeleteBatchSize < 0 {
 		return MaintenanceOptions{}, fmt.Errorf("%w: invalid garbage collection policy", ErrInvalidMaintenanceOptions)
 	}
 	if opts.GarbageCollection.DeleteBatchSize == 0 {
 		opts.GarbageCollection.DeleteBatchSize = defaults.GarbageCollection.DeleteBatchSize
-	}
-	if opts.GarbageCollection.GracePeriod == 0 {
-		opts.GarbageCollection.GracePeriod = defaults.GarbageCollection.GracePeriod
 	}
 	if opts.Checkpoint.MaxReplayPages == 0 {
 		opts.Checkpoint.MaxReplayPages = defaults.Checkpoint.MaxReplayPages
@@ -332,7 +327,6 @@ func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compac
 		OnCompactionEnd:   m.recordCompaction,
 		GCCursorStorage:   gcCursor,
 		GCDeleteBatchSize: m.opts.GarbageCollection.DeleteBatchSize,
-		GCGracePeriod:     m.opts.GarbageCollection.GracePeriod,
 	}
 }
 
@@ -352,7 +346,6 @@ func (m *Maintenance) retentionOptions(gcCursor manifest.GCCursorStorage) retent
 		OnCleanup:          m.recordRetention,
 		GCCursorStorage:    gcCursor,
 		GCDeleteBatchSize:  m.opts.GarbageCollection.DeleteBatchSize,
-		GCGracePeriod:      m.opts.GarbageCollection.GracePeriod,
 	}
 }
 
