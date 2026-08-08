@@ -34,36 +34,36 @@ type Level struct {
 }
 
 type SSTSignature struct {
-	Algorithm string
-	KeyID     string
-	Hash      string
-	Signature []byte
+	Algorithm string `json:"algorithm"`
+	KeyID     string `json:"key_id"`
+	Hash      string `json:"hash"`
+	Signature []byte `json:"signature"`
 }
 
 type BloomMeta struct {
-	BitsPerKey int
-	K          int
-	Offset     int64
-	Length     int64
+	BitsPerKey int   `json:"bits_per_key"`
+	K          int   `json:"k"`
+	Offset     int64 `json:"offset"`
+	Length     int64 `json:"length"`
 }
 
 type SSTMeta struct {
-	ID        string
-	Epoch     uint64
-	SeqLo     uint64
-	SeqHi     uint64
-	MinKey    []byte
-	MaxKey    []byte
-	Size      int64
-	Checksum  string
-	Signature *SSTSignature
-	Bloom     BloomMeta
-	CreatedAt time.Time
+	ID        string        `json:"id"`
+	Epoch     uint64        `json:"epoch"`
+	SeqLo     uint64        `json:"seq_lo"`
+	SeqHi     uint64        `json:"seq_hi"`
+	MinKey    []byte        `json:"min_key"`
+	MaxKey    []byte        `json:"max_key"`
+	Size      int64         `json:"size"`
+	Checksum  string        `json:"checksum"`
+	Signature *SSTSignature `json:"signature,omitempty"`
+	Bloom     BloomMeta     `json:"bloom"`
+	CreatedAt time.Time     `json:"created_at"`
 
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
-	Level       uint32
-	HasBlobRefs bool
+	Level       uint32 `json:"level"`
+	HasBlobRefs bool   `json:"has_blob_refs"`
 }
 
 // ChangeBatchMeta describes one committed, seq-ordered mutation batch emitted
@@ -87,9 +87,9 @@ type ChangeBatchMeta struct {
 // WriterCommit is one logical memtable publication. ID remains unchanged when
 // SST upload or manifest publication is retried.
 type WriterCommit struct {
-	ID          string
-	SSTable     SSTMeta
-	ChangeBatch *ChangeBatchMeta
+	ID          string           `json:"id"`
+	SSTable     SSTMeta          `json:"sstable"`
+	ChangeBatch *ChangeBatchMeta `json:"change_batch,omitempty"`
 }
 
 // WriterCommitMarker is the bounded idempotency receipt retained in CURRENT.
