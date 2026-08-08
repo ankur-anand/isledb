@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +37,7 @@ type writer struct {
 	manifestLog *manifest.Store
 	opts        WriterOptions
 	valueConfig config.ValueStorageConfig
+	sstOutput   SSTEncodingOptions
 
 	changeFeedPayload ChangeFeedPayload
 	ctx               context.Context
@@ -90,10 +90,26 @@ func (p *pendingFlush) SeqLo() uint64 {
 }
 
 func newWriter(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions) (*writer, error) {
-	return newWriterWithMaintenanceWake(ctx, store, manifestLog, opts, nil, StorePolicy{MaxPinnedViewAge: DefaultMaxPinnedViewAge})
+	return newWriterWithMaintenanceWake(
+		ctx,
+		store,
+		manifestLog,
+		opts,
+		nil,
+		StorePolicy{MaxPinnedViewAge: DefaultMaxPinnedViewAge},
+		DefaultSSTOutputOptions().L0,
+	)
 }
 
-func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts WriterOptions, maintenanceWake <-chan struct{}, storePolicy StorePolicy) (*writer, error) {
+func newWriterWithMaintenanceWake(
+	ctx context.Context,
+	store *blobstore.Store,
+	manifestLog *manifest.Store,
+	opts WriterOptions,
+	maintenanceWake <-chan struct{},
+	storePolicy StorePolicy,
+	sstOutput SSTEncodingOptions,
+) (*writer, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -115,6 +131,7 @@ func newWriterWithMaintenanceWake(ctx context.Context, store *blobstore.Store, m
 		manifestLog:             manifestLog,
 		opts:                    opts,
 		valueConfig:             valueConfig,
+		sstOutput:               sstOutput,
 		ctx:                     writerCtx,
 		cancel:                  cancel,
 		memtable:                internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, valueConfig), memtableInlineThreshold),
@@ -179,29 +196,6 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	if opts.Maintenance.PollInterval == 0 {
 		opts.Maintenance.PollInterval = d.Maintenance.PollInterval
 	}
-	if opts.SST.BloomBitsPerKey < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: bloom_bits_per_key=%d", ErrInvalidWriterOptions, opts.SST.BloomBitsPerKey)
-	}
-	if opts.SST.BloomBitsPerKey == 0 {
-		opts.SST.BloomBitsPerKey = d.SST.BloomBitsPerKey
-	}
-	if opts.SST.BlockBytes < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: block_bytes=%d", ErrInvalidWriterOptions, opts.SST.BlockBytes)
-	}
-	if opts.SST.BlockBytes == 0 {
-		opts.SST.BlockBytes = d.SST.BlockBytes
-	}
-	compression := strings.ToLower(strings.TrimSpace(cmp.Or(opts.SST.Compression, d.SST.Compression)))
-	switch compression {
-	case "none", "snappy", "zstd":
-		opts.SST.Compression = compression
-	default:
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: unsupported compression=%q", ErrInvalidWriterOptions, opts.SST.Compression)
-	}
-
 	vd := defaultWriterValueOptions()
 	values := opts.Values
 	if values.InlineValueBytes < 0 {
@@ -611,9 +605,9 @@ func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 
 func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error {
 	sstOpts := sstWriterOptions{
-		BloomBitsPerKey: w.opts.SST.BloomBitsPerKey,
-		BlockSize:       w.opts.SST.BlockBytes,
-		Compression:     w.opts.SST.Compression,
+		BloomBitsPerKey: w.sstOutput.BloomBitsPerKey,
+		BlockSize:       w.sstOutput.BlockBytes,
+		Compression:     w.sstOutput.Compression,
 	}
 
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {

@@ -51,6 +51,33 @@ type ChangeFeedOptions struct {
 	Payload ChangeFeedPayload
 }
 
+// SSTOutputOptions configures the encoding of newly created SSTs. L0 is used
+// by writer flushes; Compacted is used for maintenance output. Existing SSTs
+// remain self-describing and readable when these settings change.
+type SSTOutputOptions struct {
+	L0        SSTEncodingOptions
+	Compacted SSTEncodingOptions
+}
+
+// SSTEncodingOptions controls the physical encoding of one SST class. Zero
+// fields select production defaults.
+type SSTEncodingOptions struct {
+	Compression     string
+	BlockBytes      int
+	BloomBitsPerKey int
+}
+
+// DefaultSSTOutputOptions returns the current production SST encoding for both
+// writer flushes and compacted output.
+func DefaultSSTOutputOptions() SSTOutputOptions {
+	encoding := SSTEncodingOptions{
+		Compression:     "snappy",
+		BlockBytes:      4096,
+		BloomBitsPerKey: 10,
+	}
+	return SSTOutputOptions{L0: encoding, Compacted: encoding}
+}
+
 // Writer provides write access to the database.
 //
 // A Writer owns one fenced write session for a DB bucket/prefix. It buffers
@@ -144,14 +171,14 @@ type DB struct {
 	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
 	storePolicy     StorePolicy
+	sstOutput       SSTOutputOptions
 
-	changeFeedRetention *changeFeedRetentionPolicy
-	mu                  sync.Mutex
-	closers             []dbCloser
-	writerOpen          bool
-	readerOpen          bool
-	maintenanceOpen     bool
-	closed              atomic.Bool
+	mu              sync.Mutex
+	closers         []dbCloser
+	writerOpen      bool
+	readerOpen      bool
+	maintenanceOpen bool
+	closed          atomic.Bool
 }
 
 type dbCloser interface {
@@ -167,6 +194,10 @@ type DBOptions struct {
 	// commits. Nil leaves a new feed disabled and adopts an already-persisted
 	// configuration when reopening a prefix.
 	ChangeFeed *ChangeFeedOptions
+
+	// SSTOutput configures newly flushed and compacted SSTs. Zero fields select
+	// defaults. This is runtime output policy and is not persisted in CURRENT.
+	SSTOutput SSTOutputOptions
 
 	// Policy contains store-wide safety settings persisted by the first writer.
 	Policy StorePolicy
@@ -185,15 +216,19 @@ const DefaultMaxPinnedViewAge = manifest.DefaultMaxPinnedViewAge
 var ErrStorePolicyMismatch = manifest.ErrStorePolicyMismatch
 
 type dbOpenOptions struct {
-	manifestStorage     manifest.Storage
-	gcCursorStorage     manifest.GCCursorStorage
-	changeFeedPayload   manifest.ChangeFeedPayload
-	changeFeedRetention *changeFeedRetentionPolicy
-	storePolicy         StorePolicy
+	manifestStorage   manifest.Storage
+	gcCursorStorage   manifest.GCCursorStorage
+	changeFeedPayload manifest.ChangeFeedPayload
+	storePolicy       StorePolicy
+	sstOutput         SSTOutputOptions
 }
 
 func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*DB, error) {
 	storePolicy, err := normalizeStorePolicy(opts.storePolicy)
+	if err != nil {
+		return nil, err
+	}
+	sstOutput, err := normalizeSSTOutputOptions(opts.sstOutput)
 	if err != nil {
 		return nil, err
 	}
@@ -212,12 +247,12 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		}
 	}
 	return &DB{
-		store:               store,
-		manifestStore:       manifestStore,
-		gcCursorStorage:     gcCursorStorage,
-		maintenanceWake:     make(chan struct{}, 1),
-		storePolicy:         storePolicy,
-		changeFeedRetention: opts.changeFeedRetention,
+		store:           store,
+		manifestStore:   manifestStore,
+		gcCursorStorage: gcCursorStorage,
+		maintenanceWake: make(chan struct{}, 1),
+		storePolicy:     storePolicy,
+		sstOutput:       sstOutput,
 	}, nil
 }
 
@@ -233,7 +268,15 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.releaseWriter(nil)
 		return nil, err
 	}
-	w, err := newWriterWithMaintenanceWake(ctx, db.store, db.manifestStore, opts, db.maintenanceWake, db.storePolicy)
+	w, err := newWriterWithMaintenanceWake(
+		ctx,
+		db.store,
+		db.manifestStore,
+		opts,
+		db.maintenanceWake,
+		db.storePolicy,
+		db.sstOutput.L0,
+	)
 	if err != nil {
 		db.releaseWriter(nil)
 		return nil, err
@@ -360,7 +403,14 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		return nil, err
 	}
 
-	maintenance, err := newMaintenance(ctx, db.store, db.manifestStore, db.gcCursorStorage, opts, db.changeFeedRetention)
+	maintenance, err := newMaintenance(
+		ctx,
+		db.store,
+		db.manifestStore,
+		db.gcCursorStorage,
+		opts,
+		db.sstOutput.Compacted,
+	)
 	if err != nil {
 		db.releaseMaintenance(nil)
 		return nil, err

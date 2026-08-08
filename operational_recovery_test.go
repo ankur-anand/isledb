@@ -109,7 +109,6 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 	opts := DefaultWriterOptions()
 	opts.OwnerID = "operational-writer-before-crash"
 	opts.Flush.Interval = 5 * time.Millisecond
-	opts.SST.Compression = "none"
 	opts.OnFlushError = func(err error) { backgroundErr <- err }
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
@@ -163,7 +162,6 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 	restartedOpts := DefaultWriterOptions()
 	restartedOpts.OwnerID = "operational-writer-after-crash"
 	restartedOpts.Flush.Interval = 0
-	restartedOpts.SST.Compression = "none"
 	restartedWriter, err := restarted.OpenWriter(ctx, restartedOpts)
 	if err != nil {
 		t.Fatalf("open restarted writer: %v", err)
@@ -198,7 +196,6 @@ func TestOperationalRecovery_LostManifestResponseIsIdempotent(t *testing.T) {
 	opts := DefaultWriterOptions()
 	opts.OwnerID = "operational-lost-response-writer"
 	opts.Flush.Interval = 0
-	opts.SST.Compression = "none"
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
@@ -265,7 +262,6 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	opts := DefaultWriterOptions()
 	opts.OwnerID = "operational-contention-writer"
 	opts.Flush.Interval = 0
-	opts.SST.Compression = "none"
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
@@ -289,7 +285,6 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	maintenanceOpts.Compaction.L0SSTCount = 4
 	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
-	maintenanceOpts.Compaction.Compression = "none"
 	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -335,7 +330,6 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 	opts1 := DefaultWriterOptions()
 	opts1.OwnerID = "operational-writer-1"
 	opts1.Flush.Interval = 0
-	opts1.SST.Compression = "none"
 	writer1, err := db1.OpenWriter(ctx, opts1)
 	if err != nil {
 		t.Fatalf("open first writer: %v", err)
@@ -350,7 +344,6 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 	opts2 := DefaultWriterOptions()
 	opts2.OwnerID = "operational-writer-2"
 	opts2.Flush.Interval = 0
-	opts2.SST.Compression = "none"
 	writer2, err := db2.OpenWriter(ctx, opts2)
 	if err != nil {
 		t.Fatalf("open second writer: %v", err)
@@ -397,7 +390,6 @@ func TestOperationalSignals_BackpressureCounter(t *testing.T) {
 	opts.Memtable.TargetBytes = 512
 	opts.Memtable.MaxPendingMemtables = 1
 	opts.Flush.Interval = 0
-	opts.SST.Compression = "none"
 	opts.Metrics = metrics
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
@@ -459,7 +451,6 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		writerOpts := DefaultWriterOptions()
 		writerOpts.OwnerID = fmt.Sprintf("soak-writer-%06d", cycles)
 		writerOpts.Flush.Interval = 0
-		writerOpts.SST.Compression = "none"
 		writer, err := db.OpenWriter(ctx, writerOpts)
 		if err != nil {
 			t.Fatalf("cycle %d open writer: %v", cycles, err)
@@ -477,7 +468,6 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		maintenanceOpts.Compaction.L0SSTCount = 8
 		maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 		maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
-		maintenanceOpts.Compaction.Compression = "none"
 		maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
 		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {

@@ -87,7 +87,7 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	store := setupFakeS3StoreWithPrefix(t, fmt.Sprintf("e2e-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -98,8 +98,6 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	writerOpts.Memtable.TargetBytes = 512
 	writerOpts.Memtable.MaxPendingMemtables = 4
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.BlockBytes = 1024
-	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
@@ -112,8 +110,6 @@ func TestS3E2E_WriteCompactReadRetain(t *testing.T) {
 	maintenanceOpts.Compaction.L0SSTCount = 4
 	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 2 * 1024
-	maintenanceOpts.Compaction.BlockBytes = 1024
-	maintenanceOpts.Compaction.Compression = "none"
 
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -347,7 +343,7 @@ func TestS3E2E_KVLifecycle(t *testing.T) {
 func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -363,8 +359,6 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "kv-lifecycle-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.BlockBytes = 1024
-	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
@@ -438,8 +432,6 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	opts.Compaction.L0SSTCount = 2
 	opts.Compaction.BaseLevelBytes = 1 << 60
 	opts.Compaction.TargetSSTBytes = 1 << 20
-	opts.Compaction.BlockBytes = 1024
-	opts.Compaction.Compression = "none"
 	opts.GarbageCollection.DeleteBatchSize = len(oldSSTs)
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
@@ -518,7 +510,7 @@ func assertReaderValue(t testing.TB, ctx context.Context, reader *Reader, key, w
 func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 4096)})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -530,7 +522,6 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "change-feed-e2e-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
@@ -562,10 +553,10 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	changeFeed.KeepFor = time.Millisecond
 	// Retain the newest writer commit and its change batch.
 	changeFeed.KeepAtLeastManifestEntries = 1
-	changeFeed.DeleteGracePeriod = -1
-	db.changeFeedRetention = &changeFeed
+	changeFeed.DeleteGracePeriod = time.Nanosecond
 	opts := DefaultMaintenanceOptions()
 	opts.OwnerID = "change-feed-e2e-maintenance"
+	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
@@ -612,7 +603,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	store := setupFakeS3StoreWithPrefix(b, fmt.Sprintf("bench-%d", time.Now().UnixNano()))
 	defer store.Close()
 
-	db, err := openDB(ctx, store, dbOpenOptions{})
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 4096)})
 	if err != nil {
 		b.Fatalf("open db: %v", err)
 	}
@@ -622,8 +613,6 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	writerOpts.OwnerID = "s3-bench-writer"
 	writerOpts.Memtable.TargetBytes = 4 << 10
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.BlockBytes = 4096
-	writerOpts.SST.Compression = "none"
 
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
@@ -636,7 +625,6 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	maintenanceOpts.Compaction.L0SSTCount = 8
 	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.Compaction.TargetSSTBytes = 64 << 10
-	maintenanceOpts.Compaction.Compression = "none"
 
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {

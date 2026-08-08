@@ -141,7 +141,10 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	store := blobstore.NewMemory(fmt.Sprintf("mailbox-fault-%s-%s", phase, point))
 	defer store.Close()
 	storage := &mailboxFaultStorage{BlobStoreBackend: manifest.NewBlobStoreBackend(store)}
-	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
+	db, err := openDB(ctx, store, dbOpenOptions{
+		manifestStorage: storage,
+		sstOutput:       testSSTOutput("none", 4096),
+	})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -150,7 +153,6 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "mailbox-fault-writer"
 	writerOpts.Flush.Interval = 0
-	writerOpts.SST.Compression = "none"
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
@@ -27,6 +28,10 @@ func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	sstOutput, err := normalizeSSTOutputOptions(opts.SSTOutput)
+	if err != nil {
+		return nil, err
+	}
 	store, err := blobstore.Open(ctx, bucketURL, opts.Prefix)
 	if err != nil {
 		return nil, err
@@ -35,6 +40,7 @@ func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error) {
 	db, err := openDB(ctx, store, dbOpenOptions{
 		changeFeedPayload: payload,
 		storePolicy:       policy,
+		sstOutput:         sstOutput,
 	})
 	if err != nil {
 		_ = store.Close()
@@ -61,12 +67,62 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 	if err != nil {
 		return nil, err
 	}
+	sstOutput, err := normalizeSSTOutputOptions(opts.SSTOutput)
+	if err != nil {
+		return nil, err
+	}
 
 	store := blobstore.New(bucket, bucketName, opts.Prefix)
 	return openDB(ctx, store, dbOpenOptions{
 		changeFeedPayload: payload,
 		storePolicy:       policy,
+		sstOutput:         sstOutput,
 	})
+}
+
+func normalizeSSTOutputOptions(opts SSTOutputOptions) (SSTOutputOptions, error) {
+	defaults := DefaultSSTOutputOptions()
+	l0, err := normalizeSSTEncodingOptions("l0", opts.L0, defaults.L0)
+	if err != nil {
+		return SSTOutputOptions{}, err
+	}
+	compacted, err := normalizeSSTEncodingOptions("compacted", opts.Compacted, defaults.Compacted)
+	if err != nil {
+		return SSTOutputOptions{}, err
+	}
+	return SSTOutputOptions{L0: l0, Compacted: compacted}, nil
+}
+
+func normalizeSSTEncodingOptions(
+	class string,
+	opts SSTEncodingOptions,
+	defaults SSTEncodingOptions,
+) (SSTEncodingOptions, error) {
+	if opts.BlockBytes < 0 {
+		return SSTEncodingOptions{}, fmt.Errorf(
+			"%w: sst_output.%s.block_bytes=%d", ErrInvalidDBOptions, class, opts.BlockBytes)
+	}
+	if opts.BloomBitsPerKey < 0 {
+		return SSTEncodingOptions{}, fmt.Errorf(
+			"%w: sst_output.%s.bloom_bits_per_key=%d", ErrInvalidDBOptions, class, opts.BloomBitsPerKey)
+	}
+	if opts.BlockBytes == 0 {
+		opts.BlockBytes = defaults.BlockBytes
+	}
+	if opts.BloomBitsPerKey == 0 {
+		opts.BloomBitsPerKey = defaults.BloomBitsPerKey
+	}
+	opts.Compression = strings.ToLower(strings.TrimSpace(opts.Compression))
+	if opts.Compression == "" {
+		opts.Compression = defaults.Compression
+	}
+	switch opts.Compression {
+	case "none", "snappy", "zstd":
+		return opts, nil
+	default:
+		return SSTEncodingOptions{}, fmt.Errorf(
+			"%w: sst_output.%s.compression=%q", ErrInvalidDBOptions, class, opts.Compression)
+	}
 }
 
 func normalizeChangeFeedOptions(opts *ChangeFeedOptions) (manifest.ChangeFeedPayload, error) {

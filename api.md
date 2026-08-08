@@ -82,8 +82,22 @@ func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opt
 type DBOptions struct {
     Prefix     string
     ChangeFeed *ChangeFeedOptions // nil leaves a new feed disabled
+    SSTOutput  SSTOutputOptions   // zero fields select production defaults
     Policy     StorePolicy
 }
+
+type SSTOutputOptions struct {
+    L0        SSTEncodingOptions // writer flush output
+    Compacted SSTEncodingOptions // maintenance compaction output
+}
+
+type SSTEncodingOptions struct {
+    Compression     string // "none", "snappy", or "zstd"
+    BlockBytes      int
+    BloomBitsPerKey int
+}
+
+func DefaultSSTOutputOptions() SSTOutputOptions
 
 type ChangeFeedPayload uint8
 
@@ -111,6 +125,31 @@ adopts an already-persisted configuration.
 `MaxPinnedViewAge` is persisted by the first writer. Later writers must present
 the same value. Readers and SST garbage collection both derive their safety
 deadline from this one store policy.
+
+`SSTOutput` is the single encoding policy used by all writers and maintenance
+handles opened from the `DB`. It affects only newly created SSTs and is not
+persisted in `manifest/CURRENT`. SST files are self-describing, so readers can
+open a mixture of old and new encodings without receiving this configuration.
+The current zero-value default is Snappy compression, 4 KiB data blocks, and
+10 Bloom-filter bits per key for both L0 and compacted SSTs.
+
+For example, foreground flushes can remain inexpensive while maintenance
+produces denser, larger-block SSTs:
+
+```go
+SSTOutput: isledb.SSTOutputOptions{
+    L0: isledb.SSTEncodingOptions{
+        Compression:     "snappy",
+        BlockBytes:      4 << 10,
+        BloomBitsPerKey: 10,
+    },
+    Compacted: isledb.SSTEncodingOptions{
+        Compression:     "zstd",
+        BlockBytes:      16 << 10,
+        BloomBitsPerKey: 10,
+    },
+},
+```
 
 ---
 
@@ -151,7 +190,6 @@ type WriterOptions struct {
     Memtable     WriterMemtableOptions
     Flush        WriterFlushOptions
     Maintenance  WriterMaintenanceOptions
-    SST          WriterSSTOptions
     Values       ValueOptions
     OnFlushError func(error)
     Metrics      *WriterMetrics
@@ -170,12 +208,6 @@ type WriterMaintenanceOptions struct {
     PollInterval time.Duration // Minimum interval between maintenance mailbox reads.
 }
 
-type WriterSSTOptions struct {
-    BloomBitsPerKey int    // Zero selects the default.
-    BlockBytes      int    // Zero selects the default.
-    Compression     string // "none", "snappy", or "zstd"; empty selects the default.
-}
-
 type ValueOptions struct {
     MaxKeyBytes      int   // Largest accepted key size.
     InlineValueBytes int   // Values at or above this size are stored outside the SST.
@@ -188,8 +220,8 @@ func DefaultWriterOptions() WriterOptions
 **Errors:**
 - `ErrBackpressure` - writer hit `Memtable.MaxPendingMemtables`; caller should retry after a delay or flush.
 - `ErrInvalidWriterOptions` - writer configuration contains a negative size or
-  interval, unsupported compression, oversized identity, invalid value limit,
-  or a memtable configuration that exceeds the arena format limit.
+  interval, oversized identity, invalid value limit, or a memtable
+  configuration that exceeds the arena format limit.
 - `ErrWriterFailed` - background flushing failed. The writer is terminal and the error wraps the original cause.
 
 Background flush:
@@ -494,13 +526,32 @@ maintenance handle opened from the same `DB`.
 
 ```go
 type MaintenanceOptions struct {
-    OwnerID            string
-    Every              time.Duration
-    Compaction         CompactionPolicy
-    GarbageCollection  GarbageCollectionPolicy
-    Retention          *RetentionPolicy
-    OnCycle            func(MaintenanceStats)
-    OnError            func(error)
+    OwnerID             string
+    Every               time.Duration
+    Compaction          CompactionPolicy
+    GarbageCollection   GarbageCollectionPolicy
+    Checkpoint          CheckpointPolicy
+    Retention           *RetentionPolicy
+    ChangeFeedRetention *ChangeFeedRetentionPolicy
+    OnCycle             func(MaintenanceStats)
+    OnError             func(error)
+}
+
+type ChangeFeedRetentionPolicy struct {
+    KeepFor                    time.Duration
+    KeepAtLeastManifestEntries uint64
+    DeleteBatchSize            int
+    DeleteGracePeriod          time.Duration
+    OnCleanup                  func(ChangeFeedCleanupStats)
+}
+
+type ChangeFeedCleanupStats struct {
+    EntriesRetired  int
+    BatchesMarked   int
+    BatchesDeleted  int
+    BlockedRetained int
+    FailedDeletes   int
+    Duration        time.Duration
 }
 
 type CompactionPolicy struct {
@@ -511,9 +562,6 @@ type CompactionPolicy struct {
     LevelSizeMultiplier         int
     MaxInputSSTs                int
     TargetSSTBytes              int64
-    BloomBitsPerKey             int
-    BlockBytes                  int
-    Compression                 string
     ValidateSSTChecksum         bool
     SSTHashVerifier             SSTHashVerifier
     OnCompactionStart           func(CompactionJob)
@@ -550,8 +598,14 @@ type RetentionPolicy struct {
 
 ```
 
-`DefaultMaintenanceOptions` enables compaction and leaves retention disabled.
-Use `DefaultRetentionPolicy` before enabling destructive cleanup.
+`DefaultMaintenanceOptions` enables compaction and leaves both KV and
+change-feed retention disabled. Use `DefaultRetentionPolicy` or
+`DefaultChangeFeedRetentionPolicy` before enabling destructive cleanup.
+
+Change-feed retention requires an enabled feed and runs only while maintenance
+runs. The policy is runtime maintenance configuration, not part of the
+persisted immutable payload choice. Omitting it preserves feed history
+indefinitely.
 
 In `RetentionByAge` mode, `KeepAtLeastSSTs` protects the newest SSTs. In
 `RetentionByTimeWindow` mode, `Window` defines the grouping interval and
@@ -569,6 +623,10 @@ retention := isledb.DefaultRetentionPolicy()
 retention.KeepFor = 7 * 24 * time.Hour
 retention.KeepAtLeastSSTs = 10
 opts.Retention = &retention
+
+feedRetention := isledb.DefaultChangeFeedRetentionPolicy()
+feedRetention.KeepFor = 24 * time.Hour
+opts.ChangeFeedRetention = &feedRetention
 
 m, err := db.OpenMaintenance(ctx, opts)
 if err != nil {
