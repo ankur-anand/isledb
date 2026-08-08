@@ -13,6 +13,8 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
+const changeFeedCleanerScanBatchSize = 1024
+
 type changeFeedCleanerOptions struct {
 	// RetentionPeriod is the minimum age retained for change-feed entries.
 	// Entries with change batches older than this can be retired, subject to
@@ -221,11 +223,11 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	}
 	start := time.Now()
 
-	current, err := c.manifestLog.ReadCurrentData(ctx)
+	view, err := c.manifestLog.LoadChangeFeedView(ctx)
 	if err != nil {
-		return fmt.Errorf("read current: %w", err)
+		return fmt.Errorf("load change-feed view: %w", err)
 	}
-	if current == nil || current.NextSeq <= current.ChangeFeedLogStart {
+	if view.Head() <= view.RetainedFrom() {
 		stats, err := runPendingChangeBatchSweeper(ctx, c.store, c.manifestLog, c.opts.SweepBatchSize, c.opts.SweepGracePeriod)
 		if err != nil {
 			return err
@@ -237,7 +239,7 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	}
 
 	now := time.Now().UTC()
-	floor, candidates, err := c.planRetentionFloor(ctx, current, now)
+	floor, candidates, err := c.planRetentionFloor(ctx, view, now)
 	if err != nil {
 		return err
 	}
@@ -249,7 +251,7 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	}
 
 	var entriesRetired int
-	if floor > current.ChangeFeedLogStart {
+	if floor > view.RetainedFrom() {
 		var err error
 		if c.stageCommand != nil {
 			err = c.stageCommand(ctx, manifest.MaintenanceCommand{
@@ -262,7 +264,7 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("advance change-feed floor: %w", err)
 		}
-		entriesRetired = int(floor - current.ChangeFeedLogStart)
+		entriesRetired = int(floor - view.RetainedFrom())
 	}
 
 	sweepStats, err := runPendingChangeBatchSweeper(ctx, c.store, c.manifestLog, c.opts.SweepBatchSize, c.opts.SweepGracePeriod)
@@ -284,13 +286,16 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, current *manifest.Current, now time.Time) (uint64, []changeBatchDeleteCandidate, error) {
-	if current == nil || current.NextSeq <= current.ChangeFeedLogStart {
-		return currentNextSeqForCleaner(current), nil, nil
+func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, view *manifest.ChangeFeedView, now time.Time) (uint64, []changeBatchDeleteCandidate, error) {
+	if view == nil || view.Head() <= view.RetainedFrom() {
+		if view == nil {
+			return 0, nil, nil
+		}
+		return view.Head(), nil, nil
 	}
 
-	start := current.ChangeFeedLogStart
-	end := current.NextSeq
+	start := view.RetainedFrom()
+	end := view.Head()
 	maxFloor := end
 	if c.opts.KeepAtLeastManifestEntries > 0 && end-start > c.opts.KeepAtLeastManifestEntries {
 		maxFloor = end - c.opts.KeepAtLeastManifestEntries
@@ -301,39 +306,41 @@ func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, current *man
 	cutoff := now.Add(-c.opts.RetentionPeriod)
 	floor := start
 	candidates := make([]changeBatchDeleteCandidate, 0)
-	for seq := start; seq < maxFloor; seq++ {
-		entry, err := c.manifestLog.ReadEntry(ctx, seq)
+	for floor < maxFloor {
+		limit := changeFeedCleanerScanBatchSize
+		if remaining := maxFloor - floor; remaining < uint64(limit) {
+			limit = int(remaining)
+		}
+		entries, err := c.manifestLog.ReadChangeEntriesFromView(ctx, view, floor, false, limit)
 		if err != nil {
-			return floor, nil, fmt.Errorf("read manifest entry seq=%d: %w", seq, err)
+			return floor, nil, fmt.Errorf("read manifest entries from seq=%d: %w", floor, err)
 		}
-		if entry == nil {
-			return floor, nil, fmt.Errorf("manifest entry seq=%d not found", seq)
+		if len(entries) == 0 {
+			return floor, nil, fmt.Errorf("manifest scan made no progress at seq=%d", floor)
 		}
-		if entry.ChangeBatch != nil {
-			createdAt := entry.ChangeBatch.CreatedAt
-			if createdAt.IsZero() {
-				createdAt = entry.Timestamp
+		for _, entry := range entries {
+			if entry == nil {
+				return floor, nil, fmt.Errorf("manifest scan returned nil entry at seq=%d", floor)
 			}
-			if !createdAt.IsZero() && !createdAt.Before(cutoff) {
-				break
+			if entry.ChangeBatch != nil {
+				createdAt := entry.ChangeBatch.CreatedAt
+				if createdAt.IsZero() {
+					createdAt = entry.Timestamp
+				}
+				if !createdAt.IsZero() && !createdAt.Before(cutoff) {
+					return floor, candidates, nil
+				}
+				candidates = append(candidates, changeBatchDeleteCandidate{
+					Path:     entry.ChangeBatch.Path,
+					ID:       entry.ChangeBatch.ID,
+					Seq:      entry.Seq,
+					Size:     entry.ChangeBatch.Size,
+					Checksum: entry.ChangeBatch.Checksum,
+				})
 			}
-			candidates = append(candidates, changeBatchDeleteCandidate{
-				Path:     entry.ChangeBatch.Path,
-				ID:       entry.ChangeBatch.ID,
-				Seq:      entry.Seq,
-				Size:     entry.ChangeBatch.Size,
-				Checksum: entry.ChangeBatch.Checksum,
-			})
+			floor = entry.Seq + 1
 		}
-		floor = seq + 1
 	}
 
 	return floor, candidates, nil
-}
-
-func currentNextSeqForCleaner(current *manifest.Current) uint64 {
-	if current == nil {
-		return 0
-	}
-	return current.NextSeq
 }
