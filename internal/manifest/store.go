@@ -1367,9 +1367,6 @@ func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error)
 	if err != nil {
 		return nil, err
 	}
-	if current != nil {
-		current = current.Clone()
-	}
 	return &ChangeFeedView{current: current}, nil
 }
 

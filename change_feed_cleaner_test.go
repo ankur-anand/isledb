@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,24 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
+
+type changeFeedCleanerScanStorage struct {
+	manifest.Storage
+	manifest.PageStorage
+
+	currentReads atomic.Int64
+	pageReads    atomic.Int64
+}
+
+func (s *changeFeedCleanerScanStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	s.currentReads.Add(1)
+	return s.Storage.ReadCurrent(ctx)
+}
+
+func (s *changeFeedCleanerScanStorage) ReadPage(ctx context.Context, path string) ([]byte, error) {
+	s.pageReads.Add(1)
+	return s.PageStorage.ReadPage(ctx, path)
+}
 
 func TestChangeFeedCleanerRetiresOldBatches(t *testing.T) {
 	ctx := context.Background()
@@ -84,6 +103,63 @@ func TestChangeFeedCleanerRetiresOldBatches(t *testing.T) {
 	}
 	if replayed.LookupSST("old.sst") == nil || replayed.LookupSST("recent.sst") == nil {
 		t.Fatalf("change-feed cleanup changed visible SST state: %+v", replayed.AllSSTIDs())
+	}
+}
+
+func TestChangeFeedCleanerPlansInPageBatchesFromOneView(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-feed-cleaner-page-scan")
+	defer store.Close()
+
+	backend := manifest.NewBlobStoreBackend(store)
+	storage := &changeFeedCleanerScanStorage{Storage: backend, PageStorage: backend}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	writerFence, err := manifestStore.ClaimWriter(ctx, "writer-1")
+	if err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if err := manifestStore.EnableChangeFeed(ctx); err != nil {
+		t.Fatalf("enable change feed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	for i := 0; i < 130; i++ {
+		appendChangeFeedCleanerManifestEntry(t, ctx, manifestStore, writerFence.Epoch, i, now.Add(-2*time.Hour))
+	}
+	recent := appendChangeFeedCleanerManifestEntry(t, ctx, manifestStore, writerFence.Epoch, 130, now)
+
+	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, changeFeedCleanerOptions{
+		RetentionPeriod:            time.Hour,
+		KeepAtLeastManifestEntries: 1,
+	})
+	if err != nil {
+		t.Fatalf("new change feed cleaner: %v", err)
+	}
+	view, err := manifestStore.LoadChangeFeedView(ctx)
+	if err != nil {
+		t.Fatalf("load change-feed view: %v", err)
+	}
+	storage.currentReads.Store(0)
+	storage.pageReads.Store(0)
+
+	floor, candidates, err := cleaner.planRetentionFloor(ctx, view, now)
+	if err != nil {
+		t.Fatalf("plan retention floor: %v", err)
+	}
+	if floor != recent.Seq {
+		t.Fatalf("floor=%d want recent seq=%d", floor, recent.Seq)
+	}
+	if len(candidates) != 130 {
+		t.Fatalf("candidates=%d want=130", len(candidates))
+	}
+	if got := storage.currentReads.Load(); got != 0 {
+		t.Fatalf("CURRENT reads during pinned scan=%d want=0", got)
+	}
+	if got := storage.pageReads.Load(); got != 2 {
+		t.Fatalf("page reads=%d want=2", got)
 	}
 }
 
@@ -209,4 +285,39 @@ func writeChangeBatchForCleanerTest(t *testing.T, ctx context.Context, store *bl
 		CreatedAt: createdAt,
 		Version:   1,
 	}
+}
+
+func appendChangeFeedCleanerManifestEntry(
+	t *testing.T,
+	ctx context.Context,
+	manifestStore *manifest.Store,
+	epoch uint64,
+	index int,
+	createdAt time.Time,
+) *manifest.ManifestLogEntry {
+	t.Helper()
+	seq := uint64(index + 1)
+	change := manifest.ChangeBatchMeta{
+		ID:        fmt.Sprintf("change-%03d", index),
+		Path:      fmt.Sprintf("changes/change-%03d.batch", index),
+		Epoch:     epoch,
+		SeqLo:     seq,
+		SeqHi:     seq,
+		Count:     1,
+		Size:      128,
+		RawSize:   256,
+		Checksum:  "sha256:test",
+		CreatedAt: createdAt,
+	}
+	entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx, manifest.SSTMeta{
+		ID:        fmt.Sprintf("sst-%03d", index),
+		Epoch:     epoch,
+		SeqLo:     seq,
+		SeqHi:     seq,
+		CreatedAt: createdAt,
+	}, &change)
+	if err != nil {
+		t.Fatalf("append entry %d: %v", index, err)
+	}
+	return entry
 }
