@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
@@ -149,6 +152,20 @@ func TestDecodeChangeBatchRejectsCorruptBlock(t *testing.T) {
 
 	if _, err := decodeChangeBatch(data); err == nil {
 		t.Fatal("expected corrupt block decode error")
+	}
+}
+
+func TestChangeBatchDecoderRejectsOutputBeyondDeclaredRawSize(t *testing.T) {
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		t.Fatalf("new zstd encoder: %v", err)
+	}
+	defer encoder.Close()
+
+	compressed := encoder.EncodeAll(make([]byte, 2<<20), nil)
+	_, err = decompressChangeBatchBlock(compressed, 1<<10)
+	if !errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+		t.Fatalf("decode error=%v want=%v", err, zstd.ErrDecoderSizeExceeded)
 	}
 }
 
