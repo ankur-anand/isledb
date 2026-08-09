@@ -21,7 +21,7 @@ func writeLogEntry(t *testing.T, ctx context.Context, backend *BlobStoreBackend,
 	commitEntriesForTest(t, ctx, backend, []*ManifestLogEntry{entry})
 }
 
-func writeSnapshot(t *testing.T, ctx context.Context, backend *BlobStoreBackend, id string, snap *Manifest) string {
+func writeSnapshot(t *testing.T, ctx context.Context, backend *BlobStoreBackend, id string, snap *Manifest) *ObjectRef {
 	t.Helper()
 	data, err := EncodeSnapshot(snap)
 	if err != nil {
@@ -31,7 +31,11 @@ func writeSnapshot(t *testing.T, ctx context.Context, backend *BlobStoreBackend,
 	if err != nil {
 		t.Fatalf("write snapshot: %v", err)
 	}
-	return path
+	ref, err := newManifestObjectRef(path, data, manifestObjectKindSnapshot, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("snapshot ref: %v", err)
+	}
+	return &ref
 }
 
 func TestReplay_Snapshot_FenceClaimInWindow_PreservesEarlierEpochs(t *testing.T) {
@@ -45,6 +49,7 @@ func TestReplay_Snapshot_FenceClaimInWindow_PreservesEarlierEpochs(t *testing.T)
 	snap := &Manifest{
 		Version:   2,
 		NextEpoch: 2,
+		LogSeq:    9,
 		L0SSTs: []SSTMeta{{
 			ID:    "snap.sst",
 			Epoch: 1,
@@ -141,6 +146,7 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 	snap := &Manifest{
 		Version:   2,
 		NextEpoch: 3,
+		LogSeq:    19,
 		L0SSTs: []SSTMeta{{
 			ID:    "snap-base.sst",
 			Epoch: 1,

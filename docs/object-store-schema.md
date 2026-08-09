@@ -9,12 +9,12 @@ demo/p000/
   manifest/
     CURRENT
     snapshots/
-      <id>.manifest
+      <id>.manifest.zst
     pages/
       l00/
-        <page-id>.json
+        <page-id>.page.zst
       l01/
-        <page-id>.json
+        <page-id>.page.zst
     gc/
       pending-sst/
         pending.json
@@ -31,8 +31,11 @@ demo/p000/
 
 ## Serialization Notes
 
-- `manifest/CURRENT`, `maintenance/HEAD`, `manifest/snapshots/*.manifest`,
-  `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
+- `manifest/CURRENT`, `maintenance/HEAD`, and `manifest/gc/*.json` are UTF-8 JSON.
+- `manifest/snapshots/*.manifest.zst` and `manifest/pages/**/*.page.zst` use the
+  versioned `ISLM` binary envelope. Their payload is UTF-8 JSON compressed with
+  zstd. References carry the exact encoded size and SHA-256 of the complete
+  stored envelope; its header carries the bounded raw size.
 - `sstable/*` and `changes/*` are binary objects, not JSON.
 - `changes/*` stores mutation batches opened by the public `ChangeReader`.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
@@ -41,6 +44,20 @@ demo/p000/
 - Top-level manifest fields use explicit `snake_case` JSON tags.
 - Manifest fields use explicit `snake_case` JSON tags. `Level` uses explicit
   `number` and `ssts` fields.
+
+The fixed 16-byte `ISLM` envelope is:
+
+| Offset | Bytes | Field |
+| --- | ---: | --- |
+| 0 | 4 | Magic `ISLM` |
+| 4 | 1 | Envelope version (`1`) |
+| 5 | 1 | Object kind (`1` snapshot, `2` page) |
+| 6 | 1 | Codec (`1` zstd) |
+| 7 | 1 | Reserved flags (`0`) |
+| 8 | 8 | Uncompressed JSON length, unsigned big-endian |
+
+Readers verify the reference's encoded size and SHA-256 before decompressing,
+then enforce the declared raw length as the decoder's output limit.
 
 ## Directory View
 
@@ -52,14 +69,14 @@ This is a representative JSON-style view of the object families under one prefix
     "manifest": {
       "CURRENT": "{...json...}",
       "snapshots": {
-        "<id>.manifest": "{...json...}"
+        "<id>.manifest.zst": "<ISLM envelope + zstd JSON>"
       },
       "pages": {
         "l00": {
-          "<page-id>.json": "{...json...}"
+          "<page-id>.page.zst": "<ISLM envelope + zstd JSON>"
         },
         "l01": {
-          "<page-id>.json": "{...json...}"
+          "<page-id>.page.zst": "<ISLM envelope + zstd JSON>"
         }
       },
       "gc": {
@@ -105,9 +122,14 @@ Example:
 
 ```json
 {
-  "layout_version": 1,
-  "format": "isledb-manifest-v1",
-  "snapshot": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest",
+  "layout_version": 2,
+  "format": "isledb-manifest-v2",
+  "snapshot": {
+    "path": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest.zst",
+    "encoded_bytes": 65168,
+    "checksum": "sha256:abc",
+    "created_at": "2026-04-15T10:14:11Z"
+  },
   "log_seq_start": 412,
   "change_feed_enabled": true,
   "change_feed_payload": "full_values",
@@ -119,8 +141,9 @@ Example:
       "level": 0,
       "seq_lo": 412,
       "seq_hi": 419,
-      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.json",
+      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.page.zst",
       "count": 8,
+      "encoded_bytes": 6350,
       "checksum": "sha256:abc",
       "created_at": "2026-04-15T10:14:11Z"
     }
@@ -193,7 +216,7 @@ polls it on the flush path. It contains at most one pending command.
 
 ```json
 {
-  "layout_version": 1,
+  "layout_version": 2,
   "epoch": 7,
   "owner_id": "maintenance-p000",
   "claimed_at": "2026-04-15T10:13:11Z",
@@ -220,21 +243,21 @@ Readers never fetch this object. See
 [Maintenance Publication](maintenance-publication.md) for ownership and crash
 recovery.
 
-## `manifest/snapshots/<id>.manifest`
+## `manifest/snapshots/<id>.manifest.zst`
 
 Optional full manifest snapshot describing the complete visible SST topology at a point in time.
 
 Path:
 
 ```text
-demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest
+demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest.zst
 ```
 
-Example:
+Decompressed JSON payload example:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "next_epoch": 19,
   "log_seq": 411,
   "writer_fence": {
@@ -297,7 +320,7 @@ Notes:
 - `MinKey` and `MaxKey` are raw key bytes encoded as base64 in JSON.
 - If your workload uses monotonic 8-byte big-endian keys, those bytes can be decoded into numeric positions or offsets.
 
-## `manifest/pages/l<level>/<id>.json`
+## `manifest/pages/l<level>/<id>.page.zst`
 
 Immutable committed manifest pages. A page is visible only when
 `manifest/CURRENT` references it through `index_frontier`. Candidate pages left
@@ -314,15 +337,15 @@ directly in `CURRENT`.
 Path:
 
 ```text
-demo/p000/manifest/pages/l00/412-419-2YBx.json
-demo/p000/manifest/pages/l01/412-1435-7Kq9.json
+demo/p000/manifest/pages/l00/412-419-2YBx.page.zst
+demo/p000/manifest/pages/l01/412-1435-7Kq9.page.zst
 ```
 
-Level 0 page example:
+Decompressed level 0 page example:
 
 ```json
 {
-  "layout_version": 1,
+  "layout_version": 2,
   "page_type": "commit_l00",
   "level": 0,
   "seq_lo": 412,
@@ -346,7 +369,7 @@ Index page example:
 
 ```json
 {
-  "layout_version": 1,
+  "layout_version": 2,
   "page_type": "commit_index",
   "level": 1,
   "seq_lo": 412,
@@ -357,8 +380,9 @@ Index page example:
       "level": 0,
       "seq_lo": 412,
       "seq_hi": 419,
-      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.json",
+      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.page.zst",
       "count": 8,
+      "encoded_bytes": 6350,
       "checksum": "sha256:abc",
       "created_at": "2026-04-15T10:14:11Z"
     }

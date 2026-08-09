@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -119,7 +120,8 @@ func TestManifestSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCurrentRoundTrip(t *testing.T) {
-	c := &Current{LayoutVersion: 1, Format: "paged-v1", NextSeq: 8, NextEpoch: 2, RetirementLogStart: 3}
+	c := &Current{LayoutVersion: LayoutVersion, Format: CurrentFormat, NextSeq: 8, NextEpoch: 2, RetirementLogStart: 3}
+	normalizeCurrent(c)
 	body, err := EncodeCurrent(c)
 	if err != nil {
 		t.Fatal(err)
@@ -130,5 +132,12 @@ func TestCurrentRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, c) {
 		t.Fatalf("round trip\n got=%+v\nwant=%+v", got, c)
+	}
+}
+
+func TestDecodeCurrentRejectsOldLayout(t *testing.T) {
+	body := []byte(`{"layout_version":1,"format":"isledb-manifest-v1","next_seq":1,"next_epoch":1}`)
+	if _, err := DecodeCurrent(body); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("DecodeCurrent error=%v, want %v", err, ErrInvalidManifest)
 	}
 }

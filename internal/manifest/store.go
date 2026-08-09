@@ -53,7 +53,7 @@ type replayCache struct {
 
 	// snapshot and logSeqStart identify the base; if either changes we
 	// must fall back to a full replay.
-	snapshot    string
+	snapshot    *ObjectRef
 	logSeqStart uint64
 
 	// nextSeq is the CURRENT.NextSeq at the time of the last replay.
@@ -985,22 +985,21 @@ func (s *Store) writeCommitPage(ctx context.Context, page *CommitPage) (PageRef,
 	if err != nil {
 		return PageRef{}, err
 	}
-	sum := sha256.Sum256(data)
-	checksum := fmt.Sprintf("sha256:%x", sum[:])
 	id := fmt.Sprintf("%020d-%020d-%s", page.SeqLo, page.SeqHi, ksuid.New().String())
 	path, err := pages.WritePage(ctx, page.Level, id, data)
 	if err != nil {
 		return PageRef{}, err
 	}
+	objectRef, err := newManifestObjectRef(path, data, manifestObjectKindPage, page.CreatedAt)
+	if err != nil {
+		return PageRef{}, err
+	}
 	return PageRef{
-		Level:        page.Level,
-		SeqLo:        page.SeqLo,
-		SeqHi:        page.SeqHi,
-		Path:         path,
-		Count:        page.Count,
-		EncodedBytes: uint64(len(data)),
-		Checksum:     checksum,
-		CreatedAt:    page.CreatedAt,
+		ObjectRef: objectRef,
+		Level:     page.Level,
+		SeqLo:     page.SeqLo,
+		SeqHi:     page.SeqHi,
+		Count:     page.Count,
 	}, nil
 }
 
@@ -1042,7 +1041,7 @@ func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Ma
 	}
 
 	// If the snapshot or log window base changed, we must do a full replay.
-	if current.Snapshot != rc.snapshot || current.LogSeqStart != rc.logSeqStart {
+	if !objectRefsEqual(current.Snapshot, rc.snapshot) || current.LogSeqStart != rc.logSeqStart {
 		return nil, false
 	}
 
@@ -1132,7 +1131,7 @@ func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Ma
 	// Update the cache with the new state.
 	s.rcache = &replayCache{
 		manifest:             m.Clone(),
-		snapshot:             current.Snapshot,
+		snapshot:             current.Snapshot.Clone(),
 		logSeqStart:          current.LogSeqStart,
 		nextSeq:              current.NextSeq,
 		activeWriterEpoch:    activeWriterEpoch,
@@ -1151,22 +1150,32 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 	var m *Manifest
 	var err error
 
-	if current != nil && current.Snapshot != "" {
-		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot)
+	if current != nil && current.Snapshot != nil {
+		if err := validateManifestObjectRef(*current.Snapshot, manifestObjectKindSnapshot); err != nil {
+			return nil, err
+		}
+		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot.Path)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
-				return nil, fmt.Errorf("read snapshot %q: %w", current.Snapshot, err)
+				return nil, fmt.Errorf("read snapshot %q: %w", current.Snapshot.Path, err)
 			}
 			return nil, err
 		}
 		if len(data) > 0 {
+			if err := verifyManifestObjectRef(data, *current.Snapshot, manifestObjectKindSnapshot); err != nil {
+				return nil, err
+			}
 			snap, err := DecodeSnapshot(data)
 			if err != nil {
 				return nil, err
 			}
+			if current.LogSeqStart > 0 && snap.LogSeq != current.LogSeqStart-1 {
+				return nil, fmt.Errorf("%w: snapshot log_seq=%d want=%d path=%q",
+					ErrInvalidManifest, snap.LogSeq, current.LogSeqStart-1, current.Snapshot.Path)
+			}
 			m = snap
 		} else {
-			return nil, fmt.Errorf("snapshot %q is empty", current.Snapshot)
+			return nil, fmt.Errorf("snapshot %q is empty", current.Snapshot.Path)
 		}
 	}
 	if m == nil {
@@ -1280,7 +1289,7 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 	if current != nil {
 		s.rcache = &replayCache{
 			manifest:             m.Clone(),
-			snapshot:             current.Snapshot,
+			snapshot:             current.Snapshot.Clone(),
 			logSeqStart:          current.LogSeqStart,
 			nextSeq:              current.NextSeq,
 			activeWriterEpoch:    activeWriterEpoch,
@@ -1529,36 +1538,17 @@ func (s *Store) ReadRetirementEntries(ctx context.Context, start uint64, limit i
 	return entries, current.NextSeq, nil
 }
 
-func (s *Store) WriteSnapshot(ctx context.Context, m *Manifest) (string, error) {
-	return s.writeSnapshot(ctx, m, nil)
-}
-
-// WriteCheckpoint publishes a snapshot under the current compactor fence.
-func (s *Store) WriteCheckpoint(ctx context.Context, m *Manifest, token *FenceToken) (string, error) {
-	if token == nil {
-		return "", ErrFenced
+func (s *Store) writeSnapshotObject(ctx context.Context, m *Manifest) (ObjectRef, error) {
+	data, err := EncodeSnapshot(m)
+	if err != nil {
+		return ObjectRef{}, err
 	}
-	return s.writeSnapshot(ctx, m, token)
-}
-
-// CheckpointResult describes one snapshot publication and any newer manifest
-// pages that remain to be replayed after it.
-type CheckpointResult struct {
-	Path                 string
-	SnapshotNextSeq      uint64
-	HeadNextSeq          uint64
-	FoldedReplayPages    uint64
-	FoldedReplayBytes    uint64
-	RemainingReplayPages uint64
-	RemainingReplayBytes uint64
-}
-
-type checkpointBase struct {
-	snapshot         string
-	logSeqStart      uint64
-	nextSeq          uint64
-	stateReplayPages uint64
-	stateReplayBytes uint64
+	createdAt := time.Now().UTC()
+	path, err := s.storage.WriteSnapshot(ctx, ksuid.New().String(), data)
+	if err != nil {
+		return ObjectRef{}, err
+	}
+	return newManifestObjectRef(path, data, manifestObjectKindSnapshot, createdAt)
 }
 
 // PrepareCheckpoint writes an immutable snapshot candidate and returns the
@@ -1585,233 +1575,18 @@ func (s *Store) PrepareCheckpoint(ctx context.Context) (CheckpointCommand, error
 		state.LogSeq = current.NextSeq - 1
 	}
 
-	body, err := EncodeSnapshot(state)
-	if err != nil {
-		return CheckpointCommand{}, err
-	}
-	path, err := s.storage.WriteSnapshot(ctx, ksuid.New().String(), body)
+	snapshot, err := s.writeSnapshotObject(ctx, state)
 	if err != nil {
 		return CheckpointCommand{}, err
 	}
 	return CheckpointCommand{
-		Snapshot:          path,
-		BaseSnapshot:      current.Snapshot,
+		Snapshot:          snapshot,
+		BaseSnapshot:      current.Snapshot.Clone(),
 		BaseLogSeqStart:   current.LogSeqStart,
 		SnapshotNextSeq:   current.NextSeq,
 		FoldedReplayPages: current.StateReplayPages,
 		FoldedReplayBytes: current.StateReplayBytes,
 	}, nil
-}
-
-// CreateCheckpoint snapshots a stable manifest sequence and publishes it while
-// preserving writer entries and pages committed during the snapshot upload.
-func (s *Store) CreateCheckpoint(ctx context.Context, token *FenceToken) (CheckpointResult, error) {
-	if token == nil {
-		return CheckpointResult{}, ErrFenced
-	}
-	current, _, err := s.readCurrentWithETag(ctx)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	if current == nil {
-		return CheckpointResult{}, ErrFenced
-	}
-	if err := checkFenceToken(token, current.CompactorFence); err != nil {
-		return CheckpointResult{}, err
-	}
-
-	state, err := s.fullReplay(ctx, current)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	if err := state.ValidateLevels(); err != nil {
-		return CheckpointResult{}, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
-	}
-	state.WriterFence = current.WriterFence.Clone()
-	state.CompactorFence = current.CompactorFence.Clone()
-	if current.NextSeq > 0 {
-		state.LogSeq = current.NextSeq - 1
-	}
-
-	body, err := EncodeSnapshot(state)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	path, err := s.storage.WriteSnapshot(ctx, ksuid.New().String(), body)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-
-	base := checkpointBase{
-		snapshot:         current.Snapshot,
-		logSeqStart:      current.LogSeqStart,
-		nextSeq:          current.NextSeq,
-		stateReplayPages: current.StateReplayPages,
-		stateReplayBytes: current.StateReplayBytes,
-	}
-	return s.publishCheckpoint(ctx, path, base, token)
-}
-
-func (s *Store) publishCheckpoint(ctx context.Context, path string, base checkpointBase, token *FenceToken) (CheckpointResult, error) {
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-
-	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
-		current, etag, err := s.readCurrentWithETag(ctx)
-		if err != nil {
-			return CheckpointResult{}, err
-		}
-		if current == nil {
-			return CheckpointResult{}, ErrFenced
-		}
-		if err := checkFenceToken(token, current.CompactorFence); err != nil {
-			return CheckpointResult{}, err
-		}
-		if current.Snapshot != base.snapshot || current.LogSeqStart != base.logSeqStart {
-			return CheckpointResult{}, ErrFenceConflict
-		}
-		if current.NextSeq < base.nextSeq ||
-			current.StateReplayPages < base.stateReplayPages ||
-			current.StateReplayBytes < base.stateReplayBytes {
-			return CheckpointResult{}, fmt.Errorf("%w: checkpoint base is ahead of CURRENT", ErrInvalidManifest)
-		}
-
-		updated := current.Clone()
-		oldLogSeqStart := updated.LogSeqStart
-		if !updated.ChangeFeedEnabled && updated.ChangeFeedLogStart == oldLogSeqStart {
-			updated.ChangeFeedLogStart = base.nextSeq
-		}
-		updated.Snapshot = path
-		updated.LogSeqStart = base.nextSeq
-		updated.StateReplayPages -= base.stateReplayPages
-		updated.StateReplayBytes -= base.stateReplayBytes
-		retainedFrom := retainedEntryFloor(updated)
-		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, retainedFrom)
-		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, retainedFrom)
-
-		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
-			if errors.Is(err, ErrPreconditionFailed) {
-				if attempt+1 < currentCASMaxRetries {
-					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
-						return CheckpointResult{}, err
-					}
-				}
-				continue
-			}
-			return CheckpointResult{}, err
-		}
-
-		s.mu.Lock()
-		if s.nextSeq < updated.NextSeq {
-			s.nextSeq = updated.NextSeq
-		}
-		s.mu.Unlock()
-		return CheckpointResult{
-			Path:                 path,
-			SnapshotNextSeq:      base.nextSeq,
-			HeadNextSeq:          updated.NextSeq,
-			FoldedReplayPages:    base.stateReplayPages,
-			FoldedReplayBytes:    base.stateReplayBytes,
-			RemainingReplayPages: updated.StateReplayPages,
-			RemainingReplayBytes: updated.StateReplayBytes,
-		}, nil
-	}
-
-	return CheckpointResult{}, ErrFenceConflict
-}
-
-func (s *Store) writeSnapshot(ctx context.Context, m *Manifest, token *FenceToken) (string, error) {
-	if m == nil {
-		return "", errors.New("nil manifest")
-	}
-
-	current, etag, err := s.readCurrentWithETag(ctx)
-	if err != nil {
-		return "", err
-	}
-	if token != nil {
-		if current == nil {
-			return "", ErrFenced
-		}
-		if err := checkFenceToken(token, current.CompactorFence); err != nil {
-			return "", err
-		}
-	}
-
-	manifestNextSeq := m.LogSeq + 1
-	if m.LogSeq == 0 &&
-		len(m.L0SSTs) == 0 &&
-		len(m.Levels) == 0 &&
-		m.WriterFence == nil &&
-		m.CompactorFence == nil &&
-		m.NextEpoch <= 1 {
-		manifestNextSeq = 0
-	}
-	if m.LogSeq == math.MaxUint64 {
-		return "", fmt.Errorf("%w: snapshot log sequence overflow", ErrInvalidManifest)
-	}
-	nextSeq := currentNextSeq(current)
-	if manifestNextSeq != nextSeq {
-		return "", fmt.Errorf("%w: snapshot next_seq=%d current next_seq=%d",
-			ErrPreconditionFailed, manifestNextSeq, nextSeq)
-	}
-
-	snap := m.Clone()
-	if nextSeq > 0 {
-		snap.LogSeq = nextSeq - 1
-	}
-
-	data, err := EncodeSnapshot(snap)
-	if err != nil {
-		return "", err
-	}
-
-	id := ksuid.New().String()
-	path, err := s.storage.WriteSnapshot(ctx, id, data)
-	if err != nil {
-		return "", err
-	}
-
-	// Snapshot upload is immutable and may overlap normal commits. Serialize
-	// only the visibility CAS; a concurrent commit makes this candidate stale
-	// and the caller can retry from a fresh manifest.
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-	if token != nil {
-		if err := checkFenceToken(token, current.CompactorFence); err != nil {
-			return "", err
-		}
-	}
-
-	if current == nil {
-		current = &Current{NextEpoch: m.NextEpoch}
-	}
-	normalizeCurrent(current)
-	oldLogSeqStart := current.LogSeqStart
-	if !current.ChangeFeedEnabled && current.ChangeFeedLogStart == oldLogSeqStart {
-		current.ChangeFeedLogStart = nextSeq
-	}
-	current.Snapshot = path
-	current.LogSeqStart = nextSeq
-	current.StateReplayPages = 0
-	current.StateReplayBytes = 0
-	retainedFrom := retainedEntryFloor(current)
-	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, retainedFrom)
-	current.IndexFrontier = filterPageRefsAtOrAfter(current.IndexFrontier, retainedFrom)
-	if current.NextEpoch < m.NextEpoch {
-		current.NextEpoch = m.NextEpoch
-	}
-	current.NextSeq = nextSeq
-
-	if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
-		return "", err
-	}
-	s.mu.Lock()
-	if s.nextSeq < nextSeq {
-		s.nextSeq = nextSeq
-	}
-	s.mu.Unlock()
-	return path, nil
 }
 
 func filterEntriesAtOrAfter(entries []ManifestLogEntry, floor uint64) []ManifestLogEntry {
@@ -1925,16 +1700,15 @@ func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end 
 	if !ok {
 		return nil, errors.New("manifest page storage unsupported")
 	}
+	if err := validatePageRef(ref); err != nil {
+		return nil, err
+	}
 	data, err := pages.ReadPage(ctx, ref.Path)
 	if err != nil {
 		return nil, err
 	}
-	if ref.Checksum != "" {
-		sum := sha256.Sum256(data)
-		checksum := fmt.Sprintf("sha256:%x", sum[:])
-		if checksum != ref.Checksum {
-			return nil, fmt.Errorf("manifest page checksum mismatch path=%q", ref.Path)
-		}
+	if err := verifyManifestObjectRef(data, ref.ObjectRef, manifestObjectKindPage); err != nil {
+		return nil, err
 	}
 	page, err := DecodeCommitPage(data)
 	if err != nil {
@@ -1977,6 +1751,12 @@ func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end 
 func validateCommitPage(page *CommitPage, path string) error {
 	if page == nil {
 		return fmt.Errorf("manifest page is nil path=%q", path)
+	}
+	if page.LayoutVersion != LayoutVersion {
+		return fmt.Errorf("manifest page layout version mismatch path=%q version=%d", path, page.LayoutVersion)
+	}
+	if page.CreatedAt.IsZero() {
+		return fmt.Errorf("manifest page creation time is missing path=%q", path)
 	}
 	if page.SeqHi < page.SeqLo {
 		return fmt.Errorf("manifest page invalid range path=%q seq_lo=%d seq_hi=%d", path, page.SeqLo, page.SeqHi)
@@ -2026,6 +1806,9 @@ func validateCommitPage(page *CommitPage, path string) error {
 		}
 		expected := page.SeqLo
 		for _, child := range page.Children {
+			if err := validatePageRef(child); err != nil {
+				return err
+			}
 			if child.Level+1 != page.Level {
 				return fmt.Errorf("manifest index child level mismatch path=%q child_level=%d page_level=%d", path, child.Level, page.Level)
 			}
@@ -2299,6 +2082,10 @@ func nextEpochFromEntry(current uint64, entry *ManifestLogEntry) uint64 {
 	case LogOpCheckpoint:
 		if entry.Checkpoint != nil && entry.Checkpoint.NextEpoch > next {
 			next = entry.Checkpoint.NextEpoch
+		}
+	case LogOpFenceClaim:
+		if entry.Epoch >= next {
+			next = entry.Epoch + 1
 		}
 	}
 

@@ -44,7 +44,7 @@ func (c *Current) Clone() *Current {
 	clone := &Current{
 		LayoutVersion:      c.LayoutVersion,
 		Format:             c.Format,
-		Snapshot:           c.Snapshot,
+		Snapshot:           c.Snapshot.Clone(),
 		LogSeqStart:        c.LogSeqStart,
 		NextSeq:            c.NextSeq,
 		NextEpoch:          c.NextEpoch,

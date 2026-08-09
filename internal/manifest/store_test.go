@@ -94,6 +94,115 @@ func testManifestEntry(seq uint64) ManifestLogEntry {
 	}
 }
 
+func testObjectRef(path string) ObjectRef {
+	return ObjectRef{
+		Path:         path,
+		EncodedBytes: manifestObjectHeaderBytes + 1,
+		Checksum:     "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		CreatedAt:    time.Unix(1_700_000_000, 0).UTC(),
+	}
+}
+
+func testObjectRefPtr(path string) *ObjectRef {
+	ref := testObjectRef(path)
+	return &ref
+}
+
+func stageAndApplyCheckpointForTest(t *testing.T, ctx context.Context, store *Store, command CheckpointCommand) MaintenanceApplyResult {
+	t.Helper()
+	token, err := store.ClaimMaintenance(ctx, "maintenance-test")
+	if err != nil {
+		t.Fatalf("claim maintenance: %v", err)
+	}
+	staged, err := store.StageMaintenance(ctx, MaintenanceCommand{
+		ID:         ksuid.New().String(),
+		Kind:       MaintenanceCommandCheckpoint,
+		Checkpoint: &command,
+	}, token)
+	if err != nil {
+		t.Fatalf("stage checkpoint: %v", err)
+	}
+	result, err := store.ApplyPendingMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("apply checkpoint: %v", err)
+	}
+	if result.Status != MaintenanceStatusApplied || !result.Changed {
+		t.Fatalf("checkpoint result=%+v, want changed applied", result)
+	}
+	if _, err := store.ClearMaintenance(ctx, staged.Pending.ID, staged.Pending.Epoch, staged.Pending.Generation, token); err != nil {
+		t.Fatalf("clear checkpoint: %v", err)
+	}
+	return result
+}
+
+func prepareAndApplyCheckpointForTest(t *testing.T, ctx context.Context, store *Store) CheckpointCommand {
+	t.Helper()
+	command, err := store.PrepareCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("prepare checkpoint: %v", err)
+	}
+	stageAndApplyCheckpointForTest(t, ctx, store, command)
+	return command
+}
+
+// applyManifestCheckpointForTest is test setup for hand-built CURRENT values.
+// Production code creates the candidate with PrepareCheckpoint and still
+// publishes it only through maintenance/HEAD and the active writer CAS.
+func applyManifestCheckpointForTest(t *testing.T, ctx context.Context, store *Store, state *Manifest) CheckpointCommand {
+	t.Helper()
+	current, etag, err := store.readCurrentWithETag(ctx)
+	if err != nil {
+		t.Fatalf("read CURRENT for checkpoint: %v", err)
+	}
+	if current == nil {
+		t.Fatal("checkpoint test requires CURRENT")
+	}
+	if current.WriterFence == nil {
+		now := time.Now().UTC()
+		current.WriterFence = &FenceToken{Epoch: current.NextEpoch, Owner: "writer-test", ClaimedAt: now}
+		if current.WriterFence.Epoch == 0 {
+			current.WriterFence.Epoch = 1
+		}
+		if current.NextEpoch <= current.WriterFence.Epoch {
+			current.NextEpoch = current.WriterFence.Epoch + 1
+		}
+		if err := store.writeCurrentWithCAS(ctx, current, etag); err != nil {
+			t.Fatalf("install test writer fence: %v", err)
+		}
+	}
+	store.mu.Lock()
+	store.writerFence = current.WriterFence.Clone()
+	store.mu.Unlock()
+
+	snapshot := state.Clone()
+	if snapshot == nil {
+		t.Fatal("nil checkpoint state")
+	}
+	snapshot.Version = 2
+	if snapshot.NextEpoch < current.NextEpoch {
+		snapshot.NextEpoch = current.NextEpoch
+	}
+	snapshot.WriterFence = current.WriterFence.Clone()
+	snapshot.CompactorFence = current.CompactorFence.Clone()
+	if current.NextSeq > 0 {
+		snapshot.LogSeq = current.NextSeq - 1
+	}
+	ref, err := store.writeSnapshotObject(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("write checkpoint candidate: %v", err)
+	}
+	command := CheckpointCommand{
+		Snapshot:          ref,
+		BaseSnapshot:      current.Snapshot.Clone(),
+		BaseLogSeqStart:   current.LogSeqStart,
+		SnapshotNextSeq:   current.NextSeq,
+		FoldedReplayPages: current.StateReplayPages,
+		FoldedReplayBytes: current.StateReplayBytes,
+	}
+	stageAndApplyCheckpointForTest(t, ctx, store, command)
+	return command
+}
+
 func TestAppendWithWriterFence_FencedOut(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
@@ -790,7 +899,7 @@ func TestReplay_SurvivesTransientCurrentCASConflictWithoutSequenceGap(t *testing
 	}
 }
 
-func TestWriteSnapshot_DoesNotRegressCurrentNextSeqOnFreshStore(t *testing.T) {
+func TestCheckpointDoesNotRegressCurrentNextSeq(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -825,15 +934,7 @@ func TestWriteSnapshot_DoesNotRegressCurrentNextSeqOnFreshStore(t *testing.T) {
 		t.Fatalf("decode current before snapshot: %v", err)
 	}
 
-	m, err := ms1.Replay(ctx)
-	if err != nil {
-		t.Fatalf("replay before snapshot: %v", err)
-	}
-
-	ms2 := NewStoreWithStorage(backend)
-	if _, err := ms2.WriteSnapshot(ctx, m); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	prepareAndApplyCheckpointForTest(t, ctx, ms1)
 
 	afterData, _, err := backend.ReadCurrent(ctx)
 	if err != nil {
@@ -887,7 +988,7 @@ func TestReadEntry_HonorsChangeFeedLogStart(t *testing.T) {
 	}
 }
 
-func TestWriteSnapshot_PrunesRefsBelowChangeFeedFloor(t *testing.T) {
+func TestCheckpointPrunesRefsBelowChangeFeedFloor(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -905,15 +1006,13 @@ func TestWriteSnapshot_PrunesRefsBelowChangeFeedFloor(t *testing.T) {
 			testManifestEntry(3),
 		},
 		IndexFrontier: []PageRef{
-			{Level: 0, SeqLo: 0, SeqHi: 1, Path: "pages/l00/old"},
-			{Level: 0, SeqLo: 2, SeqHi: 3, Path: "pages/l00/kept"},
+			{ObjectRef: testObjectRef("pages/l00/old"), Level: 0, SeqLo: 0, SeqHi: 1, Count: 2},
+			{ObjectRef: testObjectRef("pages/l00/kept"), Level: 0, SeqLo: 2, SeqHi: 3, Count: 2},
 		},
 	})
 
 	ms := NewStoreWithStorage(backend)
-	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 3}); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	applyManifestCheckpointForTest(t, ctx, ms, &Manifest{NextEpoch: 1, LogSeq: 3})
 	current, err := ms.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("read current: %v", err)
@@ -935,7 +1034,7 @@ func TestWriteSnapshot_PrunesRefsBelowChangeFeedFloor(t *testing.T) {
 	}
 }
 
-func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
+func TestCheckpointAdvancesDefaultChangeFeedFloor(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -954,9 +1053,7 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	})
 
 	ms := NewStoreWithStorage(backend)
-	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	applyManifestCheckpointForTest(t, ctx, ms, &Manifest{NextEpoch: 1, LogSeq: 1})
 	current, err := ms.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("read current: %v", err)
@@ -969,7 +1066,7 @@ func TestWriteSnapshot_AdvancesDefaultChangeFeedFloor(t *testing.T) {
 	}
 }
 
-func TestWriteSnapshotPreservesEnabledChangeFeedFloor(t *testing.T) {
+func TestCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("change-feed-checkpoint")
 	defer store.Close()
@@ -990,9 +1087,7 @@ func TestWriteSnapshotPreservesEnabledChangeFeedFloor(t *testing.T) {
 	})
 
 	ms := NewStoreWithStorage(backend)
-	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	applyManifestCheckpointForTest(t, ctx, ms, &Manifest{NextEpoch: 1, LogSeq: 1})
 	current, err := ms.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("read current: %v", err)
@@ -1005,7 +1100,7 @@ func TestWriteSnapshotPreservesEnabledChangeFeedFloor(t *testing.T) {
 	}
 }
 
-func TestWriteSnapshotKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
+func TestCheckpointKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -1024,9 +1119,7 @@ func TestWriteSnapshotKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
 	})
 
 	ms := NewStoreWithStorage(backend)
-	if _, err := ms.WriteSnapshot(ctx, &Manifest{NextEpoch: 1, LogSeq: 1}); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	applyManifestCheckpointForTest(t, ctx, ms, &Manifest{NextEpoch: 1, LogSeq: 1})
 	current, err := ms.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("read current: %v", err)
@@ -1055,8 +1148,8 @@ func TestAdvanceChangeFeedLogStartKeepsRefsNeededForStateReplay(t *testing.T) {
 			testManifestEntry(3),
 		},
 		IndexFrontier: []PageRef{
-			{Level: 0, SeqLo: 0, SeqHi: 1, Path: "pages/l00/old"},
-			{Level: 0, SeqLo: 2, SeqHi: 3, Path: "pages/l00/kept"},
+			{ObjectRef: testObjectRef("pages/l00/old"), Level: 0, SeqLo: 0, SeqHi: 1, Count: 2},
+			{ObjectRef: testObjectRef("pages/l00/kept"), Level: 0, SeqLo: 2, SeqHi: 3, Count: 2},
 		},
 	})
 
@@ -1125,14 +1218,8 @@ func TestReplay_ErrsWhenCurrentSnapshotIsMissing(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	m, err := ms.Replay(ctx)
-	if err != nil {
-		t.Fatalf("replay before snapshot: %v", err)
-	}
-	snapPath, err := ms.WriteSnapshot(ctx, m)
-	if err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	command := prepareAndApplyCheckpointForTest(t, ctx, ms)
+	snapPath := command.Snapshot.Path
 
 	if err := store.Delete(ctx, snapPath); err != nil {
 		t.Fatalf("delete snapshot: %v", err)
@@ -1144,7 +1231,7 @@ func TestReplay_ErrsWhenCurrentSnapshotIsMissing(t *testing.T) {
 	}
 }
 
-func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T) {
+func TestCheckpointDuringConcurrentAppendsNoSeqRegressionOrLostSSTs(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -1177,15 +1264,12 @@ func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T
 		appendSST(fmt.Sprintf("base-%02d.sst", i), 1)
 	}
 
-	manifestBeforeSnapshot, err := ms.Replay(ctx)
-	if err != nil {
-		t.Fatalf("replay before snapshot: %v", err)
-	}
-
-	snapshotErrCh := make(chan error, 1)
+	checkpointCh := make(chan CheckpointCommand, 1)
+	checkpointErrCh := make(chan error, 1)
 	go func() {
-		_, err := ms.WriteSnapshot(ctx, manifestBeforeSnapshot)
-		snapshotErrCh <- err
+		command, err := ms.PrepareCheckpoint(ctx)
+		checkpointCh <- command
+		checkpointErrCh <- err
 	}()
 
 	<-blocking.started
@@ -1204,18 +1288,11 @@ func TestSnapshotDuringConcurrentAppends_NoSeqRegression_NoLostSSTs(t *testing.T
 	}
 
 	close(blocking.block)
-	firstSnapshotErr := <-snapshotErrCh
-	if !errors.Is(firstSnapshotErr, ErrPreconditionFailed) {
-		t.Fatalf("expected first snapshot attempt to fail with CAS conflict, got: %v", firstSnapshotErr)
+	command := <-checkpointCh
+	if err := <-checkpointErrCh; err != nil {
+		t.Fatalf("prepare checkpoint: %v", err)
 	}
-
-	latestManifest, err := ms.Replay(ctx)
-	if err != nil {
-		t.Fatalf("replay before snapshot retry: %v", err)
-	}
-	if _, err := ms.WriteSnapshot(ctx, latestManifest); err != nil {
-		t.Fatalf("snapshot retry: %v", err)
-	}
+	stageAndApplyCheckpointForTest(t, ctx, ms, command)
 
 	for i := 0; i < 10; i++ {
 		appendSST(fmt.Sprintf("after-%02d.sst", i), 1)
@@ -1500,8 +1577,11 @@ func TestReplay_DetectsCommittedPageShapeMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode page: %v", err)
 	}
-	sum := sha256.Sum256(pageData)
-	current.IndexFrontier[0].Checksum = fmt.Sprintf("sha256:%x", sum[:])
+	tamperedRef, err := newManifestObjectRef(ref.Path, pageData, manifestObjectKindPage, ref.CreatedAt)
+	if err != nil {
+		t.Fatalf("create tampered page ref: %v", err)
+	}
+	current.IndexFrontier[0].ObjectRef = tamperedRef
 	currentData, err := EncodeCurrent(current)
 	if err != nil {
 		t.Fatalf("encode current: %v", err)
@@ -1693,8 +1773,15 @@ func TestStorePagesEntryLargerThanCurrentLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read oversized entry page: %v", err)
 	}
-	if got := len(pageData); got <= ms.currentByteLimit() {
-		t.Fatalf("page bytes=%d, want greater than CURRENT limit=%d", got, ms.currentByteLimit())
+	rawBytes, err := manifestObjectRawBytes(pageData, manifestObjectKindPage, maxManifestPageRawBytes)
+	if err != nil {
+		t.Fatalf("read page envelope: %v", err)
+	}
+	if got := rawBytes; got <= uint64(ms.currentByteLimit()) {
+		t.Fatalf("page raw bytes=%d, want greater than CURRENT limit=%d", got, ms.currentByteLimit())
+	}
+	if got := uint64(len(pageData)); got != ref.EncodedBytes {
+		t.Fatalf("page encoded bytes=%d, want=%d", got, ref.EncodedBytes)
 	}
 	sum := sha256.Sum256(pageData)
 	if got, want := ref.Checksum, fmt.Sprintf("sha256:%x", sum[:]); got != want {

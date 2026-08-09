@@ -10,7 +10,7 @@ import (
 	"github.com/segmentio/ksuid"
 )
 
-const MaintenanceHeadLayoutVersion = 1
+const MaintenanceHeadLayoutVersion = 2
 
 const maxMaintenanceCommandIDBytes = 128
 
@@ -54,12 +54,12 @@ type MaintenanceCommand struct {
 }
 
 type CheckpointCommand struct {
-	Snapshot          string `json:"snapshot"`
-	BaseSnapshot      string `json:"base_snapshot,omitempty"`
-	BaseLogSeqStart   uint64 `json:"base_log_seq_start"`
-	SnapshotNextSeq   uint64 `json:"snapshot_next_seq"`
-	FoldedReplayPages uint64 `json:"folded_replay_pages"`
-	FoldedReplayBytes uint64 `json:"folded_replay_bytes"`
+	Snapshot          ObjectRef  `json:"snapshot"`
+	BaseSnapshot      *ObjectRef `json:"base_snapshot,omitempty"`
+	BaseLogSeqStart   uint64     `json:"base_log_seq_start"`
+	SnapshotNextSeq   uint64     `json:"snapshot_next_seq"`
+	FoldedReplayPages uint64     `json:"folded_replay_pages"`
+	FoldedReplayBytes uint64     `json:"folded_replay_bytes"`
 }
 
 type CompactionCommand struct {
@@ -157,8 +157,16 @@ func (c *MaintenanceCommand) Validate() error {
 	}
 	switch c.Kind {
 	case MaintenanceCommandCheckpoint:
-		if c.Checkpoint == nil || c.Checkpoint.Snapshot == "" {
+		if c.Checkpoint == nil {
 			return fmt.Errorf("%w: invalid checkpoint", ErrInvalidMaintenanceCommand)
+		}
+		if err := validateManifestObjectRef(c.Checkpoint.Snapshot, manifestObjectKindSnapshot); err != nil {
+			return fmt.Errorf("%w: invalid checkpoint snapshot: %v", ErrInvalidMaintenanceCommand, err)
+		}
+		if c.Checkpoint.BaseSnapshot != nil {
+			if err := validateManifestObjectRef(*c.Checkpoint.BaseSnapshot, manifestObjectKindSnapshot); err != nil {
+				return fmt.Errorf("%w: invalid checkpoint base snapshot: %v", ErrInvalidMaintenanceCommand, err)
+			}
 		}
 	case MaintenanceCommandCompaction:
 		if c.Compaction == nil {
@@ -325,6 +333,7 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
+	var checkpointVerification checkpointSnapshotVerification
 	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil {
@@ -344,7 +353,7 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 
 		updated := current.Clone()
 		status := MaintenanceStatusApplied
-		if err := s.applyMaintenanceCommand(ctx, updated, &command); err != nil {
+		if err := s.applyMaintenanceCommand(ctx, updated, &command, &checkpointVerification); err != nil {
 			if !errors.Is(err, ErrMaintenanceCommandRejected) {
 				return MaintenanceApplyResult{}, err
 			}
@@ -387,21 +396,51 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 	return MaintenanceApplyResult{}, ErrFenceConflict
 }
 
-func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, command *MaintenanceCommand) error {
+// checkpointSnapshotVerification caches a deterministic candidate validation
+// across CURRENT CAS retries. Immutable snapshot candidates never change at a
+// given path, so downloading and decoding one more than once would only add
+// work without changing the result.
+type checkpointSnapshotVerification struct {
+	done bool
+	err  error
+}
+
+func (s *Store) applyMaintenanceCommand(
+	ctx context.Context,
+	current *Current,
+	command *MaintenanceCommand,
+	verification *checkpointSnapshotVerification,
+) error {
 	switch command.Kind {
 	case MaintenanceCommandCheckpoint:
 		checkpoint := command.Checkpoint
-		if current.Snapshot != checkpoint.BaseSnapshot || current.LogSeqStart != checkpoint.BaseLogSeqStart ||
+		if !objectRefsEqual(current.Snapshot, checkpoint.BaseSnapshot) || current.LogSeqStart != checkpoint.BaseLogSeqStart ||
+			checkpoint.SnapshotNextSeq < current.LogSeqStart ||
 			current.NextSeq < checkpoint.SnapshotNextSeq ||
 			current.StateReplayPages < checkpoint.FoldedReplayPages ||
 			current.StateReplayBytes < checkpoint.FoldedReplayBytes {
 			return ErrMaintenanceCommandRejected
 		}
+		if verification == nil {
+			return fmt.Errorf("%w: checkpoint snapshot was not verified", ErrInvalidMaintenanceCommand)
+		}
+		if !verification.done {
+			verification.err = s.verifyCheckpointSnapshot(ctx, current, checkpoint)
+			// Missing, malformed, or corrupt immutable input is a permanent
+			// command rejection. Other storage failures remain retryable and
+			// must not be recorded as a durable rejection receipt.
+			if verification.err == nil || errors.Is(verification.err, ErrMaintenanceCommandRejected) {
+				verification.done = true
+			}
+		}
+		if verification.err != nil {
+			return verification.err
+		}
 		oldLogSeqStart := current.LogSeqStart
 		if !current.ChangeFeedEnabled && current.ChangeFeedLogStart == oldLogSeqStart {
 			current.ChangeFeedLogStart = checkpoint.SnapshotNextSeq
 		}
-		current.Snapshot = checkpoint.Snapshot
+		current.Snapshot = checkpoint.Snapshot.Clone()
 		current.LogSeqStart = checkpoint.SnapshotNextSeq
 		current.StateReplayPages -= checkpoint.FoldedReplayPages
 		current.StateReplayBytes -= checkpoint.FoldedReplayBytes
@@ -455,6 +494,67 @@ func (s *Store) applyMaintenanceCommand(ctx context.Context, current *Current, c
 	default:
 		return fmt.Errorf("%w: kind=%q", ErrInvalidMaintenanceCommand, command.Kind)
 	}
+}
+
+// verifyCheckpointSnapshot verifies every property on which publishing the
+// candidate depends before its ObjectRef can become visible through CURRENT.
+// The checksum covers the complete encoded envelope; DecodeSnapshot then
+// verifies the zstd envelope and bounded raw size before JSON decoding.
+func (s *Store) verifyCheckpointSnapshot(ctx context.Context, current *Current, checkpoint *CheckpointCommand) error {
+	data, err := s.storage.ReadSnapshot(ctx, checkpoint.Snapshot.Path)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("%w: checkpoint snapshot %q is missing", ErrMaintenanceCommandRejected, checkpoint.Snapshot.Path)
+		}
+		return fmt.Errorf("read checkpoint snapshot %q: %w", checkpoint.Snapshot.Path, err)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("%w: checkpoint snapshot %q is empty", ErrMaintenanceCommandRejected, checkpoint.Snapshot.Path)
+	}
+	if err := verifyManifestObjectRef(data, checkpoint.Snapshot, manifestObjectKindSnapshot); err != nil {
+		return fmt.Errorf("%w: checkpoint snapshot reference: %v", ErrMaintenanceCommandRejected, err)
+	}
+	snapshot, err := DecodeSnapshot(data)
+	if err != nil {
+		return fmt.Errorf("%w: decode checkpoint snapshot: %v", ErrMaintenanceCommandRejected, err)
+	}
+	if snapshot.Version != 2 {
+		return fmt.Errorf("%w: checkpoint snapshot version=%d want=2", ErrMaintenanceCommandRejected, snapshot.Version)
+	}
+	if snapshot.NextEpoch == 0 {
+		return fmt.Errorf("%w: checkpoint snapshot next_epoch is zero", ErrMaintenanceCommandRejected)
+	}
+	if snapshot.NextEpoch > current.NextEpoch {
+		return fmt.Errorf("%w: checkpoint snapshot next_epoch=%d exceeds CURRENT=%d",
+			ErrMaintenanceCommandRejected, snapshot.NextEpoch, current.NextEpoch)
+	}
+	if err := validateCheckpointSnapshotFence("writer", snapshot.WriterFence, snapshot.NextEpoch); err != nil {
+		return err
+	}
+	if err := validateCheckpointSnapshotFence("compactor", snapshot.CompactorFence, snapshot.NextEpoch); err != nil {
+		return err
+	}
+	if checkpoint.SnapshotNextSeq == 0 {
+		if snapshot.LogSeq != 0 || len(snapshot.L0SSTs) != 0 || len(snapshot.Levels) != 0 {
+			return fmt.Errorf("%w: non-empty checkpoint snapshot at next_seq=0", ErrMaintenanceCommandRejected)
+		}
+	} else if want := checkpoint.SnapshotNextSeq - 1; snapshot.LogSeq != want {
+		return fmt.Errorf("%w: checkpoint snapshot log_seq=%d want=%d", ErrMaintenanceCommandRejected, snapshot.LogSeq, want)
+	}
+	if err := snapshot.ValidateLevels(); err != nil {
+		return fmt.Errorf("%w: checkpoint snapshot topology: %v", ErrMaintenanceCommandRejected, err)
+	}
+	return nil
+}
+
+func validateCheckpointSnapshotFence(role string, fence *FenceToken, nextEpoch uint64) error {
+	if fence == nil {
+		return nil
+	}
+	if fence.Epoch == 0 || fence.Epoch >= nextEpoch || fence.Owner == "" || fence.ClaimedAt.IsZero() {
+		return fmt.Errorf("%w: invalid checkpoint snapshot %s fence", ErrMaintenanceCommandRejected, role)
+	}
+	return nil
 }
 
 func (s *Store) appendWriterOwnedMaintenanceEntry(ctx context.Context, current *Current, entry *ManifestLogEntry) error {
