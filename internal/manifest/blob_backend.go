@@ -60,7 +60,7 @@ func (b *BlobStoreBackend) ReadSnapshot(ctx context.Context, path string) ([]byt
 
 func (b *BlobStoreBackend) WriteSnapshot(ctx context.Context, id string, data []byte) (string, error) {
 	path := b.store.ManifestSnapshotPath(id)
-	_, err := b.store.Write(ctx, path, data)
+	_, err := b.store.WriteIfNotExist(ctx, path, data)
 	return path, b.mapError(err)
 }
 

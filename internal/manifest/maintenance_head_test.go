@@ -23,7 +23,7 @@ func TestMaintenanceHeadClaimStageAndClear(t *testing.T) {
 		ID:   "checkpoint-1",
 		Kind: MaintenanceCommandCheckpoint,
 		Checkpoint: &CheckpointCommand{
-			Snapshot:          "manifest/snapshots/checkpoint-1.manifest",
+			Snapshot:          testObjectRef("manifest/snapshots/checkpoint-1.manifest.zst"),
 			SnapshotNextSeq:   100,
 			FoldedReplayPages: 64,
 		},
@@ -37,7 +37,7 @@ func TestMaintenanceHeadClaimStageAndClear(t *testing.T) {
 	if _, err := manifestStore.StageMaintenance(ctx, MaintenanceCommand{
 		ID:         "checkpoint-2",
 		Kind:       MaintenanceCommandCheckpoint,
-		Checkpoint: &CheckpointCommand{Snapshot: "unused"},
+		Checkpoint: &CheckpointCommand{Snapshot: testObjectRef("unused")},
 	}, token); !errors.Is(err, ErrMaintenanceCommandPending) {
 		t.Fatalf("StageMaintenance(second) error=%v, want %v", err, ErrMaintenanceCommandPending)
 	}
@@ -96,7 +96,7 @@ func TestMaintenanceCommandRejectsMultiplePayloads(t *testing.T) {
 		Generation:      1,
 		Kind:            MaintenanceCommandCheckpoint,
 		CreatedAt:       time.Now().UTC(),
-		Checkpoint:      &CheckpointCommand{Snapshot: "snapshot"},
+		Checkpoint:      &CheckpointCommand{Snapshot: testObjectRef("snapshot")},
 		RetirementFloor: &AdvanceFloorCommand{Floor: 1},
 	}
 	if err := command.Validate(); !errors.Is(err, ErrInvalidMaintenanceCommand) {
@@ -106,7 +106,7 @@ func TestMaintenanceCommandRejectsMultiplePayloads(t *testing.T) {
 
 func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 	current := &Current{
-		Snapshot:           "old-snapshot",
+		Snapshot:           testObjectRefPtr("old-snapshot"),
 		LogSeqStart:        0,
 		NextSeq:            10,
 		ChangeFeedEnabled:  true,
@@ -118,8 +118,8 @@ func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 	command := &MaintenanceCommand{
 		Kind: MaintenanceCommandCheckpoint,
 		Checkpoint: &CheckpointCommand{
-			Snapshot:          "new-snapshot",
-			BaseSnapshot:      "old-snapshot",
+			Snapshot:          testObjectRef("new-snapshot"),
+			BaseSnapshot:      testObjectRefPtr("old-snapshot"),
 			BaseLogSeqStart:   0,
 			SnapshotNextSeq:   8,
 			FoldedReplayPages: 2,
@@ -127,7 +127,8 @@ func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 		},
 	}
 
-	if err := (&Store{}).applyMaintenanceCommand(context.Background(), current, command); err != nil {
+	verification := &checkpointSnapshotVerification{done: true}
+	if err := (&Store{}).applyMaintenanceCommand(context.Background(), current, command, verification); err != nil {
 		t.Fatalf("apply checkpoint: %v", err)
 	}
 	if current.ChangeFeedLogStart != 0 {
@@ -231,8 +232,8 @@ func TestWriterRejectsStaleCheckpointWithDurableReceipt(t *testing.T) {
 		ID:   "stale-checkpoint",
 		Kind: MaintenanceCommandCheckpoint,
 		Checkpoint: &CheckpointCommand{
-			Snapshot:        "manifest/snapshots/stale.manifest",
-			BaseSnapshot:    "different-snapshot",
+			Snapshot:        testObjectRef("manifest/snapshots/stale.manifest.zst"),
+			BaseSnapshot:    testObjectRefPtr("different-snapshot"),
 			SnapshotNextSeq: 1,
 		},
 	}, token); err != nil {
@@ -250,7 +251,7 @@ func TestWriterRejectsStaleCheckpointWithDurableReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadCurrentData: %v", err)
 	}
-	if current.Snapshot != "" || current.MaintenanceReceipt == nil || current.MaintenanceReceipt.Status != MaintenanceStatusRejected {
+	if current.Snapshot != nil || current.MaintenanceReceipt == nil || current.MaintenanceReceipt.Status != MaintenanceStatusRejected {
 		t.Fatalf("current=%+v", current)
 	}
 }

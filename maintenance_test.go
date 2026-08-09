@@ -177,7 +177,7 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 		t.Fatalf("replay accounting after maintenance=(%d pages, %d bytes), want zero",
 			current.StateReplayPages, current.StateReplayBytes)
 	}
-	if current.Snapshot == "" {
+	if current.Snapshot == nil {
 		t.Fatal("maintenance did not publish a snapshot")
 	}
 }

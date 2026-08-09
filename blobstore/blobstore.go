@@ -149,21 +149,6 @@ func ChangeBatchBucket(id string) string {
 	return SSTBucket(id)
 }
 
-func (s *Store) BlobPath(blobID string) string {
-	if len(blobID) < 2 {
-		return s.path("blobs", blobID+".blob")
-	}
-	return s.path("blobs", blobID[:2], blobID+".blob")
-}
-
-func (s *Store) ListBlobFiles(ctx context.Context) ([]ObjectInfo, error) {
-	result, err := s.List(ctx, ListOptions{Prefix: "blobs/"})
-	if err != nil {
-		return nil, err
-	}
-	return result.Objects, nil
-}
-
 func (s *Store) ManifestPath() string {
 	return s.path("manifest", "CURRENT")
 }
@@ -173,11 +158,11 @@ func (s *Store) MaintenanceHeadPath() string {
 }
 
 func (s *Store) ManifestSnapshotPath(id string) string {
-	return s.path("manifest", "snapshots", id+".manifest")
+	return s.path("manifest", "snapshots", id+".manifest.zst")
 }
 
 func (s *Store) ManifestPagePath(level uint8, id string) string {
-	return s.path("manifest", "pages", fmt.Sprintf("l%02d", level), id+".json")
+	return s.path("manifest", "pages", fmt.Sprintf("l%02d", level), id+".page.zst")
 }
 
 type Attributes struct {

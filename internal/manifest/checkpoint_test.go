@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/segmentio/ksuid"
 )
 
 type pageCASConflictStorage struct {
@@ -16,6 +17,26 @@ type pageCASConflictStorage struct {
 	mu        sync.Mutex
 	conflicts int
 	snapshots int
+	reads     int
+}
+
+type checkpointReadErrorStorage struct {
+	*BlobStoreBackend
+	err error
+}
+
+func (s *checkpointReadErrorStorage) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.BlobStoreBackend.ReadSnapshot(ctx, path)
+}
+
+func (s *pageCASConflictStorage) ReadSnapshot(ctx context.Context, path string) ([]byte, error) {
+	s.mu.Lock()
+	s.reads++
+	s.mu.Unlock()
+	return s.BlobStoreBackend.ReadSnapshot(ctx, path)
 }
 
 func (s *pageCASConflictStorage) WriteSnapshot(ctx context.Context, id string, data []byte) (string, error) {
@@ -46,6 +67,12 @@ func (s *pageCASConflictStorage) snapshotWrites() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.snapshots
+}
+
+func (s *pageCASConflictStorage) snapshotReads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
 }
 
 func TestCurrentClonePreservesStateReplayAccounting(t *testing.T) {
@@ -175,7 +202,7 @@ func TestStateReplayAccountingIgnoresOrphanPageFromCASRetry(t *testing.T) {
 	}
 }
 
-func TestWriteCheckpointRequiresCurrentFenceAndResetsReplayAccounting(t *testing.T) {
+func TestStagedCheckpointResetsReplayAccounting(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("fenced-checkpoint")
 	defer store.Close()
@@ -196,17 +223,7 @@ func TestWriteCheckpointRequiresCurrentFenceAndResetsReplayAccounting(t *testing
 			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
 		}
 	}
-	token, err := manifestStore.ClaimCompactor(ctx, "maintenance-1")
-	if err != nil {
-		t.Fatalf("ClaimCompactor: %v", err)
-	}
-	state, err := manifestStore.Replay(ctx)
-	if err != nil {
-		t.Fatalf("Replay before checkpoint: %v", err)
-	}
-	if _, err := manifestStore.WriteCheckpoint(ctx, state, token); err != nil {
-		t.Fatalf("WriteCheckpoint: %v", err)
-	}
+	prepareAndApplyCheckpointForTest(t, ctx, manifestStore)
 
 	current, err := manifestStore.ReadCurrentData(ctx)
 	if err != nil {
@@ -216,89 +233,12 @@ func TestWriteCheckpointRequiresCurrentFenceAndResetsReplayAccounting(t *testing
 		t.Fatalf("replay accounting after checkpoint=(%d pages, %d bytes), want zero",
 			current.StateReplayPages, current.StateReplayBytes)
 	}
-	if current.Snapshot == "" {
+	if current.Snapshot == nil {
 		t.Fatal("checkpoint did not publish a snapshot")
 	}
-
-	otherStore := NewStoreWithStorage(backend)
-	if _, err := otherStore.ClaimCompactor(ctx, "maintenance-2"); err != nil {
-		t.Fatalf("ClaimCompactor(new owner): %v", err)
-	}
-	if _, err := manifestStore.WriteCheckpoint(ctx, state, token); !errors.Is(err, ErrFenced) {
-		t.Fatalf("WriteCheckpoint(stale token) error=%v, want %v", err, ErrFenced)
-	}
 }
 
-func TestWriteCheckpointCASConflictPreservesReplayAccounting(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("checkpoint-cas-conflict")
-	defer store.Close()
-
-	backend := NewBlobStoreBackend(store)
-	manifestStore := NewStoreWithStorage(backend)
-	if _, err := manifestStore.Replay(ctx); err != nil {
-		t.Fatalf("Replay: %v", err)
-	}
-	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
-		t.Fatalf("ClaimWriter: %v", err)
-	}
-	for i := range defaultActiveEntryLimit {
-		if _, err := manifestStore.AppendAddSSTableWithFence(ctx, SSTMeta{
-			ID:    fmt.Sprintf("sst-%03d", i),
-			Level: 0,
-		}); err != nil {
-			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
-		}
-	}
-	token, err := manifestStore.ClaimCompactor(ctx, "maintenance-1")
-	if err != nil {
-		t.Fatalf("ClaimCompactor: %v", err)
-	}
-	state, err := manifestStore.Replay(ctx)
-	if err != nil {
-		t.Fatalf("Replay before checkpoint: %v", err)
-	}
-	before, err := manifestStore.ReadCurrentData(ctx)
-	if err != nil {
-		t.Fatalf("ReadCurrentData(before checkpoint): %v", err)
-	}
-
-	blocking := &blockingSnapshotStorage{
-		Storage:     backend,
-		PageStorage: backend,
-		block:       make(chan struct{}),
-		started:     make(chan struct{}),
-	}
-	checkpointStore := NewStoreWithStorage(blocking)
-	result := make(chan error, 1)
-	go func() {
-		_, err := checkpointStore.WriteCheckpoint(ctx, state, token)
-		result <- err
-	}()
-	<-blocking.started
-
-	if _, err := manifestStore.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "concurrent", Level: 0}); err != nil {
-		t.Fatalf("AppendAddSSTableWithFence(concurrent): %v", err)
-	}
-	close(blocking.block)
-	if err := <-result; !errors.Is(err, ErrPreconditionFailed) {
-		t.Fatalf("WriteCheckpoint error=%v, want %v", err, ErrPreconditionFailed)
-	}
-
-	after, err := manifestStore.ReadCurrentData(ctx)
-	if err != nil {
-		t.Fatalf("ReadCurrentData(after checkpoint): %v", err)
-	}
-	if after.StateReplayPages != before.StateReplayPages || after.StateReplayBytes != before.StateReplayBytes {
-		t.Fatalf("replay accounting after failed checkpoint=(%d pages, %d bytes), want (%d pages, %d bytes)",
-			after.StateReplayPages, after.StateReplayBytes, before.StateReplayPages, before.StateReplayBytes)
-	}
-	if after.Snapshot != before.Snapshot {
-		t.Fatalf("snapshot after failed checkpoint=%q, want %q", after.Snapshot, before.Snapshot)
-	}
-}
-
-func TestCreateCheckpointPreservesWriterPagesCommittedDuringUpload(t *testing.T) {
+func TestStagedCheckpointPreservesWriterPagesCommittedDuringUpload(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("concurrent-writer-checkpoint")
 	defer store.Close()
@@ -318,10 +258,6 @@ func TestCreateCheckpointPreservesWriterPagesCommittedDuringUpload(t *testing.T)
 		}); err != nil {
 			t.Fatalf("AppendAddSSTableWithFence(before fence %d): %v", i, err)
 		}
-	}
-	token, err := writerStore.ClaimCompactor(ctx, "maintenance-1")
-	if err != nil {
-		t.Fatalf("ClaimCompactor: %v", err)
 	}
 	for i := 0; i < defaultActiveEntryLimit-2; i++ {
 		if _, err := writerStore.AppendAddSSTableWithFence(ctx, SSTMeta{
@@ -346,43 +282,40 @@ func TestCreateCheckpointPreservesWriterPagesCommittedDuringUpload(t *testing.T)
 		started:     make(chan struct{}),
 	}
 	maintenanceStore := NewStoreWithStorage(blocking)
-	results := make(chan CheckpointResult, 1)
+	results := make(chan CheckpointCommand, 1)
 	errs := make(chan error, 1)
 	go func() {
-		result, err := maintenanceStore.CreateCheckpoint(ctx, token)
+		result, err := maintenanceStore.PrepareCheckpoint(ctx)
 		results <- result
 		errs <- err
 	}()
 	<-blocking.started
 
-	if _, err := writerStore.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "during-upload", Level: 0}); err != nil {
-		t.Fatalf("AppendAddSSTableWithFence(during upload): %v", err)
+	for _, id := range []string{"during-upload-1", "during-upload-2"} {
+		if _, err := writerStore.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Level: 0}); err != nil {
+			t.Fatalf("AppendAddSSTableWithFence(%s): %v", id, err)
+		}
 	}
 	close(blocking.block)
 	result := <-results
 	if err := <-errs; err != nil {
-		t.Fatalf("CreateCheckpoint: %v", err)
+		t.Fatalf("PrepareCheckpoint: %v", err)
 	}
+	stageAndApplyCheckpointForTest(t, ctx, writerStore, result)
 	if result.SnapshotNextSeq != base.NextSeq {
 		t.Fatalf("SnapshotNextSeq=%d, want %d", result.SnapshotNextSeq, base.NextSeq)
 	}
-	if result.HeadNextSeq != base.NextSeq+1 {
-		t.Fatalf("HeadNextSeq=%d, want %d", result.HeadNextSeq, base.NextSeq+1)
-	}
 	if result.FoldedReplayPages != base.StateReplayPages {
 		t.Fatalf("FoldedReplayPages=%d, want %d", result.FoldedReplayPages, base.StateReplayPages)
-	}
-	if result.RemainingReplayPages != 1 {
-		t.Fatalf("RemainingReplayPages=%d, want 1", result.RemainingReplayPages)
 	}
 
 	current, err := writerStore.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("ReadCurrentData(after checkpoint): %v", err)
 	}
-	if current.LogSeqStart != base.NextSeq || current.NextSeq != base.NextSeq+1 {
+	if current.LogSeqStart != base.NextSeq || current.NextSeq != base.NextSeq+2 {
 		t.Fatalf("CURRENT range=[%d,%d), want [%d,%d)",
-			current.LogSeqStart, current.NextSeq, base.NextSeq, base.NextSeq+1)
+			current.LogSeqStart, current.NextSeq, base.NextSeq, base.NextSeq+2)
 	}
 	if current.StateReplayPages != 1 {
 		t.Fatalf("StateReplayPages=%d, want 1", current.StateReplayPages)
@@ -392,12 +325,14 @@ func TestCreateCheckpointPreservesWriterPagesCommittedDuringUpload(t *testing.T)
 	if err != nil {
 		t.Fatalf("Replay after checkpoint: %v", err)
 	}
-	if replayed.LookupSST("during-upload") == nil {
-		t.Fatal("writer SST committed during checkpoint upload was lost")
+	for _, id := range []string{"during-upload-1", "during-upload-2"} {
+		if replayed.LookupSST(id) == nil {
+			t.Fatalf("writer SST %q committed during checkpoint upload was lost", id)
+		}
 	}
 }
 
-func TestCreateCheckpointRetriesCurrentCASWithoutRebuildingSnapshot(t *testing.T) {
+func TestApplyCheckpointRetriesCurrentCASWithoutRebuildingSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("checkpoint-cas-retry")
 	defer store.Close()
@@ -418,63 +353,314 @@ func TestCreateCheckpointRetriesCurrentCASWithoutRebuildingSnapshot(t *testing.T
 			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
 		}
 	}
-	token, err := manifestStore.ClaimCompactor(ctx, "maintenance-1")
+	command, err := manifestStore.PrepareCheckpoint(ctx)
 	if err != nil {
-		t.Fatalf("ClaimCompactor: %v", err)
+		t.Fatalf("PrepareCheckpoint: %v", err)
+	}
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	staged, err := manifestStore.StageMaintenance(ctx, MaintenanceCommand{
+		ID:         "checkpoint-cas-retry",
+		Kind:       MaintenanceCommandCheckpoint,
+		Checkpoint: &command,
+	}, token)
+	if err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
 	}
 
 	storage.failNextCAS()
-	result, err := manifestStore.CreateCheckpoint(ctx, token)
+	result, err := manifestStore.ApplyPendingMaintenance(ctx)
 	if err != nil {
-		t.Fatalf("CreateCheckpoint: %v", err)
+		t.Fatalf("ApplyPendingMaintenance: %v", err)
 	}
-	if result.FoldedReplayPages == 0 || result.RemainingReplayPages != 0 {
-		t.Fatalf("checkpoint replay pages=(folded=%d remaining=%d), want folded>0 and remaining=0",
-			result.FoldedReplayPages, result.RemainingReplayPages)
+	if result.Status != MaintenanceStatusApplied || !result.Changed {
+		t.Fatalf("result=%+v, want changed applied", result)
 	}
 	if writes := storage.snapshotWrites(); writes != 1 {
 		t.Fatalf("snapshot writes=%d, want 1", writes)
 	}
+	if reads := storage.snapshotReads(); reads != 1 {
+		t.Fatalf("snapshot reads=%d, want 1 across CURRENT CAS retry", reads)
+	}
+	repeated, err := manifestStore.ApplyPendingMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("ApplyPendingMaintenance(repeated): %v", err)
+	}
+	if repeated.Changed {
+		t.Fatalf("repeated apply changed CURRENT: %+v", repeated)
+	}
+	if reads := storage.snapshotReads(); reads != 1 {
+		t.Fatalf("snapshot reads=%d, want 1 after receipt replay", reads)
+	}
+	if _, err := manifestStore.ClearMaintenance(ctx, staged.Pending.ID, staged.Pending.Epoch, staged.Pending.Generation, token); err != nil {
+		t.Fatalf("ClearMaintenance: %v", err)
+	}
 }
 
-func TestWriteCheckpointRejectsStaleManifestBeforeUpload(t *testing.T) {
+func TestWriterRejectsMissingCheckpointSnapshotBeforePublishing(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("stale-checkpoint")
-	defer store.Close()
+	blob := blobstore.NewMemory("checkpoint-missing-snapshot")
+	defer blob.Close()
 
-	backend := NewBlobStoreBackend(store)
-	manifestStore := NewStoreWithStorage(backend)
-	if _, err := manifestStore.Replay(ctx); err != nil {
+	store := NewStoreWithStorage(NewBlobStoreBackend(blob))
+	if _, err := store.Replay(ctx); err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+	if _, err := store.ClaimWriter(ctx, "writer-1"); err != nil {
 		t.Fatalf("ClaimWriter: %v", err)
 	}
-	token, err := manifestStore.ClaimCompactor(ctx, "maintenance-1")
+	current, err := store.ReadCurrentData(ctx)
 	if err != nil {
-		t.Fatalf("ClaimCompactor: %v", err)
+		t.Fatalf("ReadCurrentData: %v", err)
 	}
-	staleState, err := manifestStore.Replay(ctx)
-	if err != nil {
-		t.Fatalf("Replay before concurrent append: %v", err)
+	command := CheckpointCommand{
+		Snapshot:          testObjectRef("manifest/snapshots/missing.manifest.zst"),
+		BaseSnapshot:      current.Snapshot.Clone(),
+		BaseLogSeqStart:   current.LogSeqStart,
+		SnapshotNextSeq:   current.NextSeq,
+		FoldedReplayPages: current.StateReplayPages,
+		FoldedReplayBytes: current.StateReplayBytes,
 	}
-	if _, err := manifestStore.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "concurrent", Level: 0}); err != nil {
-		t.Fatalf("AppendAddSSTableWithFence: %v", err)
+	assertCheckpointRejected(t, ctx, store, command)
+}
+
+func TestWriterRejectsInvalidCheckpointSnapshotBeforePublishing(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand)
+	}{
+		{
+			name: "checksum mismatch",
+			mutate: func(_ *testing.T, _ context.Context, _ *Store, command *CheckpointCommand) {
+				command.Snapshot.Checksum = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+			},
+		},
+		{
+			name: "wrong sequence",
+			mutate: func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand) {
+				state, err := store.Replay(ctx)
+				if err != nil {
+					t.Fatalf("Replay candidate: %v", err)
+				}
+				state.LogSeq++
+				ref, err := store.writeSnapshotObject(ctx, state)
+				if err != nil {
+					t.Fatalf("write wrong-sequence candidate: %v", err)
+				}
+				command.Snapshot = ref
+			},
+		},
+		{
+			name: "invalid topology",
+			mutate: func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand) {
+				state, err := store.Replay(ctx)
+				if err != nil {
+					t.Fatalf("Replay candidate: %v", err)
+				}
+				state.L0SSTs = append(state.L0SSTs,
+					SSTMeta{ID: "duplicate", Level: 0},
+					SSTMeta{ID: "duplicate", Level: 0})
+				ref, err := store.writeSnapshotObject(ctx, state)
+				if err != nil {
+					t.Fatalf("write invalid-topology candidate: %v", err)
+				}
+				command.Snapshot = ref
+			},
+		},
+		{
+			name: "unsupported manifest version",
+			mutate: func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand) {
+				state, err := store.Replay(ctx)
+				if err != nil {
+					t.Fatalf("Replay candidate: %v", err)
+				}
+				state.Version = 1
+				ref, err := store.writeSnapshotObject(ctx, state)
+				if err != nil {
+					t.Fatalf("write wrong-version candidate: %v", err)
+				}
+				command.Snapshot = ref
+			},
+		},
+		{
+			name: "future epoch",
+			mutate: func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand) {
+				state, err := store.Replay(ctx)
+				if err != nil {
+					t.Fatalf("Replay candidate: %v", err)
+				}
+				state.NextEpoch += 100
+				ref, err := store.writeSnapshotObject(ctx, state)
+				if err != nil {
+					t.Fatalf("write future-epoch candidate: %v", err)
+				}
+				command.Snapshot = ref
+			},
+		},
+		{
+			name: "invalid writer fence",
+			mutate: func(t *testing.T, ctx context.Context, store *Store, command *CheckpointCommand) {
+				state, err := store.Replay(ctx)
+				if err != nil {
+					t.Fatalf("Replay candidate: %v", err)
+				}
+				current, err := store.ReadCurrentData(ctx)
+				if err != nil {
+					t.Fatalf("ReadCurrentData: %v", err)
+				}
+				state.WriterFence = current.WriterFence.Clone()
+				state.WriterFence.Owner = ""
+				ref, err := store.writeSnapshotObject(ctx, state)
+				if err != nil {
+					t.Fatalf("write invalid-fence candidate: %v", err)
+				}
+				command.Snapshot = ref
+			},
+		},
 	}
 
-	blocking := &blockingSnapshotStorage{
-		Storage:     backend,
-		PageStorage: backend,
-		block:       make(chan struct{}),
-		started:     make(chan struct{}),
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			blob := blobstore.NewMemory("checkpoint-invalid-" + test.name)
+			defer blob.Close()
+
+			store := NewStoreWithStorage(NewBlobStoreBackend(blob))
+			if _, err := store.Replay(ctx); err != nil {
+				t.Fatalf("Replay: %v", err)
+			}
+			if _, err := store.ClaimWriter(ctx, "writer-1"); err != nil {
+				t.Fatalf("ClaimWriter: %v", err)
+			}
+			command, err := store.PrepareCheckpoint(ctx)
+			if err != nil {
+				t.Fatalf("PrepareCheckpoint: %v", err)
+			}
+			test.mutate(t, ctx, store, &command)
+			assertCheckpointRejected(t, ctx, store, command)
+		})
 	}
-	checkpointStore := NewStoreWithStorage(blocking)
-	if _, err := checkpointStore.WriteCheckpoint(ctx, staleState, token); !errors.Is(err, ErrPreconditionFailed) {
-		t.Fatalf("WriteCheckpoint(stale state) error=%v, want %v", err, ErrPreconditionFailed)
+}
+
+func TestWriterRejectsCheckpointReplayFloorRegression(t *testing.T) {
+	ctx := context.Background()
+	blob := blobstore.NewMemory("checkpoint-floor-regression")
+	defer blob.Close()
+
+	store := NewStoreWithStorage(NewBlobStoreBackend(blob))
+	if _, err := store.Replay(ctx); err != nil {
+		t.Fatalf("Replay: %v", err)
 	}
-	select {
-	case <-blocking.started:
-		t.Fatal("stale checkpoint uploaded a snapshot candidate")
-	default:
+	if _, err := store.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	if _, err := store.AppendAddSSTableWithFence(ctx, SSTMeta{ID: "sst-1", Level: 0}); err != nil {
+		t.Fatalf("AppendAddSSTableWithFence: %v", err)
+	}
+	prepareAndApplyCheckpointForTest(t, ctx, store)
+
+	current, err := store.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.LogSeqStart == 0 {
+		t.Fatal("checkpoint did not advance replay floor")
+	}
+	command, err := store.PrepareCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("PrepareCheckpoint: %v", err)
+	}
+	command.SnapshotNextSeq = current.LogSeqStart - 1
+	assertCheckpointRejected(t, ctx, store, command)
+}
+
+func TestCheckpointSnapshotReadFailureIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	blob := blobstore.NewMemory("checkpoint-read-failure")
+	defer blob.Close()
+
+	storage := &checkpointReadErrorStorage{BlobStoreBackend: NewBlobStoreBackend(blob)}
+	store := NewStoreWithStorage(storage)
+	if _, err := store.Replay(ctx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := store.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	command, err := store.PrepareCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("PrepareCheckpoint: %v", err)
+	}
+	token, err := store.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	if _, err := store.StageMaintenance(ctx, MaintenanceCommand{
+		ID:         "checkpoint-read-failure",
+		Kind:       MaintenanceCommandCheckpoint,
+		Checkpoint: &command,
+	}, token); err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+
+	wantErr := errors.New("temporary snapshot read failure")
+	storage.err = wantErr
+	if _, err := store.ApplyPendingMaintenance(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("ApplyPendingMaintenance error=%v, want %v", err, wantErr)
+	}
+	current, err := store.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.Snapshot != nil || current.MaintenanceReceipt != nil {
+		t.Fatalf("transient read failure changed CURRENT: snapshot=%+v receipt=%+v", current.Snapshot, current.MaintenanceReceipt)
+	}
+
+	storage.err = nil
+	result, err := store.ApplyPendingMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("ApplyPendingMaintenance(retry): %v", err)
+	}
+	if result.Status != MaintenanceStatusApplied || !result.Changed {
+		t.Fatalf("retry result=%+v, want changed applied", result)
+	}
+}
+
+func assertCheckpointRejected(t *testing.T, ctx context.Context, store *Store, command CheckpointCommand) {
+	t.Helper()
+	before, err := store.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(before): %v", err)
+	}
+	token, err := store.ClaimMaintenance(ctx, "maintenance-reject-test")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	staged, err := store.StageMaintenance(ctx, MaintenanceCommand{
+		ID:         "checkpoint-reject-" + ksuid.New().String(),
+		Kind:       MaintenanceCommandCheckpoint,
+		Checkpoint: &command,
+	}, token)
+	if err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+	result, err := store.ApplyPendingMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("ApplyPendingMaintenance: %v", err)
+	}
+	if result.Status != MaintenanceStatusRejected || !result.Changed {
+		t.Fatalf("result=%+v, want changed rejected", result)
+	}
+	after, err := store.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(after): %v", err)
+	}
+	if !objectRefsEqual(after.Snapshot, before.Snapshot) || after.LogSeqStart != before.LogSeqStart {
+		t.Fatalf("rejected checkpoint changed base: before=%+v after=%+v", before.Snapshot, after.Snapshot)
+	}
+	if !receiptMatchesCommand(after.MaintenanceReceipt, staged.Pending) || after.MaintenanceReceipt.Status != MaintenanceStatusRejected {
+		t.Fatalf("rejection receipt=%+v pending=%+v", after.MaintenanceReceipt, staged.Pending)
 	}
 }

@@ -157,14 +157,7 @@ func TestIncrementalReplay_FallsBackAfterSnapshot(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		appendSSTEntry(t, ctx, ms, fmt.Sprintf("sst-%02d", i), 1)
 	}
-	m1, err := ms.Replay(ctx)
-	if err != nil {
-		t.Fatalf("seed replay: %v", err)
-	}
-
-	if _, err := ms.WriteSnapshot(ctx, m1); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
+	prepareAndApplyCheckpointForTest(t, ctx, ms)
 
 	for i := 5; i < 7; i++ {
 		appendSSTEntry(t, ctx, ms, fmt.Sprintf("sst-%02d", i), 1)

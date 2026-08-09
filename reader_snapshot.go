@@ -152,10 +152,14 @@ func versionFromCurrent(current *manifest.Current) Version {
 	if current == nil {
 		return Version{}
 	}
+	snapshot := ""
+	if current.Snapshot != nil {
+		snapshot = current.Snapshot.Path + ":" + current.Snapshot.Checksum
+	}
 
 	return Version{
 		value: fmt.Sprintf("%s:%d:%d",
-			current.Snapshot,
+			snapshot,
 			current.LogSeqStart,
 			current.NextSeq,
 		),

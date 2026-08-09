@@ -122,12 +122,12 @@ type WriterCommitMarker struct {
 }
 
 type Current struct {
-	LayoutVersion int    `json:"layout_version,omitempty"`
-	Format        string `json:"format,omitempty"`
-	Snapshot      string `json:"snapshot"`
-	LogSeqStart   uint64 `json:"log_seq_start,omitempty"`
-	NextSeq       uint64 `json:"next_seq"`
-	NextEpoch     uint64 `json:"next_epoch"`
+	LayoutVersion int        `json:"layout_version,omitempty"`
+	Format        string     `json:"format,omitempty"`
+	Snapshot      *ObjectRef `json:"snapshot,omitempty"`
+	LogSeqStart   uint64     `json:"log_seq_start,omitempty"`
+	NextSeq       uint64     `json:"next_seq"`
+	NextEpoch     uint64     `json:"next_epoch"`
 
 	ChangeFeedEnabled  bool              `json:"change_feed_enabled,omitempty"`
 	ChangeFeedPayload  ChangeFeedPayload `json:"change_feed_payload,omitempty"`
@@ -146,15 +146,19 @@ type Current struct {
 	MaintenanceReceipt *MaintenanceReceipt `json:"maintenance_receipt,omitempty"`
 }
 
-type PageRef struct {
-	Level        uint8     `json:"level"`
-	SeqLo        uint64    `json:"seq_lo"`
-	SeqHi        uint64    `json:"seq_hi"`
+type ObjectRef struct {
 	Path         string    `json:"path"`
-	Count        uint32    `json:"count"`
 	EncodedBytes uint64    `json:"encoded_bytes"`
 	Checksum     string    `json:"checksum"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+type PageRef struct {
+	ObjectRef
+	Level uint8  `json:"level"`
+	SeqLo uint64 `json:"seq_lo"`
+	SeqHi uint64 `json:"seq_hi"`
+	Count uint32 `json:"count"`
 }
 
 type CommitPage struct {
@@ -170,22 +174,53 @@ type CommitPage struct {
 }
 
 func EncodeSnapshot(m *Manifest) ([]byte, error) {
-	return json.Marshal(m)
+	if m == nil {
+		return nil, fmt.Errorf("%w: nil manifest snapshot", ErrInvalidManifest)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return encodeManifestObject(raw, manifestObjectKindSnapshot, maxManifestSnapshotRawBytes)
 }
 
 func DecodeSnapshot(data []byte) (*Manifest, error) {
+	raw, err := decodeManifestObject(data, manifestObjectKindSnapshot, maxManifestSnapshotRawBytes)
+	if err != nil {
+		return nil, err
+	}
 	var m Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
 func EncodeCurrent(c *Current) ([]byte, error) {
-	if c != nil && c.MaxPinnedViewAge < 0 {
+	if c == nil {
+		return nil, fmt.Errorf("%w: nil CURRENT", ErrInvalidManifest)
+	}
+	if c.MaxPinnedViewAge < 0 {
 		return nil, fmt.Errorf("%w: max_pinned_view_age=%s", ErrInvalidManifest, c.MaxPinnedViewAge)
 	}
-	return json.Marshal(c)
+	// New in-memory CURRENT values have no persisted format yet. Stamp a shallow
+	// encoding copy; production write paths are already normalized and do not
+	// pay for this branch. Decoding remains strict and rejects an on-disk v1.
+	encoded := c
+	if c.LayoutVersion == 0 || c.Format == "" {
+		clone := *c
+		if clone.LayoutVersion == 0 {
+			clone.LayoutVersion = LayoutVersion
+		}
+		if clone.Format == "" {
+			clone.Format = CurrentFormat
+		}
+		encoded = &clone
+	}
+	if err := validateCurrentFormat(encoded); err != nil {
+		return nil, err
+	}
+	return json.Marshal(encoded)
 }
 
 func DecodeCurrent(data []byte) (*Current, error) {
@@ -196,5 +231,35 @@ func DecodeCurrent(data []byte) (*Current, error) {
 	if c.MaxPinnedViewAge < 0 {
 		return nil, fmt.Errorf("%w: max_pinned_view_age=%s", ErrInvalidManifest, c.MaxPinnedViewAge)
 	}
+	if err := validateCurrentFormat(&c); err != nil {
+		return nil, err
+	}
+	if err := validateCurrentRefs(&c); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+func validateCurrentFormat(c *Current) error {
+	if c == nil || c.LayoutVersion != LayoutVersion || c.Format != CurrentFormat {
+		if c == nil {
+			return fmt.Errorf("%w: nil CURRENT", ErrInvalidManifest)
+		}
+		return fmt.Errorf("%w: CURRENT layout=%d format=%q", ErrInvalidManifest, c.LayoutVersion, c.Format)
+	}
+	return nil
+}
+
+func validateCurrentRefs(c *Current) error {
+	if c.Snapshot != nil {
+		if err := validateManifestObjectRef(*c.Snapshot, manifestObjectKindSnapshot); err != nil {
+			return err
+		}
+	}
+	for i := range c.IndexFrontier {
+		if err := validatePageRef(c.IndexFrontier[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
