@@ -79,14 +79,13 @@ func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 
 		writerOpts := testChangeWriterOptions()
 		writerOpts.OwnerID = "change-keys-writer-1"
-		writerOpts.Values.InlineValueBytes = 1
 		writer, err := db.OpenWriter(ctx, writerOpts)
 		if err != nil {
 			t.Fatalf("open writer: %v", err)
 		}
 		largeValue := benchmarkChangeFeedValues(1, 4<<10, true)[0]
 		if err := writer.PutWithTTL(ctx, []byte("stored"), largeValue, time.Hour); err != nil {
-			t.Fatalf("put blob-backed value: %v", err)
+			t.Fatalf("put large value: %v", err)
 		}
 		if err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
 			t.Fatalf("put empty value: %v", err)
@@ -107,7 +106,7 @@ func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 		}
 		value, found, err := kv.Get(ctx, []byte("stored"))
 		if err != nil || !found || string(value) != string(largeValue) {
-			t.Fatalf("blob-backed KV Get bytes=%d found=%v err=%v", len(value), found, err)
+			t.Fatalf("large-value KV Get bytes=%d found=%v err=%v", len(value), found, err)
 		}
 		if err := kv.Close(); err != nil {
 			t.Fatalf("close KV reader: %v", err)

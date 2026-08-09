@@ -82,8 +82,8 @@ func TestWriteSST_Inline(t *testing.T) {
 	inline := []byte("x")
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: inline},
-		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: inline},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -100,10 +100,6 @@ func TestWriteSST_Inline(t *testing.T) {
 	if !bytes.Equal(res.Meta.MinKey, []byte("a")) || !bytes.Equal(res.Meta.MaxKey, []byte("b")) {
 		t.Errorf("key range mismatch: %s-%s", res.Meta.MinKey, res.Meta.MaxKey)
 	}
-	if res.Meta.HasBlobRefs {
-		t.Fatalf("expected HasBlobRefs=false for inline-only SST")
-	}
-
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
@@ -148,23 +144,23 @@ func TestWriteSST_Inline(t *testing.T) {
 	if !bytes.Equal(seen[0].key, []byte("a")) || seen[0].seq != 2 {
 		t.Fatalf("first entry mismatch: key=%s seq=%d", seen[0].key, seen[0].seq)
 	}
-	if !seen[0].value.Inline || !bytes.Equal(seen[0].value.Value, inline) {
+	if !bytes.Equal(seen[0].value.Value, inline) {
 		t.Fatalf("inline entry mismatch")
 	}
 
 	if !bytes.Equal(seen[1].key, []byte("b")) || seen[1].seq != 1 {
 		t.Fatalf("second entry mismatch: key=%s seq=%d", seen[1].key, seen[1].seq)
 	}
-	if !seen[1].value.Inline || !bytes.Equal(seen[1].value.Value, []byte("y")) {
+	if !bytes.Equal(seen[1].value.Value, []byte("y")) {
 		t.Fatalf("expected inline entry")
 	}
 }
 
-func TestWriteSST_BlobReference(t *testing.T) {
-	blobID := internal.ComputeBlobID([]byte("large-value-content"))
+func TestWriteSST_LargeValue(t *testing.T) {
+	value := bytes.Repeat([]byte("large-value-content"), 16<<10)
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: false, BlobID: blobID},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: value},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -175,10 +171,6 @@ func TestWriteSST_BlobReference(t *testing.T) {
 	if len(res.SSTData) == 0 {
 		t.Fatalf("expected SST data")
 	}
-	if !res.Meta.HasBlobRefs {
-		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
-	}
-
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
@@ -203,14 +195,8 @@ func TestWriteSST_BlobReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
-	if decoded.Inline {
-		t.Fatalf("expected blob reference, got inline")
-	}
-	if !decoded.HasBlobID() {
-		t.Fatalf("expected blob ID")
-	}
-	if decoded.BlobID != blobID {
-		t.Fatalf("blob id mismatch: got %x, want %x", decoded.BlobID, blobID)
+	if !bytes.Equal(decoded.Value, value) {
+		t.Fatalf("large value mismatch: got %d bytes, want %d", len(decoded.Value), len(value))
 	}
 }
 
@@ -224,8 +210,8 @@ func TestWriteSST_EmptyIterator(t *testing.T) {
 
 func TestWriteSST_OutOfOrder(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
-		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -240,8 +226,8 @@ func TestWriteSST_OutOfOrder(t *testing.T) {
 
 func TestWriteSST_DuplicateKeySeqOrder(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v1")},
-		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("v2")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v1")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("v2")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -304,7 +290,7 @@ func (s *ed25519Signer) SignHash(hash []byte) ([]byte, error) {
 
 func TestWriteSST_Signature(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
 	}
 	it := &sliceSSTIter{entries: entries}
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)

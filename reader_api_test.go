@@ -2,15 +2,16 @@ package isledb
 
 import "testing"
 
-func TestReaderOpenOptionsMapsBlobVerification(t *testing.T) {
+func TestReaderOpenOptionsMapsCacheOptions(t *testing.T) {
 	opts := DefaultReaderOpenOptions(t.TempDir())
-	opts.VerifyBlobsOnRead = true
+	opts.SSTCacheSize = 1234
+	opts.BlockCacheSize = 5678
 
 	internal, err := readerOptionsFromPublic(opts)
 	if err != nil {
 		t.Fatalf("readerOptionsFromPublic: %v", err)
 	}
-	if !internal.ValueStorageConfig.VerifyBlobsOnRead {
-		t.Fatal("VerifyBlobsOnRead was not propagated to internal value storage")
+	if internal.SSTCacheSize != opts.SSTCacheSize || internal.BlockCacheSize != opts.BlockCacheSize {
+		t.Fatalf("cache options were not propagated: %+v", internal)
 	}
 }

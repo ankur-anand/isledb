@@ -119,7 +119,6 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 
 	manifestStore := newManifestStore(store, nil)
 	opts := testWriterOptions(1<<20, 0)
-	opts.Values.InlineValueBytes = 1
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
@@ -241,13 +240,12 @@ func TestWriter_ChangeFeedDisabledByDefault(t *testing.T) {
 	}
 }
 
-func TestWriter_ChangeFeedBufferTriggersRotationForBlobValues(t *testing.T) {
+func TestWriter_ChangeFeedBufferTriggersRotationForLargeValues(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-change-feed-rotation")
 	defer store.Close()
 
 	opts := testWriterOptions(1<<10, 0)
-	opts.Values.InlineValueBytes = 1
 	w, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
@@ -936,8 +934,14 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if got, want := DefaultWriterOptions().Memtable.MaxPendingMemtables, 4; got != want {
 		t.Fatalf("default max pending memtables=%d, want=%d", got, want)
 	}
+	if got, want := DefaultWriterOptions().Values.MaxKeyBytes, 64<<10; got != want {
+		t.Fatalf("default max key bytes=%d, want=%d", got, want)
+	}
+	if got, want := DefaultWriterOptions().Values.MaxValueBytes, int64(16<<20); got != want {
+		t.Fatalf("default max value bytes=%d, want=%d", got, want)
+	}
 
-	normalized, values, err := normalizeWriterOptions(WriterOptions{})
+	normalized, err := normalizeWriterOptions(WriterOptions{})
 	if err != nil {
 		t.Fatalf("normalizeWriterOptions: %v", err)
 	}
@@ -954,31 +958,25 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if normalized.Flush.Interval != 0 {
 		t.Fatalf("zero-value flush interval=%s, want disabled", normalized.Flush.Interval)
 	}
-	if values.MaxKeySize <= 0 || values.BlobThreshold <= 0 || values.MaxValueSize <= 0 {
-		t.Fatalf("normalized value options=%+v", values.ValueOptions)
+	if normalized.Values.MaxKeyBytes <= 0 || normalized.Values.MaxValueBytes <= 0 {
+		t.Fatalf("normalized value options=%+v", normalized.Values)
 	}
 }
 
 func TestWriterOptions_MapValueOptions(t *testing.T) {
 	opts := WriterOptions{
 		Values: ValueOptions{
-			MaxKeyBytes:      1024,
-			InlineValueBytes: 2048,
-			MaxValueBytes:    4096,
+			MaxKeyBytes:   1024,
+			MaxValueBytes: 4096,
 		},
 	}
 
-	normalized, values, err := normalizeWriterOptions(opts)
+	normalized, err := normalizeWriterOptions(opts)
 	if err != nil {
 		t.Fatalf("normalizeWriterOptions: %v", err)
 	}
 	if normalized.Values != opts.Values {
 		t.Fatalf("normalized values=%+v, want=%+v", normalized.Values, opts.Values)
-	}
-	if values.MaxKeySize != opts.Values.MaxKeyBytes ||
-		values.BlobThreshold != opts.Values.InlineValueBytes ||
-		values.MaxValueSize != opts.Values.MaxValueBytes {
-		t.Fatalf("internal values=%+v, public values=%+v", values.ValueOptions, opts.Values)
 	}
 }
 
@@ -992,13 +990,11 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative pending memtables", mutate: func(o *WriterOptions) { o.Memtable.MaxPendingMemtables = -1 }},
 		{name: "negative flush interval", mutate: func(o *WriterOptions) { o.Flush.Interval = -time.Nanosecond }},
 		{name: "negative maintenance poll interval", mutate: func(o *WriterOptions) { o.Maintenance.PollInterval = -time.Nanosecond }},
-		{name: "negative inline value bytes", mutate: func(o *WriterOptions) { o.Values.InlineValueBytes = -1 }},
 		{name: "negative max key bytes", mutate: func(o *WriterOptions) { o.Values.MaxKeyBytes = -1 }},
 		{name: "negative max value bytes", mutate: func(o *WriterOptions) { o.Values.MaxValueBytes = -1 }},
 		{name: "target exceeds arena", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = maxMemtableArenaBytes + 1 }},
 		{name: "inline entry exceeds arena", mutate: func(o *WriterOptions) {
 			o.Values.MaxKeyBytes = int(maxMemtableArenaBytes / 2)
-			o.Values.InlineValueBytes = int(maxMemtableArenaBytes / 2)
 			o.Values.MaxValueBytes = maxMemtableArenaBytes
 		}},
 	}
@@ -1007,7 +1003,7 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			opts := DefaultWriterOptions()
 			test.mutate(&opts)
-			_, _, err := normalizeWriterOptions(opts)
+			_, err := normalizeWriterOptions(opts)
 			if !errors.Is(err, ErrInvalidWriterOptions) {
 				t.Fatalf("normalizeWriterOptions error=%v, want %v", err, ErrInvalidWriterOptions)
 			}
@@ -1144,7 +1140,7 @@ func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
 	t.Fatalf("expected ErrBackpressure from deletes")
 }
 
-func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
+func TestWriter_CanceledPutDoesNotAdvanceSequence(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-putblob-seq-rollback")
 	defer store.Close()
@@ -1153,7 +1149,6 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.InlineValueBytes = 1
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
@@ -1162,15 +1157,15 @@ func TestWriter_PutBlobWriteFailureDoesNotAdvanceSequence(t *testing.T) {
 	defer w.close(ctx)
 
 	seqBefore := w.seq
-	blobCtx, cancel := context.WithCancel(context.Background())
+	putCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = w.put(blobCtx, []byte("k"), []byte("v"))
+	err = w.put(putCtx, []byte("k"), []byte("v"))
 	if err == nil {
-		t.Fatalf("expected put blob error with canceled blob write context")
+		t.Fatalf("expected put error with canceled context")
 	}
 	if w.seq != seqBefore {
-		t.Fatalf("blob write error should not advance sequence: before=%d after=%d", seqBefore, w.seq)
+		t.Fatalf("put error should not advance sequence: before=%d after=%d", seqBefore, w.seq)
 	}
 }
 
@@ -1198,9 +1193,8 @@ func TestWriter_OpenContextCancellationDoesNotBlockWrites(t *testing.T) {
 	if err := w.delete(opCtx, []byte("k-inline")); err != nil {
 		t.Fatalf("delete after opening ctx cancel: %v", err)
 	}
-	w.valueConfig.BlobThreshold = 1
-	if err := w.put(opCtx, []byte("k-blob"), []byte("b")); err != nil {
-		t.Fatalf("put blob after opening ctx cancel: %v", err)
+	if err := w.put(opCtx, []byte("k-large"), bytes.Repeat([]byte("b"), 256<<10)); err != nil {
+		t.Fatalf("put large value after opening ctx cancel: %v", err)
 	}
 }
 
@@ -1245,7 +1239,7 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 	}
 }
 
-func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
+func TestWriter_MetricsFlushAndTTLPaths(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-metrics-coverage")
 	defer store.Close()
@@ -1253,7 +1247,6 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 0
-	opts.Values.InlineValueBytes = 1
 	opts.Metrics = DefaultWriterMetrics(nil)
 
 	w, err := newWriter(ctx, store, manifestStore, opts)
@@ -1262,8 +1255,8 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	blobValue := []byte("blob-value")
-	if err := w.putWithTTL(ctx, []byte("k1"), blobValue, time.Second); err != nil {
+	value := []byte("value")
+	if err := w.putWithTTL(ctx, []byte("k1"), value, time.Second); err != nil {
 		t.Fatalf("putWithTTL success: %v", err)
 	}
 	if err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
@@ -1282,15 +1275,6 @@ func TestWriter_MetricsBlobFlushAndTTLPaths(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.PutErrors); got != 1 {
 		t.Fatalf("put_errors_total mismatch: got %v want 1", got)
-	}
-	if got := testutil.ToFloat64(metrics.PutBlobTotal); got != 1 {
-		t.Fatalf("put_blob_total mismatch: got %v want 1", got)
-	}
-	if got := testutil.ToFloat64(metrics.PutBlobErrors); got != 0 {
-		t.Fatalf("put_blob_errors_total mismatch: got %v want 0", got)
-	}
-	if got := testutil.ToFloat64(metrics.BlobBytesTotal); got != float64(len(blobValue)) {
-		t.Fatalf("blob_bytes_total mismatch: got %v want %d", got, len(blobValue))
 	}
 	if got := testutil.ToFloat64(metrics.DeleteTotal); got != 1 {
 		t.Fatalf("delete_total mismatch: got %v want 1", got)

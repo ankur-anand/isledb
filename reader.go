@@ -19,7 +19,6 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/cachestore"
-	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
@@ -37,12 +36,8 @@ type Reader struct {
 	bloomCache    sync.Map
 	bloomLoads    singleflight.Group
 	sstLoads      singleflight.Group
-	blobLoads     singleflight.Group
 	manifestLoads singleflight.Group
 
-	blobStorage              *internal.BlobStorage
-	blobCache                internal.BlobCache
-	valueConfig              config.ValueStorageConfig
 	verifySST                bool
 	verifier                 SSTHashVerifier
 	allowUnverifiedRangeRead bool
@@ -50,7 +45,6 @@ type Reader struct {
 
 	ownsSSTCache   bool
 	ownsBlockCache bool
-	ownsBlobCache  bool
 	cacheDir       string
 
 	lifecycleMu   sync.RWMutex
@@ -101,17 +95,6 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		}
 	}()
 
-	blobCache, ownsBlobCache, err := initBlobCache(opts)
-	if err != nil {
-		return nil, err
-	}
-	cleanupBlobCache := ownsBlobCache
-	defer func() {
-		if cleanupBlobCache {
-			_ = blobCache.Close()
-		}
-	}()
-
 	blockCache, ownsBlockCache, err := initBlockCache(opts)
 	if err != nil {
 		return nil, err
@@ -122,11 +105,6 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 			blockCache.Close()
 		}
 	}()
-
-	valueConfig := opts.ValueStorageConfig
-	if valueConfig.BlobThreshold == 0 {
-		valueConfig = config.DefaultValueStorageConfig()
-	}
 
 	viewRefreshAt := viewLoadedAt.Add(viewPolicy.RefreshAfter)
 	viewExpiresAt := viewLoadedAt.Add(ms.CurrentData().PinnedViewAge())
@@ -140,23 +118,18 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		viewExpiresAt:            viewExpiresAt,
 		sstCache:                 sstCache,
 		blockCache:               blockCache,
-		blobStorage:              internal.NewBlobStorage(store, valueConfig),
-		blobCache:                blobCache,
-		valueConfig:              valueConfig,
 		verifySST:                opts.ValidateSSTChecksum,
 		verifier:                 opts.SSTHashVerifier,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ownsSSTCache:             ownsSSTCache,
 		ownsBlockCache:           ownsBlockCache,
-		ownsBlobCache:            ownsBlobCache,
 		cacheDir:                 opts.CacheDir,
 		metrics:                  opts.Metrics,
 	}
 	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
 	cleanupSSTCache = false
 	cleanupBlockCache = false
-	cleanupBlobCache = false
 	return reader, nil
 }
 
@@ -180,28 +153,6 @@ func initSSTCache(opts readerOptions) (diskcache.RefCountedCache, bool, error) {
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("create sst cache: %w", err)
-	}
-
-	return cache, true, nil
-}
-
-func initBlobCache(opts readerOptions) (diskcache.Cache, bool, error) {
-	if opts.BlobCache != nil {
-		return opts.BlobCache, false, nil
-	}
-
-	maxSize := opts.BlobCacheSize
-	if maxSize == 0 {
-		maxSize = defaultBlobCacheSize
-	}
-
-	cache, err := diskcache.NewBlobCache(diskcache.BlobCacheOptions{
-		Dir:         filepath.Join(opts.CacheDir, "blob"),
-		MaxSize:     maxSize,
-		MaxItemSize: opts.BlobCacheMaxItemSize,
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("create blob cache: %w", err)
 	}
 
 	return cache, true, nil
@@ -358,11 +309,6 @@ func (r *Reader) Close() error {
 		r.blockCache.Close()
 	}
 
-	if r.blobCache != nil && r.ownsBlobCache {
-		if err := r.blobCache.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
 	return firstErr
 }
 
@@ -740,19 +686,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 	if decoded.Kind == internal.OpDelete {
 		return nil, true, true, nil
 	}
-	if decoded.Inline {
-		return append([]byte(nil), decoded.Value...), true, false, nil
-	}
-
-	if decoded.HasBlobID() {
-		value, err := r.fetchBlob(ctx, decoded.BlobID)
-		if err != nil {
-			return nil, false, false, err
-		}
-		return value, true, false, nil
-	}
-
-	return nil, false, false, errors.New("corrupt entry: non-inline, non-blob")
+	return append([]byte(nil), decoded.Value...), true, false, nil
 }
 
 func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) (bool, error) {
@@ -792,79 +726,8 @@ func (r *Reader) sstCached(id string) bool {
 	return false
 }
 
-func (r *Reader) entryValue(ctx context.Context, entry internal.CompactionEntry) ([]byte, error) {
-	if entry.Inline {
-		return append([]byte(nil), entry.Value...), nil
-	}
-
-	if entry.HasBlobID() {
-		return r.fetchBlob(ctx, entry.BlobID)
-	}
-
-	return nil, errors.New("corrupt entry: non-inline, non-blob")
-}
-
-type blobFetchResult struct {
-	data     []byte
-	cacheHit bool
-}
-
-func (r *Reader) fetchBlob(ctx context.Context, blobID [32]byte) (value []byte, err error) {
-	start := time.Now()
-	cacheHit := false
-	defer func() {
-		r.metrics.ObserveBlobFetch(time.Since(start), len(value), cacheHit, err)
-	}()
-
-	blobIDHex := internal.BlobIDToHex(blobID)
-
-	if r.blobCache != nil {
-		if data, ok := r.getCachedBlob(blobIDHex, blobID); ok {
-			cacheHit = true
-			return data, nil
-		}
-	}
-
-	var sfValue interface{}
-	sfValue, err, _ = r.blobLoads.Do(blobIDHex, func() (interface{}, error) {
-		if r.blobCache != nil {
-			if data, ok := r.getCachedBlob(blobIDHex, blobID); ok {
-				return blobFetchResult{data: data, cacheHit: true}, nil
-			}
-		}
-
-		data, err := r.blobStorage.Read(ctx, blobID)
-		if err != nil {
-			return nil, err
-		}
-		if r.blobCache != nil {
-			r.blobCache.Set(blobIDHex, data)
-		}
-		return blobFetchResult{data: data, cacheHit: false}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	result, ok := sfValue.(blobFetchResult)
-	if !ok {
-		return nil, errors.New("internal error: unexpected blob fetch result")
-	}
-	cacheHit = result.cacheHit
-	return result.data, nil
-}
-
-func (r *Reader) getCachedBlob(blobIDHex string, blobID [32]byte) ([]byte, bool) {
-	data, ok := r.blobCache.Get(blobIDHex)
-	if !ok {
-		return nil, false
-	}
-	if r.valueConfig.VerifyBlobsOnRead {
-		if err := internal.VerifyBlob(blobID, data); err != nil {
-			r.blobCache.Remove(blobIDHex)
-			return nil, false
-		}
-	}
-	return data, true
+func (r *Reader) entryValue(_ context.Context, entry internal.CompactionEntry) ([]byte, error) {
+	return append([]byte(nil), entry.Value...), nil
 }
 
 func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
@@ -872,13 +735,6 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 		return meta.Size, nil
 	}
 	return 0, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
-}
-
-func (r *Reader) BlobCacheStats() CacheStats {
-	if r.blobCache != nil {
-		return cacheStatsFromDisk(r.blobCache.Stats())
-	}
-	return CacheStats{}
 }
 
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {

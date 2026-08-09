@@ -209,9 +209,8 @@ type WriterMaintenanceOptions struct {
 }
 
 type ValueOptions struct {
-    MaxKeyBytes      int   // Largest accepted key size.
-    InlineValueBytes int   // Values at or above this size are stored outside the SST.
-    MaxValueBytes    int64 // Largest accepted value size.
+    MaxKeyBytes   int   // Largest accepted key size. Default: 64 KiB.
+    MaxValueBytes int64 // Largest accepted value size. Default: 16 MiB.
 }
 
 func DefaultWriterOptions() WriterOptions
@@ -309,7 +308,6 @@ the caller needs an immediate visibility check.
 | Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
 | Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
 | Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
-| BlobCacheStats | `() CacheStats` | External-value cache statistics |
 | SSTCacheStats | `() CacheStats` | SST cache statistics |
 | ManifestPageCacheStats | `() CacheStats` | Manifest commit-page cache statistics |
 
@@ -317,15 +315,12 @@ the caller needs an immediate visibility check.
 type ReaderOpenOptions struct {
     CacheDir                 string               // Required disk cache directory.
     SSTCacheSize             int64                // Default: 1GB
-    BlobCacheSize            int64                // Default: 1GB
-    BlobCacheMaxItemSize     int64                // Max size per cached blob (0 = no limit)
     BlockCacheSize           int64                // Range-read block cache (0 = disabled)
     AllowUnverifiedRangeRead bool                 // Allow range reads without checksum verification
     RangeReadMinSSTSize      int64                // Minimum SST size for range-read optimization
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
     SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Manifest freshness policy
-    VerifyBlobsOnRead        bool
 }
 
 type CacheStats struct {

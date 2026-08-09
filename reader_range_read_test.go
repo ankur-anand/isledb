@@ -27,11 +27,10 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		entries = append(entries, internal.MemEntry{
-			Key:    []byte(key),
-			Value:  value,
-			Kind:   internal.OpPut,
-			Seq:    uint64(i + 1),
-			Inline: true,
+			Key:   []byte(key),
+			Value: value,
+			Kind:  internal.OpPut,
+			Seq:   uint64(i + 1),
 		})
 	}
 
@@ -112,11 +111,10 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		key := fmt.Sprintf("key-%06d", i)
 		entries = append(entries, internal.MemEntry{
-			Key:    []byte(key),
-			Value:  value,
-			Kind:   internal.OpPut,
-			Seq:    uint64(i + 1),
-			Inline: true,
+			Key:   []byte(key),
+			Value: value,
+			Kind:  internal.OpPut,
+			Seq:   uint64(i + 1),
 		})
 	}
 

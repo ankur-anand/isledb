@@ -3,16 +3,16 @@ package isledb
 import (
 	"time"
 
-	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/cachestore"
-	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
+const defaultSSTCacheSize = 1 << 30
+
 const (
-	defaultSSTCacheSize  = 1 << 30
-	defaultBlobCacheSize = 1 << 30
+	defaultMaxKeyBytes   = 64 * 1024
+	defaultMaxValueBytes = 16 * 1024 * 1024
 )
 
 type WriterOptions struct {
@@ -30,7 +30,7 @@ type WriterOptions struct {
 	// process using the same object-store prefix.
 	Maintenance WriterMaintenanceOptions
 
-	// Values controls inline-vs-external value storage and key/value limits.
+	// Values controls key/value limits. Values are stored inline in SSTs.
 	Values ValueOptions
 
 	// OnFlushError is called once after the background flush worker stops. The
@@ -67,15 +67,11 @@ type WriterMaintenanceOptions struct {
 	PollInterval time.Duration
 }
 
-// ValueOptions controls writer key/value limits and external value storage.
-// Zero fields select defaults.
+// ValueOptions controls writer key/value limits. Values are stored inline in
+// SSTs. Zero fields select defaults.
 type ValueOptions struct {
 	// MaxKeyBytes is the largest accepted key size.
 	MaxKeyBytes int
-
-	// InlineValueBytes is the external-storage threshold. Values with a size
-	// greater than or equal to this value are stored outside the SST.
-	InlineValueBytes int
 
 	// MaxValueBytes is the largest accepted value size.
 	MaxValueBytes int64
@@ -98,11 +94,9 @@ func DefaultWriterOptions() WriterOptions {
 }
 
 func defaultWriterValueOptions() ValueOptions {
-	defaults := config.DefaultValueOptions()
 	return ValueOptions{
-		MaxKeyBytes:      defaults.MaxKeySize,
-		InlineValueBytes: defaults.BlobThreshold,
-		MaxValueBytes:    defaults.MaxValueSize,
+		MaxKeyBytes:   defaultMaxKeyBytes,
+		MaxValueBytes: defaultMaxValueBytes,
 	}
 }
 
@@ -116,16 +110,6 @@ type readerOptions struct {
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
 	SSTCacheSize int64
 
-	// BlobCache is an optional pre-created blob cache.
-	BlobCache internal.BlobCache
-
-	// BlobCacheSize is the maximum bytes for blob cache (default 1GB).
-	BlobCacheSize int64
-
-	// BlobCacheMaxItemSize is the maximum size per item in the blob cache.
-	// Items larger than this will not be cached. Default 0 means no limit.
-	BlobCacheMaxItemSize int64
-
 	// BlockCacheSize is the maximum bytes for the in-memory block cache used
 	// when range-reading SSTs. Default 0 disables the block cache.
 	BlockCacheSize int64
@@ -138,8 +122,7 @@ type readerOptions struct {
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
 
-	ValueStorageConfig config.ValueStorageConfig
-	ManifestStorage    manifest.Storage
+	ManifestStorage manifest.Storage
 
 	ManifestPageCache        cachestore.ManifestPageCache
 	ManifestPageCacheSize    int
@@ -160,8 +143,7 @@ type readerOptions struct {
 
 func defaultReaderOptions() readerOptions {
 	return readerOptions{
-		SSTCacheSize:  defaultSSTCacheSize,
-		BlobCacheSize: defaultBlobCacheSize,
+		SSTCacheSize: defaultSSTCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},

@@ -13,7 +13,6 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/segmentio/ksuid"
 	"golang.org/x/sync/errgroup"
@@ -36,22 +35,19 @@ type writer struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
 	opts        WriterOptions
-	valueConfig config.ValueStorageConfig
 	sstOutput   SSTEncodingOptions
 
 	changeFeedPayload ChangeFeedPayload
 	ctx               context.Context
 	cancel            context.CancelFunc
 
-	mu                      sync.Mutex
-	memtable                *internal.Memtable
-	changeBuffer            *changeBatchBuffer
-	immQueue                []*pendingFlush
-	pendingMemtables        int
-	memtableInlineThreshold int
-	seq                     uint64
-	epoch                   uint64
-	blobStorage             *internal.BlobStorage
+	mu               sync.Mutex
+	memtable         *internal.Memtable
+	changeBuffer     *changeBatchBuffer
+	immQueue         []*pendingFlush
+	pendingMemtables int
+	seq              uint64
+	epoch            uint64
 
 	flushMu             sync.Mutex
 	flushTicker         *time.Ticker
@@ -113,7 +109,7 @@ func newWriterWithMaintenanceWake(
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	opts, valueConfig, err := normalizeWriterOptions(opts)
+	opts, err := normalizeWriterOptions(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -123,26 +119,22 @@ func newWriterWithMaintenanceWake(
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
 
-	memtableInlineThreshold := valueConfig.BlobThreshold
 	writerCtx, cancel := context.WithCancel(context.Background())
 
 	w := &writer{
-		store:                   store,
-		manifestLog:             manifestLog,
-		opts:                    opts,
-		valueConfig:             valueConfig,
-		sstOutput:               sstOutput,
-		ctx:                     writerCtx,
-		cancel:                  cancel,
-		memtable:                internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, valueConfig), memtableInlineThreshold),
-		memtableInlineThreshold: memtableInlineThreshold,
-		seq:                     m.MaxSeqNum(),
-		epoch:                   m.NextEpoch,
-		blobStorage:             internal.NewBlobStorage(store, valueConfig),
-		maintenanceWake:         maintenanceWake,
-		stopCh:                  make(chan struct{}),
-		workerDone:              make(chan struct{}),
-		metrics:                 opts.Metrics,
+		store:           store,
+		manifestLog:     manifestLog,
+		opts:            opts,
+		sstOutput:       sstOutput,
+		ctx:             writerCtx,
+		cancel:          cancel,
+		memtable:        internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, opts.Values)),
+		seq:             m.MaxSeqNum(),
+		epoch:           m.NextEpoch,
+		maintenanceWake: maintenanceWake,
+		stopCh:          make(chan struct{}),
+		workerDone:      make(chan struct{}),
+		metrics:         opts.Metrics,
 	}
 
 	ownerID := opts.OwnerID
@@ -165,32 +157,32 @@ func newWriterWithMaintenanceWake(
 	return w, nil
 }
 
-func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStorageConfig, error) {
+func normalizeWriterOptions(opts WriterOptions) (WriterOptions, error) {
 	d := DefaultWriterOptions()
 	if len(opts.OwnerID) > maxWriterOwnerIDBytes {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: owner_id bytes=%d max=%d", ErrInvalidWriterOptions, len(opts.OwnerID), maxWriterOwnerIDBytes)
 	}
 	if opts.Memtable.TargetBytes < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: target_bytes=%d", ErrInvalidWriterOptions, opts.Memtable.TargetBytes)
 	}
 	if opts.Memtable.TargetBytes == 0 {
 		opts.Memtable.TargetBytes = d.Memtable.TargetBytes
 	}
 	if opts.Memtable.MaxPendingMemtables < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: max_pending_memtables=%d", ErrInvalidWriterOptions, opts.Memtable.MaxPendingMemtables)
 	}
 	if opts.Memtable.MaxPendingMemtables == 0 {
 		opts.Memtable.MaxPendingMemtables = d.Memtable.MaxPendingMemtables
 	}
 	if opts.Flush.Interval < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: flush_interval=%s", ErrInvalidWriterOptions, opts.Flush.Interval)
 	}
 	if opts.Maintenance.PollInterval < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: maintenance_poll_interval=%s", ErrInvalidWriterOptions, opts.Maintenance.PollInterval)
 	}
 	if opts.Maintenance.PollInterval == 0 {
@@ -198,67 +190,50 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, config.ValueStor
 	}
 	vd := defaultWriterValueOptions()
 	values := opts.Values
-	if values.InlineValueBytes < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
-			"%w: inline_value_bytes=%d", ErrInvalidWriterOptions, values.InlineValueBytes)
-	}
 	if values.MaxKeyBytes < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: max_key_bytes=%d", ErrInvalidWriterOptions, values.MaxKeyBytes)
 	}
 	if values.MaxValueBytes < 0 {
-		return WriterOptions{}, config.ValueStorageConfig{}, fmt.Errorf(
+		return WriterOptions{}, fmt.Errorf(
 			"%w: max_value_bytes=%d", ErrInvalidWriterOptions, values.MaxValueBytes)
 	}
-	values.InlineValueBytes = cmp.Or(values.InlineValueBytes, vd.InlineValueBytes)
 	values.MaxKeyBytes = cmp.Or(values.MaxKeyBytes, vd.MaxKeyBytes)
 	values.MaxValueBytes = cmp.Or(values.MaxValueBytes, vd.MaxValueBytes)
 	opts.Values = values
 
-	valueConfig := config.DefaultValueStorageConfig()
-	valueConfig.BlobThreshold = values.InlineValueBytes
-	valueConfig.MaxKeySize = values.MaxKeyBytes
-	valueConfig.MaxValueSize = values.MaxValueBytes
-	if err := validateMemtableArena(opts.Memtable.TargetBytes, valueConfig); err != nil {
-		return WriterOptions{}, config.ValueStorageConfig{}, err
+	if err := validateMemtableArena(opts.Memtable.TargetBytes, values); err != nil {
+		return WriterOptions{}, err
 	}
-	return opts, valueConfig, nil
+	return opts, nil
 }
 
-func validateMemtableArena(targetBytes int64, valueConfig config.ValueStorageConfig) error {
+func validateMemtableArena(targetBytes int64, values ValueOptions) error {
 	if targetBytes > maxMemtableArenaBytes {
 		return fmt.Errorf("%w: target_bytes=%d exceeds arena max=%d",
 			ErrInvalidWriterOptions, targetBytes, maxMemtableArenaBytes)
 	}
 
-	maxInlineValue := int64(valueConfig.BlobThreshold - 1)
-	if maxInlineValue > valueConfig.MaxValueSize {
-		maxInlineValue = valueConfig.MaxValueSize
-	}
-	maxKeySize := int64(valueConfig.MaxKeySize)
-	if maxKeySize > maxMemtableArenaBytes || maxInlineValue > maxMemtableArenaBytes ||
-		maxKeySize+maxInlineValue+1024 > maxMemtableArenaBytes {
+	maxKeySize := int64(values.MaxKeyBytes)
+	if maxKeySize > maxMemtableArenaBytes || values.MaxValueBytes > maxMemtableArenaBytes ||
+		maxKeySize+values.MaxValueBytes+1024 > maxMemtableArenaBytes {
 		return fmt.Errorf("%w: maximum inline entry exceeds arena max=%d",
 			ErrInvalidWriterOptions, maxMemtableArenaBytes)
 	}
-	if arenaBytes := defaultMemtableArenaBytes(targetBytes, valueConfig); arenaBytes > maxMemtableArenaBytes {
+	if arenaBytes := defaultMemtableArenaBytes(targetBytes, values); arenaBytes > maxMemtableArenaBytes {
 		return fmt.Errorf("%w: memtable arena bytes=%d max=%d",
 			ErrInvalidWriterOptions, arenaBytes, maxMemtableArenaBytes)
 	}
 	return nil
 }
 
-func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorageConfig) int64 {
+func defaultMemtableArenaBytes(targetBytes int64, values ValueOptions) int64 {
 	headroom := targetBytes / 4
 	if headroom < minMemtableArenaHeadroom {
 		headroom = minMemtableArenaHeadroom
 	}
 
-	maxInlineValue := int64(valueConfig.BlobThreshold - 1)
-	if maxInlineValue < 0 || maxInlineValue > valueConfig.MaxValueSize {
-		maxInlineValue = valueConfig.MaxValueSize
-	}
-	maxInlineEntry := int64(valueConfig.MaxKeySize) + maxInlineValue + 1024
+	maxInlineEntry := int64(values.MaxKeyBytes) + values.MaxValueBytes + 1024
 	if headroom < maxInlineEntry {
 		headroom = maxInlineEntry
 	}
@@ -270,8 +245,8 @@ func defaultMemtableArenaBytes(targetBytes int64, valueConfig config.ValueStorag
 }
 
 func (w *writer) newMemtable() *internal.Memtable {
-	arenaBytes := defaultMemtableArenaBytes(w.opts.Memtable.TargetBytes, w.valueConfig)
-	return internal.NewMemtable(arenaBytes, w.memtableInlineThreshold)
+	arenaBytes := defaultMemtableArenaBytes(w.opts.Memtable.TargetBytes, w.opts.Values)
+	return internal.NewMemtable(arenaBytes)
 }
 
 // newPendingFlushLocked assigns identity and epoch exactly once. The caller
@@ -323,11 +298,11 @@ func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Dur
 	if len(key) == 0 {
 		return errors.New("empty key")
 	}
-	if len(key) > w.valueConfig.MaxKeySize {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
+	if len(key) > w.opts.Values.MaxKeyBytes {
+		return fmt.Errorf("key size %d exceeds max %d", len(key), w.opts.Values.MaxKeyBytes)
 	}
-	if int64(len(value)) > w.valueConfig.MaxValueSize {
-		return fmt.Errorf("value size %d exceeds max %d", len(value), w.valueConfig.MaxValueSize)
+	if int64(len(value)) > w.opts.Values.MaxValueBytes {
+		return fmt.Errorf("value size %d exceeds max %d", len(value), w.opts.Values.MaxValueBytes)
 	}
 
 	var expireAt int64
@@ -335,9 +310,6 @@ func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Dur
 		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 
-	if len(value) >= w.valueConfig.BlobThreshold {
-		return w.putBlob(ctx, key, value, expireAt)
-	}
 	return w.putInline(key, value, expireAt)
 }
 
@@ -363,45 +335,6 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 	return nil
 }
 
-func (w *writer) putBlob(ctx context.Context, key, value []byte, expireAt int64) (err error) {
-	start := time.Now()
-	defer func() {
-		w.metrics.ObservePutBlob(len(value), time.Since(start), err)
-	}()
-
-	w.mu.Lock()
-	if err := w.ensureCapacityLocked(); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	w.mu.Unlock()
-
-	blobID, err := w.blobStorage.Write(ctx, value)
-	if err != nil {
-		return fmt.Errorf("write blob: %w", err)
-	}
-
-	w.mu.Lock()
-	if err := w.ensureCapacityLocked(); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	seq := w.seq + 1
-	if w.changeFeedPayload != 0 {
-		if w.changeBuffer == nil {
-			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
-		}
-		if err := w.changeBuffer.appendPutForPayload(seq, key, value, expireAt, w.changeFeedPayload); err != nil {
-			w.mu.Unlock()
-			return err
-		}
-	}
-	w.seq = seq
-	w.memtable.PutBlobRefWithTTL(key, blobID, seq, expireAt)
-	w.mu.Unlock()
-	return nil
-}
-
 func (w *writer) delete(ctx context.Context, key []byte) error {
 	w.metrics.ObserveDelete()
 
@@ -415,8 +348,8 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 	if len(key) == 0 {
 		return errors.New("empty key")
 	}
-	if len(key) > w.valueConfig.MaxKeySize {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), w.valueConfig.MaxKeySize)
+	if len(key) > w.opts.Values.MaxKeyBytes {
+		return fmt.Errorf("key size %d exceeds max %d", len(key), w.opts.Values.MaxKeyBytes)
 	}
 
 	w.mu.Lock()

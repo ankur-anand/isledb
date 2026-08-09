@@ -11,13 +11,7 @@ import (
 
 const (
 	memEntryInline  byte = 1
-	memEntryBlob    byte = 3
 	memEntryTTLFlag byte = 0x80
-)
-
-const (
-	blobRefSize    = 2 + 32
-	blobRefSizeTTL = 2 + 8 + 32
 )
 
 type Memtable struct {
@@ -27,7 +21,7 @@ type Memtable struct {
 	seqHi uint64
 }
 
-func NewMemtable(arenaBytes int64, inlineThreshold int) *Memtable {
+func NewMemtable(arenaBytes int64) *Memtable {
 	return &Memtable{
 		sl:    skl.NewSkiplist(arenaBytes),
 		seqLo: ^uint64(0),
@@ -88,30 +82,6 @@ func (m *Memtable) PutWithTTL(key, value []byte, seq uint64, expireAt int64) {
 		encoded[1] = memEntryInline
 		copy(encoded[2:], value)
 		m.sl.Put(ikey, y.ValueStruct{Value: encoded})
-	}
-}
-
-func (m *Memtable) PutBlobRef(key []byte, blobID [32]byte, seq uint64) {
-	m.PutBlobRefWithTTL(key, blobID, seq, 0)
-}
-
-func (m *Memtable) PutBlobRefWithTTL(key []byte, blobID [32]byte, seq uint64, expireAt int64) {
-	iKey := y.KeyWithTs(key, seq)
-	m.updateSeqBounds(seq)
-
-	if expireAt > 0 {
-		encoded := make([]byte, blobRefSizeTTL)
-		encoded[0] = byte(OpPut)
-		encoded[1] = memEntryBlob | memEntryTTLFlag
-		binary.BigEndian.PutUint64(encoded[2:10], uint64(expireAt))
-		copy(encoded[10:42], blobID[:])
-		m.sl.Put(iKey, y.ValueStruct{Value: encoded})
-	} else {
-		encoded := make([]byte, blobRefSize)
-		encoded[0] = byte(OpPut)
-		encoded[1] = memEntryBlob
-		copy(encoded[2:34], blobID[:])
-		m.sl.Put(iKey, y.ValueStruct{Value: encoded})
 	}
 }
 
@@ -205,18 +175,10 @@ func decodeMemEntry(key []byte, vs y.ValueStruct) (MemEntry, error) {
 		return entry, nil
 	}
 
-	switch entryType {
-	case memEntryInline:
-		entry.Inline = true
-		entry.Value = append([]byte(nil), vs.Value[offset:]...)
-	case memEntryBlob:
-		if len(vs.Value) < offset+32 {
-			return MemEntry{}, errors.New("blob entry too short")
-		}
-		copy(entry.BlobID[:], vs.Value[offset:offset+32])
-	default:
+	if entryType != memEntryInline {
 		return MemEntry{}, errors.New("unknown entry type")
 	}
+	entry.Value = append([]byte(nil), vs.Value[offset:]...)
 
 	return entry, nil
 }

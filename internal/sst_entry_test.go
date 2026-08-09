@@ -18,21 +18,8 @@ func assertKeyEntry(t *testing.T, got, want KeyEntry) {
 		return
 	}
 
-	if want.Inline {
-		if !got.Inline {
-			t.Errorf("expected inline=true")
-		}
-		if !bytes.Equal(got.Value, want.Value) {
-			t.Errorf("value mismatch: got %v, want %v", got.Value, want.Value)
-		}
-		return
-	}
-
-	if got.Inline {
-		t.Errorf("expected inline=false")
-	}
-	if got.BlobID != want.BlobID {
-		t.Errorf("BlobID mismatch: got %v, want %v", got.BlobID, want.BlobID)
+	if !bytes.Equal(got.Value, want.Value) {
+		t.Errorf("value mismatch: got %v, want %v", got.Value, want.Value)
 	}
 }
 
@@ -46,9 +33,6 @@ func patternValue(size int) []byte {
 
 func TestEncodeDecodeKeyEntry(t *testing.T) {
 	key := []byte("testkey")
-
-	var blobID [32]byte
-	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
 
 	cases := []struct {
 		name    string
@@ -66,10 +50,9 @@ func TestEncodeDecodeKeyEntry(t *testing.T) {
 		{
 			name: "inline",
 			entry: KeyEntry{
-				Key:    key,
-				Kind:   OpPut,
-				Inline: true,
-				Value:  []byte("small value"),
+				Key:   key,
+				Kind:  OpPut,
+				Value: []byte("small value"),
 			},
 			marker:  MarkerInline,
 			wantLen: 1 + len("small value"),
@@ -77,23 +60,6 @@ func TestEncodeDecodeKeyEntry(t *testing.T) {
 				t.Helper()
 				if !bytes.Equal(encoded[1:], entry.Value) {
 					t.Fatalf("value mismatch in encoded bytes")
-				}
-			},
-		},
-		{
-			name: "blob_reference",
-			entry: KeyEntry{
-				Key:    key,
-				Kind:   OpPut,
-				Inline: false,
-				BlobID: blobID,
-			},
-			marker:  MarkerBlob,
-			wantLen: 1 + 32,
-			check: func(t *testing.T, encoded []byte, entry KeyEntry) {
-				t.Helper()
-				if !bytes.Equal(encoded[1:33], entry.BlobID[:]) {
-					t.Fatalf("blob ID mismatch in encoded bytes")
 				}
 			},
 		},
@@ -128,7 +94,7 @@ func TestDecodeKeyEntry_Errors(t *testing.T) {
 	}{
 		{name: "empty", encoded: []byte{}},
 		{name: "unknown_marker", encoded: []byte{0xFF}},
-		{name: "blob_too_short", encoded: []byte{MarkerBlob, 0x01, 0x02}},
+		{name: "removed_blob_marker", encoded: []byte{0x03, 0x01, 0x02}},
 	}
 
 	for _, tc := range cases {
@@ -138,53 +104,5 @@ func TestDecodeKeyEntry_Errors(t *testing.T) {
 				t.Errorf("expected error for %s", tc.name)
 			}
 		})
-	}
-}
-
-func TestKeyEntry_HasBlobID(t *testing.T) {
-
-	entry1 := KeyEntry{
-		Key:    []byte("key1"),
-		Kind:   OpPut,
-		Inline: true,
-		Value:  []byte("value"),
-	}
-	if entry1.HasBlobID() {
-		t.Error("expected HasBlobID=false for inline entry")
-	}
-
-	var blobID [32]byte
-	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
-	entry2 := KeyEntry{
-		Key:    []byte("key2"),
-		Kind:   OpPut,
-		BlobID: blobID,
-	}
-	if !entry2.HasBlobID() {
-		t.Error("expected HasBlobID=true for blob reference entry")
-	}
-}
-
-func TestCompactionEntry_HasBlobID(t *testing.T) {
-
-	entry1 := CompactionEntry{
-		Key:    []byte("key1"),
-		Kind:   OpPut,
-		Inline: true,
-		Value:  []byte("value"),
-	}
-	if entry1.HasBlobID() {
-		t.Error("expected HasBlobID=false for inline entry")
-	}
-
-	var blobID [32]byte
-	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
-	entry2 := CompactionEntry{
-		Key:    []byte("key2"),
-		Kind:   OpPut,
-		BlobID: blobID,
-	}
-	if !entry2.HasBlobID() {
-		t.Error("expected HasBlobID=true for blob reference entry")
 	}
 }

@@ -19,8 +19,8 @@ import (
 
 func TestWriteSSTStreaming_Basic(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
-		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("x")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -64,9 +64,6 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 	if result.Meta.Epoch != 1 {
 		t.Errorf("epoch mismatch: got %d", result.Meta.Epoch)
 	}
-	if result.Meta.HasBlobRefs {
-		t.Fatalf("expected HasBlobRefs=false for inline-only SST")
-	}
 	expectedSize := result.Meta.Size + result.Meta.Bloom.Length
 	if result.Meta.Bloom.Length > 0 {
 		expectedSize += bloomTrailerLen
@@ -105,7 +102,7 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 
 func TestWriteSSTStreaming_UploadError(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -129,7 +126,7 @@ func TestWriteSSTStreaming_ProducerError(t *testing.T) {
 	iterErr := errors.New("iterator failed")
 	it := &sliceSSTIter{
 		entries: []internal.MemEntry{
-			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
 		},
 		err: iterErr,
 	}
@@ -152,11 +149,10 @@ func TestWriteSSTStreaming_ContextCancellation(t *testing.T) {
 	entries := make([]internal.MemEntry, 1000)
 	for i := range entries {
 		entries[i] = internal.MemEntry{
-			Key:    []byte{byte(i / 256), byte(i % 256)},
-			Seq:    uint64(1000 - i),
-			Kind:   internal.OpPut,
-			Inline: true,
-			Value:  bytes.Repeat([]byte("x"), 100),
+			Key:   []byte{byte(i / 256), byte(i % 256)},
+			Seq:   uint64(1000 - i),
+			Kind:  internal.OpPut,
+			Value: bytes.Repeat([]byte("x"), 100),
 		}
 	}
 	it := &sliceSSTIter{entries: entries}
@@ -199,8 +195,8 @@ func TestWriteSSTStreaming_EmptyIterator(t *testing.T) {
 
 func TestWriteSSTStreaming_HashVerification(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("key1"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("value1")},
-		{Key: []byte("key2"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("value2")},
+		{Key: []byte("key1"), Seq: 3, Kind: internal.OpPut, Value: []byte("value1")},
+		{Key: []byte("key2"), Seq: 2, Kind: internal.OpPut, Value: []byte("value2")},
 		{Key: []byte("key3"), Seq: 1, Kind: internal.OpDelete},
 	}
 	it := &sliceSSTIter{entries: entries}
@@ -234,11 +230,11 @@ func TestWriteSSTStreaming_HashVerification(t *testing.T) {
 	}
 }
 
-func TestWriteSSTStreaming_BlobReference(t *testing.T) {
-	blobID := internal.ComputeBlobID([]byte("large-value-content"))
+func TestWriteSSTStreaming_LargeValue(t *testing.T) {
+	value := bytes.Repeat([]byte("large-value-content"), 16<<10)
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: false, BlobID: blobID},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: value},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -284,18 +280,12 @@ func TestWriteSSTStreaming_BlobReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
-	if decoded.Inline {
-		t.Fatalf("expected blob reference, got inline")
-	}
-	if decoded.BlobID != blobID {
-		t.Fatalf("blob id mismatch")
+	if !bytes.Equal(decoded.Value, value) {
+		t.Fatalf("large value mismatch: got %d bytes, want %d", len(decoded.Value), len(value))
 	}
 
 	if result.Meta.SeqLo != 1 || result.Meta.SeqHi != 1 {
 		t.Errorf("seq range mismatch: got %d-%d", result.Meta.SeqLo, result.Meta.SeqHi)
-	}
-	if !result.Meta.HasBlobRefs {
-		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
 	}
 }
 
@@ -317,9 +307,9 @@ func TestBuildSSTIDWithTimestamp(t *testing.T) {
 
 func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("value-a")},
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("value-b")},
-		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value-c")},
+		{Key: []byte("a"), Seq: 3, Kind: internal.OpPut, Value: []byte("value-a")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("value-b")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Value: []byte("value-c")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -364,16 +354,13 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 		if result.Meta.Size == 0 {
 			t.Errorf("result %d: zero size", i)
 		}
-		if result.Meta.HasBlobRefs {
-			t.Errorf("result %d: expected HasBlobRefs=false for inline-only entries", i)
-		}
 	}
 }
 
 func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
-		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("y")},
+		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("x")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Value: []byte("y")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -441,7 +428,7 @@ func TestWriteMultipleSSTsStreaming_EmptyIterator(t *testing.T) {
 
 func TestWriteMultipleSSTsStreaming_UploadError(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -466,11 +453,10 @@ func TestWriteMultipleSSTsStreaming_ContextCancellation(t *testing.T) {
 	entries := make([]internal.MemEntry, 100)
 	for i := range entries {
 		entries[i] = internal.MemEntry{
-			Key:    []byte{byte(i)},
-			Seq:    uint64(100 - i),
-			Kind:   internal.OpPut,
-			Inline: true,
-			Value:  bytes.Repeat([]byte("x"), 100),
+			Key:   []byte{byte(i)},
+			Seq:   uint64(100 - i),
+			Kind:  internal.OpPut,
+			Value: bytes.Repeat([]byte("x"), 100),
 		}
 	}
 	it := &sliceSSTIter{entries: entries}
@@ -491,8 +477,8 @@ func TestWriteMultipleSSTsStreaming_ContextCancellation(t *testing.T) {
 
 func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
 	entries := []internal.MemEntry{
-		{Key: []byte("key1"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("value1")},
-		{Key: []byte("key2"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value2")},
+		{Key: []byte("key1"), Seq: 2, Kind: internal.OpPut, Value: []byte("value1")},
+		{Key: []byte("key2"), Seq: 1, Kind: internal.OpPut, Value: []byte("value2")},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -530,7 +516,7 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 	iterErr := errors.New("iterator failed")
 	it := &sliceSSTIter{
 		entries: []internal.MemEntry{
-			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("x")},
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
 		},
 		err: iterErr,
 	}
@@ -549,10 +535,10 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 	}
 }
 
-func TestWriteMultipleSSTsStreaming_BlobReference(t *testing.T) {
-	blobID := internal.ComputeBlobID([]byte("large-value-content"))
+func TestWriteMultipleSSTsStreaming_LargeValue(t *testing.T) {
+	value := bytes.Repeat([]byte("large-value-content"), 16<<10)
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: false, BlobID: blobID},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: value},
 	}
 	it := &sliceSSTIter{entries: entries}
 
@@ -567,8 +553,5 @@ func TestWriteMultipleSSTsStreaming_BlobReference(t *testing.T) {
 	}
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if !results[0].Meta.HasBlobRefs {
-		t.Fatalf("expected HasBlobRefs=true for blob-ref SST")
 	}
 }

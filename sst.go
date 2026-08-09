@@ -55,7 +55,6 @@ func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch 
 	sst := sstable.NewWriter(writable, wo)
 
 	state := newSSTBuildState()
-	hasBlobRefs := false
 	abort := func(err error) (writeSSTResult, error) {
 		writable.Abort()
 		_ = sst.Close()
@@ -73,14 +72,7 @@ func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch 
 			hashes = append(hashes, bloomHashKey(k))
 		}
 
-		keyEntry, err := buildKeyEntry(e, k)
-		if err != nil {
-			return abort(err)
-		}
-		if keyEntry.Kind == internal.OpPut && !keyEntry.Inline {
-			hasBlobRefs = true
-		}
-
+		keyEntry := buildKeyEntry(e, k)
 		encodedValue := internal.EncodeKeyEntry(keyEntry)
 
 		if err := state.updateOrder(k, e.Seq); err != nil {
@@ -150,8 +142,7 @@ func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch 
 			Offset:     sstSize,
 			Length:     int64(len(bloomBytes)),
 		},
-		CreatedAt:   time.Now().UTC(),
-		HasBlobRefs: hasBlobRefs,
+		CreatedAt: time.Now().UTC(),
 	}
 	if opts.Signer != nil {
 		sig, err := opts.Signer.SignHash(hashBytes)
@@ -214,7 +205,7 @@ func (s *sstBuildState) updateBounds(key []byte, seq uint64) {
 	}
 }
 
-func buildKeyEntry(e internal.MemEntry, key []byte) (internal.KeyEntry, error) {
+func buildKeyEntry(e internal.MemEntry, key []byte) internal.KeyEntry {
 	keyEntry := internal.KeyEntry{
 		Key:      key,
 		Seq:      e.Seq,
@@ -223,23 +214,10 @@ func buildKeyEntry(e internal.MemEntry, key []byte) (internal.KeyEntry, error) {
 	}
 
 	if e.Kind == internal.OpDelete {
-		return keyEntry, nil
+		return keyEntry
 	}
-
-	if e.Inline {
-		keyEntry.Inline = true
-		keyEntry.Value = e.Value
-		return keyEntry, nil
-	}
-
-	var zeroBlobID [32]byte
-	if e.BlobID != zeroBlobID {
-		keyEntry.Inline = false
-		keyEntry.BlobID = e.BlobID
-		return keyEntry, nil
-	}
-
-	return internal.KeyEntry{}, fmt.Errorf("corrupt entry: non-inline, non-blob for key %q", key)
+	keyEntry.Value = e.Value
+	return keyEntry
 }
 
 func buildSSTID(epoch, seqLo, seqHi uint64, hashHex string) string {

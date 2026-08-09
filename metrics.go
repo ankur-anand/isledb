@@ -14,10 +14,6 @@ type WriterMetrics struct {
 	PutTotal          prometheus.Counter
 	PutErrors         prometheus.Counter
 	BackPressureTotal prometheus.Counter
-	PutBlobTotal      prometheus.Counter
-	PutBlobErrors     prometheus.Counter
-	PutBlobLatency    prometheus.Histogram
-	BlobBytesTotal    prometheus.Counter
 	DeleteTotal       prometheus.Counter
 }
 
@@ -64,21 +60,6 @@ func (m *WriterMetrics) ObserveDelete() {
 		return
 	}
 	m.incCounter(m.DeleteTotal)
-}
-
-func (m *WriterMetrics) ObservePutBlob(sizeBytes int, d time.Duration, err error) {
-	if m == nil {
-		return
-	}
-	m.incCounter(m.PutBlobTotal)
-	m.observeHistogram(m.PutBlobLatency, d.Seconds())
-	if err != nil {
-		m.incCounter(m.PutBlobErrors)
-		return
-	}
-	if sizeBytes > 0 {
-		m.addCounter(m.BlobBytesTotal, float64(sizeBytes))
-	}
 }
 
 func (m *WriterMetrics) ObserveFlushBytes(sizeBytes int64) {
@@ -152,34 +133,6 @@ func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 			Help:        "Total times ErrBackPressure was returned.",
 			ConstLabels: constLabels,
 		}),
-		PutBlobTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "writer",
-			Name:        "put_blob_total",
-			Help:        "Total PutBlob Operations.",
-			ConstLabels: constLabels,
-		}),
-		PutBlobErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "writer",
-			Name:        "put_blob_errors_total",
-			Help:        "Total PutBlob Errors.",
-			ConstLabels: constLabels,
-		}),
-		PutBlobLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace:   "isledb",
-			Subsystem:   "writer",
-			Name:        "put_blob_latency_seconds",
-			Help:        "Histogram of memtable put blob latency in seconds",
-			ConstLabels: constLabels,
-		}),
-		BlobBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "writer",
-			Name:        "blob_bytes_total",
-			Help:        "Total number of large blob bytes written to object Storage",
-			ConstLabels: constLabels,
-		}),
 		DeleteTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace:   "isledb",
 			Subsystem:   "writer",
@@ -210,13 +163,6 @@ type ReaderMetrics struct {
 	ScanLimitErrors  prometheus.Counter
 	ScanLimitLatency prometheus.Histogram
 	ScanLimitResults prometheus.Counter
-
-	BlobFetchTotal   prometheus.Counter
-	BlobFetchErrors  prometheus.Counter
-	BlobFetchLatency prometheus.Histogram
-	BlobCacheHits    prometheus.Counter
-	BlobCacheMisses  prometheus.Counter
-	BlobBytesTotal   prometheus.Counter
 
 	SSTCacheHits       prometheus.Counter
 	SSTCacheMisses     prometheus.Counter
@@ -309,26 +255,6 @@ func (m *ReaderMetrics) ObserveScanLimit(d time.Duration, resultCount int, err e
 	}
 	if resultCount > 0 {
 		m.addCounter(m.ScanLimitResults, float64(resultCount))
-	}
-}
-
-func (m *ReaderMetrics) ObserveBlobFetch(d time.Duration, sizeBytes int, cacheHit bool, err error) {
-	if m == nil {
-		return
-	}
-	m.incCounter(m.BlobFetchTotal)
-	m.observeHistogram(m.BlobFetchLatency, d.Seconds())
-	if cacheHit {
-		m.incCounter(m.BlobCacheHits)
-	} else {
-		m.incCounter(m.BlobCacheMisses)
-	}
-	if err != nil {
-		m.incCounter(m.BlobFetchErrors)
-		return
-	}
-	if sizeBytes > 0 {
-		m.addCounter(m.BlobBytesTotal, float64(sizeBytes))
 	}
 }
 
@@ -496,48 +422,6 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "scan_limit_results_total",
 			Help:        "Total number of key/value results returned by ScanLimit.",
-			ConstLabels: constLabels,
-		}),
-		BlobFetchTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_fetch_total",
-			Help:        "Total number of blob fetch operations.",
-			ConstLabels: constLabels,
-		}),
-		BlobFetchErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_fetch_errors_total",
-			Help:        "Total number of blob fetch errors.",
-			ConstLabels: constLabels,
-		}),
-		BlobFetchLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_fetch_latency_seconds",
-			Help:        "Histogram of blob fetch latency in seconds.",
-			ConstLabels: constLabels,
-		}),
-		BlobCacheHits: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_cache_hits_total",
-			Help:        "Total number of blob cache hits.",
-			ConstLabels: constLabels,
-		}),
-		BlobCacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_cache_misses_total",
-			Help:        "Total number of blob cache misses.",
-			ConstLabels: constLabels,
-		}),
-		BlobBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "blob_bytes_total",
-			Help:        "Total blob payload bytes returned by reader fetches.",
 			ConstLabels: constLabels,
 		}),
 		SSTCacheHits: prometheus.NewCounter(prometheus.CounterOpts{

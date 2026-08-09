@@ -1,15 +1,5 @@
 package diskcache
 
-// Cache is a generic diskcache interface.
-type Cache interface {
-	Get(key string) ([]byte, bool)
-	Set(key string, data []byte) error
-	Remove(key string)
-	Clear() error
-	Stats() Stats
-	Close() error
-}
-
 type Stats struct {
 	Hits       int64
 	Misses     int64

@@ -15,7 +15,6 @@ const (
 const (
 	MarkerInline byte = 0x00
 	MarkerDelete byte = 0x02
-	MarkerBlob   byte = 0x03
 
 	MarkerTTLFlag byte = 0x80
 )
@@ -25,10 +24,7 @@ type KeyEntry struct {
 	Seq  uint64
 	Kind OpKind
 
-	Inline bool
-	Value  []byte
-
-	BlobID [32]byte
+	Value []byte
 
 	ExpireAt int64
 }
@@ -46,30 +42,16 @@ func EncodeKeyEntry(e KeyEntry) []byte {
 		return []byte{MarkerDelete}
 	}
 
-	if e.Inline {
-		if hasTTL {
-			buf := make([]byte, 1+8+len(e.Value))
-			buf[0] = MarkerInline | MarkerTTLFlag
-			binary.BigEndian.PutUint64(buf[1:], uint64(e.ExpireAt))
-			copy(buf[9:], e.Value)
-			return buf
-		}
-		buf := make([]byte, 1+len(e.Value))
-		buf[0] = MarkerInline
-		copy(buf[1:], e.Value)
-		return buf
-	}
-
 	if hasTTL {
-		buf := make([]byte, 1+8+32)
-		buf[0] = MarkerBlob | MarkerTTLFlag
+		buf := make([]byte, 1+8+len(e.Value))
+		buf[0] = MarkerInline | MarkerTTLFlag
 		binary.BigEndian.PutUint64(buf[1:], uint64(e.ExpireAt))
-		copy(buf[9:], e.BlobID[:])
+		copy(buf[9:], e.Value)
 		return buf
 	}
-	buf := make([]byte, 1+32)
-	buf[0] = MarkerBlob
-	copy(buf[1:], e.BlobID[:])
+	buf := make([]byte, 1+len(e.Value))
+	buf[0] = MarkerInline
+	copy(buf[1:], e.Value)
 	return buf
 }
 
@@ -100,15 +82,7 @@ func DecodeKeyEntry(key, encoded []byte) (KeyEntry, error) {
 		e.Kind = OpDelete
 	case MarkerInline:
 		e.Kind = OpPut
-		e.Inline = true
 		e.Value = encoded[offset:]
-	case MarkerBlob:
-		if len(encoded) < offset+32 {
-			return KeyEntry{}, errors.New("blob entry too short")
-		}
-		e.Kind = OpPut
-		e.Inline = false
-		copy(e.BlobID[:], encoded[offset:offset+32])
 	default:
 		return KeyEntry{}, errors.New("unknown marker byte")
 	}
@@ -116,19 +90,11 @@ func DecodeKeyEntry(key, encoded []byte) (KeyEntry, error) {
 	return e, nil
 }
 
-func (e *KeyEntry) HasBlobID() bool {
-	var zeroBlobID [32]byte
-	return e.BlobID != zeroBlobID
-}
-
 type MemEntry struct {
-	Key    []byte
-	Seq    uint64
-	Kind   OpKind
-	Inline bool
-	Value  []byte
-
-	BlobID [32]byte
+	Key   []byte
+	Seq   uint64
+	Kind  OpKind
+	Value []byte
 
 	ExpireAt int64
 }
@@ -138,10 +104,7 @@ type CompactionEntry struct {
 	Seq  uint64
 	Kind OpKind
 
-	Inline bool
-	Value  []byte
-
-	BlobID [32]byte
+	Value []byte
 
 	ExpireAt int64
 }
@@ -156,9 +119,4 @@ func (e *MemEntry) IsExpired(nowMs int64) bool {
 
 func (e *CompactionEntry) IsExpired(nowMs int64) bool {
 	return e.ExpireAt > 0 && e.ExpireAt <= nowMs
-}
-
-func (e *CompactionEntry) HasBlobID() bool {
-	var zeroBlobID [32]byte
-	return e.BlobID != zeroBlobID
 }

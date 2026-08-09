@@ -59,13 +59,11 @@ func writeSSTStreaming(
 	state := newSSTBuildState()
 
 	type producerResult struct {
-		state       *sstBuildState
-		bloom       bloomMetadata
-		hasBlobRefs bool
-		err         error
+		state *sstBuildState
+		bloom bloomMetadata
+		err   error
 	}
 	producerDone := make(chan producerResult, 1)
-	hasBlobRefs := false
 
 	var uploadErr atomic.Value
 	getUploadErr := func() error {
@@ -77,7 +75,7 @@ func writeSSTStreaming(
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// read from the pipe and upload to the blob
+	// Read from the pipe and upload to object storage.
 	g.Go(func() error {
 		err := uploadFn(gctx, sstID, pr)
 		if err != nil {
@@ -111,18 +109,7 @@ func writeSSTStreaming(
 				hashes = append(hashes, bloomHashKey(k))
 			}
 
-			keyEntry, err := buildKeyEntry(e, k)
-			if err != nil {
-				writable.Abort()
-				_ = sst.Close()
-				producerDone <- producerResult{err: err}
-				pw.CloseWithError(err)
-				return fmt.Errorf("sst producer: %w", err)
-			}
-			if keyEntry.Kind == internal.OpPut && !keyEntry.Inline {
-				hasBlobRefs = true
-			}
-
+			keyEntry := buildKeyEntry(e, k)
 			encodedValue := internal.EncodeKeyEntry(keyEntry)
 
 			if err := state.updateOrder(k, e.Seq); err != nil {
@@ -218,7 +205,6 @@ func writeSSTStreaming(
 				Offset:     sstSize,
 				Length:     int64(len(bloomBytes)),
 			},
-			hasBlobRefs: hasBlobRefs,
 		}
 		return nil
 	})
@@ -235,17 +221,16 @@ func writeSSTStreaming(
 	hashStr := hex.EncodeToString(hashBytes)
 
 	result.Meta = sstMetadata{
-		ID:          sstID,
-		Epoch:       epoch,
-		SeqLo:       pResult.state.seqLo,
-		SeqHi:       pResult.state.seqHi,
-		MinKey:      pResult.state.minKey,
-		MaxKey:      pResult.state.maxKey,
-		Size:        writable.size,
-		Checksum:    "sha256:" + hashStr,
-		Bloom:       pResult.bloom,
-		CreatedAt:   ts,
-		HasBlobRefs: pResult.hasBlobRefs,
+		ID:        sstID,
+		Epoch:     epoch,
+		SeqLo:     pResult.state.seqLo,
+		SeqHi:     pResult.state.seqHi,
+		MinKey:    pResult.state.minKey,
+		MaxKey:    pResult.state.maxKey,
+		Size:      writable.size,
+		Checksum:  "sha256:" + hashStr,
+		Bloom:     pResult.bloom,
+		CreatedAt: ts,
 	}
 
 	if opts.Signer != nil {
@@ -299,7 +284,6 @@ func writeMultipleSSTsStreaming(
 	var uploadDone chan struct{}
 	var started bool
 	var sstIndex int
-	var hasBlobRefs bool
 
 	getUploadErr := func() error {
 		if v := uploadErr.Load(); v != nil {
@@ -318,7 +302,6 @@ func writeMultipleSSTsStreaming(
 		sst = sstable.NewWriter(writable, wo)
 		state = newSSTBuildState()
 		hashes = nil
-		hasBlobRefs = false
 		uploadErr = atomic.Value{}
 		uploadDone = make(chan struct{})
 		started = true
@@ -395,8 +378,7 @@ func writeMultipleSSTsStreaming(
 					Offset:     sstSize,
 					Length:     int64(len(bloomBytes)),
 				},
-				CreatedAt:   ts,
-				HasBlobRefs: hasBlobRefs,
+				CreatedAt: ts,
 			},
 		}
 
@@ -465,15 +447,7 @@ func writeMultipleSSTsStreaming(
 			hashes = append(hashes, bloomHashKey(k))
 		}
 
-		keyEntry, err := buildKeyEntry(e, k)
-		if err != nil {
-			abortCurrentSST()
-			return nil, err
-		}
-		if keyEntry.Kind == internal.OpPut && !keyEntry.Inline {
-			hasBlobRefs = true
-		}
-
+		keyEntry := buildKeyEntry(e, k)
 		encodedValue := internal.EncodeKeyEntry(keyEntry)
 
 		if err := state.updateOrder(k, e.Seq); err != nil {

@@ -447,7 +447,6 @@ func TestChangeFeedKeysOnlyPreservesKVAndOmitsFeedValues(t *testing.T) {
 	defer db.Close()
 
 	writerOpts := testChangeWriterOptions()
-	writerOpts.Values.InlineValueBytes = 1 // Exercise a blob-backed KV value.
 	writer, err := db.OpenWriter(ctx, writerOpts)
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
@@ -536,7 +535,7 @@ func TestChangeFeedPayloadConfigurationIsExplicitAndImmutable(t *testing.T) {
 func TestPublicChangeDistinguishesEmptyFromOmittedValue(t *testing.T) {
 	var pageData []byte
 	full := publicChange(changeRecord{
-		Seq: 1, Kind: changePut, Key: []byte("full"), Inline: true, Value: []byte{},
+		Seq: 1, Kind: changePut, Key: []byte("full"), Value: []byte{},
 	}, &pageData)
 	if !full.HasValue || full.Value == nil || len(full.Value) != 0 {
 		t.Fatalf("full empty value=%+v", full)

@@ -19,7 +19,7 @@ func TestReaderSnapshotPinsLoadedState(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
@@ -43,7 +43,7 @@ func TestReaderSnapshotPinsLoadedState(t *testing.T) {
 	}
 
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("vb")},
 	}, 0, 1)
 
 	if err := reader.Refresh(ctx); err != nil {
@@ -80,9 +80,9 @@ func TestReaderSnapshotScanLimitAndIterator(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
-		{Key: []byte("c"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("vc")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("vb")},
+		{Key: []byte("c"), Seq: 3, Kind: internal.OpPut, Value: []byte("vc")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
@@ -133,7 +133,7 @@ func TestReaderSnapshotCloseIsIdempotentAndRejectsFurtherUse(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
@@ -169,7 +169,7 @@ func TestReaderCloseRejectsFurtherUse(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
@@ -268,14 +268,14 @@ func TestReaderRefreshesExpiredManifestBeforeRead(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)
 	defer reader.Close()
 
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("vb")},
 	}, 0, 1)
 
 	if _, found, err := reader.Get(ctx, []byte("b")); err != nil {
@@ -301,7 +301,7 @@ func TestReaderSnapshotAndIteratorExpire(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
 	}, 0, 1)
 
 	reader := openTestReader(t, ctx, store)

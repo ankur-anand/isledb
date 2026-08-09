@@ -62,8 +62,7 @@ type SSTMeta struct {
 
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
-	Level       uint32 `json:"level"`
-	HasBlobRefs bool   `json:"has_blob_refs"`
+	Level uint32 `json:"level"`
 }
 
 // ChangeFeedPayload identifies which PUT payload is retained in committed
