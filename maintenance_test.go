@@ -14,26 +14,71 @@ import (
 
 func TestMaintenanceDefaultsUseExplicitUnits(t *testing.T) {
 	maintenance := DefaultMaintenanceOptions()
-	if maintenance.Checkpoint.MaxReplayPages != DefaultCheckpointReplayPages {
-		t.Fatalf("MaxReplayPages=%d, want %d", maintenance.Checkpoint.MaxReplayPages, DefaultCheckpointReplayPages)
+	normalized, err := normalizeMaintenanceOptions(maintenance)
+	if err != nil {
+		t.Fatalf("normalizeMaintenanceOptions: %v", err)
+	}
+	if normalized.checkpointReplayPages != defaultCheckpointReplayPages {
+		t.Fatalf("checkpointReplayPages=%d, want %d", normalized.checkpointReplayPages, defaultCheckpointReplayPages)
 	}
 
-	changeFeed := DefaultChangeFeedRetentionPolicy()
-	if changeFeed.KeepAtLeastManifestEntries != 1024 {
-		t.Fatalf("KeepAtLeastManifestEntries=%d, want 1024", changeFeed.KeepAtLeastManifestEntries)
+	changeFeed := DefaultChangeFeedRetentionOptions()
+	if changeFeed.RetainFor != 7*24*time.Hour {
+		t.Fatalf("RetainFor=%v, want 7 days", changeFeed.RetainFor)
+	}
+}
+
+func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
+	opts := MaintenanceOptions{
+		SSTCompaction: SSTCompactionOptions{L0TriggerSSTs: 12},
+	}
+	normalized, err := normalizeMaintenanceOptions(opts)
+	if err != nil {
+		t.Fatalf("normalizeMaintenanceOptions: %v", err)
+	}
+	defaults := DefaultMaintenanceOptions()
+	if normalized.sstCompaction.L0TriggerSSTs != 12 {
+		t.Fatalf("L0TriggerSSTs=%d, want 12", normalized.sstCompaction.L0TriggerSSTs)
+	}
+	if normalized.sstCompaction.ReadConcurrency != defaults.SSTCompaction.ReadConcurrency ||
+		normalized.sstCompaction.LevelGrowthFactor != defaults.SSTCompaction.LevelGrowthFactor {
+		t.Fatalf("zero fields did not inherit defaults: %+v", normalized.sstCompaction)
+	}
+
+	tests := []struct {
+		name string
+		opts SSTCompactionOptions
+	}{
+		{name: "negative", opts: SSTCompactionOptions{ReadConcurrency: -1}},
+		{name: "invalid growth", opts: SSTCompactionOptions{LevelGrowthFactor: 1}},
+		{name: "too many inputs", opts: SSTCompactionOptions{MaxInputSSTsPerJob: manifest.MaxRetiredObjectsPerEntry + 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := normalizeMaintenanceOptions(MaintenanceOptions{SSTCompaction: test.opts})
+			if !errors.Is(err, ErrInvalidMaintenanceOptions) {
+				t.Fatalf("normalize error=%v, want %v", err, ErrInvalidMaintenanceOptions)
+			}
+		})
+	}
+}
+
+func TestMaintenanceStateString(t *testing.T) {
+	for state, want := range map[MaintenanceState]string{
+		MaintenanceIdle:             "idle",
+		MaintenanceWaitingForWriter: "waiting_for_writer",
+		MaintenanceState(255):       "MaintenanceState(255)",
+	} {
+		if got := state.String(); got != want {
+			t.Errorf("state %d String()=%q, want %q", state, got, want)
+		}
 	}
 }
 
 func TestMaintenanceRecordsPublicChangeFeedCleanupStats(t *testing.T) {
-	var callbackStats ChangeFeedCleanupStats
-	policy := DefaultChangeFeedRetentionPolicy()
-	policy.OnCleanup = func(stats ChangeFeedCleanupStats) {
-		callbackStats = stats
-	}
 	cycle := MaintenanceStats{}
 	maintenance := &Maintenance{
-		currentStats:        &cycle,
-		changeFeedRetention: &policy,
+		currentStats: &cycle,
 	}
 	want := ChangeFeedCleanupStats{
 		EntriesRetired:  7,
@@ -47,9 +92,6 @@ func TestMaintenanceRecordsPublicChangeFeedCleanupStats(t *testing.T) {
 	maintenance.recordChangeFeed(want)
 	if cycle.ChangeFeedRetention != want {
 		t.Fatalf("cycle stats=%+v want=%+v", cycle.ChangeFeedRetention, want)
-	}
-	if callbackStats != want {
-		t.Fatalf("callback stats=%+v want=%+v", callbackStats, want)
 	}
 }
 
@@ -84,13 +126,13 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 	}
 
 	opts := DefaultMaintenanceOptions()
-	opts.Checkpoint.MaxReplayPages = 1
-	opts.Compaction.L0SSTCount = 10_000
+	opts.SSTCompaction.L0TriggerSSTs = 10_000
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
 	defer maintenance.Close(ctx)
+	maintenance.opts.checkpointReplayPages = 1
 	beforeRun, err := db.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("ReadCurrentData(before run): %v", err)
@@ -114,15 +156,18 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 				t.Fatalf("ApplyPendingMaintenance(%d): %v", attempt, err)
 			}
 		}
-		if stats.CheckpointStaged {
+		if stats.ManifestCheckpoint.Staged {
 			break
 		}
 	}
-	if !stats.CheckpointStaged {
+	if !stats.ManifestCheckpoint.Staged {
 		t.Fatal("maintenance did not stage a checkpoint")
 	}
-	if stats.CheckpointReplayPages < 1 || stats.CheckpointReplayBytes == 0 {
-		t.Fatalf("checkpoint stats=(%d pages, %d bytes), want non-zero", stats.CheckpointReplayPages, stats.CheckpointReplayBytes)
+	if stats.State != MaintenanceWaitingForWriter {
+		t.Fatalf("checkpoint cycle state=%v, want waiting for writer", stats.State)
+	}
+	if stats.ManifestCheckpoint.ReplayPages < 1 || stats.ManifestCheckpoint.ReplayBytes == 0 {
+		t.Fatalf("checkpoint stats=(%d pages, %d bytes), want non-zero", stats.ManifestCheckpoint.ReplayPages, stats.ManifestCheckpoint.ReplayBytes)
 	}
 	current, err := db.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
@@ -232,7 +277,7 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.GarbageCollection.DeleteBatchSize = -1
+	opts.Interval = -time.Second
 	if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrInvalidMaintenanceOptions) {
 		t.Fatalf("OpenMaintenance(invalid) error=%v, want %v", err, ErrInvalidMaintenanceOptions)
 	}
@@ -251,7 +296,7 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	store := blobstore.NewMemory("maintenance-shared-fence")
 	defer store.Close()
 
-	changeFeed := defaultChangeFeedRetentionPolicy()
+	changeFeed := DefaultChangeFeedRetentionOptions()
 	db, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
@@ -259,7 +304,6 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.OwnerID = "maintenance-owner"
 	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
@@ -349,12 +393,18 @@ func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
 	if err := secondWriter.Flush(ctx); err != nil {
 		t.Fatalf("second writer Flush: %v", err)
 	}
+	cycle := MaintenanceStats{State: MaintenanceWaitingForWriter}
+	maintenance.currentStats = &cycle
 	waiting, err := maintenance.reconcilePendingCommand(ctx)
+	maintenance.currentStats = nil
 	if err != nil {
 		t.Fatalf("reconcilePendingCommand: %v", err)
 	}
 	if waiting {
 		t.Fatal("maintenance still waiting after replacement writer applied command")
+	}
+	if cycle.State != MaintenanceIdle {
+		t.Fatalf("reconciled state=%v, want idle", cycle.State)
 	}
 	head, _, err := firstDB.manifestStore.ReadMaintenanceHead(ctx)
 	if err != nil {
@@ -407,7 +457,6 @@ func TestNewMaintenanceOwnerClearsReceiptAfterPreviousOwnerStops(t *testing.T) {
 	}
 
 	secondOpts := DefaultMaintenanceOptions()
-	secondOpts.OwnerID = "maintenance-replacement"
 	second, err := db.OpenMaintenance(ctx, secondOpts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance(second): %v", err)
@@ -441,7 +490,7 @@ func TestMaintenanceRunStopsOnClose(t *testing.T) {
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.Every = time.Hour
+	opts.Interval = time.Hour
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
@@ -485,9 +534,8 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	}
 	defer secondDB.Close()
 
-	changeFeed := defaultChangeFeedRetentionPolicy()
+	changeFeed := DefaultChangeFeedRetentionOptions()
 	firstOpts := DefaultMaintenanceOptions()
-	firstOpts.OwnerID = "maintenance-first"
 	firstOpts.ChangeFeedRetention = &changeFeed
 	first, err := firstDB.OpenMaintenance(ctx, firstOpts)
 	if err != nil {
@@ -496,7 +544,6 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 	defer first.Close(ctx)
 
 	secondOpts := DefaultMaintenanceOptions()
-	secondOpts.OwnerID = "maintenance-second"
 	second, err := secondDB.OpenMaintenance(ctx, secondOpts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance(second): %v", err)

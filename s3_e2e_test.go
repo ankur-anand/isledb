@@ -105,11 +105,10 @@ func TestS3E2E_WriteCompactRead(t *testing.T) {
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.OwnerID = "s3-e2e-maintenance"
-	maintenanceOpts.Every = 10 * time.Millisecond
-	maintenanceOpts.Compaction.L0SSTCount = 4
-	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-	maintenanceOpts.Compaction.TargetSSTBytes = 2 * 1024
+	maintenanceOpts.Interval = 10 * time.Millisecond
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenanceOpts.SSTCompaction.TargetSSTBytes = 2 * 1024
 
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -363,17 +362,15 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	}
 
 	opts := DefaultMaintenanceOptions()
-	opts.OwnerID = "kv-lifecycle-maintenance"
-	opts.Compaction.L0SSTCount = 2
-	opts.Compaction.BaseLevelBytes = 1 << 60
-	opts.Compaction.TargetSSTBytes = 1 << 20
-	opts.GarbageCollection.DeleteBatchSize = len(oldSSTs)
+	opts.SSTCompaction.L0TriggerSSTs = 2
+	opts.SSTCompaction.BaseLevelBytes = 1 << 60
+	opts.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
 	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
-	if stats.CompactionJobs == 0 {
+	if stats.SSTCompaction.Jobs == 0 {
 		t.Fatalf("compaction did not run: %+v", stats)
 	}
 	if err := maintenance.Close(ctx); err != nil {
@@ -484,19 +481,19 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	}
 
 	time.Sleep(2 * time.Millisecond)
-	changeFeed := defaultChangeFeedRetentionPolicy()
-	changeFeed.KeepFor = time.Millisecond
-	// Retain the newest writer commit and its change batch.
-	changeFeed.KeepAtLeastManifestEntries = 1
-	changeFeed.DeleteGracePeriod = time.Nanosecond
+	changeFeed := DefaultChangeFeedRetentionOptions()
+	changeFeed.RetainFor = time.Millisecond
 	opts := DefaultMaintenanceOptions()
-	opts.OwnerID = "change-feed-e2e-maintenance"
 	opts.ChangeFeedRetention = &changeFeed
 
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
+	// Retain the newest writer commit and its change batch while keeping the
+	// production safeguards internal to the public API.
+	maintenance.changeFeed.opts.KeepAtLeastManifestEntries = 1
+	maintenance.changeFeed.opts.SweepGracePeriod = time.Nanosecond
 	driveMaintenanceToIdle(t, ctx, maintenance, writer)
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
@@ -555,11 +552,10 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.OwnerID = "s3-bench-maintenance"
-	maintenanceOpts.Every = 25 * time.Millisecond
-	maintenanceOpts.Compaction.L0SSTCount = 8
-	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-	maintenanceOpts.Compaction.TargetSSTBytes = 64 << 10
+	maintenanceOpts.Interval = 25 * time.Millisecond
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 8
+	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenanceOpts.SSTCompaction.TargetSSTBytes = 64 << 10
 
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -614,11 +610,11 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 		if err != nil {
 			t.Fatalf("maintenance RunOnce(%d): %v", attempt, err)
 		}
-		total.CompactionJobs += stats.CompactionJobs
-		total.CompactionInputSSTs += stats.CompactionInputSSTs
-		total.CompactionOutputSSTs += stats.CompactionOutputSSTs
-		total.CompactionOutputBytes += stats.CompactionOutputBytes
-		total.CheckpointStaged = total.CheckpointStaged || stats.CheckpointStaged
+		total.SSTCompaction.Jobs += stats.SSTCompaction.Jobs
+		total.SSTCompaction.InputSSTs += stats.SSTCompaction.InputSSTs
+		total.SSTCompaction.OutputSSTs += stats.SSTCompaction.OutputSSTs
+		total.SSTCompaction.OutputBytes += stats.SSTCompaction.OutputBytes
+		total.ManifestCheckpoint.Staged = total.ManifestCheckpoint.Staged || stats.ManifestCheckpoint.Staged
 
 		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)
 		if err != nil {
@@ -630,7 +626,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 			}
 			continue
 		}
-		if !stats.CommandApplied && !stats.CommandRejected && !stats.CommandPending {
+		if stats.State == MaintenanceIdle {
 			return total
 		}
 	}

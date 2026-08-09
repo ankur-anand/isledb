@@ -212,12 +212,10 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.OwnerID = "multiprocess-maintenance"
-	opts.Every = 5 * time.Millisecond
-	opts.Compaction.L0SSTCount = 4
-	opts.Compaction.BaseLevelBytes = 1 << 60
-	opts.Compaction.TargetSSTBytes = 32 << 10
-	opts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
+	opts.Interval = 5 * time.Millisecond
+	opts.SSTCompaction.L0TriggerSSTs = 4
+	opts.SSTCompaction.BaseLevelBytes = 1 << 60
+	opts.SSTCompaction.TargetSSTBytes = 32 << 10
 	maintenance, err := db.OpenMaintenance(parent, opts)
 	if err != nil {
 		t.Fatalf("maintenance OpenMaintenance: %v", err)
@@ -253,11 +251,9 @@ func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blob
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.OwnerID = "multiprocess-drain-maintenance"
-	maintenanceOpts.Compaction.L0SSTCount = 4
-	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-	maintenanceOpts.Compaction.TargetSSTBytes = 32 << 10
-	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenanceOpts.SSTCompaction.TargetSSTBytes = 32 << 10
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
 		t.Fatalf("drain OpenMaintenance: %v", err)
