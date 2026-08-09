@@ -37,7 +37,7 @@ func TestMemtable_PutAndIterator(t *testing.T) {
 	key := []byte("key1")
 	value := []byte("test value")
 
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 	mt.Put(key, value, 1)
 
 	entry := singleEntry(t, mt)
@@ -50,20 +50,17 @@ func TestMemtable_PutAndIterator(t *testing.T) {
 	if entry.Kind != OpPut {
 		t.Errorf("kind mismatch: got %v, want OpPut", entry.Kind)
 	}
-	if !entry.Inline {
-		t.Errorf("expected inline")
-	}
 	if !bytes.Equal(entry.Value, value) {
 		t.Errorf("value mismatch: got %s, want %s", entry.Value, value)
 	}
 }
 
-func TestMemtable_PutBlobRef(t *testing.T) {
-	key := []byte("blobkey")
-	blobID := ComputeBlobID([]byte("large-blob-content"))
+func TestMemtable_PutLargeValue(t *testing.T) {
+	key := []byte("large-key")
+	value := bytes.Repeat([]byte("v"), 256<<10)
 
-	mt := NewMemtable(1<<20, 0)
-	mt.PutBlobRef(key, blobID, 1)
+	mt := NewMemtable(1 << 20)
+	mt.Put(key, value, 1)
 
 	entry := singleEntry(t, mt)
 	if !bytes.Equal(entry.Key, key) {
@@ -75,16 +72,13 @@ func TestMemtable_PutBlobRef(t *testing.T) {
 	if entry.Kind != OpPut {
 		t.Errorf("kind mismatch: got %v, want OpPut", entry.Kind)
 	}
-	if entry.Inline {
-		t.Errorf("expected non-inline for blob ref")
-	}
-	if entry.BlobID != blobID {
-		t.Errorf("blob id mismatch: got %x, want %x", entry.BlobID, blobID)
+	if !bytes.Equal(entry.Value, value) {
+		t.Errorf("large value mismatch")
 	}
 }
 
 func TestMemtable_Delete(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 	key := []byte("deletekey")
 	mt.Delete(key, 5)
 
@@ -101,7 +95,7 @@ func TestMemtable_Delete(t *testing.T) {
 }
 
 func TestMemtable_MultipleEntries_SortedOrder(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 	inputs := []struct {
 		key   string
 		value string
@@ -129,7 +123,7 @@ func TestMemtable_MultipleEntries_SortedOrder(t *testing.T) {
 }
 
 func TestMemtable_SameKeyDifferentSeq(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	key := []byte("mykey")
 	values := []struct {
@@ -157,7 +151,7 @@ func TestMemtable_SameKeyDifferentSeq(t *testing.T) {
 }
 
 func TestMemtable_ApproxSize(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	initialSize := mt.ApproxSize()
 	puts := []struct {
@@ -178,7 +172,7 @@ func TestMemtable_ApproxSize(t *testing.T) {
 }
 
 func TestMemtable_Empty(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 	if !mt.Empty() {
 		t.Fatal("new memtable should be empty")
 	}
@@ -189,7 +183,7 @@ func TestMemtable_Empty(t *testing.T) {
 }
 
 func TestMemtable_TotalSize(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	mt.Put([]byte("small"), []byte("tiny"), 1)
 	smallTotal := mt.TotalSize()
@@ -203,7 +197,7 @@ func TestMemtable_TotalSize(t *testing.T) {
 }
 
 func TestMemtable_EmptyIterator(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	entries := readEntries(t, mt)
 	if len(entries) != 0 {
@@ -212,7 +206,7 @@ func TestMemtable_EmptyIterator(t *testing.T) {
 }
 
 func TestMemtable_ConcurrentPuts(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	var wg sync.WaitGroup
 	numGoroutines := 10
@@ -239,8 +233,8 @@ func TestMemtable_ConcurrentPuts(t *testing.T) {
 	}
 }
 
-func TestMemtable_ConcurrentBlobRefs(t *testing.T) {
-	mt := NewMemtable(10<<20, 0)
+func TestMemtable_ConcurrentLargeValues(t *testing.T) {
+	mt := NewMemtable(10 << 20)
 
 	var wg sync.WaitGroup
 	numGoroutines := 5
@@ -252,8 +246,8 @@ func TestMemtable_ConcurrentBlobRefs(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < entriesPerGoroutine; i++ {
 				key := []byte(fmt.Sprintf("g%d-k%d", gid, i))
-				blobID := ComputeBlobID([]byte(fmt.Sprintf("blob-content-%d-%d", gid, i)))
-				mt.PutBlobRef(key, blobID, uint64(gid*1000+i))
+				value := bytes.Repeat([]byte{byte(gid + i)}, 32<<10)
+				mt.Put(key, value, uint64(gid*1000+i))
 			}
 		}(g)
 	}
@@ -268,7 +262,7 @@ func TestMemtable_ConcurrentBlobRefs(t *testing.T) {
 }
 
 func TestMemtable_Iterator_MultipleRewinds(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	mt.Put([]byte("a"), []byte("1"), 1)
 	mt.Put([]byte("b"), []byte("2"), 2)
@@ -290,7 +284,7 @@ func TestMemtable_Iterator_MultipleRewinds(t *testing.T) {
 }
 
 func TestMemtable_EmptyKeyAndValue(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	mt.Put([]byte{}, []byte("value"), 1)
 	mt.Put([]byte("key"), []byte{}, 2)
@@ -303,7 +297,7 @@ func TestMemtable_EmptyKeyAndValue(t *testing.T) {
 
 func BenchmarkMemtable_Put_Small(b *testing.B) {
 	const arenaBytes int64 = 64 << 20
-	mt := NewMemtable(arenaBytes, 0)
+	mt := NewMemtable(arenaBytes)
 	key := []byte("benchmark-key")
 	value := []byte("small value")
 
@@ -311,14 +305,14 @@ func BenchmarkMemtable_Put_Small(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		mt.Put(key, value, uint64(i))
 		if mt.ApproxSize() >= arenaBytes-(1<<20) {
-			mt = NewMemtable(arenaBytes, 0)
+			mt = NewMemtable(arenaBytes)
 		}
 	}
 }
 
 func BenchmarkMemtable_Put_Large(b *testing.B) {
 	const arenaBytes int64 = 64 << 20
-	mt := NewMemtable(arenaBytes, 0)
+	mt := NewMemtable(arenaBytes)
 	key := []byte("benchmark-key")
 	value := make([]byte, 10000)
 
@@ -326,13 +320,13 @@ func BenchmarkMemtable_Put_Large(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		mt.Put(key, value, uint64(i))
 		if mt.ApproxSize() >= arenaBytes-(1<<20) {
-			mt = NewMemtable(arenaBytes, 0)
+			mt = NewMemtable(arenaBytes)
 		}
 	}
 }
 
 func BenchmarkMemtable_Iterator(b *testing.B) {
-	mt := NewMemtable(64<<20, 0)
+	mt := NewMemtable(64 << 20)
 
 	for i := 0; i < 10000; i++ {
 		mt.Put([]byte(fmt.Sprintf("key%05d", i)), []byte("value"), uint64(i))
@@ -349,7 +343,7 @@ func BenchmarkMemtable_Iterator(b *testing.B) {
 }
 
 func TestMemtable_SeqBounds(t *testing.T) {
-	mt := NewMemtable(1<<20, 0)
+	mt := NewMemtable(1 << 20)
 
 	if mt.SeqLo() != 0 {
 		t.Errorf("expected SeqLo=0 for empty memtable, got %d", mt.SeqLo())
@@ -378,9 +372,8 @@ func TestMemtable_SeqBounds(t *testing.T) {
 		t.Errorf("after delete: expected 3-15, got %d-%d", mt.SeqLo(), mt.SeqHi())
 	}
 
-	var blobID [32]byte
-	mt.PutBlobRef([]byte("e"), blobID, 1)
+	mt.Put([]byte("e"), []byte("v0"), 1)
 	if mt.SeqLo() != 1 || mt.SeqHi() != 15 {
-		t.Errorf("after blob ref: expected 1-15, got %d-%d", mt.SeqLo(), mt.SeqHi())
+		t.Errorf("after older put: expected 1-15, got %d-%d", mt.SeqLo(), mt.SeqHi())
 	}
 }

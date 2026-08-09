@@ -62,10 +62,10 @@ func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
 			t.Fatalf("seq[%d]=%d want %d", i, gotSeqs[i], wantSeqs[i])
 		}
 	}
-	if batch.Changes[0].Kind != changePut || !batch.Changes[0].Inline || string(batch.Changes[0].Value) != "va" {
+	if batch.Changes[0].Kind != changePut || string(batch.Changes[0].Value) != "va" {
 		t.Fatalf("inline put mismatch: %+v", batch.Changes[0])
 	}
-	if batch.Changes[1].Kind != changePut || !batch.Changes[1].Inline || string(batch.Changes[1].Value) != "external-value" || batch.Changes[1].ExpireAt != 1234 {
+	if batch.Changes[1].Kind != changePut || string(batch.Changes[1].Value) != "external-value" || batch.Changes[1].ExpireAt != 1234 {
 		t.Fatalf("second put mismatch: %+v", batch.Changes[1])
 	}
 	if batch.Changes[2].Kind != changeDelete {
@@ -110,7 +110,7 @@ func TestChangeBatchKeysOnlyOmitsPutValues(t *testing.T) {
 		t.Fatalf("batch payload=%s want=%s", batch.Payload, ChangeFeedKeysOnly)
 	}
 	put := batch.Changes[0]
-	if put.Kind != changePut || !put.ValueOmitted || put.Inline || put.Value != nil ||
+	if put.Kind != changePut || !put.ValueOmitted || put.Value != nil ||
 		string(put.Key) != "key" || put.ExpireAt != 1234 {
 		t.Fatalf("keys-only put mismatch: %+v", put)
 	}
@@ -123,8 +123,8 @@ func TestEncodeChangeBatchRejectsOutOfOrderChanges(t *testing.T) {
 		SeqLo:   1,
 		SeqHi:   2,
 		Changes: []changeRecord{
-			{Seq: 2, Kind: changePut, Key: []byte("b"), Inline: true, Value: []byte("vb")},
-			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("va")},
+			{Seq: 2, Kind: changePut, Key: []byte("b"), Value: []byte("vb")},
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Value: []byte("va")},
 		},
 	})
 	if err == nil {
@@ -139,9 +139,9 @@ func TestDecodeChangeBatchRejectsCorruptBlock(t *testing.T) {
 		SeqLo:   1,
 		SeqHi:   3,
 		Changes: []changeRecord{
-			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("va")},
-			{Seq: 2, Kind: changePut, Key: []byte("b"), Inline: true, Value: []byte("vb")},
-			{Seq: 3, Kind: changePut, Key: []byte("c"), Inline: true, Value: []byte("vc")},
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Value: []byte("va")},
+			{Seq: 2, Kind: changePut, Key: []byte("b"), Value: []byte("vb")},
+			{Seq: 3, Kind: changePut, Key: []byte("c"), Value: []byte("vc")},
 		},
 	})
 	if err != nil {
@@ -176,7 +176,7 @@ func TestDecodeChangeBatchRejectsOtherFormatVersions(t *testing.T) {
 		SeqLo:   1,
 		SeqHi:   1,
 		Changes: []changeRecord{
-			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("value")},
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Value: []byte("value")},
 		},
 	})
 	if err != nil {
@@ -197,7 +197,7 @@ func TestDecodeChangeBatchRejectsPayloadModeThatDoesNotMatchRecords(t *testing.T
 		SeqLo:   1,
 		SeqHi:   1,
 		Changes: []changeRecord{
-			{Seq: 1, Kind: changePut, Key: []byte("a"), Inline: true, Value: []byte("value")},
+			{Seq: 1, Kind: changePut, Key: []byte("a"), Value: []byte("value")},
 		},
 	})
 	if err != nil {

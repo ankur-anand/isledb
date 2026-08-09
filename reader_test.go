@@ -3,13 +3,11 @@ package isledb
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/config"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -69,16 +67,16 @@ func setupReaderFixture(t *testing.T) (*Reader, context.Context, func()) {
 	}
 
 	l1Entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-a")},
-		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-c")},
-		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-d")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-a")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-c")},
+		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-d")},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 1)
 
 	l0Entries := []internal.MemEntry{
 		{Key: []byte("a"), Seq: 3, Kind: internal.OpDelete},
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-b")},
-		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-e")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("l0-b")},
+		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Value: []byte("l0-e")},
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
@@ -167,12 +165,12 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	oldEntries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, oldEntries, 0, 1)
 
 	newEntries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 3, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
+		{Key: []byte("k"), Seq: 3, Kind: internal.OpPut, Value: []byte("new")},
 	}
 	writeTestSST(t, ctx, store, ms, newEntries, 0, 2)
 
@@ -218,7 +216,7 @@ func TestReader_Refresh_PicksUpNewSSTs(t *testing.T) {
 	}
 
 	entries := []internal.MemEntry{
-		{Key: []byte("x"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("value")},
+		{Key: []byte("x"), Seq: 5, Kind: internal.OpPut, Value: []byte("value")},
 	}
 	writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
@@ -241,12 +239,12 @@ func TestReader_Get_L0PrefersNewerSeq(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	older := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
+		{Key: []byte("k"), Seq: 2, Kind: internal.OpPut, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, older, 0, 1)
 
 	newer := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Value: []byte("new")},
 	}
 	writeTestSST(t, ctx, store, ms, newer, 0, 2)
 
@@ -274,14 +272,14 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	first := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("va")},
-		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("vb")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+		{Key: []byte("b"), Seq: 1, Kind: internal.OpPut, Value: []byte("vb")},
 	}
 	writeTestSST(t, ctx, store, ms, first, 1, 1)
 
 	second := []internal.MemEntry{
-		{Key: []byte("d"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("vd")},
-		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("ve")},
+		{Key: []byte("d"), Seq: 2, Kind: internal.OpPut, Value: []byte("vd")},
+		{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Value: []byte("ve")},
 	}
 	writeTestSST(t, ctx, store, ms, second, 1, 2)
 
@@ -321,7 +319,7 @@ func TestReader_Get_TombstoneShadowsLowerLevel(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	l2Entries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("old")},
 	}
 	writeTestSST(t, ctx, store, ms, l2Entries, 2, 1)
 
@@ -352,8 +350,8 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	l2Entries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
-		{Key: []byte("m"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("keep")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("old")},
+		{Key: []byte("m"), Seq: 1, Kind: internal.OpPut, Value: []byte("keep")},
 	}
 	writeTestSST(t, ctx, store, ms, l2Entries, 2, 1)
 
@@ -393,7 +391,7 @@ func TestReader_VerifierRequiresSignature(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
 	}
 	writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
@@ -427,7 +425,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	}
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
 	}
 
 	it := &sliceSSTIter{entries: entries}
@@ -481,7 +479,7 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 	ms := manifest.NewStore(store)
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("value")},
 	}
 	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
@@ -536,14 +534,14 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 	}
 
 	l1Entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-a")},
-		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-c")},
-		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("l1-d")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-a")},
+		{Key: []byte("c"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-c")},
+		{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Value: []byte("l1-d")},
 	}
 	writeTestSST(t, ctx, store, ms, l1Entries, 1, 1)
 
 	l0Entries := []internal.MemEntry{
-		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("l0-b")},
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("l0-b")},
 	}
 	writeTestSST(t, ctx, store, ms, l0Entries, 0, 2)
 
@@ -638,134 +636,6 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 	}
 }
 
-func TestReader_MetricsBlobFetch(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("reader-metrics-blob")
-	defer store.Close()
-
-	manifestStore := newManifestStore(store, nil)
-	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = 0
-	wOpts.Values.InlineValueBytes = 1
-
-	w, err := newWriter(ctx, store, manifestStore, wOpts)
-	if err != nil {
-		t.Fatalf("newWriter: %v", err)
-	}
-	defer w.close(ctx)
-
-	blobValue := []byte("blob-value")
-	if err := w.put(ctx, []byte("blob-key"), blobValue); err != nil {
-		t.Fatalf("put blob: %v", err)
-	}
-	if err := w.flush(ctx); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir: t.TempDir(),
-		Metrics:  metrics,
-	})
-	if err != nil {
-		t.Fatalf("newReader: %v", err)
-	}
-	defer reader.Close()
-
-	got, found, err := reader.Get(ctx, []byte("blob-key"))
-	if err != nil || !found {
-		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
-	}
-	if !bytes.Equal(got, blobValue) {
-		t.Fatalf("Get #1 value mismatch: got=%q want=%q", got, blobValue)
-	}
-
-	got, found, err = reader.Get(ctx, []byte("blob-key"))
-	if err != nil || !found {
-		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
-	}
-	if !bytes.Equal(got, blobValue) {
-		t.Fatalf("Get #2 value mismatch: got=%q want=%q", got, blobValue)
-	}
-
-	if got := testutil.ToFloat64(metrics.BlobFetchTotal); got != 2 {
-		t.Fatalf("blob_fetch_total mismatch: got=%v want=2", got)
-	}
-	if got := testutil.ToFloat64(metrics.BlobFetchErrors); got != 0 {
-		t.Fatalf("blob_fetch_errors_total mismatch: got=%v want=0", got)
-	}
-	if got := testutil.ToFloat64(metrics.BlobCacheHits); got != 1 {
-		t.Fatalf("blob_cache_hits_total mismatch: got=%v want=1", got)
-	}
-	if got := testutil.ToFloat64(metrics.BlobCacheMisses); got != 1 {
-		t.Fatalf("blob_cache_misses_total mismatch: got=%v want=1", got)
-	}
-	if got := testutil.ToFloat64(metrics.BlobBytesTotal); got != float64(len(blobValue)*2) {
-		t.Fatalf("blob_bytes_total mismatch: got=%v want=%d", got, len(blobValue)*2)
-	}
-}
-
-func TestReader_VerifiesAndRepairsCorruptCachedBlob(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("reader-verify-cached-blob")
-	defer store.Close()
-
-	manifestStore := newManifestStore(store, nil)
-	wOpts := DefaultWriterOptions()
-	wOpts.Flush.Interval = 0
-	wOpts.Values.InlineValueBytes = 1
-
-	w, err := newWriter(ctx, store, manifestStore, wOpts)
-	if err != nil {
-		t.Fatalf("newWriter: %v", err)
-	}
-	defer w.close(ctx)
-
-	value := []byte("blob-value")
-	if err := w.put(ctx, []byte("blob-key"), value); err != nil {
-		t.Fatalf("put blob: %v", err)
-	}
-	if err := w.flush(ctx); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	valueConfig := config.DefaultValueStorageConfig()
-	valueConfig.VerifyBlobsOnRead = true
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:           t.TempDir(),
-		ValueStorageConfig: valueConfig,
-	})
-	if err != nil {
-		t.Fatalf("newReader: %v", err)
-	}
-	defer reader.Close()
-
-	got, found, err := reader.Get(ctx, []byte("blob-key"))
-	if err != nil || !found || !bytes.Equal(got, value) {
-		t.Fatalf("initial Get: value=%q found=%v err=%v", got, found, err)
-	}
-
-	blobID := sha256.Sum256(value)
-	blobIDHex := internal.BlobIDToHex(blobID)
-	corrupt := bytes.Repeat([]byte("x"), len(value))
-	if err := reader.blobCache.Set(blobIDHex, corrupt); err != nil {
-		t.Fatalf("corrupt cache entry: %v", err)
-	}
-
-	got, found, err = reader.Get(ctx, []byte("blob-key"))
-	if err != nil || !found || !bytes.Equal(got, value) {
-		t.Fatalf("Get after cache corruption: value=%q found=%v err=%v", got, found, err)
-	}
-
-	cached, ok := reader.blobCache.Get(blobIDHex)
-	if !ok {
-		t.Fatal("repaired blob was not cached")
-	}
-	if err := internal.VerifyBlob(blobID, cached); err != nil {
-		t.Fatalf("repaired cache entry: %v", err)
-	}
-}
-
 func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-metrics-sst-cache")
@@ -773,7 +643,7 @@ func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	entries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
 	}
 	_ = writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
@@ -818,7 +688,7 @@ func TestReader_MetricsSSTDownloadError(t *testing.T) {
 
 	ms := manifest.NewStore(store)
 	entries := []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("v")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
 	}
 	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
 	if err := store.Delete(ctx, store.SSTPath(res.Meta.ID)); err != nil {

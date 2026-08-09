@@ -23,9 +23,7 @@ const (
 )
 
 const (
-	changeFlagInline byte = 1 << iota
-	changeFlagBlob
-	changeFlagValueOmitted
+	changeFlagValueOmitted byte = 1 << iota
 )
 
 type changeKind byte
@@ -39,9 +37,7 @@ type changeRecord struct {
 	Seq          uint64
 	Kind         changeKind
 	Key          []byte
-	Inline       bool
 	Value        []byte
-	BlobID       [32]byte
 	ValueOmitted bool
 	ExpireAt     int64
 }
@@ -323,8 +319,8 @@ func decodeChangeBatchBlock(data []byte, block changeBatchBlock, payload ChangeF
 			return nil, err
 		}
 		if change.Kind == changePut &&
-			((payload == ChangeFeedKeysOnly && (!change.ValueOmitted || change.Inline)) ||
-				(payload == ChangeFeedFullValues && (change.ValueOmitted || !change.Inline))) {
+			((payload == ChangeFeedKeysOnly && !change.ValueOmitted) ||
+				(payload == ChangeFeedFullValues && change.ValueOmitted)) {
 			return nil, fmt.Errorf("change payload does not match batch mode %s", payload)
 		}
 		if i == 0 {
@@ -372,12 +368,8 @@ func encodeChange(buf *bytes.Buffer, change changeRecord) error {
 	case changePut:
 		if change.ValueOmitted {
 			flags |= changeFlagValueOmitted
-		} else if change.Inline {
-			flags |= changeFlagInline
-			valueLen = len(change.Value)
 		} else {
-			flags |= changeFlagBlob
-			valueLen = len(change.BlobID)
+			valueLen = len(change.Value)
 		}
 	default:
 		return fmt.Errorf("unsupported change kind %d", change.Kind)
@@ -395,10 +387,8 @@ func encodeChange(buf *bytes.Buffer, change changeRecord) error {
 	writeU64(buf, change.Seq)
 	writeI64(buf, change.ExpireAt)
 	buf.Write(change.Key)
-	if flags&changeFlagInline != 0 {
+	if change.Kind == changePut && flags == 0 {
 		buf.Write(change.Value)
-	} else if flags&changeFlagBlob != 0 {
-		buf.Write(change.BlobID[:])
 	}
 	return nil
 }
@@ -433,16 +423,9 @@ func decodeChange(data []byte, off int) (changeRecord, int, error) {
 		}
 	case changePut:
 		switch flags {
-		case changeFlagInline:
-			change.Inline = true
+		case 0:
 			change.Value = data[off : off+int(valueLen)]
 			off += int(valueLen)
-		case changeFlagBlob:
-			if valueLen != 32 {
-				return changeRecord{}, 0, errors.New("invalid blob change payload")
-			}
-			copy(change.BlobID[:], data[off:off+32])
-			off += 32
 		case changeFlagValueOmitted:
 			if valueLen != 0 {
 				return changeRecord{}, 0, errors.New("invalid omitted change payload")

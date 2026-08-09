@@ -27,22 +27,20 @@ demo/p000/
   changes/
     <bucket>/
       <change-batch-id>
-  blobs/
-    <prefix>/
-      <blob-id>.blob
 ```
 
 ## Serialization Notes
 
 - `manifest/CURRENT`, `maintenance/HEAD`, `manifest/snapshots/*.manifest`,
   `manifest/pages/**/*.json`, and `manifest/gc/*.json` are UTF-8 JSON.
-- `sstable/*`, `changes/*`, and `blobs/*` are binary objects, not JSON.
+- `sstable/*` and `changes/*` are binary objects, not JSON.
 - `changes/*` stores mutation batches opened by the public `ChangeReader`.
 - `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
 - Manifest log `role` is `0` for writer-owned publication. Applied maintenance
   entries are also writer-owned because only the writer updates `CURRENT`.
 - Top-level manifest fields use explicit `snake_case` JSON tags.
-- Nested `SSTMeta`, `BloomMeta`, and `SSTSignature` fields currently serialize with Go's default exported field names, so the on-disk JSON uses keys like `ID`, `SeqLo`, `MinKey`, `Bloom`, and `HasBlobRefs`. `Level` uses explicit `number` and `ssts` fields.
+- Manifest fields use explicit `snake_case` JSON tags. `Level` uses explicit
+  `number` and `ssts` fields.
 
 ## Directory View
 
@@ -246,24 +244,23 @@ Example:
   },
   "l0_ssts": [
     {
-      "ID": "sst-a100",
-      "Epoch": 18,
-      "SeqLo": 400,
-      "SeqHi": 405,
-      "MinKey": "AAAAAAAAAWg=",
-      "MaxKey": "AAAAAAAAAW0=",
-      "Size": 1048576,
-      "Checksum": "sha256:abc",
-      "Signature": null,
-      "Bloom": {
-        "BitsPerKey": 0,
-        "K": 0,
-        "Offset": 0,
-        "Length": 0
+      "id": "sst-a100",
+      "epoch": 18,
+      "seq_lo": 400,
+      "seq_hi": 405,
+      "min_key": "AAAAAAAAAWg=",
+      "max_key": "AAAAAAAAAW0=",
+      "size": 1048576,
+      "checksum": "sha256:abc",
+      "signature": null,
+      "bloom": {
+        "bits_per_key": 0,
+        "k": 0,
+        "offset": 0,
+        "length": 0
       },
-      "CreatedAt": "2026-04-15T10:14:01Z",
-      "Level": 0,
-      "HasBlobRefs": false
+      "created_at": "2026-04-15T10:14:01Z",
+      "level": 0
     }
   ],
   "levels": [
@@ -271,24 +268,23 @@ Example:
       "number": 1,
       "ssts": [
         {
-          "ID": "sst-b010",
-          "Epoch": 17,
-          "SeqLo": 290,
-          "SeqHi": 320,
-          "MinKey": "AAAAAAAAAPA=",
-          "MaxKey": "AAAAAAAAARc=",
-          "Size": 8388608,
-          "Checksum": "sha256:def",
-          "Signature": null,
-          "Bloom": {
-            "BitsPerKey": 0,
-            "K": 0,
-            "Offset": 0,
-            "Length": 0
+          "id": "sst-b010",
+          "epoch": 17,
+          "seq_lo": 290,
+          "seq_hi": 320,
+          "min_key": "AAAAAAAAAPA=",
+          "max_key": "AAAAAAAAARc=",
+          "size": 8388608,
+          "checksum": "sha256:def",
+          "signature": null,
+          "bloom": {
+            "bits_per_key": 0,
+            "k": 0,
+            "offset": 0,
+            "length": 0
           },
-          "CreatedAt": "2026-04-15T09:58:00Z",
-          "Level": 1,
-          "HasBlobRefs": false
+          "created_at": "2026-04-15T09:58:00Z",
+          "level": 1
         }
       ]
     }
@@ -517,30 +513,4 @@ Visibility rule:
 ```text
 The SST and change batch upload concurrently and may exist before commit.
 They become visible only when manifest/CURRENT commits the add_sstable entry.
-```
-
-## `blobs/<prefix>/<blob-id>.blob`
-
-External value object for out-of-line large values. This object is binary, not JSON.
-
-Path:
-
-```text
-demo/p000/blobs/ab/ab34ef...c1.blob
-```
-
-JSON-style descriptor:
-
-```json
-{
-  "path": "demo/p000/blobs/ab/ab34ef...c1.blob",
-  "encoding": "binary",
-  "written_by": [
-    "writer"
-  ],
-  "read_by": [
-    "reader"
-  ],
-  "contents": "blob value bytes"
-}
 ```

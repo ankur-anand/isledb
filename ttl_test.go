@@ -17,7 +17,6 @@ func TestTTL_EntryEncodeDecode(t *testing.T) {
 		Key:      []byte("key1"),
 		Seq:      1,
 		Kind:     internal.OpPut,
-		Inline:   true,
 		Value:    []byte("value1"),
 		ExpireAt: expireAt,
 	}
@@ -34,9 +33,6 @@ func TestTTL_EntryEncodeDecode(t *testing.T) {
 	if decoded.Kind != internal.OpPut {
 		t.Errorf("kind mismatch: got %d, want %d", decoded.Kind, internal.OpPut)
 	}
-	if !decoded.Inline {
-		t.Error("Expected Inline to be true")
-	}
 	if string(decoded.Value) != "value1" {
 		t.Errorf("value mismatch: got %q, want %q", decoded.Value, "value1")
 	}
@@ -48,7 +44,6 @@ func TestTTL_EntryEncodeDecodeNoTTL(t *testing.T) {
 		Key:      []byte("key1"),
 		Seq:      1,
 		Kind:     internal.OpPut,
-		Inline:   true,
 		Value:    []byte("value1"),
 		ExpireAt: 0,
 	}
@@ -92,18 +87,19 @@ func TestTTL_DeleteWithTTL(t *testing.T) {
 	}
 }
 
-func TestTTL_BlobWithTTL(t *testing.T) {
+func TestTTL_LargeValueWithTTL(t *testing.T) {
 
 	expireAt := time.Now().Add(time.Hour).UnixMilli()
-	var blobID [32]byte
-	copy(blobID[:], []byte("0123456789abcdef0123456789abcdef"))
+	value := make([]byte, 256<<10)
+	for i := range value {
+		value[i] = byte(i)
+	}
 
 	entry := internal.KeyEntry{
 		Key:      []byte("key1"),
 		Seq:      1,
 		Kind:     internal.OpPut,
-		Inline:   false,
-		BlobID:   blobID,
+		Value:    value,
 		ExpireAt: expireAt,
 	}
 
@@ -116,11 +112,8 @@ func TestTTL_BlobWithTTL(t *testing.T) {
 	if decoded.ExpireAt != expireAt {
 		t.Errorf("ExpireAt mismatch: got %d, want %d", decoded.ExpireAt, expireAt)
 	}
-	if decoded.BlobID != blobID {
-		t.Errorf("BlobID mismatch")
-	}
-	if decoded.Inline {
-		t.Error("Expected Inline to be false")
+	if len(decoded.Value) != len(value) || decoded.Value[12345] != value[12345] {
+		t.Error("large value mismatch")
 	}
 }
 
@@ -149,7 +142,7 @@ func TestTTL_IsExpired(t *testing.T) {
 }
 
 func TestTTL_MemtablePutWithTTL(t *testing.T) {
-	m := internal.NewMemtable(1024*1024, 4096)
+	m := internal.NewMemtable(1024 * 1024)
 	expireAt := time.Now().Add(time.Hour).UnixMilli()
 
 	m.PutWithTTL([]byte("key1"), []byte("value1"), 1, expireAt)

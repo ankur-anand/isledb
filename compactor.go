@@ -828,18 +828,13 @@ func (a *mergeIteratorAdapter) Next() bool {
 		Key:      entry.Key,
 		Seq:      entry.Seq,
 		Kind:     entry.Kind,
-		Inline:   entry.Inline,
 		Value:    entry.Value,
-		BlobID:   entry.BlobID,
 		ExpireAt: entry.ExpireAt,
 	}
 
 	if entry.ExpireAt > 0 && entry.ExpireAt <= a.nowMs {
 		a.current.Kind = internal.OpDelete
-		a.current.Inline = false
 		a.current.Value = nil
-		a.current.BlobID = [32]byte{}
-
 		a.current.ExpireAt = 0
 	}
 

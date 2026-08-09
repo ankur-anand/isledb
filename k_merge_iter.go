@@ -229,9 +229,7 @@ func (mi *kMergeIterator) entry() (internal.CompactionEntry, error) {
 	}
 
 	entry.Kind = keyEntry.Kind
-	entry.Inline = keyEntry.Inline
 	entry.Value = keyEntry.Value
-	entry.BlobID = keyEntry.BlobID
 	entry.ExpireAt = keyEntry.ExpireAt
 
 	return entry, nil

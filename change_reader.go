@@ -923,7 +923,7 @@ func publicChange(change changeRecord, pageData *[]byte) Change {
 	*pageData = append(*pageData, change.Key...)
 	key := (*pageData)[keyStart:len(*pageData)]
 	var value []byte
-	hasValue := change.Kind == changePut && change.Inline && !change.ValueOmitted
+	hasValue := change.Kind == changePut && !change.ValueOmitted
 	if hasValue {
 		valueStart := len(*pageData)
 		*pageData = append(*pageData, change.Value...)

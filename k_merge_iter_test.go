@@ -165,9 +165,7 @@ func (mi *heapMergeIterator) entry() (internal.CompactionEntry, error) {
 	}
 
 	entry.Kind = keyEntry.Kind
-	entry.Inline = keyEntry.Inline
 	entry.Value = keyEntry.Value
-	entry.BlobID = keyEntry.BlobID
 	entry.ExpireAt = keyEntry.ExpireAt
 
 	return entry, nil
@@ -197,12 +195,12 @@ func (mi *heapMergeIterator) close() error {
 
 func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 	readerOld, iterOld := buildTestIter(t, []internal.MemEntry{
-		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("old")},
+		{Key: []byte("k"), Seq: 1, Kind: internal.OpPut, Value: []byte("old")},
 	})
 	defer readerOld.Close()
 
 	readerNew, iterNew := buildTestIter(t, []internal.MemEntry{
-		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("new")},
+		{Key: []byte("k"), Seq: 5, Kind: internal.OpPut, Value: []byte("new")},
 	})
 	defer readerNew.Close()
 
@@ -222,7 +220,7 @@ func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 	if entry.Seq != 5 {
 		t.Fatalf("seq: got %d want 5", entry.Seq)
 	}
-	if !entry.Inline || !bytes.Equal(entry.Value, []byte("new")) {
+	if !bytes.Equal(entry.Value, []byte("new")) {
 		t.Fatalf("value: got %q want %q", entry.Value, []byte("new"))
 	}
 	if merge.Next() {
@@ -233,7 +231,7 @@ func TestKMergeIterator_PrefersHigherSeq(t *testing.T) {
 func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 	seq := uint64(7)
 	readerSet, iterSet := buildTestIter(t, []internal.MemEntry{
-		{Key: []byte("k"), Seq: seq, Kind: internal.OpPut, Inline: true, Value: []byte("set")},
+		{Key: []byte("k"), Seq: seq, Kind: internal.OpPut, Value: []byte("set")},
 	})
 	defer readerSet.Close()
 
@@ -278,19 +276,19 @@ func TestKMergeIterator_PrefersHigherTrailerKind(t *testing.T) {
 func TestTournamentMergeIterator_MatchesHeap(t *testing.T) {
 	entries := [][]internal.MemEntry{
 		{
-			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("a1")},
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("a1")},
 			{Key: []byte("b"), Seq: 3, Kind: internal.OpDelete, ExpireAt: 12345},
-			{Key: []byte("c"), Seq: 5, Kind: internal.OpPut, Inline: true, Value: []byte("c5")},
+			{Key: []byte("c"), Seq: 5, Kind: internal.OpPut, Value: []byte("c5")},
 		},
 		{
-			{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("a2")},
-			{Key: []byte("b"), Seq: 4, Kind: internal.OpPut, Inline: true, Value: []byte("b4")},
-			{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("d1")},
+			{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("a2")},
+			{Key: []byte("b"), Seq: 4, Kind: internal.OpPut, Value: []byte("b4")},
+			{Key: []byte("d"), Seq: 1, Kind: internal.OpPut, Value: []byte("d1")},
 		},
 		{
 			{Key: []byte("a"), Seq: 3, Kind: internal.OpDelete},
-			{Key: []byte("c"), Seq: 6, Kind: internal.OpPut, Inline: true, Value: []byte("c6")},
-			{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Inline: true, Value: []byte("e2")},
+			{Key: []byte("c"), Seq: 6, Kind: internal.OpPut, Value: []byte("c6")},
+			{Key: []byte("e"), Seq: 2, Kind: internal.OpPut, Value: []byte("e2")},
 		},
 	}
 
@@ -362,8 +360,8 @@ func TestTournamentMergeIterator_MatchesHeap(t *testing.T) {
 	for i := range gotHeap {
 		h := gotHeap[i]
 		tm := gotTournament[i]
-		if !bytes.Equal(h.Key, tm.Key) || h.Seq != tm.Seq || h.Kind != tm.Kind || h.Inline != tm.Inline ||
-			!bytes.Equal(h.Value, tm.Value) || h.BlobID != tm.BlobID || h.ExpireAt != tm.ExpireAt {
+		if !bytes.Equal(h.Key, tm.Key) || h.Seq != tm.Seq || h.Kind != tm.Kind ||
+			!bytes.Equal(h.Value, tm.Value) || h.ExpireAt != tm.ExpireAt {
 			t.Fatalf("entry %d mismatch: heap=%+v tournament=%+v", i, h, tm)
 		}
 	}
@@ -378,7 +376,7 @@ func TestKMergeIterator_DeleteCorruptValue(t *testing.T) {
 	})
 
 	ikey := pebble.MakeInternalKey([]byte("k"), pebble.SeqNum(1), pebble.InternalKeyKindDelete)
-	badValue := []byte{internal.MarkerBlob}
+	badValue := []byte{0x03} // Removed external-value marker.
 	if err := writer.Raw().Add(ikey, badValue, false); err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -420,11 +418,10 @@ func buildBenchIter(b *testing.B, n int, keyOffset int, valueSize int) (*sstable
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key%010d", keyOffset+i)
 		entries[i] = internal.MemEntry{
-			Key:    []byte(key),
-			Seq:    uint64(keyOffset + i),
-			Kind:   internal.OpPut,
-			Inline: true,
-			Value:  value,
+			Key:   []byte(key),
+			Seq:   uint64(keyOffset + i),
+			Kind:  internal.OpPut,
+			Value: value,
 		}
 	}
 
@@ -557,11 +554,10 @@ func buildBenchIterWithSeqOffset(b *testing.B, n int, keyOffset int, valueSize i
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key%010d", keyOffset+i)
 		entries[i] = internal.MemEntry{
-			Key:    []byte(key),
-			Seq:    seqOffset + uint64(i),
-			Kind:   internal.OpPut,
-			Inline: true,
-			Value:  value,
+			Key:   []byte(key),
+			Seq:   seqOffset + uint64(i),
+			Kind:  internal.OpPut,
+			Value: value,
 		}
 	}
 

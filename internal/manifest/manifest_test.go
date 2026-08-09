@@ -29,16 +29,15 @@ func TestSSTMetaJSONSchema(t *testing.T) {
 			Offset:     2048,
 			Length:     256,
 		},
-		CreatedAt:   time.Date(2026, time.August, 8, 10, 30, 0, 0, time.UTC),
-		Level:       1,
-		HasBlobRefs: true,
+		CreatedAt: time.Date(2026, time.August, 8, 10, 30, 0, 0, time.UTC),
+		Level:     1,
 	}
 
 	body, err := json.Marshal(meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"id":"sst-001","epoch":2,"seq_lo":10,"seq_hi":20,"min_key":"YWxwaGE=","max_key":"b21lZ2E=","size":4096,"checksum":"sha256:abc","signature":{"algorithm":"ed25519","key_id":"key-1","hash":"sha256:def","signature":"AQID"},"bloom":{"bits_per_key":10,"k":7,"offset":2048,"length":256},"created_at":"2026-08-08T10:30:00Z","level":1,"has_blob_refs":true}`
+	const want = `{"id":"sst-001","epoch":2,"seq_lo":10,"seq_hi":20,"min_key":"YWxwaGE=","max_key":"b21lZ2E=","size":4096,"checksum":"sha256:abc","signature":{"algorithm":"ed25519","key_id":"key-1","hash":"sha256:def","signature":"AQID"},"bloom":{"bits_per_key":10,"k":7,"offset":2048,"length":256},"created_at":"2026-08-08T10:30:00Z","level":1}`
 	if string(body) != want {
 		t.Fatalf("SSTMeta JSON schema changed\n got: %s\nwant: %s", body, want)
 	}
@@ -57,7 +56,7 @@ func TestSSTMetaJSONOmitsAbsentSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"id":"","epoch":0,"seq_lo":0,"seq_hi":0,"min_key":null,"max_key":null,"size":0,"checksum":"","bloom":{"bits_per_key":0,"k":0,"offset":0,"length":0},"created_at":"0001-01-01T00:00:00Z","level":0,"has_blob_refs":false}`
+	const want = `{"id":"","epoch":0,"seq_lo":0,"seq_hi":0,"min_key":null,"max_key":null,"size":0,"checksum":"","bloom":{"bits_per_key":0,"k":0,"offset":0,"length":0},"created_at":"0001-01-01T00:00:00Z","level":0}`
 	if string(body) != want {
 		t.Fatalf("zero SSTMeta JSON schema changed\n got: %s\nwant: %s", body, want)
 	}

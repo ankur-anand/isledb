@@ -75,7 +75,6 @@ func (b *changeBatchBuffer) appendPutForPayload(
 		Seq:          seq,
 		Kind:         changePut,
 		Key:          key,
-		Inline:       payload == ChangeFeedFullValues,
 		Value:        value,
 		ValueOmitted: payload == ChangeFeedKeysOnly,
 		ExpireAt:     expireAt,
@@ -113,12 +112,12 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	case changePut:
 		switch b.payload {
 		case ChangeFeedKeysOnly:
-			if !change.ValueOmitted || change.Inline {
+			if !change.ValueOmitted {
 				return errors.New("keys-only change put must omit its value")
 			}
 		case ChangeFeedFullValues:
-			if change.ValueOmitted || !change.Inline {
-				return errors.New("full-value change put must contain an inline value")
+			if change.ValueOmitted {
+				return errors.New("full-value change put must contain a value")
 			}
 			valueLen = len(change.Value)
 		}
@@ -136,8 +135,6 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	if change.Kind == changePut {
 		if change.ValueOmitted {
 			header[1] = changeFlagValueOmitted
-		} else {
-			header[1] = changeFlagInline
 		}
 	}
 	binary.BigEndian.PutUint32(header[4:8], uint32(len(change.Key)))

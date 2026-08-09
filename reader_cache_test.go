@@ -20,7 +20,7 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 	ms := manifest.NewStore(store)
 
 	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Inline: true, Value: []byte("value")},
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("value")},
 	}
 	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
