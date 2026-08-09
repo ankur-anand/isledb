@@ -159,8 +159,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.OwnerID = "mailbox-fault-maintenance"
-	maintenanceOpts.Compaction.L0SSTCount = 1 << 20
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 1 << 20
 
 	if phase == "claim" {
 		storage.arm(point)

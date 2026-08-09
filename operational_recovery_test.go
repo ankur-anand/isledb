@@ -281,17 +281,15 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 		expected[key] = value
 	}
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.OwnerID = "operational-contention-maintenance"
-	maintenanceOpts.Compaction.L0SSTCount = 4
-	maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-	maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
-	maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenanceOpts.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
 	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
-	if stats.CompactionJobs == 0 {
+	if stats.SSTCompaction.Jobs == 0 {
 		t.Fatalf("maintenance performed no compaction: %+v", stats)
 	}
 	if err := maintenance.Close(ctx); err != nil {
@@ -464,11 +462,9 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 			expected[key] = value
 		}
 		maintenanceOpts := DefaultMaintenanceOptions()
-		maintenanceOpts.OwnerID = fmt.Sprintf("soak-maintenance-%06d", cycles)
-		maintenanceOpts.Compaction.L0SSTCount = 8
-		maintenanceOpts.Compaction.BaseLevelBytes = 1 << 60
-		maintenanceOpts.Compaction.TargetSSTBytes = 1 << 20
-		maintenanceOpts.GarbageCollection.DeleteBatchSize = manifest.MaxRetiredObjectsPerEntry
+		maintenanceOpts.SSTCompaction.L0TriggerSSTs = 8
+		maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
+		maintenanceOpts.SSTCompaction.TargetSSTBytes = 1 << 20
 		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {
 			t.Fatalf("cycle %d open maintenance: %v", cycles, err)

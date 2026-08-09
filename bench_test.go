@@ -400,7 +400,7 @@ func BenchmarkDB_Get_AfterCompaction(b *testing.B) {
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.Compaction.L0SSTCount = 4
+	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
 
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 	if err != nil {
@@ -722,7 +722,7 @@ func BenchmarkCompactor_L0Promotion(b *testing.B) {
 		}
 
 		maintenanceOpts := DefaultMaintenanceOptions()
-		maintenanceOpts.Compaction.L0SSTCount = 4
+		maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
 
 		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {
@@ -787,7 +787,7 @@ func BenchmarkCompactor_L0Rewrite(b *testing.B) {
 			b.Fatal(err)
 		}
 		maintenanceOpts := DefaultMaintenanceOptions()
-		maintenanceOpts.Compaction.L0SSTCount = 4
+		maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
 		maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)
 		if err != nil {
 			b.Fatal(err)

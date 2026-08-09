@@ -41,7 +41,6 @@ func TestDBSSTOutputRoutesBySSTClass(t *testing.T) {
 	}
 
 	maintenanceOptions := DefaultMaintenanceOptions()
-	maintenanceOptions.OwnerID = "sst-output-routing"
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOptions)
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
@@ -137,16 +136,15 @@ func TestMixedSSTOutputEncodingsCompactAndRead(t *testing.T) {
 	}
 
 	maintenanceOptions := DefaultMaintenanceOptions()
-	maintenanceOptions.OwnerID = "mixed-sst-output"
-	maintenanceOptions.Compaction.L0SSTCount = 2
-	maintenanceOptions.Compaction.BaseLevelBytes = 1 << 60
-	maintenanceOptions.Compaction.TargetSSTBytes = 1 << 20
+	maintenanceOptions.SSTCompaction.L0TriggerSSTs = 2
+	maintenanceOptions.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenanceOptions.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOptions)
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
 	stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
-	if stats.CompactionJobs == 0 {
+	if stats.SSTCompaction.Jobs == 0 {
 		t.Fatalf("compaction did not run: %+v", stats)
 	}
 	if err := maintenance.Close(ctx); err != nil {

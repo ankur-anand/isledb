@@ -21,81 +21,76 @@ var (
 	ErrInvalidMaintenanceOptions = errors.New("invalid maintenance options")
 )
 
-// DefaultCheckpointReplayPages bounds cold state replay to roughly 64
+// defaultCheckpointReplayPages bounds cold state replay to roughly 64
 // immutable page reads between snapshots.
-const DefaultCheckpointReplayPages uint64 = 64
+const defaultCheckpointReplayPages uint64 = 64
 
 // MaintenanceOptions configures one fenced maintenance owner for a DB.
 type MaintenanceOptions struct {
-	// OwnerID is stored in the maintenance fence. Empty generates a process-local ID.
-	OwnerID string
+	// Interval is the delay between completed cycles when Run is used. Zero
+	// selects the production default.
+	Interval time.Duration
 
-	// Every is the delay between completed cycles when Run is used.
-	Every time.Duration
-
-	Compaction CompactionPolicy
-
-	GarbageCollection GarbageCollectionPolicy
-
-	// Checkpoint bounds manifest state replay between snapshots.
-	Checkpoint CheckpointPolicy
+	// SSTCompaction controls L0 and leveled SST compaction. Zero fields select
+	// production defaults.
+	SSTCompaction SSTCompactionOptions
 
 	// ChangeFeedRetention is nil by default, preserving change-feed history
 	// indefinitely. When configured, maintenance retires and deletes old feed
 	// batches without affecting KV state.
-	ChangeFeedRetention *ChangeFeedRetentionPolicy
+	ChangeFeedRetention *ChangeFeedRetentionOptions
 
+	// OnCycle is called synchronously by Run after each successful cycle.
 	OnCycle func(MaintenanceStats)
+	// OnError is called synchronously by Run when a cycle fails with a
+	// recoverable error.
 	OnError func(error)
 }
 
-// CheckpointPolicy bounds the immutable manifest pages needed to rebuild the
-// current KV state. MaxReplayPages defaults to DefaultCheckpointReplayPages.
-type CheckpointPolicy struct {
-	MaxReplayPages uint64
+// SSTCompactionOptions controls the workload and resource tradeoffs of L0 and
+// leveled SST compaction. Zero fields select production defaults.
+type SSTCompactionOptions struct {
+	// ReadConcurrency bounds concurrent input-SST reads within one job.
+	ReadConcurrency int
+	// L0TriggerSSTs starts L0 compaction at this many files.
+	L0TriggerSSTs int
+	// MaxConsecutiveL0Jobs prevents sustained L0 traffic from starving higher
+	// levels.
+	MaxConsecutiveL0Jobs int
+	// BaseLevelBytes is the target size of L1.
+	BaseLevelBytes int64
+	// LevelGrowthFactor scales the target size of each successive level. It
+	// must be at least 2.
+	LevelGrowthFactor int
+	// MaxInputSSTsPerJob bounds the inputs and retirement records in one job.
+	MaxInputSSTsPerJob int
+	// TargetSSTBytes is the approximate output-file size. Encoding settings
+	// come from DBOptions.SSTOutput.
+	TargetSSTBytes int64
 }
 
-// CompactionPolicy controls L0 and leveled compaction.
-type CompactionPolicy struct {
-	InputReadParallelism        int
-	L0SSTCount                  int
-	MaxConsecutiveL0Compactions int
-	BaseLevelBytes              int64
-	LevelSizeMultiplier         int
-	MaxInputSSTs                int
-	TargetSSTBytes              int64
-	ValidateSSTChecksum         bool
-	SSTHashVerifier             SSTHashVerifier
-	OnCompactionStart           func(CompactionJob)
-	OnCompactionEnd             func(CompactionJob, error)
-}
-
-// GarbageCollectionPolicy controls deterministic deletion of objects retired
-// by committed manifest entries.
-type GarbageCollectionPolicy struct {
-	DeleteBatchSize int
-}
-
-// ChangeFeedRetentionPolicy controls removal of old change-feed history. It is
+// ChangeFeedRetentionOptions controls removal of old change-feed history. It is
 // enabled only when MaintenanceOptions.ChangeFeedRetention is non-nil.
-type ChangeFeedRetentionPolicy struct {
-	// KeepFor is the minimum age retained. Zero selects the default.
-	KeepFor time.Duration
+type ChangeFeedRetentionOptions struct {
+	// RetainFor is the minimum age retained. Zero selects seven days.
+	RetainFor time.Duration
+}
 
-	// KeepAtLeastManifestEntries is the minimum number of newest manifest
-	// entries retained for cursor replay, including entries that do not contain
-	// a change batch. Zero selects the default.
-	KeepAtLeastManifestEntries uint64
+type maintenanceOptions struct {
+	interval                     time.Duration
+	sstCompaction                SSTCompactionOptions
+	changeFeedRetention          *changeFeedRetentionOptions
+	onCycle                      func(MaintenanceStats)
+	onError                      func(error)
+	checkpointReplayPages        uint64
+	retiredObjectDeletesPerCycle int
+}
 
-	// DeleteBatchSize limits physical change-batch deletes per maintenance
-	// cycle. Zero selects the default.
-	DeleteBatchSize int
-
-	// DeleteGracePeriod delays physical deletion after history is retired from
-	// the manifest. Zero selects the default.
-	DeleteGracePeriod time.Duration
-
-	OnCleanup func(ChangeFeedCleanupStats)
+type changeFeedRetentionOptions struct {
+	retainFor             time.Duration
+	minimumHistoryEntries uint64
+	deletesPerCycle       int
+	deleteGracePeriod     time.Duration
 }
 
 // ChangeFeedCleanupStats describes change-feed retention work completed in one
@@ -109,22 +104,53 @@ type ChangeFeedCleanupStats struct {
 	Duration        time.Duration
 }
 
+// MaintenanceState describes whether another maintenance step can make
+// progress immediately.
+type MaintenanceState uint8
+
+const (
+	// MaintenanceIdle means the cycle left no staged command waiting for
+	// publication.
+	MaintenanceIdle MaintenanceState = iota
+	// MaintenanceWaitingForWriter means the active writer must publish or
+	// reject the staged command before maintenance can continue.
+	MaintenanceWaitingForWriter
+)
+
+func (state MaintenanceState) String() string {
+	switch state {
+	case MaintenanceIdle:
+		return "idle"
+	case MaintenanceWaitingForWriter:
+		return "waiting_for_writer"
+	default:
+		return fmt.Sprintf("MaintenanceState(%d)", state)
+	}
+}
+
+// SSTCompactionStats describes SST compaction work completed in one cycle.
+type SSTCompactionStats struct {
+	Jobs        int
+	InputSSTs   int
+	OutputSSTs  int
+	OutputBytes int64
+}
+
+// ManifestCheckpointStats describes a manifest checkpoint staged in one cycle.
+type ManifestCheckpointStats struct {
+	Staged      bool
+	ReplayPages uint64
+	ReplayBytes uint64
+}
+
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
 // Command-producing work is not visible until the writer applies it.
 type MaintenanceStats struct {
-	CompactionJobs        int
-	CompactionInputSSTs   int
-	CompactionOutputSSTs  int
-	CompactionOutputBytes int64
-	ChangeFeedRetention   ChangeFeedCleanupStats
-	CheckpointStaged      bool
-	CheckpointReplayPages uint64
-	CheckpointReplayBytes uint64
-	CommandPending        bool
-	WaitingForWriter      bool
-	CommandApplied        bool
-	CommandRejected       bool
-	Duration              time.Duration
+	State               MaintenanceState
+	SSTCompaction       SSTCompactionStats
+	ChangeFeedRetention ChangeFeedCleanupStats
+	ManifestCheckpoint  ManifestCheckpointStats
+	Duration            time.Duration
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
@@ -132,38 +158,27 @@ type MaintenanceStats struct {
 func DefaultMaintenanceOptions() MaintenanceOptions {
 	compaction := defaultCompactorOptions()
 	return MaintenanceOptions{
-		Every: compaction.Trigger.CheckInterval,
-		Compaction: CompactionPolicy{
-			InputReadParallelism:        compaction.InputReadParallelism,
-			L0SSTCount:                  compaction.Trigger.L0SSTCount,
-			MaxConsecutiveL0Compactions: compaction.Trigger.MaxConsecutiveL0Compactions,
-			BaseLevelBytes:              compaction.Trigger.BaseLevelBytes,
-			LevelSizeMultiplier:         compaction.Trigger.LevelSizeMultiplier,
-			MaxInputSSTs:                compaction.Trigger.MaxInputSSTs,
-			TargetSSTBytes:              compaction.Output.TargetSSTBytes,
+		Interval: compaction.Trigger.CheckInterval,
+		SSTCompaction: SSTCompactionOptions{
+			ReadConcurrency:      compaction.InputReadParallelism,
+			L0TriggerSSTs:        compaction.Trigger.L0SSTCount,
+			MaxConsecutiveL0Jobs: compaction.Trigger.MaxConsecutiveL0Compactions,
+			BaseLevelBytes:       compaction.Trigger.BaseLevelBytes,
+			LevelGrowthFactor:    compaction.Trigger.LevelSizeMultiplier,
+			MaxInputSSTsPerJob:   compaction.Trigger.MaxInputSSTs,
+			TargetSSTBytes:       compaction.Output.TargetSSTBytes,
 		},
-		GarbageCollection: GarbageCollectionPolicy{
-			DeleteBatchSize: compaction.GCDeleteBatchSize,
-		},
-		Checkpoint: CheckpointPolicy{MaxReplayPages: DefaultCheckpointReplayPages},
 	}
 }
 
-// DefaultChangeFeedRetentionPolicy returns conservative change-feed retention
-// defaults. Assigning this policy to MaintenanceOptions.ChangeFeedRetention
+// DefaultChangeFeedRetentionOptions returns conservative change-feed retention
+// defaults. Assigning these options to MaintenanceOptions.ChangeFeedRetention
 // opts into cleanup; merely enabling a feed does not delete history.
-func DefaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
+func DefaultChangeFeedRetentionOptions() ChangeFeedRetentionOptions {
 	opts := defaultChangeFeedCleanerOptions()
-	return ChangeFeedRetentionPolicy{
-		KeepFor:                    opts.RetentionPeriod,
-		KeepAtLeastManifestEntries: opts.KeepAtLeastManifestEntries,
-		DeleteBatchSize:            opts.SweepBatchSize,
-		DeleteGracePeriod:          opts.SweepGracePeriod,
+	return ChangeFeedRetentionOptions{
+		RetainFor: opts.RetentionPeriod,
 	}
-}
-
-func defaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
-	return DefaultChangeFeedRetentionPolicy()
 }
 
 // Maintenance owns compaction, checkpoints, optional change-feed retention,
@@ -171,7 +186,7 @@ func defaultChangeFeedRetentionPolicy() ChangeFeedRetentionPolicy {
 // It is safe to call Close concurrently with Run or RunOnce.
 type Maintenance struct {
 	manifestLog *manifest.Store
-	opts        MaintenanceOptions
+	opts        maintenanceOptions
 	compactor   *compactor
 	changeFeed  *changeFeedCleaner
 	fenceToken  *manifest.FenceToken
@@ -195,8 +210,7 @@ type Maintenance struct {
 	releaseOnce sync.Once
 	release     func()
 
-	changeFeedRetention *ChangeFeedRetentionPolicy
-	sstOutput           SSTEncodingOptions
+	sstOutput SSTEncodingOptions
 }
 
 func newMaintenance(
@@ -210,8 +224,7 @@ func newMaintenance(
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	var err error
-	opts, err = normalizeMaintenanceOptions(opts)
+	normalized, err := normalizeMaintenanceOptions(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +233,7 @@ func newMaintenance(
 	if err != nil {
 		return nil, fmt.Errorf("replay manifest: %w", err)
 	}
-	if opts.ChangeFeedRetention != nil {
+	if normalized.changeFeedRetention != nil {
 		view, err := manifestLog.LoadChangeFeedView(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load change-feed configuration: %w", err)
@@ -229,22 +242,18 @@ func newMaintenance(
 			return nil, ErrChangeFeedDisabled
 		}
 	}
-	ownerID := opts.OwnerID
-	if ownerID == "" {
-		ownerID = fmt.Sprintf("maintenance-%d-%d", time.Now().UnixNano(), state.NextEpoch)
-	}
+	ownerID := fmt.Sprintf("maintenance-%d-%d", time.Now().UnixNano(), state.NextEpoch)
 	token, err := manifestLog.ClaimMaintenance(ctx, ownerID)
 	if err != nil {
 		return nil, fmt.Errorf("claim maintenance fence: %w", err)
 	}
 
 	m := &Maintenance{
-		manifestLog:         manifestLog,
-		opts:                opts,
-		fenceToken:          token,
-		runGate:             make(chan struct{}, 1),
-		changeFeedRetention: opts.ChangeFeedRetention,
-		sstOutput:           sstOutput,
+		manifestLog: manifestLog,
+		opts:        normalized,
+		fenceToken:  token,
+		runGate:     make(chan struct{}, 1),
+		sstOutput:   sstOutput,
 	}
 
 	compactorOpts := m.compactorOptions(gcCursor)
@@ -254,7 +263,7 @@ func newMaintenance(
 	}
 	m.compactor.stageCommand = m.stageCommand
 
-	if opts.ChangeFeedRetention != nil {
+	if normalized.changeFeedRetention != nil {
 		changeFeedOpts := m.changeFeedOptions()
 		m.changeFeed, err = newChangeFeedCleanerWithFence(ctx, store, manifestLog, changeFeedOpts, token)
 		if err != nil {
@@ -267,68 +276,103 @@ func newMaintenance(
 	return m, nil
 }
 
-func normalizeMaintenanceOptions(opts MaintenanceOptions) (MaintenanceOptions, error) {
+func normalizeMaintenanceOptions(opts MaintenanceOptions) (maintenanceOptions, error) {
 	defaults := DefaultMaintenanceOptions()
-	if opts.Every <= 0 {
-		opts.Every = defaults.Every
+	if opts.Interval < 0 {
+		return maintenanceOptions{}, fmt.Errorf("%w: negative interval", ErrInvalidMaintenanceOptions)
 	}
+	if opts.Interval == 0 {
+		opts.Interval = defaults.Interval
+	}
+	compaction, err := normalizeSSTCompactionOptions(opts.SSTCompaction, defaults.SSTCompaction)
+	if err != nil {
+		return maintenanceOptions{}, err
+	}
+	var retention *changeFeedRetentionOptions
 	if opts.ChangeFeedRetention != nil {
-		policy, err := normalizeChangeFeedRetentionPolicy(*opts.ChangeFeedRetention)
+		normalizedRetention, err := normalizeChangeFeedRetentionOptions(*opts.ChangeFeedRetention)
 		if err != nil {
-			return MaintenanceOptions{}, err
+			return maintenanceOptions{}, err
 		}
-		opts.ChangeFeedRetention = &policy
+		retention = &normalizedRetention
 	}
-	if opts.GarbageCollection.DeleteBatchSize < 0 {
-		return MaintenanceOptions{}, fmt.Errorf("%w: invalid garbage collection policy", ErrInvalidMaintenanceOptions)
+	return maintenanceOptions{
+		interval:                     opts.Interval,
+		sstCompaction:                compaction,
+		changeFeedRetention:          retention,
+		onCycle:                      opts.OnCycle,
+		onError:                      opts.OnError,
+		checkpointReplayPages:        defaultCheckpointReplayPages,
+		retiredObjectDeletesPerCycle: defaultCompactorOptions().GCDeleteBatchSize,
+	}, nil
+}
+
+func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTCompactionOptions, error) {
+	if opts.ReadConcurrency < 0 || opts.L0TriggerSSTs < 0 || opts.MaxConsecutiveL0Jobs < 0 ||
+		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.MaxInputSSTsPerJob < 0 ||
+		opts.TargetSSTBytes < 0 {
+		return SSTCompactionOptions{}, fmt.Errorf("%w: negative SST compaction option", ErrInvalidMaintenanceOptions)
 	}
-	if opts.GarbageCollection.DeleteBatchSize == 0 {
-		opts.GarbageCollection.DeleteBatchSize = defaults.GarbageCollection.DeleteBatchSize
+	if opts.LevelGrowthFactor == 1 {
+		return SSTCompactionOptions{}, fmt.Errorf("%w: level growth factor must be at least 2", ErrInvalidMaintenanceOptions)
 	}
-	if opts.Checkpoint.MaxReplayPages == 0 {
-		opts.Checkpoint.MaxReplayPages = defaults.Checkpoint.MaxReplayPages
+	if opts.MaxInputSSTsPerJob > manifest.MaxRetiredObjectsPerEntry {
+		return SSTCompactionOptions{}, fmt.Errorf(
+			"%w: max input SSTs per job=%d exceeds %d",
+			ErrInvalidMaintenanceOptions, opts.MaxInputSSTsPerJob, manifest.MaxRetiredObjectsPerEntry)
+	}
+	if opts.ReadConcurrency == 0 {
+		opts.ReadConcurrency = defaults.ReadConcurrency
+	}
+	if opts.L0TriggerSSTs == 0 {
+		opts.L0TriggerSSTs = defaults.L0TriggerSSTs
+	}
+	if opts.MaxConsecutiveL0Jobs == 0 {
+		opts.MaxConsecutiveL0Jobs = defaults.MaxConsecutiveL0Jobs
+	}
+	if opts.BaseLevelBytes == 0 {
+		opts.BaseLevelBytes = defaults.BaseLevelBytes
+	}
+	if opts.LevelGrowthFactor == 0 {
+		opts.LevelGrowthFactor = defaults.LevelGrowthFactor
+	}
+	if opts.MaxInputSSTsPerJob == 0 {
+		opts.MaxInputSSTsPerJob = defaults.MaxInputSSTsPerJob
+	}
+	if opts.TargetSSTBytes == 0 {
+		opts.TargetSSTBytes = defaults.TargetSSTBytes
 	}
 	return opts, nil
 }
 
-func normalizeChangeFeedRetentionPolicy(policy ChangeFeedRetentionPolicy) (ChangeFeedRetentionPolicy, error) {
-	if policy.KeepFor < 0 {
-		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed retention period", ErrInvalidMaintenanceOptions)
+func normalizeChangeFeedRetentionOptions(opts ChangeFeedRetentionOptions) (changeFeedRetentionOptions, error) {
+	if opts.RetainFor < 0 {
+		return changeFeedRetentionOptions{}, fmt.Errorf("%w: negative change-feed retention period", ErrInvalidMaintenanceOptions)
 	}
-	if policy.DeleteBatchSize < 0 {
-		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed delete batch size", ErrInvalidMaintenanceOptions)
+	defaults := defaultChangeFeedCleanerOptions()
+	if opts.RetainFor == 0 {
+		opts.RetainFor = defaults.RetentionPeriod
 	}
-	if policy.DeleteGracePeriod < 0 {
-		return ChangeFeedRetentionPolicy{}, fmt.Errorf("%w: negative change-feed delete grace period", ErrInvalidMaintenanceOptions)
-	}
-	defaults := DefaultChangeFeedRetentionPolicy()
-	if policy.KeepFor == 0 {
-		policy.KeepFor = defaults.KeepFor
-	}
-	if policy.KeepAtLeastManifestEntries == 0 {
-		policy.KeepAtLeastManifestEntries = defaults.KeepAtLeastManifestEntries
-	}
-	if policy.DeleteBatchSize == 0 {
-		policy.DeleteBatchSize = defaults.DeleteBatchSize
-	}
-	if policy.DeleteGracePeriod == 0 {
-		policy.DeleteGracePeriod = defaults.DeleteGracePeriod
-	}
-	return policy, nil
+	return changeFeedRetentionOptions{
+		retainFor:             opts.RetainFor,
+		minimumHistoryEntries: defaults.KeepAtLeastManifestEntries,
+		deletesPerCycle:       defaults.SweepBatchSize,
+		deleteGracePeriod:     defaults.SweepGracePeriod,
+	}, nil
 }
 
 func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compactorOptions {
-	p := m.opts.Compaction
+	p := m.opts.sstCompaction
 	return compactorOptions{
-		OwnerID:              m.opts.OwnerID,
-		InputReadParallelism: p.InputReadParallelism,
+		OwnerID:              m.fenceToken.Owner,
+		InputReadParallelism: p.ReadConcurrency,
 		Trigger: compactionTriggerOptions{
-			CheckInterval:               m.opts.Every,
-			L0SSTCount:                  p.L0SSTCount,
-			MaxConsecutiveL0Compactions: p.MaxConsecutiveL0Compactions,
+			CheckInterval:               m.opts.interval,
+			L0SSTCount:                  p.L0TriggerSSTs,
+			MaxConsecutiveL0Compactions: p.MaxConsecutiveL0Jobs,
 			BaseLevelBytes:              p.BaseLevelBytes,
-			LevelSizeMultiplier:         p.LevelSizeMultiplier,
-			MaxInputSSTs:                p.MaxInputSSTs,
+			LevelSizeMultiplier:         p.LevelGrowthFactor,
+			MaxInputSSTs:                p.MaxInputSSTsPerJob,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  p.TargetSSTBytes,
@@ -336,25 +380,20 @@ func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compac
 			BlockBytes:      m.sstOutput.BlockBytes,
 			Compression:     m.sstOutput.Compression,
 		},
-		Safety: compactionSafetyOptions{
-			ValidateSSTChecksum: p.ValidateSSTChecksum,
-			SSTHashVerifier:     p.SSTHashVerifier,
-		},
-		OnCompactionStart: p.OnCompactionStart,
 		OnCompactionEnd:   m.recordCompaction,
 		GCCursorStorage:   gcCursor,
-		GCDeleteBatchSize: m.opts.GarbageCollection.DeleteBatchSize,
+		GCDeleteBatchSize: m.opts.retiredObjectDeletesPerCycle,
 	}
 }
 
 func (m *Maintenance) changeFeedOptions() changeFeedCleanerOptions {
-	p := m.changeFeedRetention
+	p := m.opts.changeFeedRetention
 	return changeFeedCleanerOptions{
-		RetentionPeriod:            p.KeepFor,
-		KeepAtLeastManifestEntries: p.KeepAtLeastManifestEntries,
-		CheckInterval:              m.opts.Every,
-		SweepBatchSize:             p.DeleteBatchSize,
-		SweepGracePeriod:           p.DeleteGracePeriod,
+		RetentionPeriod:            p.retainFor,
+		KeepAtLeastManifestEntries: p.minimumHistoryEntries,
+		CheckInterval:              m.opts.interval,
+		SweepBatchSize:             p.deletesPerCycle,
+		SweepGracePeriod:           p.deleteGracePeriod,
 		OnCleanup:                  m.recordChangeFeed,
 	}
 }
@@ -403,16 +442,16 @@ func (m *Maintenance) Run(ctx context.Context) error {
 			}
 			if errors.Is(err, manifest.ErrFenceConflict) {
 				slog.Debug("isledb: maintenance cycle skipped after concurrent manifest update")
-			} else if m.opts.OnError != nil {
-				m.opts.OnError(err)
+			} else if m.opts.onError != nil {
+				m.opts.onError(err)
 			} else {
 				slog.Error("isledb: maintenance cycle failed", "error", err)
 			}
-		} else if m.opts.OnCycle != nil {
-			m.opts.OnCycle(stats)
+		} else if m.opts.onCycle != nil {
+			m.opts.onCycle(stats)
 		}
 
-		timer := time.NewTimer(m.opts.Every)
+		timer := time.NewTimer(m.opts.interval)
 		select {
 		case <-timer.C:
 		case <-runCtx.Done():
@@ -481,7 +520,7 @@ func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if current == nil || current.StateReplayPages < m.opts.Checkpoint.MaxReplayPages {
+	if current == nil || current.StateReplayPages < m.opts.checkpointReplayPages {
 		return nil
 	}
 
@@ -498,9 +537,9 @@ func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
 
 	m.statsMu.Lock()
 	if m.currentStats != nil {
-		m.currentStats.CheckpointStaged = true
-		m.currentStats.CheckpointReplayPages = checkpoint.FoldedReplayPages
-		m.currentStats.CheckpointReplayBytes = checkpoint.FoldedReplayBytes
+		m.currentStats.ManifestCheckpoint.Staged = true
+		m.currentStats.ManifestCheckpoint.ReplayPages = checkpoint.FoldedReplayPages
+		m.currentStats.ManifestCheckpoint.ReplayBytes = checkpoint.FoldedReplayBytes
 	}
 	m.statsMu.Unlock()
 	return nil
@@ -524,7 +563,7 @@ func (m *Maintenance) stageCommand(ctx context.Context, command manifest.Mainten
 	m.statsMu.Lock()
 	m.commandStaged = true
 	if m.currentStats != nil {
-		m.currentStats.CommandPending = true
+		m.currentStats.State = MaintenanceWaitingForWriter
 	}
 	m.statsMu.Unlock()
 	return nil
@@ -564,27 +603,19 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	}
 	m.statsMu.Lock()
 	if m.currentStats != nil {
-		m.currentStats.CommandPending = true
+		m.currentStats.State = MaintenanceWaitingForWriter
 	}
 	m.statsMu.Unlock()
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
-		m.statsMu.Lock()
-		if m.currentStats != nil {
-			m.currentStats.WaitingForWriter = true
-		}
-		m.statsMu.Unlock()
 		return true, nil
 	}
 
-	receipt := current.MaintenanceReceipt
 	if _, err := m.manifestLog.ClearMaintenance(ctx, head.Pending.ID, head.Pending.Epoch, head.Pending.Generation, m.fenceToken); err != nil {
 		return false, err
 	}
 	m.statsMu.Lock()
 	if m.currentStats != nil {
-		m.currentStats.CommandPending = false
-		m.currentStats.CommandApplied = receipt.Status == manifest.MaintenanceStatusApplied
-		m.currentStats.CommandRejected = receipt.Status == manifest.MaintenanceStatusRejected
+		m.currentStats.State = MaintenanceIdle
 	}
 	m.statsMu.Unlock()
 	return false, nil
@@ -689,21 +720,18 @@ func stopMaintenanceTimer(timer *time.Timer) {
 	}
 }
 
-func (m *Maintenance) recordCompaction(job CompactionJob, err error) {
+func (m *Maintenance) recordCompaction(job compactionJob, err error) {
 	if err == nil {
 		m.statsMu.Lock()
 		if m.currentStats != nil {
-			m.currentStats.CompactionJobs++
-			m.currentStats.CompactionInputSSTs += len(job.InputSSTs)
-			m.currentStats.CompactionOutputSSTs += len(job.OutputSSTs)
+			m.currentStats.SSTCompaction.Jobs++
+			m.currentStats.SSTCompaction.InputSSTs += len(job.InputSSTs)
+			m.currentStats.SSTCompaction.OutputSSTs += len(job.OutputSSTs)
 			for _, sst := range job.OutputSSTs {
-				m.currentStats.CompactionOutputBytes += sst.Bytes
+				m.currentStats.SSTCompaction.OutputBytes += sst.Bytes
 			}
 		}
 		m.statsMu.Unlock()
-	}
-	if callback := m.opts.Compaction.OnCompactionEnd; callback != nil {
-		callback(job, err)
 	}
 }
 
@@ -713,7 +741,4 @@ func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
 		m.currentStats.ChangeFeedRetention = stats
 	}
 	m.statsMu.Unlock()
-	if callback := m.changeFeedRetention.OnCleanup; callback != nil {
-		callback(stats)
-	}
 }

@@ -185,8 +185,8 @@ type compactorOptions struct {
 	// Safety controls source SST validation before compaction.
 	Safety compactionSafetyOptions
 
-	OnCompactionStart func(CompactionJob)
-	OnCompactionEnd   func(CompactionJob, error)
+	OnCompactionStart func(compactionJob)
+	OnCompactionEnd   func(compactionJob, error)
 
 	GCCursorStorage   manifest.GCCursorStorage
 	GCDeleteBatchSize int

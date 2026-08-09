@@ -364,7 +364,7 @@ func TestChangeFeedRetentionMaintenanceConfigurationIsPublicAndCopied(t *testing
 	}
 	defer db.Close()
 
-	retention := ChangeFeedRetentionPolicy{}
+	retention := ChangeFeedRetentionOptions{}
 	opts := DefaultMaintenanceOptions()
 	opts.ChangeFeedRetention = &retention
 	maintenance, err := db.OpenMaintenance(ctx, opts)
@@ -372,55 +372,39 @@ func TestChangeFeedRetentionMaintenanceConfigurationIsPublicAndCopied(t *testing
 		t.Fatalf("open maintenance: %v", err)
 	}
 	defer maintenance.Close(ctx)
-	if retention.KeepFor != 0 || retention.KeepAtLeastManifestEntries != 0 ||
-		retention.DeleteBatchSize != 0 || retention.DeleteGracePeriod != 0 ||
-		retention.OnCleanup != nil {
+	if retention.RetainFor != 0 {
 		t.Fatalf("OpenMaintenance mutated caller retention: %+v", retention)
 	}
-	want := DefaultChangeFeedRetentionPolicy()
-	if maintenance.changeFeedRetention == nil {
+	want := DefaultChangeFeedRetentionOptions()
+	if maintenance.opts.changeFeedRetention == nil {
 		t.Fatal("public retention was not installed")
 	}
-	if got := *maintenance.changeFeedRetention; got.KeepFor != want.KeepFor ||
-		got.KeepAtLeastManifestEntries != want.KeepAtLeastManifestEntries ||
-		got.DeleteBatchSize != want.DeleteBatchSize ||
-		got.DeleteGracePeriod != want.DeleteGracePeriod {
-		t.Fatalf("normalized retention=%+v want=%+v", got, want)
+	if got := maintenance.opts.changeFeedRetention.retainFor; got != want.RetainFor {
+		t.Fatalf("normalized retention=%v want=%v", got, want.RetainFor)
 	}
 	if maintenance.changeFeed == nil {
 		t.Fatal("public retention did not enable the maintenance cleaner")
 	}
 }
 
-func TestChangeFeedRetentionRejectsNegativeDurationsAndBatchSize(t *testing.T) {
+func TestChangeFeedRetentionRejectsNegativeDuration(t *testing.T) {
 	ctx := context.Background()
-	tests := []struct {
-		name      string
-		retention ChangeFeedRetentionPolicy
-	}{
-		{name: "keep for", retention: ChangeFeedRetentionPolicy{KeepFor: -time.Second}},
-		{name: "delete batch", retention: ChangeFeedRetentionPolicy{DeleteBatchSize: -1}},
-		{name: "delete grace", retention: ChangeFeedRetentionPolicy{DeleteGracePeriod: -time.Second}},
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+	db, err := OpenBucket(ctx, bucket, "memory", DBOptions{
+		Prefix:     "change-feed-invalid-retention",
+		ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
+	})
+	if err != nil {
+		t.Fatalf("OpenBucket: %v", err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			bucket := memblob.OpenBucket(nil)
-			defer bucket.Close()
-			db, err := OpenBucket(ctx, bucket, "memory", DBOptions{
-				Prefix:     "change-feed-invalid-retention",
-				ChangeFeed: &ChangeFeedOptions{Payload: ChangeFeedFullValues},
-			})
-			if err != nil {
-				t.Fatalf("OpenBucket: %v", err)
-			}
-			defer db.Close()
-			opts := DefaultMaintenanceOptions()
-			opts.ChangeFeedRetention = &test.retention
-			_, err = db.OpenMaintenance(ctx, opts)
-			if !errors.Is(err, ErrInvalidMaintenanceOptions) {
-				t.Fatalf("OpenMaintenance error=%v want=%v", err, ErrInvalidMaintenanceOptions)
-			}
-		})
+	defer db.Close()
+	retention := ChangeFeedRetentionOptions{RetainFor: -time.Second}
+	opts := DefaultMaintenanceOptions()
+	opts.ChangeFeedRetention = &retention
+	_, err = db.OpenMaintenance(ctx, opts)
+	if !errors.Is(err, ErrInvalidMaintenanceOptions) {
+		t.Fatalf("OpenMaintenance error=%v want=%v", err, ErrInvalidMaintenanceOptions)
 	}
 }
 
@@ -434,7 +418,7 @@ func TestChangeFeedRetentionRequiresEnabledFeed(t *testing.T) {
 	}
 	defer db.Close()
 
-	retention := DefaultChangeFeedRetentionPolicy()
+	retention := DefaultChangeFeedRetentionOptions()
 	opts := DefaultMaintenanceOptions()
 	opts.ChangeFeedRetention = &retention
 	if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrChangeFeedDisabled) {

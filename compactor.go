@@ -22,28 +22,28 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-type CompactionJobType int
+type compactionJobType int
 
 const (
-	CompactionL0ToL1 CompactionJobType = iota
-	CompactionLevelToLevel
+	compactionL0ToL1 compactionJobType = iota
+	compactionLevelToLevel
 )
 
 const compactionMaxIterations = 100
 
 var errCompactorClosed = errors.New("compactor closed")
 
-type CompactionJob struct {
-	Type             CompactionJobType
+type compactionJob struct {
+	Type             compactionJobType
 	SourceLevel      uint32
 	DestinationLevel uint32
 	InputSSTs        []string
-	OutputSSTs       []CompactionOutput
+	OutputSSTs       []compactionOutput
 	MetadataOnly     bool
 }
 
-// CompactionOutput describes one SST produced or repositioned by a compaction.
-type CompactionOutput struct {
+// compactionOutput describes one SST produced or repositioned by a compaction.
+type compactionOutput struct {
 	ID    string
 	Bytes int64
 	Level uint32
@@ -486,11 +486,11 @@ func sstsDoNotOverlap(ssts []sstMetadata) bool {
 }
 
 func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan) (err error) {
-	jobType := CompactionLevelToLevel
+	jobType := compactionLevelToLevel
 	if plan.sourceLevel == 0 {
-		jobType = CompactionL0ToL1
+		jobType = compactionL0ToL1
 	}
-	job := CompactionJob{
+	job := compactionJob{
 		Type:             jobType,
 		SourceLevel:      plan.sourceLevel,
 		DestinationLevel: plan.destinationLevel,
@@ -537,7 +537,7 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 	}
 
 	for _, output := range outputs {
-		job.OutputSSTs = append(job.OutputSSTs, CompactionOutput{
+		job.OutputSSTs = append(job.OutputSSTs, compactionOutput{
 			ID:    output.ID,
 			Bytes: output.Size,
 			Level: output.Level,

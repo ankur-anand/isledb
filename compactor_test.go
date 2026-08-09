@@ -252,11 +252,11 @@ func TestCompactor_L0Compaction(t *testing.T) {
 	compactorOpts.Trigger.CheckInterval = time.Hour
 
 	var compactionStarted, compactionEnded bool
-	var completedJob CompactionJob
-	compactorOpts.OnCompactionStart = func(job CompactionJob) {
+	var completedJob compactionJob
+	compactorOpts.OnCompactionStart = func(job compactionJob) {
 		compactionStarted = true
 	}
-	compactorOpts.OnCompactionEnd = func(job CompactionJob, err error) {
+	compactorOpts.OnCompactionEnd = func(job compactionJob, err error) {
 		compactionEnded = true
 		completedJob = job
 	}
@@ -1024,7 +1024,7 @@ func TestCompactor_RunOnceGivesLowerLevelsFairTurn(t *testing.T) {
 
 	writeL0("initial-l0", 2)
 
-	var order []CompactionJobType
+	var order []compactionJobType
 	injectedL0 := false
 	fairOpts := defaultCompactorOptions()
 	fairOpts.Trigger.L0SSTCount = 2
@@ -1033,11 +1033,11 @@ func TestCompactor_RunOnceGivesLowerLevelsFairTurn(t *testing.T) {
 	fairOpts.Trigger.CheckInterval = time.Hour
 	fairOpts.Output.Compression = "none"
 	fairOpts.Output.TargetSSTBytes = 64 * 1024
-	fairOpts.OnCompactionStart = func(job CompactionJob) {
+	fairOpts.OnCompactionStart = func(job compactionJob) {
 		order = append(order, job.Type)
 	}
-	fairOpts.OnCompactionEnd = func(job CompactionJob, err error) {
-		if err != nil || job.Type != CompactionL0ToL1 || injectedL0 {
+	fairOpts.OnCompactionEnd = func(job compactionJob, err error) {
+		if err != nil || job.Type != compactionL0ToL1 || injectedL0 {
 			return
 		}
 		injectedL0 = true
@@ -1057,10 +1057,10 @@ func TestCompactor_RunOnceGivesLowerLevelsFairTurn(t *testing.T) {
 	if len(order) < 2 {
 		t.Fatalf("compaction order=%v, want at least L0 then lower level", order)
 	}
-	if order[0] != CompactionL0ToL1 {
+	if order[0] != compactionL0ToL1 {
 		t.Fatalf("first compaction=%v, want L0", order[0])
 	}
-	if order[1] != CompactionLevelToLevel {
+	if order[1] != compactionLevelToLevel {
 		t.Fatalf("second compaction=%v, want level merge after fairness budget", order[1])
 	}
 }

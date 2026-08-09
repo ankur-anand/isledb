@@ -526,22 +526,53 @@ maintenance handle opened from the same `DB`.
 
 ```go
 type MaintenanceOptions struct {
-    OwnerID             string
-    Every               time.Duration
-    Compaction          CompactionPolicy
-    GarbageCollection   GarbageCollectionPolicy
-    Checkpoint          CheckpointPolicy
-    ChangeFeedRetention *ChangeFeedRetentionPolicy
+    Interval            time.Duration
+    SSTCompaction       SSTCompactionOptions
+    ChangeFeedRetention *ChangeFeedRetentionOptions
     OnCycle             func(MaintenanceStats)
     OnError             func(error)
 }
 
-type ChangeFeedRetentionPolicy struct {
-    KeepFor                    time.Duration
-    KeepAtLeastManifestEntries uint64
-    DeleteBatchSize            int
-    DeleteGracePeriod          time.Duration
-    OnCleanup                  func(ChangeFeedCleanupStats)
+type ChangeFeedRetentionOptions struct {
+    RetainFor time.Duration
+}
+
+type SSTCompactionOptions struct {
+    ReadConcurrency      int
+    L0TriggerSSTs        int
+    MaxConsecutiveL0Jobs int
+    BaseLevelBytes       int64
+    LevelGrowthFactor    int
+    MaxInputSSTsPerJob   int
+    TargetSSTBytes       int64
+}
+
+type MaintenanceStats struct {
+    State               MaintenanceState
+    SSTCompaction       SSTCompactionStats
+    ChangeFeedRetention ChangeFeedCleanupStats
+    ManifestCheckpoint  ManifestCheckpointStats
+    Duration            time.Duration
+}
+
+type MaintenanceState uint8
+
+const (
+    MaintenanceIdle MaintenanceState = iota
+    MaintenanceWaitingForWriter
+)
+
+type SSTCompactionStats struct {
+    Jobs        int
+    InputSSTs   int
+    OutputSSTs  int
+    OutputBytes int64
+}
+
+type ManifestCheckpointStats struct {
+    Staged      bool
+    ReplayPages uint64
+    ReplayBytes uint64
 }
 
 type ChangeFeedCleanupStats struct {
@@ -552,60 +583,32 @@ type ChangeFeedCleanupStats struct {
     FailedDeletes   int
     Duration        time.Duration
 }
-
-type CompactionPolicy struct {
-    InputReadParallelism        int
-    L0SSTCount                  int
-    MaxConsecutiveL0Compactions int
-    BaseLevelBytes              int64
-    LevelSizeMultiplier         int
-    MaxInputSSTs                int
-    TargetSSTBytes              int64
-    ValidateSSTChecksum         bool
-    SSTHashVerifier             SSTHashVerifier
-    OnCompactionStart           func(CompactionJob)
-    OnCompactionEnd             func(CompactionJob, error)
-}
-
-type GarbageCollectionPolicy struct {
-    DeleteBatchSize int
-}
-
-type CompactionJob struct {
-    Type             CompactionJobType
-    SourceLevel      uint32
-    DestinationLevel uint32
-    InputSSTs        []string
-    OutputSSTs       []CompactionOutput
-    MetadataOnly     bool
-}
-
-type CompactionOutput struct {
-    ID    string
-    Bytes int64
-    Level uint32
-}
-
 ```
 
 `DefaultMaintenanceOptions` enables compaction, checkpoints, and retired-SST
-garbage collection. Change-feed retention remains disabled. Use
-`DefaultChangeFeedRetentionPolicy` before enabling feed-history cleanup.
+garbage collection. Checkpoint and garbage-collection safeguards are internal;
+they do not need a second set of storage-format options. Change-feed retention
+remains disabled. Use
+`DefaultChangeFeedRetentionOptions` before enabling feed-history cleanup.
 
 Change-feed retention requires an enabled feed and runs only while maintenance
-runs. The policy is runtime maintenance configuration, not part of the
+runs. The setting is runtime maintenance configuration, not part of the
 persisted immutable payload choice. Omitting it preserves feed history
 indefinitely.
 
+`MaintenanceWaitingForWriter` means the cycle staged a command in the
+maintenance mailbox. The active writer must publish or reject it before the
+next maintenance command can be staged.
+
 ```go
 opts := isledb.DefaultMaintenanceOptions()
-opts.Every = 5 * time.Second
-opts.Compaction.L0SSTCount = 8
-opts.Compaction.InputReadParallelism = 4
-opts.Compaction.TargetSSTBytes = 64 << 20
+opts.Interval = 5 * time.Second
+opts.SSTCompaction.L0TriggerSSTs = 8
+opts.SSTCompaction.ReadConcurrency = 4
+opts.SSTCompaction.TargetSSTBytes = 64 << 20
 
-feedRetention := isledb.DefaultChangeFeedRetentionPolicy()
-feedRetention.KeepFor = 24 * time.Hour
+feedRetention := isledb.DefaultChangeFeedRetentionOptions()
+feedRetention.RetainFor = 24 * time.Hour
 opts.ChangeFeedRetention = &feedRetention
 
 m, err := db.OpenMaintenance(ctx, opts)
