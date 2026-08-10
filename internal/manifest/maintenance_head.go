@@ -13,6 +13,7 @@ import (
 const MaintenanceHeadLayoutVersion = 2
 
 const maxMaintenanceCommandIDBytes = 128
+const maxMaintenanceSchedulingWorkUnits uint32 = 4
 
 var (
 	ErrMaintenanceCommandPending  = errors.New("maintenance command already pending")
@@ -45,12 +46,20 @@ type MaintenanceCommand struct {
 	Generation uint64                 `json:"generation"`
 	Kind       MaintenanceCommandKind `json:"kind"`
 	CreatedAt  time.Time              `json:"created_at"`
+	Scheduling MaintenanceScheduling  `json:"scheduling,omitempty"`
 
 	Checkpoint      *CheckpointCommand     `json:"checkpoint,omitempty"`
 	Compaction      *CompactionCommand     `json:"compaction,omitempty"`
 	RemoveSSTables  *RemoveSSTablesCommand `json:"remove_sstables,omitempty"`
 	ChangeFeedFloor *AdvanceFloorCommand   `json:"change_feed_floor,omitempty"`
 	RetirementFloor *AdvanceFloorCommand   `json:"retirement_floor,omitempty"`
+}
+
+// MaintenanceScheduling records the bounded cost of a primary maintenance
+// command so the writer can advance durable fairness state atomically with
+// publication.
+type MaintenanceScheduling struct {
+	WorkUnits uint32 `json:"work_units,omitempty"`
 }
 
 type CheckpointCommand struct {
@@ -157,6 +166,9 @@ func (c *MaintenanceCommand) Validate() error {
 	}
 	switch c.Kind {
 	case MaintenanceCommandCheckpoint:
+		if c.Scheduling.WorkUnits != 0 {
+			return fmt.Errorf("%w: checkpoint work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
+		}
 		if c.Checkpoint == nil {
 			return fmt.Errorf("%w: invalid checkpoint", ErrInvalidMaintenanceCommand)
 		}
@@ -172,15 +184,28 @@ func (c *MaintenanceCommand) Validate() error {
 		if c.Compaction == nil {
 			return fmt.Errorf("%w: missing compaction", ErrInvalidMaintenanceCommand)
 		}
+		if c.Scheduling.WorkUnits > maxMaintenanceSchedulingWorkUnits {
+			return fmt.Errorf("%w: compaction work_units=%d max=%d",
+				ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits, maxMaintenanceSchedulingWorkUnits)
+		}
 	case MaintenanceCommandRemoveSSTables:
+		if c.Scheduling.WorkUnits != 0 {
+			return fmt.Errorf("%w: remove SST work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
+		}
 		if c.RemoveSSTables == nil || len(c.RemoveSSTables.SSTableIDs) == 0 {
 			return fmt.Errorf("%w: missing removed SSTs", ErrInvalidMaintenanceCommand)
 		}
 	case MaintenanceCommandChangeFeedFloor:
+		if c.Scheduling.WorkUnits != 0 {
+			return fmt.Errorf("%w: change-feed floor work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
+		}
 		if c.ChangeFeedFloor == nil {
 			return fmt.Errorf("%w: missing change-feed floor", ErrInvalidMaintenanceCommand)
 		}
 	case MaintenanceCommandRetirementFloor:
+		if c.Scheduling.WorkUnits != 0 {
+			return fmt.Errorf("%w: retirement floor work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
+		}
 		if c.RetirementFloor == nil {
 			return fmt.Errorf("%w: missing retirement floor", ErrInvalidMaintenanceCommand)
 		}
@@ -366,6 +391,9 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 			Status:     status,
 			AppliedAt:  time.Now().UTC(),
 		}
+		if status == MaintenanceStatusApplied {
+			advanceMaintenanceScheduler(updated, &command)
+		}
 		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
 			return MaintenanceApplyResult{}, err
 		}
@@ -394,6 +422,42 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 		}, nil
 	}
 	return MaintenanceApplyResult{}, ErrFenceConflict
+}
+
+func advanceMaintenanceScheduler(current *Current, command *MaintenanceCommand) {
+	if current == nil || command == nil {
+		return
+	}
+	switch command.Kind {
+	case MaintenanceCommandCheckpoint:
+		current.MaintenanceScheduler.LastPrimary = MaintenanceCommandCheckpoint
+		current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint = 0
+	case MaintenanceCommandCompaction:
+		units := command.Scheduling.WorkUnits
+		if units == 0 {
+			units = 1
+		}
+		current.MaintenanceScheduler.LastPrimary = MaintenanceCommandCompaction
+		current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint = saturatingAddUint32(
+			current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint, units)
+		sourceLevel := command.Compaction.Payload.SourceLevel
+		if sourceLevel == 0 {
+			current.MaintenanceScheduler.L0UnitsSinceLower = saturatingAddUint32(
+				current.MaintenanceScheduler.L0UnitsSinceLower, units)
+			return
+		}
+		current.MaintenanceScheduler.L0UnitsSinceLower = 0
+		if sourceLevel != ^uint32(0) {
+			current.MaintenanceScheduler.NextLowerLevel = sourceLevel + 1
+		}
+	}
+}
+
+func saturatingAddUint32(a, b uint32) uint32 {
+	if a > ^uint32(0)-b {
+		return ^uint32(0)
+	}
+	return a + b
 }
 
 // checkpointSnapshotVerification caches a deterministic candidate validation

@@ -140,10 +140,20 @@ type Current struct {
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
 
-	WriterFence        *FenceToken         `json:"writer_fence,omitempty"`
-	CompactorFence     *FenceToken         `json:"compactor_fence,omitempty"`
-	LastWriterCommit   *WriterCommitMarker `json:"last_writer_commit,omitempty"`
-	MaintenanceReceipt *MaintenanceReceipt `json:"maintenance_receipt,omitempty"`
+	WriterFence          *FenceToken               `json:"writer_fence,omitempty"`
+	CompactorFence       *FenceToken               `json:"compactor_fence,omitempty"`
+	LastWriterCommit     *WriterCommitMarker       `json:"last_writer_commit,omitempty"`
+	MaintenanceReceipt   *MaintenanceReceipt       `json:"maintenance_receipt,omitempty"`
+	MaintenanceScheduler MaintenanceSchedulerState `json:"maintenance_scheduler,omitempty"`
+}
+
+// MaintenanceSchedulerState is advisory control-plane state. It affects work
+// ordering but never logical KV contents.
+type MaintenanceSchedulerState struct {
+	LastPrimary                    MaintenanceCommandKind `json:"last_primary,omitempty"`
+	CompactionUnitsSinceCheckpoint uint32                 `json:"compaction_units_since_checkpoint,omitempty"`
+	L0UnitsSinceLower              uint32                 `json:"l0_units_since_lower,omitempty"`
+	NextLowerLevel                 uint32                 `json:"next_lower_level,omitempty"`
 }
 
 type ObjectRef struct {

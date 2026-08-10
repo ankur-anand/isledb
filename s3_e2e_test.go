@@ -105,7 +105,7 @@ func TestS3E2E_WriteCompactRead(t *testing.T) {
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.Interval = 10 * time.Millisecond
+	maintenanceOpts.IdleInterval = 10 * time.Millisecond
 	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
 	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.SSTCompaction.TargetSSTBytes = 2 * 1024
@@ -552,7 +552,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	}
 
 	maintenanceOpts := DefaultMaintenanceOptions()
-	maintenanceOpts.Interval = 25 * time.Millisecond
+	maintenanceOpts.IdleInterval = 25 * time.Millisecond
 	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 8
 	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.SSTCompaction.TargetSSTBytes = 64 << 10
@@ -604,8 +604,9 @@ func replayManifestForTest(t testing.TB, ctx context.Context, store *blobstore.S
 
 func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Maintenance, writer *Writer) MaintenanceStats {
 	t.Helper()
+	const maxMaintenanceDrainCycles = 400
 	var total MaintenanceStats
-	for attempt := 0; attempt < compactionMaxIterations*4; attempt++ {
+	for attempt := 0; attempt < maxMaintenanceDrainCycles; attempt++ {
 		stats, err := maintenance.RunOnce(ctx)
 		if err != nil {
 			t.Fatalf("maintenance RunOnce(%d): %v", attempt, err)
@@ -630,7 +631,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 			return total
 		}
 	}
-	t.Fatalf("maintenance did not become idle after %d cycles", compactionMaxIterations*4)
+	t.Fatalf("maintenance did not become idle after %d cycles", maxMaintenanceDrainCycles)
 	return MaintenanceStats{}
 }
 

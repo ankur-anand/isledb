@@ -18,8 +18,11 @@ func TestMaintenanceDefaultsUseExplicitUnits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalizeMaintenanceOptions: %v", err)
 	}
-	if normalized.checkpointReplayPages != defaultCheckpointReplayPages {
-		t.Fatalf("checkpointReplayPages=%d, want %d", normalized.checkpointReplayPages, defaultCheckpointReplayPages)
+	if normalized.manifestCheckpoint.TargetReplayPages != defaultCheckpointReplayPages {
+		t.Fatalf("checkpointReplayPages=%d, want %d", normalized.manifestCheckpoint.TargetReplayPages, defaultCheckpointReplayPages)
+	}
+	if normalized.manifestCheckpoint.TargetReplayBytes != defaultCheckpointReplayBytes {
+		t.Fatalf("checkpointReplayBytes=%d, want %d", normalized.manifestCheckpoint.TargetReplayBytes, defaultCheckpointReplayBytes)
 	}
 
 	changeFeed := DefaultChangeFeedRetentionOptions()
@@ -50,6 +53,7 @@ func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 		opts SSTCompactionOptions
 	}{
 		{name: "negative", opts: SSTCompactionOptions{ReadConcurrency: -1}},
+		{name: "negative input bytes", opts: SSTCompactionOptions{MaxInputBytesPerJob: -1}},
 		{name: "invalid growth", opts: SSTCompactionOptions{LevelGrowthFactor: 1}},
 		{name: "too many inputs", opts: SSTCompactionOptions{MaxInputSSTsPerJob: manifest.MaxRetiredObjectsPerEntry + 1}},
 	}
@@ -63,6 +67,22 @@ func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 	}
 }
 
+func TestNormalizeMaintenanceCheckpointOptions(t *testing.T) {
+	opts := MaintenanceOptions{
+		ManifestCheckpoint: ManifestCheckpointOptions{
+			TargetReplayPages: 17,
+			TargetReplayBytes: 1234,
+		},
+	}
+	normalized, err := normalizeMaintenanceOptions(opts)
+	if err != nil {
+		t.Fatalf("normalizeMaintenanceOptions: %v", err)
+	}
+	if normalized.manifestCheckpoint != opts.ManifestCheckpoint {
+		t.Fatalf("checkpoint=%+v, want %+v", normalized.manifestCheckpoint, opts.ManifestCheckpoint)
+	}
+}
+
 func TestMaintenanceStateString(t *testing.T) {
 	for state, want := range map[MaintenanceState]string{
 		MaintenanceIdle:             "idle",
@@ -71,6 +91,19 @@ func TestMaintenanceStateString(t *testing.T) {
 	} {
 		if got := state.String(); got != want {
 			t.Errorf("state %d String()=%q, want %q", state, got, want)
+		}
+	}
+}
+
+func TestMaintenanceTaskString(t *testing.T) {
+	for task, want := range map[MaintenanceTask]string{
+		MaintenanceTaskNone:               "none",
+		MaintenanceTaskSSTCompaction:      "sst_compaction",
+		MaintenanceTaskManifestCheckpoint: "manifest_checkpoint",
+		MaintenanceTask(255):              "MaintenanceTask(255)",
+	} {
+		if got := task.String(); got != want {
+			t.Errorf("task %d String()=%q, want %q", task, got, want)
 		}
 	}
 }
@@ -131,8 +164,7 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)
 	}
-	defer maintenance.Close(ctx)
-	maintenance.opts.checkpointReplayPages = 1
+	maintenance.opts.manifestCheckpoint.TargetReplayPages = 1
 	beforeRun, err := db.manifestStore.ReadCurrentData(ctx)
 	if err != nil {
 		t.Fatalf("ReadCurrentData(before run): %v", err)
@@ -179,6 +211,88 @@ func TestMaintenanceRunOnceCheckpointsAtReplayPageLimit(t *testing.T) {
 	}
 	if current.Snapshot == nil {
 		t.Fatal("maintenance did not publish a snapshot")
+	}
+}
+
+func TestMaintenanceSchedulerPersistsCheckpointAndCompactionTurns(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-scheduler-persistence")
+	defer store.Close()
+
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-scheduler"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		if _, err := db.manifestStore.AppendAddSSTableWithFence(ctx, manifest.SSTMeta{
+			ID:     fmt.Sprintf("scheduler-sst-%02d", i),
+			Level:  0,
+			MinKey: []byte(fmt.Sprintf("key-%02d", i)),
+			MaxKey: []byte(fmt.Sprintf("key-%02d", i)),
+			Size:   1,
+		}); err != nil {
+			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
+		}
+	}
+
+	opts := DefaultMaintenanceOptions()
+	opts.SSTCompaction.L0TriggerSSTs = 64
+	opts.ManifestCheckpoint.TargetReplayPages = 1
+	opts.ManifestCheckpoint.TargetReplayBytes = ^uint64(0)
+	maintenance, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+
+	checkpointStats, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("checkpoint RunOnce: %v", err)
+	}
+	if checkpointStats.Scheduling.Selected != MaintenanceTaskManifestCheckpoint {
+		t.Fatalf("selected=%v, want checkpoint: %+v", checkpointStats.Scheduling.Selected, checkpointStats)
+	}
+	if _, err := db.manifestStore.ApplyPendingMaintenance(ctx); err != nil {
+		t.Fatalf("apply checkpoint: %v", err)
+	}
+	current, err := db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(after checkpoint): %v", err)
+	}
+	if current.MaintenanceScheduler.LastPrimary != manifest.MaintenanceCommandCheckpoint {
+		t.Fatalf("last primary=%q, want checkpoint", current.MaintenanceScheduler.LastPrimary)
+	}
+	if err := maintenance.Close(ctx); err != nil {
+		t.Fatalf("close first maintenance owner: %v", err)
+	}
+	maintenance, err = db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("reopen maintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+
+	compactionStats, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("compaction RunOnce: %v", err)
+	}
+	if compactionStats.Scheduling.Selected != MaintenanceTaskSSTCompaction ||
+		compactionStats.Scheduling.CompactionSourceLevel != 0 {
+		t.Fatalf("scheduling=%+v, want L0 compaction", compactionStats.Scheduling)
+	}
+	if _, err := db.manifestStore.ApplyPendingMaintenance(ctx); err != nil {
+		t.Fatalf("apply compaction: %v", err)
+	}
+	current, err = db.manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData(after compaction): %v", err)
+	}
+	if current.MaintenanceScheduler.LastPrimary != manifest.MaintenanceCommandCompaction ||
+		current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint != 1 ||
+		current.MaintenanceScheduler.L0UnitsSinceLower != 1 {
+		t.Fatalf("scheduler state after compaction=%+v", current.MaintenanceScheduler)
 	}
 }
 
@@ -277,7 +391,7 @@ func TestDBOpenMaintenanceRejectsInvalidPolicyAndReleasesReservation(t *testing.
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.Interval = -time.Second
+	opts.IdleInterval = -time.Second
 	if _, err := db.OpenMaintenance(ctx, opts); !errors.Is(err, ErrInvalidMaintenanceOptions) {
 		t.Fatalf("OpenMaintenance(invalid) error=%v, want %v", err, ErrInvalidMaintenanceOptions)
 	}
@@ -490,7 +604,7 @@ func TestMaintenanceRunStopsOnClose(t *testing.T) {
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.Interval = time.Hour
+	opts.IdleInterval = time.Hour
 	maintenance, err := db.OpenMaintenance(ctx, opts)
 	if err != nil {
 		t.Fatalf("OpenMaintenance: %v", err)

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,9 +23,6 @@ type changeFeedCleanerOptions struct {
 	// entries retained for change-feed readers. Zero uses the default.
 	KeepAtLeastManifestEntries uint64
 
-	// CheckInterval is the background cleaner cadence used by Start.
-	CheckInterval time.Duration
-
 	// SweepBatchSize limits physical change-batch deletes per RunOnce.
 	SweepBatchSize int
 
@@ -36,15 +31,13 @@ type changeFeedCleanerOptions struct {
 	// advanced beyond the marked manifest seq.
 	SweepGracePeriod time.Duration
 
-	OnCleanup      func(ChangeFeedCleanupStats)
-	OnCleanupError func(error)
+	OnCleanup func(ChangeFeedCleanupStats)
 }
 
 func defaultChangeFeedCleanerOptions() changeFeedCleanerOptions {
 	return changeFeedCleanerOptions{
 		RetentionPeriod:            7 * 24 * time.Hour,
 		KeepAtLeastManifestEntries: 1024,
-		CheckInterval:              time.Minute,
 		SweepBatchSize:             defaultChangeFeedSweepBatchSize,
 		SweepGracePeriod:           defaultChangeFeedSweepGracePeriod,
 	}
@@ -57,13 +50,7 @@ type changeFeedCleaner struct {
 	fenceToken   *manifest.FenceToken
 	stageCommand maintenanceCommandStager
 
-	lifecycleMu sync.Mutex
-	ticker      *time.Ticker
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-
-	running atomic.Bool
-	closed  atomic.Bool
+	closed atomic.Bool
 }
 
 func newChangeFeedCleaner(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts changeFeedCleanerOptions) (*changeFeedCleaner, error) {
@@ -80,9 +67,6 @@ func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, 
 	}
 	if opts.KeepAtLeastManifestEntries == 0 {
 		opts.KeepAtLeastManifestEntries = defaults.KeepAtLeastManifestEntries
-	}
-	if opts.CheckInterval <= 0 {
-		opts.CheckInterval = defaults.CheckInterval
 	}
 	if opts.SweepBatchSize <= 0 {
 		opts.SweepBatchSize = defaults.SweepBatchSize
@@ -102,102 +86,18 @@ func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, 
 	return &changeFeedCleaner{store: store, manifestLog: manifestLog, opts: opts, fenceToken: &token}, nil
 }
 
-func (c *changeFeedCleaner) Start(ctx context.Context) error {
-	if err := checkContext(ctx); err != nil {
-		return err
-	}
-
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-
-	if c.closed.Load() {
-		return errors.New("change feed cleaner closed")
-	}
-	if !c.running.CompareAndSwap(false, true) {
-		return nil
-	}
-
-	loopCtx, cancel := context.WithCancel(ctx)
-	c.cancel = cancel
-	c.ticker = time.NewTicker(c.opts.CheckInterval)
-	c.wg.Add(1)
-	go c.cleanupLoop(loopCtx, c.ticker)
-	return nil
-}
-
-func (c *changeFeedCleaner) stopLoop() {
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-	if c.ticker != nil {
-		c.ticker.Stop()
-		c.ticker = nil
-	}
-	c.running.Store(false)
-}
-
 func (c *changeFeedCleaner) Close(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	if c.closed.CompareAndSwap(false, true) {
-		c.stopLoop()
-	}
-	return waitGroupContext(ctx, &c.wg)
+	c.closed.Store(true)
+	return nil
 }
 
 func (c *changeFeedCleaner) closeDB() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return c.Close(ctx)
-}
-
-func (c *changeFeedCleaner) cleanupLoop(ctx context.Context, ticker *time.Ticker) {
-	defer c.wg.Done()
-	defer func() {
-		ticker.Stop()
-		c.lifecycleMu.Lock()
-		if c.ticker == ticker {
-			c.ticker = nil
-			c.cancel = nil
-		}
-		c.lifecycleMu.Unlock()
-		c.running.Store(false)
-	}()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := c.RunOnce(ctx); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				if isFenceError(err) {
-					if c.opts.OnCleanupError != nil {
-						c.opts.OnCleanupError(err)
-					} else {
-						slog.Error("isledb: change-feed cleaner fenced, stopping background cleanup", "error", err)
-					}
-					return
-				}
-				if errors.Is(err, manifest.ErrFenceConflict) {
-					slog.Debug("isledb: change-feed cleanup skipped after concurrent manifest update")
-					continue
-				}
-				if c.opts.OnCleanupError != nil {
-					c.opts.OnCleanupError(err)
-				} else {
-					slog.Error("isledb: change-feed cleanup error", "error", err)
-				}
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {

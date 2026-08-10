@@ -215,7 +215,7 @@ func TestPendingChangeBatchSweeperDoesNotDeleteRetainedBatch(t *testing.T) {
 	}
 }
 
-func TestChangeFeedCleanerBackgroundLoopStopsWhenFenced(t *testing.T) {
+func TestChangeFeedCleanerRunRejectsLostFence(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("change-feed-cleaner-fenced")
 	defer store.Close()
@@ -225,13 +225,7 @@ func TestChangeFeedCleanerBackgroundLoopStopsWhenFenced(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	var cleanupErrCount atomic.Int32
-	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, changeFeedCleanerOptions{
-		CheckInterval: 20 * time.Millisecond,
-		OnCleanupError: func(error) {
-			cleanupErrCount.Add(1)
-		},
-	})
+	cleaner, err := newChangeFeedCleaner(ctx, store, manifestStore, changeFeedCleanerOptions{})
 	if err != nil {
 		t.Fatalf("new change feed cleaner: %v", err)
 	}
@@ -245,24 +239,8 @@ func TestChangeFeedCleanerBackgroundLoopStopsWhenFenced(t *testing.T) {
 		t.Fatalf("competing compactor claim: %v", err)
 	}
 
-	if err := cleaner.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for cleanupErrCount.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if cleanupErrCount.Load() == 0 {
-		t.Fatal("expected the cleanup loop to report a fence error")
-	}
-
-	first := cleanupErrCount.Load()
-	time.Sleep(100 * time.Millisecond)
-	if after := cleanupErrCount.Load(); after != first {
-		t.Fatalf("cleanup loop continued after fence loss: before=%d after=%d", first, after)
-	}
-	if cleaner.running.Load() {
-		t.Fatal("cleanup loop still running after fence loss")
+	if err := cleaner.RunOnce(ctx); !errors.Is(err, manifest.ErrFenced) {
+		t.Fatalf("RunOnce after fence loss error=%v, want %v", err, manifest.ErrFenced)
 	}
 }
 

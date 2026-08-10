@@ -11,7 +11,7 @@ func TestLevelPlannerPromotesDisjointL0WithoutRewrite(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		m.AddL0SST(plannerSST(0, i, i))
 	}
-	plan, err := c.planCompaction(m)
+	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestLevelPlannerRewritesOverlappingL0AndDestination(t *testing.T) {
 	}
 	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 20)})
 
-	plan, err := c.planCompaction(m)
+	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 	m := &manifestState{}
 	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 0), plannerSST(1, 2, 2)})
 
-	plan, err := c.planCompaction(m)
+	plan, err := plannedCandidateForLevel(c, m, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,13 +67,45 @@ func TestLevelPlannerRejectsUnboundedOverlap(t *testing.T) {
 	}
 	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 49), plannerSST(1, 50, 100)})
 
-	if _, err := c.planCompaction(m); err == nil {
+	if _, err := plannedCandidateForLevel(c, m, 0); err == nil {
 		t.Fatal("expected bounded-input error")
+	}
+}
+
+func TestLevelPlannerBoundsRewriteByInputBytes(t *testing.T) {
+	c := plannerOnlyCompactor()
+	c.opts.Trigger.L0SSTCount = 3
+	c.opts.Trigger.MaxInputBytes = 100 << 20
+	m := &manifestState{}
+	for i := 0; i < 3; i++ {
+		m.AddL0SST(plannerSST(0, i, i+2))
+	}
+	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 10)})
+
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatalf("planCompactionCandidates: %v", err)
+	}
+	if got := len(plan.sourceSSTs); got != 1 {
+		t.Fatalf("source SSTs=%d, want one indivisible oversized source", got)
 	}
 }
 
 func plannerOnlyCompactor() *compactor {
 	return &compactor{opts: normalizeCompactorOptions(defaultCompactorOptions(), nil)}
+}
+
+func plannedCandidateForLevel(c *compactor, m *manifestState, sourceLevel uint32) (*levelCompactionPlan, error) {
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		return nil, err
+	}
+	for i := range candidates {
+		if candidates[i].plan.sourceLevel == sourceLevel {
+			return candidates[i].plan, nil
+		}
+	}
+	return nil, nil
 }
 
 func plannerSST(level uint32, lo, hi int) sstMetadata {

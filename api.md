@@ -509,8 +509,8 @@ retention floor.
 ### Maintenance
 
 Owns one fenced maintenance session for a database prefix. It runs compaction,
-optional change-feed retention, checkpoints, and garbage collection in a fixed
-serialized order. `DB.OpenMaintenance` rejects a second active
+optional change-feed retention, checkpoints, and garbage collection through a
+bounded fair scheduler. `DB.OpenMaintenance` rejects a second active
 maintenance handle opened from the same `DB`.
 
 | Method | Signature | Description |
@@ -521,8 +521,9 @@ maintenance handle opened from the same `DB`.
 
 ```go
 type MaintenanceOptions struct {
-    Interval            time.Duration
+    IdleInterval        time.Duration
     SSTCompaction       SSTCompactionOptions
+    ManifestCheckpoint ManifestCheckpointOptions
     ChangeFeedRetention *ChangeFeedRetentionOptions
     OnCycle             func(MaintenanceStats)
     OnError             func(error)
@@ -533,21 +534,38 @@ type ChangeFeedRetentionOptions struct {
 }
 
 type SSTCompactionOptions struct {
-    ReadConcurrency      int
-    L0TriggerSSTs        int
-    MaxConsecutiveL0Jobs int
-    BaseLevelBytes       int64
-    LevelGrowthFactor    int
-    MaxInputSSTsPerJob   int
-    TargetSSTBytes       int64
+    ReadConcurrency     int
+    L0TriggerSSTs       int
+    BaseLevelBytes      int64
+    LevelGrowthFactor   int
+    MaxInputSSTsPerJob  int
+    MaxInputBytesPerJob int64
+    TargetSSTBytes      int64
+}
+
+type ManifestCheckpointOptions struct {
+    TargetReplayPages uint64
+    TargetReplayBytes uint64
 }
 
 type MaintenanceStats struct {
     State               MaintenanceState
+    Scheduling          MaintenanceScheduleStats
     SSTCompaction       SSTCompactionStats
     ChangeFeedRetention ChangeFeedCleanupStats
     ManifestCheckpoint  ManifestCheckpointStats
     Duration            time.Duration
+}
+
+type MaintenanceScheduleStats struct {
+    Selected              MaintenanceTask
+    CompactionSourceLevel uint32
+    CompactionWorkUnits   uint32
+    CompactionCritical    bool
+    CheckpointEligible    bool
+    CheckpointUrgent      bool
+    ReplayPages           uint64
+    ReplayBytes           uint64
 }
 
 type MaintenanceState uint8
@@ -581,8 +599,8 @@ type ChangeFeedCleanupStats struct {
 ```
 
 `DefaultMaintenanceOptions` enables compaction, checkpoints, and retired-SST
-garbage collection. Checkpoint and garbage-collection safeguards are internal;
-they do not need a second set of storage-format options. Change-feed retention
+garbage collection. Scheduler burst limits, level cursors, urgent thresholds,
+and garbage-collection safeguards remain internal. Change-feed retention
 remains disabled. Use
 `DefaultChangeFeedRetentionOptions` before enabling feed-history cleanup.
 
@@ -597,10 +615,13 @@ next maintenance command can be staged.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()
-opts.Interval = 5 * time.Second
+opts.IdleInterval = 5 * time.Second
 opts.SSTCompaction.L0TriggerSSTs = 8
 opts.SSTCompaction.ReadConcurrency = 4
+opts.SSTCompaction.MaxInputBytesPerJob = 512 << 20
 opts.SSTCompaction.TargetSSTBytes = 64 << 20
+opts.ManifestCheckpoint.TargetReplayPages = 64
+opts.ManifestCheckpoint.TargetReplayBytes = 32 << 20
 
 feedRetention := isledb.DefaultChangeFeedRetentionOptions()
 feedRetention.RetainFor = 24 * time.Hour
