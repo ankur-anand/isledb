@@ -177,6 +177,75 @@ func TestChangeReaderReusesObservedCurrentWithinBatch(t *testing.T) {
 	}
 }
 
+func TestChangeReaderRefreshesExpiredWithinBatchView(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-reader-expired-within-batch-view")
+	const maxPinnedViewAge = 20 * time.Millisecond
+	db, err := openDB(ctx, store, dbOpenOptions{
+		changeFeedPayload: manifest.ChangeFeedPayloadFullValues,
+		storePolicy:       StorePolicy{MaxPinnedViewAge: maxPinnedViewAge},
+	})
+	if err != nil {
+		store.Close()
+		t.Fatalf("open DB: %v", err)
+	}
+	writer, err := db.OpenWriter(ctx, testChangeWriterOptions())
+	if err != nil {
+		db.Close()
+		store.Close()
+		t.Fatalf("open writer: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = writer.Close(context.Background())
+		_ = db.Close()
+		_ = store.Close()
+	})
+
+	if err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("b"), []byte("two")); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+
+	first, err := reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{
+		MaxChanges: 1,
+		MaxBytes:   1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("read first change: %v", err)
+	}
+	if first.Next.index != 1 {
+		t.Fatalf("first next cursor=%q want an in-batch continuation", first.Next)
+	}
+
+	token, err := db.manifestStore.ClaimCompactor(ctx, "expire-change-reader-view")
+	if err != nil {
+		t.Fatalf("claim compactor: %v", err)
+	}
+	if _, err := db.manifestStore.AdvanceChangeFeedLogStart(ctx, first.Head.entry, token); err != nil {
+		t.Fatalf("advance change-feed floor: %v", err)
+	}
+
+	// The continuation may use its already observed view only for the lifetime
+	// promised by CURRENT. Once that lifetime passes, it must refresh CURRENT
+	// and observe that retention has expired its manifest entry.
+	time.Sleep(2 * maxPinnedViewAge)
+	_, err = reader.Read(ctx, first.Next, ChangeReadOptions{MaxChanges: 1})
+	if !errors.Is(err, ErrChangeCursorExpired) {
+		t.Fatalf("read with expired cached view error=%v want=%v", err, ErrChangeCursorExpired)
+	}
+}
+
 func TestChangeReaderZeroCursorStartsAtOldestAndLargeChangeMakesProgress(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-zero")

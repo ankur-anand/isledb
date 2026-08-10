@@ -424,6 +424,15 @@ func (r *ChangeReader) cachedContinuation(
 	if r.batch == nil || r.batchView == nil || r.batchEntry != from.entry {
 		return nil, nil, nil, false
 	}
+	if r.batchView.ExpiredAt(time.Now()) {
+		// The decoded index and blocks remain safe as immutable cached data, but
+		// the old manifest view may no longer prove that the batch is retained.
+		// Drop only that association so the caller reloads CURRENT before using
+		// the cached batch again.
+		r.batchEntry = 0
+		r.batchView = nil
+		return nil, nil, nil, false
+	}
 	meta := r.batchMeta
 	entry := &manifest.ManifestLogEntry{Seq: from.entry, ChangeBatch: &meta}
 	return r.batchView, []*manifest.ManifestLogEntry{entry}, r.batch, true
