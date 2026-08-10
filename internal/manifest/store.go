@@ -1388,7 +1388,8 @@ func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload)
 // ChangeFeedView is an immutable view of the manifest metadata required to
 // locate retained change-feed entries.
 type ChangeFeedView struct {
-	current *Current
+	current   *Current
+	expiresAt time.Time
 }
 
 func (v *ChangeFeedView) Enabled() bool {
@@ -1416,9 +1417,17 @@ func (v *ChangeFeedView) Head() uint64 {
 	return v.current.NextSeq
 }
 
+// ExpiredAt reports whether this immutable view has reached the maximum
+// lifetime published in the CURRENT object from which it was loaded. Callers
+// must load a fresh view before starting more work once this returns true.
+func (v *ChangeFeedView) ExpiredAt(now time.Time) bool {
+	return v == nil || v.expiresAt.IsZero() || !now.Before(v.expiresAt)
+}
+
 // LoadChangeFeedView reads CURRENT once and returns an immutable change-feed
-// view that can serve multiple bounded reads.
+// view that can serve multiple bounded reads until CURRENT.MaxPinnedViewAge.
 func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error) {
+	loadedAt := time.Now()
 	current, err := s.readCurrent(ctx)
 	if err != nil {
 		return nil, err
@@ -1426,7 +1435,10 @@ func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error)
 	if current != nil && current.ChangeFeedEnabled && !current.ChangeFeedPayload.Valid() {
 		return nil, fmt.Errorf("%w: change feed payload=%q", ErrInvalidManifest, current.ChangeFeedPayload)
 	}
-	return &ChangeFeedView{current: current}, nil
+	return &ChangeFeedView{
+		current:   current,
+		expiresAt: loadedAt.Add(current.PinnedViewAge()),
+	}, nil
 }
 
 // ChangeFeedBounds returns whether the feed is enabled, the oldest retained
