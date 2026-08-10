@@ -27,7 +27,6 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
 			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
-			CheckInterval:       time.Hour,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -57,7 +56,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
 	}
-	if err := compactor.RunOnce(ctx); err != nil {
+	if err := runCompactorUntilIdle(ctx, compactor); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	_ = compactor.Close(ctx)

@@ -175,15 +175,8 @@ type compactorOptions struct {
 }
 
 type compactionTriggerOptions struct {
-	// CheckInterval is the background scheduler cadence used by Start.
-	CheckInterval time.Duration
-
 	// L0SSTCount is the number of L0 SSTs that triggers an L0 merge.
 	L0SSTCount int
-
-	// MaxConsecutiveL0Compactions bounds L0 priority when a lower level is
-	// already over budget.
-	MaxConsecutiveL0Compactions int
 
 	// BaseLevelBytes is the target size of L1. Each subsequent level target is
 	// multiplied by LevelSizeMultiplier.
@@ -194,6 +187,10 @@ type compactionTriggerOptions struct {
 
 	// MaxInputSSTs bounds one atomic compaction and its retirement record.
 	MaxInputSSTs int
+
+	// MaxInputBytes softly bounds the total source and destination SST bytes in
+	// one compaction. One indivisible plan may exceed the limit.
+	MaxInputBytes int64
 }
 
 type compactionOutputOptions struct {
@@ -223,12 +220,11 @@ func defaultCompactorOptions() compactorOptions {
 		InputReadParallelism: 4,
 		GCDeleteBatchSize:    defaultSSTSweepBatchSize,
 		Trigger: compactionTriggerOptions{
-			CheckInterval:               5 * time.Second,
-			L0SSTCount:                  8,
-			MaxConsecutiveL0Compactions: 4,
-			BaseLevelBytes:              512 * 1024 * 1024,
-			LevelSizeMultiplier:         8,
-			MaxInputSSTs:                manifest.MaxRetiredObjectsPerEntry,
+			L0SSTCount:          8,
+			BaseLevelBytes:      512 * 1024 * 1024,
+			LevelSizeMultiplier: 8,
+			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
+			MaxInputBytes:       512 * 1024 * 1024,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,

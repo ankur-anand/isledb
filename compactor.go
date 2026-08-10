@@ -29,8 +29,6 @@ const (
 	compactionLevelToLevel
 )
 
-const compactionMaxIterations = 100
-
 var errCompactorClosed = errors.New("compactor closed")
 
 type compactionJob struct {
@@ -61,18 +59,13 @@ type compactor struct {
 	manifest *manifestState
 
 	lifecycleMu sync.Mutex
-	ticker      *time.Ticker
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
 	activeRuns  sync.WaitGroup
 	runGate     chan struct{}
 
-	fenced                   atomic.Bool
-	fenceToken               *manifest.FenceToken
-	consecutiveL0Compactions int
+	fenced     atomic.Bool
+	fenceToken *manifest.FenceToken
 
-	running atomic.Bool
-	closed  atomic.Bool
+	closed atomic.Bool
 }
 
 func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts compactorOptions) (*compactor, error) {
@@ -121,14 +114,8 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	if opts.InputReadParallelism <= 0 {
 		opts.InputReadParallelism = d.InputReadParallelism
 	}
-	if opts.Trigger.CheckInterval <= 0 {
-		opts.Trigger.CheckInterval = d.Trigger.CheckInterval
-	}
 	if opts.Trigger.L0SSTCount <= 0 {
 		opts.Trigger.L0SSTCount = d.Trigger.L0SSTCount
-	}
-	if opts.Trigger.MaxConsecutiveL0Compactions <= 0 {
-		opts.Trigger.MaxConsecutiveL0Compactions = d.Trigger.MaxConsecutiveL0Compactions
 	}
 	if opts.Trigger.BaseLevelBytes <= 0 {
 		opts.Trigger.BaseLevelBytes = d.Trigger.BaseLevelBytes
@@ -138,6 +125,9 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	}
 	if opts.Trigger.MaxInputSSTs <= 0 || opts.Trigger.MaxInputSSTs > manifest.MaxRetiredObjectsPerEntry {
 		opts.Trigger.MaxInputSSTs = d.Trigger.MaxInputSSTs
+	}
+	if opts.Trigger.MaxInputBytes <= 0 {
+		opts.Trigger.MaxInputBytes = d.Trigger.MaxInputBytes
 	}
 	if opts.Output.BloomBitsPerKey == 0 {
 		opts.Output.BloomBitsPerKey = d.Output.BloomBitsPerKey
@@ -158,54 +148,13 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	return opts
 }
 
-func (c *compactor) Start(ctx context.Context) error {
-	if err := checkContext(ctx); err != nil {
-		return err
-	}
-
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-
-	if c.closed.Load() {
-		return errCompactorClosed
-	}
-	if !c.running.CompareAndSwap(false, true) {
-		return nil
-	}
-
-	loopCtx, cancel := context.WithCancel(ctx)
-	c.cancel = cancel
-	c.ticker = time.NewTicker(c.opts.Trigger.CheckInterval)
-	c.wg.Add(1)
-	go c.compactionLoop(loopCtx, c.ticker)
-	return nil
-}
-
-func (c *compactor) stopLoop() {
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-	if c.ticker != nil {
-		c.ticker.Stop()
-		c.ticker = nil
-	}
-	c.running.Store(false)
-}
-
 func (c *compactor) Close(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	if c.closed.CompareAndSwap(false, true) {
-		c.stopLoop()
-	}
-	if err := waitGroupContext(ctx, &c.wg); err != nil {
-		return err
-	}
+	c.lifecycleMu.Lock()
+	c.closed.Store(true)
+	c.lifecycleMu.Unlock()
 	return waitGroupContext(ctx, &c.activeRuns)
 }
 
@@ -219,109 +168,60 @@ func (c *compactor) closeWithTimeout(timeout time.Duration) error {
 	return c.Close(ctx)
 }
 
-func (c *compactor) refresh(ctx context.Context) error {
-	m, err := c.manifestLog.Replay(ctx)
+func (c *compactor) refreshWithCurrent(ctx context.Context) (*manifest.Current, error) {
+	m, current, err := c.manifestLog.ReplayWithCurrent(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c.mu.Lock()
 	c.manifest = m
 	c.mu.Unlock()
-	return nil
+	return current, nil
 }
 
-func (c *compactor) compactionLoop(ctx context.Context, ticker *time.Ticker) {
-	defer c.wg.Done()
-	defer func() {
-		ticker.Stop()
-		c.lifecycleMu.Lock()
-		if c.ticker == ticker {
-			c.ticker = nil
-			c.cancel = nil
-		}
-		c.lifecycleMu.Unlock()
-		c.running.Store(false)
-	}()
-	for {
-		select {
-		case <-ticker.C:
-			if err := c.RunOnce(ctx); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				if isFenceError(err) {
-					slog.Error("isledb: compactor fenced, stopping background compaction")
-					return
-				}
-				if errors.Is(err, manifest.ErrFenceConflict) {
-					slog.Debug("isledb: compaction skipped after concurrent manifest update")
-					continue
-				}
-				slog.Error("isledb: compaction error", "error", err)
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// RunOnce performs one scheduler compaction pass and returns when no work remains.
-func (c *compactor) RunOnce(ctx context.Context) error {
+// runSelected executes at most one compaction chosen from all currently
+// executable level plans. It is used by Maintenance so checkpoint arbitration
+// happens before any expensive compaction work begins.
+func (c *compactor) runSelected(
+	ctx context.Context,
+	selector func(*manifest.Current, []compactionCandidate) *compactionCandidate,
+) (*compactionCandidate, error) {
 	if err := checkContext(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.beginRun(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	defer c.finishRun()
 
-	for i := 0; i < compactionMaxIterations; i++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if c.fenced.Load() {
-			return manifest.ErrFenced
-		}
-
-		if err := c.refresh(ctx); err != nil {
-			return fmt.Errorf("refresh manifest: %w", err)
-		}
-
-		c.mu.Lock()
-		m := c.manifest.Clone()
-		c.mu.Unlock()
-
-		plan, err := c.planCompaction(m)
-		if err != nil {
-			return err
-		}
-		if plan != nil {
-			if err := c.executeCompaction(ctx, m, plan); err != nil {
-				if isFenceError(err) {
-					c.fenced.Store(true)
-					return err
-				}
-				return fmt.Errorf("L%d to L%d compaction: %w", plan.sourceLevel, plan.destinationLevel, err)
-			}
-			if plan.sourceLevel == 0 {
-				c.consecutiveL0Compactions++
-			} else {
-				c.consecutiveL0Compactions = 0
-			}
-			if c.stageCommand != nil {
-				return nil
-			}
-			continue
-		}
-
-		c.runSSTSweeperBestEffort(ctx)
-		return nil
+	if c.fenced.Load() {
+		return nil, manifest.ErrFenced
 	}
-
-	slog.Warn("isledb: compaction hit max iterations, possible infinite loop or excessive L0 accumulation",
-		"compactionMaxIterations", compactionMaxIterations)
-	c.runSSTSweeperBestEffort(ctx)
-	return nil
+	current, err := c.refreshWithCurrent(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refresh manifest: %w", err)
+	}
+	c.mu.Lock()
+	m := c.manifest.Clone()
+	c.mu.Unlock()
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		return nil, err
+	}
+	selected := selector(current, candidates)
+	if selected == nil {
+		return nil, nil
+	}
+	chosen := *selected
+	if err := c.executeCompaction(ctx, m, chosen.plan); err != nil {
+		if isFenceError(err) {
+			c.fenced.Store(true)
+			return nil, err
+		}
+		return nil, fmt.Errorf("L%d to L%d compaction: %w",
+			chosen.plan.sourceLevel, chosen.plan.destinationLevel, err)
+	}
+	return &chosen, nil
 }
 
 func (c *compactor) beginRun(ctx context.Context) error {
@@ -384,37 +284,59 @@ type levelCompactionPlan struct {
 	sourceSSTs       []sstMetadata
 	destinationSSTs  []sstMetadata
 	metadataOnly     bool
+	workUnits        uint32
 }
 
-func (c *compactor) planCompaction(m *manifestState) (*levelCompactionPlan, error) {
-	var levelPlan *levelCompactionPlan
+func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCandidate, error) {
+	if m == nil {
+		return nil, nil
+	}
+	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
+	var firstPlanningErr error
+	if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount {
+		inputs := m.L0SSTs
+		if len(inputs) > c.opts.Trigger.MaxInputSSTs {
+			inputs = inputs[len(inputs)-c.opts.Trigger.MaxInputSSTs:]
+		}
+		plan, err := c.buildLevelPlan(m, 0, 1, inputs)
+		if err != nil {
+			firstPlanningErr = err
+		} else {
+			inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
+			plan.workUnits = workUnits
+			candidates = append(candidates, compactionCandidate{
+				plan:       plan,
+				inputBytes: inputBytes,
+				workUnits:  workUnits,
+				critical:   l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount),
+			})
+		}
+	}
 	for i := range m.Levels {
 		level := &m.Levels[i]
 		if level.TotalSize() <= c.levelTargetBytes(level.Number) {
 			continue
 		}
-		limit := c.opts.Trigger.MaxInputSSTs
-		if limit > len(level.SSTs) {
-			limit = len(level.SSTs)
-		}
-		var err error
-		levelPlan, err = c.buildLevelPlan(m, level.Number, level.Number+1, level.SSTs[:limit])
+		limit := min(c.opts.Trigger.MaxInputSSTs, len(level.SSTs))
+		plan, err := c.buildLevelPlan(m, level.Number, level.Number+1, level.SSTs[:limit])
 		if err != nil {
-			return nil, err
+			if firstPlanningErr == nil {
+				firstPlanningErr = err
+			}
+			continue
 		}
-		break
+		inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
+		plan.workUnits = workUnits
+		candidates = append(candidates, compactionCandidate{
+			plan:       plan,
+			inputBytes: inputBytes,
+			workUnits:  workUnits,
+		})
 	}
-
-	if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount &&
-		(levelPlan == nil || c.consecutiveL0Compactions < c.opts.Trigger.MaxConsecutiveL0Compactions) {
-		inputs := m.L0SSTs
-		if len(inputs) > c.opts.Trigger.MaxInputSSTs {
-			inputs = inputs[len(inputs)-c.opts.Trigger.MaxInputSSTs:]
-		}
-		return c.buildLevelPlan(m, 0, 1, inputs)
+	if len(candidates) == 0 && firstPlanningErr != nil {
+		return nil, firstPlanningErr
 	}
-
-	return levelPlan, nil
+	return candidates, nil
 }
 
 func (c *compactor) levelTargetBytes(level uint32) int64 {
@@ -444,13 +366,17 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source) &&
 			!c.opts.Safety.ValidateSSTChecksum && c.opts.Safety.SSTHashVerifier == nil
 		if metadataOnly || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
-			return &levelCompactionPlan{
+			plan := &levelCompactionPlan{
 				sourceLevel:      sourceLevel,
 				destinationLevel: destinationLevel,
 				sourceSSTs:       source,
 				destinationSSTs:  destination,
 				metadataOnly:     metadataOnly,
-			}, nil
+			}
+			inputBytes, _ := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
+			if metadataOnly || inputBytes <= c.opts.Trigger.MaxInputBytes || count == 1 {
+				return plan, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("compaction overlap exceeds max input SSTs=%d for L%d to L%d", c.opts.Trigger.MaxInputSSTs, sourceLevel, destinationLevel)
@@ -549,10 +475,10 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 		DestinationLevel: plan.destinationLevel,
 		AddSSTables:      outputs,
 	}
-	return c.appendCompaction(ctx, m, payload)
+	return c.appendCompaction(ctx, m, payload, plan.workUnits)
 }
 
-func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload) error {
+func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload, workUnits uint32) error {
 	added := make(map[string]struct{}, len(payload.AddSSTables))
 	for _, sst := range payload.AddSSTables {
 		added[sst.ID] = struct{}{}
@@ -570,6 +496,9 @@ func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payl
 	if c.stageCommand != nil {
 		return c.stageCommand(ctx, manifest.MaintenanceCommand{
 			Kind: manifest.MaintenanceCommandCompaction,
+			Scheduling: manifest.MaintenanceScheduling{
+				WorkUnits: workUnits,
+			},
 			Compaction: &manifest.CompactionCommand{
 				Payload:        payload,
 				RetiredObjects: retired,

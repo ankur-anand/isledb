@@ -212,7 +212,7 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 	defer db.Close()
 
 	opts := DefaultMaintenanceOptions()
-	opts.Interval = 5 * time.Millisecond
+	opts.IdleInterval = 5 * time.Millisecond
 	opts.SSTCompaction.L0TriggerSSTs = 4
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.SSTCompaction.TargetSSTBytes = 32 << 10

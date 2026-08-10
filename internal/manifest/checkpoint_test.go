@@ -660,6 +660,10 @@ func assertCheckpointRejected(t *testing.T, ctx context.Context, store *Store, c
 	if !objectRefsEqual(after.Snapshot, before.Snapshot) || after.LogSeqStart != before.LogSeqStart {
 		t.Fatalf("rejected checkpoint changed base: before=%+v after=%+v", before.Snapshot, after.Snapshot)
 	}
+	if after.MaintenanceScheduler != before.MaintenanceScheduler {
+		t.Fatalf("rejected checkpoint changed scheduler: before=%+v after=%+v",
+			before.MaintenanceScheduler, after.MaintenanceScheduler)
+	}
 	if !receiptMatchesCommand(after.MaintenanceReceipt, staged.Pending) || after.MaintenanceReceipt.Status != MaintenanceStatusRejected {
 		t.Fatalf("rejection receipt=%+v pending=%+v", after.MaintenanceReceipt, staged.Pending)
 	}

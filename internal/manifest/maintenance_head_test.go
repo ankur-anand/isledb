@@ -9,6 +9,39 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 )
 
+func TestAdvanceMaintenanceSchedulerTracksAppliedPrimaryWork(t *testing.T) {
+	current := &Current{}
+	advanceMaintenanceScheduler(current, &MaintenanceCommand{
+		Kind: MaintenanceCommandCompaction,
+		Scheduling: MaintenanceScheduling{
+			WorkUnits: 3,
+		},
+		Compaction: &CompactionCommand{Payload: CompactionLogPayload{SourceLevel: 0, DestinationLevel: 1}},
+	})
+	if current.MaintenanceScheduler.LastPrimary != MaintenanceCommandCompaction ||
+		current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint != 3 ||
+		current.MaintenanceScheduler.L0UnitsSinceLower != 3 {
+		t.Fatalf("after L0=%+v", current.MaintenanceScheduler)
+	}
+
+	advanceMaintenanceScheduler(current, &MaintenanceCommand{
+		Kind: MaintenanceCommandCompaction,
+		Scheduling: MaintenanceScheduling{
+			WorkUnits: 1,
+		},
+		Compaction: &CompactionCommand{Payload: CompactionLogPayload{SourceLevel: 2, DestinationLevel: 3}},
+	})
+	if current.MaintenanceScheduler.L0UnitsSinceLower != 0 || current.MaintenanceScheduler.NextLowerLevel != 3 {
+		t.Fatalf("after lower=%+v", current.MaintenanceScheduler)
+	}
+
+	advanceMaintenanceScheduler(current, &MaintenanceCommand{Kind: MaintenanceCommandCheckpoint})
+	if current.MaintenanceScheduler.LastPrimary != MaintenanceCommandCheckpoint ||
+		current.MaintenanceScheduler.CompactionUnitsSinceCheckpoint != 0 {
+		t.Fatalf("after checkpoint=%+v", current.MaintenanceScheduler)
+	}
+}
+
 func TestMaintenanceHeadClaimStageAndClear(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("maintenance-head")

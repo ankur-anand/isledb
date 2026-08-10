@@ -1008,6 +1008,25 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.replayCurrent(ctx, current)
+}
+
+// ReplayWithCurrent returns a manifest and the exact CURRENT value used to
+// build it. Maintenance uses this to calculate scheduling pressure without a
+// second object-store read that could observe a different generation.
+func (s *Store) ReplayWithCurrent(ctx context.Context) (*Manifest, *Current, error) {
+	current, err := s.readCurrent(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	m, err := s.replayCurrent(ctx, current)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, current, nil
+}
+
+func (s *Store) replayCurrent(ctx context.Context, current *Current) (*Manifest, error) {
 
 	// Attempt incremental replay: if the snapshot and log window base haven't
 	// changed, we only need to read the new delta entries.
