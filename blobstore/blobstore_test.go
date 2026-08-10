@@ -644,3 +644,35 @@ func TestBatchDelete(t *testing.T) {
 		}
 	})
 }
+
+func TestWalkStopsWithoutMaterializingRemainder(t *testing.T) {
+	forEachStore(t, "walk-test", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		for _, name := range []string{"a", "b", "c", "d"} {
+			if _, err := h.store.Write(ctx, h.store.path("objects", name), []byte(name)); err != nil {
+				t.Fatalf("Write(%s): %v", name, err)
+			}
+		}
+
+		visited := 0
+		if err := h.store.Walk(ctx, ListOptions{Prefix: "objects/"}, func(ObjectInfo) (bool, error) {
+			visited++
+			return visited < 2, nil
+		}); err != nil {
+			t.Fatalf("Walk: %v", err)
+		}
+		if visited != 2 {
+			t.Fatalf("visited=%d, want 2", visited)
+		}
+
+		wantErr := errors.New("visitor failed")
+		if err := h.store.Walk(ctx, ListOptions{Prefix: "objects/"}, func(ObjectInfo) (bool, error) {
+			return false, wantErr
+		}); !errors.Is(err, wantErr) {
+			t.Fatalf("Walk visitor error=%v, want %v", err, wantErr)
+		}
+		if err := h.store.Walk(ctx, ListOptions{}, nil); err == nil {
+			t.Fatal("Walk accepted a nil visitor")
+		}
+	})
+}

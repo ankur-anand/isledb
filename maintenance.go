@@ -162,6 +162,22 @@ type ManifestCheckpointStats struct {
 	ReplayBytes uint64
 }
 
+// ManifestSnapshotCleanupStats describes bounded snapshot-retirement work
+// completed in one maintenance cycle. Snapshot deletion is delayed long enough
+// for already-loaded manifest views to expire.
+type ManifestSnapshotCleanupStats struct {
+	SnapshotsMarked  int
+	DeleteAttempts   int
+	SnapshotsDeleted int
+	Protected        int
+	Deferred         int
+	Failures         int
+	MarkersScanned   int
+	MarkersCleared   int
+	ObjectsScanned   int
+	Duration         time.Duration
+}
+
 // MaintenanceTask identifies the expensive primary work selected for a cycle.
 type MaintenanceTask uint8
 
@@ -200,12 +216,13 @@ type MaintenanceScheduleStats struct {
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
 // Command-producing work is not visible until the writer applies it.
 type MaintenanceStats struct {
-	State               MaintenanceState
-	Scheduling          MaintenanceScheduleStats
-	SSTCompaction       SSTCompactionStats
-	ChangeFeedRetention ChangeFeedCleanupStats
-	ManifestCheckpoint  ManifestCheckpointStats
-	Duration            time.Duration
+	State                   MaintenanceState
+	Scheduling              MaintenanceScheduleStats
+	SSTCompaction           SSTCompactionStats
+	ChangeFeedRetention     ChangeFeedCleanupStats
+	ManifestCheckpoint      ManifestCheckpointStats
+	ManifestSnapshotCleanup ManifestSnapshotCleanupStats
+	Duration                time.Duration
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
@@ -248,6 +265,7 @@ type Maintenance struct {
 	opts        maintenanceOptions
 	compactor   *compactor
 	changeFeed  *changeFeedCleaner
+	snapshotGC  *snapshotCleaner
 	fenceToken  *manifest.FenceToken
 
 	lifecycleMu   sync.Mutex
@@ -310,6 +328,7 @@ func newMaintenance(
 	m := &Maintenance{
 		manifestLog: manifestLog,
 		opts:        normalized,
+		snapshotGC:  newSnapshotCleaner(store, manifestLog, snapshotCleanerOptions{}),
 		fenceToken:  token,
 		runGate:     make(chan struct{}, 1),
 		sstOutput:   sstOutput,
@@ -558,6 +577,16 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 	if err != nil {
 		return m.completeCycleStats(start), fmt.Errorf("reconcile maintenance command: %w", err)
 	}
+	if m.snapshotGC != nil {
+		cleanup, err := m.snapshotGC.runOnce(ctx)
+		m.recordManifestSnapshotCleanup(cleanup)
+		if err != nil {
+			// Snapshot cleanup is retryable auxiliary work. Receipt retirement
+			// above remains fail-closed, but a transient audit/list failure must
+			// not starve compaction, checkpointing, or retention.
+			slog.Error("isledb: manifest snapshot cleanup failed", "error", err)
+		}
+	}
 	if waiting {
 		return m.completeCycleStats(start), nil
 	}
@@ -622,7 +651,14 @@ func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
 		Scheduling: manifest.MaintenanceScheduling{},
 		Checkpoint: &checkpoint,
 	}); err != nil {
-		return err
+		if m.snapshotGC == nil {
+			return err
+		}
+		marked, markErr := m.snapshotGC.markAbandonedCandidate(ctx, current, checkpoint.Snapshot, "checkpoint_stage_failed")
+		if marked {
+			m.recordManifestSnapshotMarked()
+		}
+		return errors.Join(err, markErr)
 	}
 
 	m.statsMu.Lock()
@@ -717,6 +753,15 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	m.statsMu.Unlock()
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
 		return true, nil
+	}
+	if m.snapshotGC != nil {
+		marked, err := m.snapshotGC.markCheckpointOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
+		if err != nil {
+			return false, fmt.Errorf("record checkpoint snapshot retirement: %w", err)
+		}
+		if marked {
+			m.recordManifestSnapshotMarked()
+		}
 	}
 
 	if _, err := m.manifestLog.ClearMaintenance(ctx, head.Pending.ID, head.Pending.Epoch, head.Pending.Generation, m.fenceToken); err != nil {
@@ -848,6 +893,22 @@ func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
 	m.statsMu.Lock()
 	if m.currentStats != nil {
 		m.currentStats.ChangeFeedRetention = stats
+	}
+	m.statsMu.Unlock()
+}
+
+func (m *Maintenance) recordManifestSnapshotMarked() {
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		m.currentStats.ManifestSnapshotCleanup.SnapshotsMarked++
+	}
+	m.statsMu.Unlock()
+}
+
+func (m *Maintenance) recordManifestSnapshotCleanup(stats ManifestSnapshotCleanupStats) {
+	m.statsMu.Lock()
+	if m.currentStats != nil {
+		mergeManifestSnapshotCleanupStats(&m.currentStats.ManifestSnapshotCleanup, stats)
 	}
 	m.statsMu.Unlock()
 }

@@ -482,34 +482,50 @@ type ObjectInfo struct {
 }
 
 func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error) {
+	var result ListResult
+	if err := s.Walk(ctx, opts, func(object ObjectInfo) (bool, error) {
+		result.Objects = append(result.Objects, object)
+		return true, nil
+	}); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Walk streams objects in provider listing order. Returning false from visit
+// stops the listing without materializing the remainder of the prefix.
+func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInfo) (bool, error)) error {
+	if visit == nil {
+		return errors.New("nil object visitor")
+	}
 	prefix := s.prefix
 	if opts.Prefix != "" {
 		prefix = s.path(opts.Prefix)
 	}
-
 	iter := s.bucket.List(&blob.ListOptions{
 		Prefix:    prefix,
 		Delimiter: opts.Delimiter,
 	})
-
-	var result ListResult
 	for {
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
-
-		result.Objects = append(result.Objects, ObjectInfo{
+		keepGoing, err := visit(ObjectInfo{
 			Key:   obj.Key,
 			Size:  obj.Size,
 			IsDir: obj.IsDir,
 		})
+		if err != nil {
+			return err
+		}
+		if !keepGoing {
+			return nil
+		}
 	}
-
-	return &result, nil
 }
 
 func (s *Store) ListSSTFiles(ctx context.Context) ([]ObjectInfo, error) {
