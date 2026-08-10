@@ -549,12 +549,26 @@ type ManifestCheckpointOptions struct {
 }
 
 type MaintenanceStats struct {
-    State               MaintenanceState
-    Scheduling          MaintenanceScheduleStats
-    SSTCompaction       SSTCompactionStats
-    ChangeFeedRetention ChangeFeedCleanupStats
-    ManifestCheckpoint  ManifestCheckpointStats
-    Duration            time.Duration
+    State                   MaintenanceState
+    Scheduling              MaintenanceScheduleStats
+    SSTCompaction           SSTCompactionStats
+    ChangeFeedRetention     ChangeFeedCleanupStats
+    ManifestCheckpoint      ManifestCheckpointStats
+    ManifestSnapshotCleanup ManifestSnapshotCleanupStats
+    Duration                time.Duration
+}
+
+type ManifestSnapshotCleanupStats struct {
+    SnapshotsMarked  int
+    DeleteAttempts   int
+    SnapshotsDeleted int
+    Protected        int
+    Deferred         int
+    Failures         int
+    MarkersScanned   int
+    MarkersCleared   int
+    ObjectsScanned   int
+    Duration         time.Duration
 }
 
 type MaintenanceScheduleStats struct {
@@ -612,6 +626,15 @@ indefinitely.
 `MaintenanceWaitingForWriter` means the cycle staged a command in the
 maintenance mailbox. The active writer must publish or reject it before the
 next maintenance command can be staged.
+
+Checkpoint snapshot cleanup is automatic and has no public tuning surface. An
+applied checkpoint durably marks its previous snapshot as retired before the
+mailbox command is cleared; a rejected checkpoint marks its candidate instead.
+Deletion waits for the persisted maximum pinned-view age plus an internal
+safety margin, rechecks both `CURRENT` and a pending checkpoint, and is bounded
+per cycle. A periodic bounded audit finds candidates created before a crash or
+an ambiguous staging failure. Manifest-page reclamation is separate work and
+is not included in `ManifestSnapshotCleanupStats`.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()
