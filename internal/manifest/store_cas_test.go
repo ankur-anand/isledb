@@ -44,6 +44,35 @@ type trackingCASStorage struct {
 	conflicts    int
 }
 
+type staleReadCurrentStorage struct {
+	Storage
+
+	mu        sync.Mutex
+	staleData []byte
+	armed     bool
+}
+
+func (s *staleReadCurrentStorage) arm(data []byte) {
+	s.mu.Lock()
+	s.staleData = append([]byte(nil), data...)
+	s.armed = true
+	s.mu.Unlock()
+}
+
+func (s *staleReadCurrentStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	data, etag, err := s.Storage.ReadCurrent(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.armed {
+		return data, etag, nil
+	}
+	s.armed = false
+	return append([]byte(nil), s.staleData...), etag, nil
+}
+
 func (s *trackingCASStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
 	s.mu.Lock()
 	if s.conflicts > 0 {
@@ -336,6 +365,54 @@ func TestAppendWriterCommitRejectsInvalidIdentity(t *testing.T) {
 		if _, err := manifestStore.AppendWriterCommit(context.Background(), commit); !errors.Is(err, ErrInvalidWriterCommit) {
 			t.Fatalf("case %d error=%v, want %v", i, err, ErrInvalidWriterCommit)
 		}
+	}
+}
+
+func TestReadOnlyReplayCannotPoisonAppendCASPair(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("read-only-replay-cas-pair")
+	defer store.Close()
+
+	storage := &staleReadCurrentStorage{Storage: NewBlobStoreBackend(store)}
+	manifestStore := NewStoreWithStorage(storage)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+
+	staleData, _, err := storage.Storage.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("read stale CURRENT: %v", err)
+	}
+	if _, err := manifestStore.AppendWriterCommit(ctx, WriterCommit{
+		ID:      "commit-a",
+		SSTable: SSTMeta{ID: "a.sst", SeqLo: 1, SeqHi: 1},
+	}); err != nil {
+		t.Fatalf("AppendWriterCommit(a): %v", err)
+	}
+
+	// Model a storage adapter that obtained bytes before publication and the
+	// match token after publication. A read-only replay may observe that pair,
+	// but it must not install it as the base of the next read-modify-CAS.
+	storage.arm(staleData)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("stale Replay: %v", err)
+	}
+	if _, err := manifestStore.AppendWriterCommit(ctx, WriterCommit{
+		ID:      "commit-b",
+		SSTable: SSTMeta{ID: "b.sst", SeqLo: 2, SeqHi: 2},
+	}); err != nil {
+		t.Fatalf("AppendWriterCommit(b): %v", err)
+	}
+
+	fresh, err := NewStore(store).Replay(ctx)
+	if err != nil {
+		t.Fatalf("fresh Replay: %v", err)
+	}
+	if fresh.LookupSST("a.sst") == nil || fresh.LookupSST("b.sst") == nil {
+		t.Fatalf("committed SSTs missing after stale replay: ids=%v", fresh.AllSSTIDs())
 	}
 }
 

@@ -1114,6 +1114,20 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
 		return true, nil
 	}
+	changeFeedSafetyMargin := defaultChangeFeedDeletionSafetyMargin
+	if m.changeFeed != nil {
+		changeFeedSafetyMargin = m.changeFeed.opts.DeletionSafetyMargin
+	}
+	if _, err := recordChangeFeedDeletionPlan(
+		ctx,
+		m.compactor.store,
+		current,
+		head.Pending,
+		current.MaintenanceReceipt,
+		changeFeedSafetyMargin,
+	); err != nil {
+		return false, fmt.Errorf("publish change-feed deletion plan: %w", err)
+	}
 	if m.snapshotGC != nil {
 		marked, err := m.snapshotGC.markCheckpointOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
 		if err != nil {

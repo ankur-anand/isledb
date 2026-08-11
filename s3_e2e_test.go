@@ -442,7 +442,10 @@ func assertReaderValue(t testing.TB, ctx context.Context, reader *Reader, key, w
 func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 4096)})
+	db, err := openDB(ctx, store, dbOpenOptions{
+		sstOutput:   testSSTOutput("none", 4096),
+		storePolicy: StorePolicy{MaxPinnedViewAge: time.Second},
+	})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -490,11 +493,16 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	if err != nil {
 		t.Fatalf("open maintenance: %v", err)
 	}
-	// Retain the newest writer commit and its change batch while keeping the
-	// production safeguards internal to the public API.
+	// Retain the newest writer commit and its change batch. This test uses a
+	// short pinned-view policy and explicitly waits out its deletion deadline.
 	maintenance.changeFeed.opts.KeepAtLeastManifestEntries = 1
 	maintenance.changeFeed.opts.SweepGracePeriod = time.Nanosecond
+	maintenance.changeFeed.opts.DeletionSafetyMargin = 0
 	driveMaintenanceToIdle(t, ctx, maintenance, writer)
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := maintenance.RunOnce(ctx); err != nil {
+		t.Fatalf("reclaim expired change-feed batch: %v", err)
+	}
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
 	}

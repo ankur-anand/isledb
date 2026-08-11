@@ -14,6 +14,7 @@ const MaintenanceHeadLayoutVersion = 2
 
 const maxMaintenanceCommandIDBytes = 128
 const maxMaintenanceSchedulingWorkUnits uint32 = 4
+const MaxChangeFeedDeleteTargetsPerCommand = MaxRetiredObjectsPerEntry
 
 var (
 	ErrMaintenanceCommandPending  = errors.New("maintenance command already pending")
@@ -79,8 +80,18 @@ type RemoveSSTablesCommand struct {
 	RetiredObjects []RetiredObject `json:"retired_objects,omitempty"`
 }
 
+type ChangeFeedDeleteTarget struct {
+	Path     string `json:"path"`
+	ID       string `json:"id"`
+	Seq      uint64 `json:"seq"`
+	Size     int64  `json:"size"`
+	Checksum string `json:"checksum,omitempty"`
+}
+
 type AdvanceFloorCommand struct {
-	Floor uint64 `json:"floor"`
+	Floor           uint64                   `json:"floor"`
+	GracePeriod     time.Duration            `json:"grace_period_nanos,omitempty"`
+	DeletionTargets []ChangeFeedDeleteTarget `json:"deletion_targets,omitempty"`
 }
 
 type MaintenanceStatus string
@@ -211,8 +222,48 @@ func (c *MaintenanceCommand) Validate() error {
 		if c.ChangeFeedFloor == nil {
 			return fmt.Errorf("%w: missing change-feed floor", ErrInvalidMaintenanceCommand)
 		}
+		if err := validateChangeFeedFloorCommand(c.ChangeFeedFloor); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidMaintenanceCommand, err)
+		}
 	default:
 		return fmt.Errorf("%w: kind=%q", ErrInvalidMaintenanceCommand, c.Kind)
+	}
+	return nil
+}
+
+func validateChangeFeedFloorCommand(command *AdvanceFloorCommand) error {
+	if command == nil || command.GracePeriod < 0 {
+		return errors.New("invalid change-feed deletion grace period")
+	}
+	if len(command.DeletionTargets) > MaxChangeFeedDeleteTargetsPerCommand {
+		return fmt.Errorf("change-feed deletion target count=%d max=%d",
+			len(command.DeletionTargets), MaxChangeFeedDeleteTargetsPerCommand)
+	}
+	if len(command.DeletionTargets) == 0 {
+		if command.GracePeriod != 0 {
+			return errors.New("change-feed deletion grace period has no targets")
+		}
+		return nil
+	}
+	seenPaths := make(map[string]struct{}, len(command.DeletionTargets))
+	seenIDs := make(map[string]struct{}, len(command.DeletionTargets))
+	var previousSeq uint64
+	for i, target := range command.DeletionTargets {
+		if target.Path == "" || target.ID == "" || target.Size < 0 || target.Seq >= command.Floor {
+			return fmt.Errorf("invalid change-feed deletion target index=%d", i)
+		}
+		if i > 0 && target.Seq <= previousSeq {
+			return errors.New("change-feed deletion targets are not sequence ordered")
+		}
+		previousSeq = target.Seq
+		if _, exists := seenPaths[target.Path]; exists {
+			return fmt.Errorf("duplicate change-feed deletion path=%q", target.Path)
+		}
+		if _, exists := seenIDs[target.ID]; exists {
+			return fmt.Errorf("duplicate change-feed deletion id=%q", target.ID)
+		}
+		seenPaths[target.Path] = struct{}{}
+		seenIDs[target.ID] = struct{}{}
 	}
 	return nil
 }

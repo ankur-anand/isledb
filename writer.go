@@ -461,7 +461,7 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			start := time.Now()
 			err := w.flushPending(ctx, pending)
 			w.metrics.ObserveFlush(time.Since(start), err)
-			if err != nil && !errors.Is(err, errEmptyIterator) {
+			if err != nil {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
 				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
