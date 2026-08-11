@@ -285,6 +285,156 @@ func TestChangeFeedDeletionPlanDoesNotDeleteRetainedBatch(t *testing.T) {
 	}
 }
 
+func TestChangeFeedDeletionPlanReclaimerCarriesBudgetDeferredPlan(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-feed-plan-budget-carry")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := manifestStore.ClaimWriter(ctx, "change-feed-budget-writer"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+
+	now := time.Now().UTC()
+	candidates := make([]changeBatchDeleteCandidate, 5)
+	for i := range candidates {
+		meta := writeChangeBatchForCleanerTest(
+			t, ctx, store, fmt.Sprintf("budget-%d.chg", i), now.Add(-time.Hour))
+		entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(ctx,
+			manifest.SSTMeta{ID: fmt.Sprintf("budget-%d.sst", i), Epoch: meta.Epoch, SeqLo: meta.SeqLo, SeqHi: meta.SeqHi}, &meta)
+		if err != nil {
+			t.Fatalf("append batch %d: %v", i, err)
+		}
+		candidates[i] = changeBatchDeleteCandidate{
+			Path: meta.Path, ID: meta.ID, Seq: entry.Seq, Size: meta.Size, Checksum: meta.Checksum,
+		}
+	}
+	targetFloor := candidates[len(candidates)-1].Seq + 1
+	compactor, err := manifestStore.ClaimCompactor(ctx, "change-feed-budget-compactor")
+	if err != nil {
+		t.Fatalf("ClaimCompactor: %v", err)
+	}
+	if _, err := manifestStore.AdvanceChangeFeedLogStart(ctx, targetFloor, compactor); err != nil {
+		t.Fatalf("AdvanceChangeFeedLogStart: %v", err)
+	}
+
+	type builtPlan struct {
+		plan *changeFeedDeletionPlan
+		path string
+	}
+	buildPlan := func(targets []changeBatchDeleteCandidate) builtPlan {
+		t.Helper()
+		plan, payload, err := buildDueChangeFeedDeletionPlanForTest(
+			store, targets, targetFloor, now.Add(-time.Minute), 0)
+		if err != nil {
+			t.Fatalf("build plan: %v", err)
+		}
+		if created, err := storeChangeFeedDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
+			t.Fatalf("store plan created=%v error=%v", created, err)
+		}
+		return builtPlan{plan: plan, path: changeFeedDeletionPlanPath(store, plan.PlanID)}
+	}
+	left := buildPlan(candidates[:2])
+	right := buildPlan(candidates[2:])
+	firstPlan, deferredPlan := left, right
+	if right.path < left.path {
+		firstPlan, deferredPlan = right, left
+	}
+	deleteBudget := len(firstPlan.plan.Targets) + 1
+
+	iter := store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"})
+	cache := newDeletionPlanCache[changeFeedDeletionPlan]()
+	pendingPlanKey := ""
+	first, exhausted, err := reclaimChangeFeedDeletionPlans(
+		ctx, store, manifestStore, deleteBudget, defaultChangeFeedDeletionPlanScanLimit,
+		now, store, iter, cache, &pendingPlanKey)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if exhausted || first.Attempted != len(firstPlan.plan.Targets) || first.Deleted != len(firstPlan.plan.Targets) ||
+		first.PlansDeleted != 1 || first.Deferred != len(deferredPlan.plan.Targets) {
+		t.Fatalf("first run exhausted=%v stats=%+v", exhausted, first)
+	}
+	if pendingPlanKey != deferredPlan.path {
+		t.Fatalf("pending plan=%q want=%q", pendingPlanKey, deferredPlan.path)
+	}
+
+	second, exhausted, err := reclaimChangeFeedDeletionPlans(
+		ctx, store, manifestStore, deleteBudget, defaultChangeFeedDeletionPlanScanLimit,
+		now, store, iter, cache, &pendingPlanKey)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.Attempted != len(deferredPlan.plan.Targets) ||
+		second.Deleted != len(deferredPlan.plan.Targets) || second.PlansDeleted != 1 {
+		t.Fatalf("second run exhausted=%v stats=%+v", exhausted, second)
+	}
+	if pendingPlanKey != "" {
+		t.Fatalf("pending plan after reclaim=%q", pendingPlanKey)
+	}
+	for _, candidate := range candidates {
+		requireObjectExists(t, ctx, store, candidate.Path, false)
+	}
+	if plans, err := listChangeFeedDeletionPlans(ctx, store); err != nil || len(plans) != 0 {
+		t.Fatalf("remaining plans=%d error=%v", len(plans), err)
+	}
+}
+
+func TestChangeFeedDeletionPlanReclaimerStopsOnCancellation(t *testing.T) {
+	baseCtx := context.Background()
+	store := blobstore.NewMemory("change-feed-plan-cancel")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(baseCtx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := manifestStore.ClaimWriter(baseCtx, "change-feed-cancel-writer"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	now := time.Now().UTC()
+	meta := writeChangeBatchForCleanerTest(t, baseCtx, store, "cancel.chg", now.Add(-time.Hour))
+	entry, err := manifestStore.AppendAddSSTableWithChangeBatchWithFence(baseCtx,
+		manifest.SSTMeta{ID: "cancel.sst", Epoch: meta.Epoch, SeqLo: meta.SeqLo, SeqHi: meta.SeqHi}, &meta)
+	if err != nil {
+		t.Fatalf("append batch: %v", err)
+	}
+	targetFloor := entry.Seq + 1
+	compactor, err := manifestStore.ClaimCompactor(baseCtx, "change-feed-cancel-compactor")
+	if err != nil {
+		t.Fatalf("ClaimCompactor: %v", err)
+	}
+	if _, err := manifestStore.AdvanceChangeFeedLogStart(baseCtx, targetFloor, compactor); err != nil {
+		t.Fatalf("AdvanceChangeFeedLogStart: %v", err)
+	}
+	candidate := changeBatchDeleteCandidate{
+		Path: meta.Path, ID: meta.ID, Seq: entry.Seq, Size: meta.Size, Checksum: meta.Checksum,
+	}
+	plan, payload, err := buildDueChangeFeedDeletionPlanForTest(
+		store, []changeBatchDeleteCandidate{candidate}, targetFloor, now.Add(-time.Minute), 0)
+	if err != nil {
+		t.Fatalf("build plan: %v", err)
+	}
+	if created, err := storeChangeFeedDeletionPlan(baseCtx, store, *plan, payload); err != nil || !created {
+		t.Fatalf("store plan created=%v error=%v", created, err)
+	}
+
+	ctx, cancel := context.WithCancel(baseCtx)
+	deleter := &cancelingObjectDeleter{cancel: cancel}
+	stats, _, err := runChangeFeedDeletionPlanReclaimer(
+		ctx, store, manifestStore, 128, defaultChangeFeedDeletionPlanScanLimit,
+		now, deleter,
+		store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"}), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error=%v want context canceled", err)
+	}
+	if stats.Attempted != 1 || stats.Deleted != 0 || stats.Failed != 0 || deleter.batchCalls != 1 {
+		t.Fatalf("canceled reclaim stats=%+v batch_calls=%d", stats, deleter.batchCalls)
+	}
+	requireObjectExists(t, baseCtx, store, meta.Path, true)
+}
+
 func TestChangeFeedDeletionWaitsForPublishedFloorPinnedViews(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("change-feed-published-floor-deadline")

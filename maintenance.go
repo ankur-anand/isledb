@@ -905,6 +905,9 @@ func (m *Maintenance) runReclamationOnce(ctx context.Context, family Reclamation
 		var snapshotErr, pageErr error
 		if m.snapshotGC != nil {
 			stats.Manifest.Snapshots, snapshotErr = m.snapshotGC.runOnce(ctx)
+			if cancelErr := reclamationCancellation(ctx, snapshotErr); cancelErr != nil {
+				return stats, cancelErr
+			}
 		}
 		if m.pageGC != nil {
 			stats.Manifest.Pages, pageErr = m.pageGC.runOnce(ctx)
@@ -1158,12 +1161,13 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 
 func (m *Maintenance) completeCycleStats(start time.Time) MaintenanceStats {
 	m.statsMu.Lock()
-	if m.currentStats != nil {
-		m.currentStats.Duration = time.Since(start)
+	defer m.statsMu.Unlock()
+	duration := time.Since(start)
+	if m.currentStats == nil {
+		return MaintenanceStats{Duration: duration}
 	}
-	result := *m.currentStats
-	m.statsMu.Unlock()
-	return result
+	m.currentStats.Duration = duration
+	return *m.currentStats
 }
 
 func (m *Maintenance) beginCycle(ctx context.Context) error {

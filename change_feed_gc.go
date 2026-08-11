@@ -365,7 +365,24 @@ func runChangeFeedDeletionPlanReclaimer(
 	now time.Time,
 	deleter objectDeleter,
 	iter *blobstore.ListIterator,
-	cache map[string]changeFeedDeletionPlan,
+	cache *boundedPlanCache[changeFeedDeletionPlan],
+) (changeFeedSweepStats, bool, error) {
+	return reclaimChangeFeedDeletionPlans(
+		ctx, store, manifestLog, deleteBatchSize, scanLimit, now,
+		deleter, iter, cache, nil)
+}
+
+func reclaimChangeFeedDeletionPlans(
+	ctx context.Context,
+	store *blobstore.Store,
+	manifestLog *manifest.Store,
+	deleteBatchSize int,
+	scanLimit int,
+	now time.Time,
+	deleter objectDeleter,
+	iter *blobstore.ListIterator,
+	cache *boundedPlanCache[changeFeedDeletionPlan],
+	pendingPlanKey *string,
 ) (changeFeedSweepStats, bool, error) {
 	stats := changeFeedSweepStats{}
 	if deleteBatchSize <= 0 {
@@ -388,21 +405,33 @@ func runChangeFeedDeletionPlanReclaimer(
 	remaining := deleteBatchSize
 	var reclaimErr error
 	for stats.PlansScanned < scanLimit && remaining > 0 {
-		object, err := iter.Next(ctx)
-		if errors.Is(err, io.EOF) {
-			return stats, true, reclaimErr
-		}
-		if err != nil {
-			return stats, false, errors.Join(reclaimErr, err)
+		var object blobstore.ObjectInfo
+		if pendingPlanKey != nil && *pendingPlanKey != "" {
+			// Next already advanced the provider iterator past this plan in the
+			// preceding pass. Consume the carried key before listing more work.
+			object.Key = *pendingPlanKey
+			*pendingPlanKey = ""
+		} else {
+			var err error
+			object, err = iter.Next(ctx)
+			if errors.Is(err, io.EOF) {
+				return stats, true, reclaimErr
+			}
+			if err != nil {
+				return stats, false, errors.Join(reclaimErr, err)
+			}
 		}
 		if object.IsDir {
 			continue
 		}
 		stats.PlansScanned++
-		plan, ok := cache[object.Key]
+		plan, ok := cache.get(object.Key)
 		if !ok {
 			payload, _, err := store.Read(ctx, object.Key)
 			if err != nil {
+				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+					return stats, false, errors.Join(reclaimErr, cancelErr)
+				}
 				stats.Failed++
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("read change-feed deletion plan %q: %w", object.Key, err))
 				continue
@@ -413,9 +442,7 @@ func runChangeFeedDeletionPlanReclaimer(
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("decode change-feed deletion plan %q: %w", object.Key, err))
 				continue
 			}
-			if cache != nil {
-				cache[object.Key] = plan
-			}
+			cache.put(object.Key, plan, len(payload))
 		}
 		if retainedFloor < plan.TargetFloor {
 			stats.BlockedRetained += len(plan.Targets)
@@ -427,7 +454,12 @@ func runChangeFeedDeletionPlanReclaimer(
 		}
 		if len(plan.Targets) > remaining && stats.Attempted > 0 {
 			stats.Deferred += len(plan.Targets)
-			continue
+			if pendingPlanKey != nil {
+				// Preserve the item already consumed from the iterator so later
+				// plans cannot overtake it merely because of this pass's budget.
+				*pendingPlanKey = object.Key
+			}
+			return stats, false, reclaimErr
 		}
 		keys := make([]string, len(plan.Targets))
 		for i := range plan.Targets {
@@ -440,6 +472,9 @@ func runChangeFeedDeletionPlanReclaimer(
 			remaining -= len(keys)
 		}
 		if err := deleter.BatchDelete(ctx, keys); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, errors.Join(reclaimErr, cancelErr)
+			}
 			failed := len(keys)
 			var batchErr *blobstore.BatchDeleteError
 			if errors.As(err, &batchErr) {
@@ -452,11 +487,14 @@ func runChangeFeedDeletionPlanReclaimer(
 		}
 		stats.Deleted += len(keys)
 		if err := deleter.Delete(ctx, object.Key); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, errors.Join(reclaimErr, cancelErr)
+			}
 			stats.Failed++
 			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete completed change-feed plan %q: %w", plan.PlanID, err))
 			continue
 		}
-		delete(cache, object.Key)
+		cache.remove(object.Key)
 		stats.PlansDeleted++
 	}
 	return stats, false, reclaimErr

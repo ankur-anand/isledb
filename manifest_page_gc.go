@@ -120,6 +120,9 @@ func newManifestPageCleaner(store *blobstore.Store, manifestLog *manifest.Store,
 func (c *manifestPageCleaner) runOnce(ctx context.Context) (stats ManifestPageCleanupStats, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
+	if err := checkContext(ctx); err != nil {
+		return stats, err
+	}
 
 	now := c.opts.Now().UTC()
 	c.mu.Lock()
@@ -137,6 +140,9 @@ func (c *manifestPageCleaner) runOnce(ctx context.Context) (stats ManifestPageCl
 		audit, auditErr := c.discover(ctx, now)
 		mergeManifestPageCleanupStats(&stats, audit)
 		if auditErr != nil {
+			if cancelErr := reclamationCancellation(ctx, auditErr); cancelErr != nil {
+				return stats, fmt.Errorf("audit manifest pages: %w", cancelErr)
+			}
 			stats.Failures++
 			err = errors.Join(err, fmt.Errorf("audit manifest pages: %w", auditErr))
 		}
@@ -145,6 +151,9 @@ func (c *manifestPageCleaner) runOnce(ctx context.Context) (stats ManifestPageCl
 		sweep, sweepErr := c.sweep(ctx, now)
 		mergeManifestPageCleanupStats(&stats, sweep)
 		if sweepErr != nil {
+			if cancelErr := reclamationCancellation(ctx, sweepErr); cancelErr != nil {
+				return stats, fmt.Errorf("sweep manifest pages: %w", cancelErr)
+			}
 			stats.Failures++
 			err = errors.Join(err, fmt.Errorf("sweep manifest pages: %w", sweepErr))
 		}
@@ -191,6 +200,10 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 		}
 		data, _, err := c.store.Read(ctx, object.Key)
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetPageIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
@@ -202,6 +215,10 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 		reachable, reads, err := c.manifestLog.IsPageReachable(ctx, current, candidate)
 		stats.ReachabilityGETs += reads
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetPageIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
@@ -218,6 +235,10 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 		}
 		marked, err := c.mark(ctx, candidate, current, floor, now)
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetPageIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
@@ -257,6 +278,10 @@ func (c *manifestPageCleaner) sweep(ctx context.Context, now time.Time) (Manifes
 		stats.MarkersScanned++
 		mark, err := c.readMark(ctx, object.Key)
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
@@ -269,18 +294,30 @@ func (c *manifestPageCleaner) sweep(ctx context.Context, now time.Time) (Manifes
 		// can have become visible before its publishing CAS completed.
 		current, err := c.manifestLog.ReadCurrentData(ctx)
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
 		reachable, reads, err := c.manifestLog.IsPageReachable(ctx, current, mark.Page)
 		stats.ReachabilityGETs += reads
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
 		if reachable {
 			stats.Protected++
 			if err := c.delete.Delete(ctx, object.Key); err != nil {
+				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+					c.resetMarkerIterator(iter)
+					return stats, cancelErr
+				}
 				stats.Failures++
 				continue
 			}
@@ -297,11 +334,19 @@ func (c *manifestPageCleaner) sweep(ctx context.Context, now time.Time) (Manifes
 		if err != nil {
 			if errors.Is(err, blobstore.ErrNotFound) {
 				if err := c.delete.Delete(ctx, object.Key); err != nil {
+					if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+						c.resetMarkerIterator(iter)
+						return stats, cancelErr
+					}
 					stats.Failures++
 					continue
 				}
 				stats.MarkersCleared++
 				continue
+			}
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
 			}
 			stats.Failures++
 			continue
@@ -314,10 +359,18 @@ func (c *manifestPageCleaner) sweep(ctx context.Context, now time.Time) (Manifes
 
 		stats.DeleteAttempts++
 		if err := c.delete.Delete(ctx, mark.Page.Path); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
 		if err := c.delete.Delete(ctx, object.Key); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}

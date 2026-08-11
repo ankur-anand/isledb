@@ -60,9 +60,10 @@ type changeFeedCleaner struct {
 	fenceToken   *manifest.FenceToken
 	stageCommand maintenanceCommandStager
 
-	reclaimMu sync.Mutex
-	planIter  *blobstore.ListIterator
-	planCache map[string]changeFeedDeletionPlan
+	reclaimMu      sync.Mutex
+	planIter       *blobstore.ListIterator
+	pendingPlanKey string
+	planCache      *boundedPlanCache[changeFeedDeletionPlan]
 
 	closed atomic.Bool
 }
@@ -107,7 +108,7 @@ func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, 
 	token := *fence
 	return &changeFeedCleaner{
 		store: store, manifestLog: manifestLog, opts: opts, fenceToken: &token,
-		planCache: make(map[string]changeFeedDeletionPlan),
+		planCache: newDeletionPlanCache[changeFeedDeletionPlan](),
 	}, nil
 }
 
@@ -239,11 +240,15 @@ func (c *changeFeedCleaner) runReclaimOnce(ctx context.Context, deleter ...objec
 	if c.planIter == nil {
 		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"})
 	}
-	sweep, exhausted, sweepErr := runChangeFeedDeletionPlanReclaimer(
+	sweep, exhausted, sweepErr := reclaimChangeFeedDeletionPlans(
 		ctx, c.store, c.manifestLog, c.opts.SweepBatchSize,
-		defaultChangeFeedDeletionPlanScanLimit, time.Now().UTC(), deleteObjects, c.planIter, c.planCache)
+		defaultChangeFeedDeletionPlanScanLimit, time.Now().UTC(), deleteObjects,
+		c.planIter, c.planCache, &c.pendingPlanKey)
 	if exhausted || sweepErr != nil {
 		c.planIter = nil
+	}
+	if exhausted {
+		c.pendingPlanKey = ""
 	}
 	stats.BatchesDeleted = sweep.Deleted
 	stats.BlockedRetained = sweep.BlockedRetained
