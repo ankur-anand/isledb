@@ -218,9 +218,9 @@ Choose a different database when you need:
 - [Go API guide](api.md)
 - [Go package reference](https://pkg.go.dev/github.com/ankur-anand/isledb)
 - [Object-store layout and operations](docs/object-store-schema.md)
-- [Local file example](examples/kvfile)
-- [Azure Blob example](examples/wal-azblob)
-- [MinIO producer and consumer example](examples/eventhub-minio)
+- [Local quickstart](examples/quickstart)
+- [Separate writer, reader, and maintenance services with MinIO](examples/minio-services)
+- [Restartable change-feed consumer with Azurite](examples/changefeed-azurite)
 
 ## Acknowledgments
 
