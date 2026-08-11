@@ -279,6 +279,33 @@ func (r *ChangeReader) Read(
 		return ChangePage{}, err
 	}
 
+	page, err := r.readPage(ctx, from, opts)
+	if !errors.Is(err, blobstore.ErrNotFound) {
+		return page, err
+	}
+
+	// A missing immutable batch can mean that retention advanced after the
+	// view used by the first attempt. Drop only the view association, then
+	// replay the complete logical page once from the caller's original cursor.
+	// The retry reloads CURRENT and therefore classifies an expired cursor
+	// before touching the object again.
+	r.clearBatchView()
+	page, retryErr := r.readPage(ctx, from, opts)
+	if !errors.Is(retryErr, blobstore.ErrNotFound) {
+		return page, retryErr
+	}
+	return ChangePage{}, fmt.Errorf(
+		"%w: retained change-batch object is missing for cursor %q after CURRENT refresh: %v",
+		ErrCorruptChangeFeed, from.String(), retryErr)
+}
+
+func (r *ChangeReader) readPage(
+	ctx context.Context,
+	from ChangeCursor,
+	opts ChangeReadOptions,
+) (ChangePage, error) {
+	var err error
+
 	view, entries, continuationBatch, ok := r.cachedContinuation(from)
 	if !ok {
 		view, err = r.refreshView(ctx)
@@ -411,6 +438,13 @@ func (r *ChangeReader) Read(
 		page.Next = next
 	}
 	return page, nil
+}
+
+func (r *ChangeReader) clearBatchView() {
+	r.batchMu.Lock()
+	r.batchEntry = 0
+	r.batchView = nil
+	r.batchMu.Unlock()
 }
 
 func (r *ChangeReader) cachedContinuation(

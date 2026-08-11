@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,49 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"gocloud.dev/blob/memblob"
 )
+
+type changeReaderCurrentReadHookStorage struct {
+	manifest.Storage
+
+	mu        sync.Mutex
+	remaining int
+	hook      func() error
+	fired     int
+}
+
+func (s *changeReaderCurrentReadHookStorage) arm(afterReads int, hook func() error) {
+	s.mu.Lock()
+	s.remaining = afterReads
+	s.hook = hook
+	s.fired = 0
+	s.mu.Unlock()
+}
+
+func (s *changeReaderCurrentReadHookStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	var hook func() error
+	s.mu.Lock()
+	if s.remaining > 0 {
+		s.remaining--
+		if s.remaining == 0 {
+			hook = s.hook
+			s.hook = nil
+			s.fired++
+		}
+	}
+	s.mu.Unlock()
+	if hook != nil {
+		if err := hook(); err != nil {
+			return nil, "", err
+		}
+	}
+	return s.Storage.ReadCurrent(ctx)
+}
+
+func (s *changeReaderCurrentReadHookStorage) fireCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fired
+}
 
 func TestChangeReaderReadsAndResumesAcrossFlushes(t *testing.T) {
 	ctx := context.Background()
@@ -365,6 +409,152 @@ func TestChangeReaderRejectsCorruptBatch(t *testing.T) {
 	_, err = reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{})
 	if !errors.Is(err, ErrCorruptChangeBatch) {
 		t.Fatalf("read corrupt batch error=%v want=%v", err, ErrCorruptChangeBatch)
+	}
+}
+
+func TestChangeReaderRetriesMissingBatchAfterCurrentRefresh(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-reader-retry-missing-batch")
+	storage := &changeReaderCurrentReadHookStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+	}
+	db, err := openDB(ctx, store, dbOpenOptions{
+		manifestStorage:   storage,
+		changeFeedPayload: manifest.ChangeFeedPayloadFullValues,
+	})
+	if err != nil {
+		store.Close()
+		t.Fatalf("open DB: %v", err)
+	}
+	writer, err := db.OpenWriter(ctx, testChangeWriterOptions())
+	if err != nil {
+		db.Close()
+		store.Close()
+		t.Fatalf("open writer: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = writer.Close(context.Background())
+		_ = db.Close()
+		_ = store.Close()
+	})
+
+	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	meta := committedChangeBatchMeta(t, ctx, db)
+	batchData, _, err := store.Read(ctx, meta.Path)
+	if err != nil {
+		t.Fatalf("read committed batch: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	if err := store.Delete(ctx, meta.Path); err != nil {
+		t.Fatalf("delete batch before transient read: %v", err)
+	}
+	storage.arm(2, func() error {
+		_, err := store.Write(ctx, meta.Path, batchData)
+		return err
+	})
+
+	page, err := reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{})
+	if err != nil {
+		t.Fatalf("read after transient missing batch: %v", err)
+	}
+	if len(page.Changes) != 1 || string(page.Changes[0].Key) != "key" || string(page.Changes[0].Value) != "value" {
+		t.Fatalf("recovered page=%+v", page)
+	}
+	if got := storage.fireCount(); got != 1 {
+		t.Fatalf("restore hook calls=%d want=1", got)
+	}
+}
+
+func TestChangeReaderReportsRetainedMissingBatchAsCorruption(t *testing.T) {
+	ctx := context.Background()
+	store, db, writer := openChangeReaderTestDB(t, "change-reader-retained-missing-batch")
+	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	meta := committedChangeBatchMeta(t, ctx, db)
+	if err := store.Delete(ctx, meta.Path); err != nil {
+		t.Fatalf("delete retained batch: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	_, err = reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{})
+	if !errors.Is(err, ErrCorruptChangeFeed) {
+		t.Fatalf("read retained missing batch error=%v want=%v", err, ErrCorruptChangeFeed)
+	}
+	if errors.Is(err, ErrChangeCursorExpired) || errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("retained missing batch leaked wrong classification: %v", err)
+	}
+}
+
+func TestChangeReaderMissingContinuationRefreshesToExpiredCursor(t *testing.T) {
+	const records = defaultChangeBatchBlockRecords + 1
+	ctx := context.Background()
+	store, db, writer := openChangeReaderTestDB(t, "change-reader-missing-continuation-expired")
+	for i := 0; i < records; i++ {
+		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), []byte("value")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	first, err := reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{
+		MaxChanges: defaultChangeBatchBlockRecords,
+		MaxBytes:   64 << 20,
+	})
+	if err != nil {
+		t.Fatalf("read first block: %v", err)
+	}
+	if len(first.Changes) != defaultChangeBatchBlockRecords || first.Next.index != defaultChangeBatchBlockRecords {
+		t.Fatalf("first page changes=%d next=%q", len(first.Changes), first.Next)
+	}
+	reader.batchMu.Lock()
+	meta := reader.batchMeta
+	index := reader.batch
+	reader.batchMu.Unlock()
+	if index == nil || len(index.Blocks) != 2 {
+		t.Fatalf("batch blocks=%v want=2", index)
+	}
+	if err := store.Delete(ctx, meta.Path); err != nil {
+		t.Fatalf("delete batch before continuation: %v", err)
+	}
+	token, err := db.manifestStore.ClaimCompactor(ctx, "expire-missing-change-batch")
+	if err != nil {
+		t.Fatalf("claim compactor: %v", err)
+	}
+	if _, err := db.manifestStore.AdvanceChangeFeedLogStart(ctx, first.Head.entry, token); err != nil {
+		t.Fatalf("advance change-feed floor: %v", err)
+	}
+
+	_, err = reader.Read(ctx, first.Next, ChangeReadOptions{MaxChanges: 1, MaxBytes: 1 << 20})
+	if !errors.Is(err, ErrChangeCursorExpired) {
+		t.Fatalf("read missing expired continuation error=%v want=%v", err, ErrChangeCursorExpired)
+	}
+	if errors.Is(err, ErrCorruptChangeFeed) || errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("expired continuation leaked wrong classification: %v", err)
 	}
 }
 
@@ -962,6 +1152,21 @@ func openChangeReaderTestDB(t *testing.T, prefix string) (*blobstore.Store, *DB,
 		_ = store.Close()
 	})
 	return store, db, writer
+}
+
+func committedChangeBatchMeta(t *testing.T, ctx context.Context, db *DB) manifest.ChangeBatchMeta {
+	t.Helper()
+	entries, _, _, _, err := db.manifestStore.ReadChangeEntries(ctx, 0, true, maxChangeManifestEntries)
+	if err != nil {
+		t.Fatalf("read manifest entries: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.ChangeBatch != nil {
+			return *entry.ChangeBatch
+		}
+	}
+	t.Fatal("missing committed change batch")
+	return manifest.ChangeBatchMeta{}
 }
 
 func testChangeWriterOptions() WriterOptions {
