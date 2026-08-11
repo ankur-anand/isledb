@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 942.5 325" role="img" aria-label="IsleDB">
+  <defs>
+    <linearGradient id="tide" x1="42" y1="0" x2="297" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67c899"/>
+      <stop offset="100%" stop-color="#20d6a1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="942.5" height="325" rx="13.92" fill="#ffffff"/>
+  <rect width="327.84" height="325" rx="14" fill="#102927"/>
+  <path fill="#e2e8f0" d="M93.67 185.71h140.5c7.76 0 14.05 6.24 14.05 13.93s-6.29 13.93-14.05 13.93H93.67c-7.76 0-14.05-6.24-14.05-13.93s6.29-13.93 14.05-13.93Z"/>
+  <path fill="#e2e8f0" d="M112.4 143.93h103.03c7.76 0 14.05 6.24 14.05 13.93s-6.29 13.93-14.05 13.93H112.4c-7.76 0-14.05-6.24-14.05-13.93s6.29-13.93 14.05-13.93Z"/>
+  <path fill="#e2e8f0" d="M131.13 102.14h65.57c7.76 0 14.05 6.24 14.05 13.93S204.46 130 196.7 130h-65.57c-7.76 0-14.05-6.24-14.05-13.93s6.29-13.93 14.05-13.93Z"/>
+  <text x="398.09" y="218.22" font-family="Helvetica, Arial, sans-serif" font-size="167.14" font-weight="700" fill="#102927">isle</text>
+  <text x="679.31" y="218.22" font-family="Helvetica, Arial, sans-serif" font-size="167.14" font-weight="700" fill="#187552">db</text>
+  <path d="M42.15 235.75c32.66-19.37 65.32-19.37 97.97 0 32.66 19.37 65.32 19.37 97.97 0 32.66-19.37 52.25-19.37 58.78 0" fill="none" stroke="url(#tide)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M42.15 257.83c39.19-11.62 76.75-11.62 112.67 0 35.92 11.62 68.58 11.62 97.97 0 29.39-11.62 44.09-11.62 44.09 0" fill="none" stroke="url(#tide)" stroke-width="5.5" stroke-linecap="round" opacity="0.85"/>
+  <path d="M45.09 277.21c42.46-11.62 83.28-11.62 122.47 0 39.19 11.62 71.85 11.62 97.97 0s35.92-11.62 29.39 0" fill="none" stroke="url(#tide)" stroke-width="4.5" stroke-linecap="round" opacity="0.72"/>
+</svg>

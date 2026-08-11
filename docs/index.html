@@ -3,61 +3,84 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>IsleDB | Embedded Go Key-Value Database for Object Storage</title>
+    <meta name="theme-color" content="#f8fbf8" />
     <meta
       name="description"
-      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
+      content="IsleDB is an embedded key-value database written in Go for Amazon S3, Google Cloud Storage, Azure Blob Storage, MinIO, and local object storage."
     />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
     <link rel="canonical" href="https://isledb.com/" />
-    <meta name="robots" content="index,follow" />
-    <meta property="og:title" content="IsleDB | Embedded Go Key-Value Database for Object Storage" />
+    <title>IsleDB: Go Key-Value Database for S3, GCS &amp; Azure Blob</title>
+
+    <meta property="og:title" content="IsleDB: Go Key-Value Database for Object Storage" />
     <meta
       property="og:description"
-      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
+      content="One writer. Many readers. Independent compaction. IsleDB is a Go key-value database for object storage."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://isledb.com/" />
     <meta property="og:site_name" content="IsleDB" />
-    <meta property="og:image" content="https://isledb.com/social.png" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta
-      property="og:image:alt"
-      content="IsleDB homepage preview for an embedded Go key-value database on object storage."
-    />
+    <meta property="og:image:alt" content="IsleDB, a Go key-value database for object storage" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="IsleDB | Embedded Go Key-Value Database for Object Storage" />
+    <meta name="twitter:title" content="IsleDB: Go Key-Value Database for Object Storage" />
     <meta
       name="twitter:description"
-      content="IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction."
+      content="An embedded Go key-value database for S3, GCS, Azure Blob Storage, MinIO, and local buckets."
     />
-    <meta name="twitter:image" content="https://isledb.com/social.png" />
-    <meta
-      name="twitter:image:alt"
-      content="IsleDB homepage preview for an embedded Go key-value database on object storage."
-    />
-    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
-    <link rel="shortcut icon" href="./favicon.svg" />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <meta name="twitter:image:alt" content="IsleDB, a Go key-value database for object storage" />
+    <meta name="application-name" content="IsleDB" />
+    <meta name="apple-mobile-web-app-title" content="IsleDB" />
+    <link rel="icon" href="./favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="./favicon-v2.svg" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="./favicon-16x16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="./site.webmanifest" />
+
+    <script>
+      document.documentElement.classList.add("js");
+    </script>
 
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
-        "@type": "SoftwareSourceCode",
-        "name": "IsleDB",
-        "url": "https://isledb.com/",
-        "description": "IsleDB is an embedded Go key-value database for S3, GCS, Azure Blob, and MinIO, built for writes, scans, tailing readers, and compaction.",
-        "codeRepository": "https://github.com/ankur-anand/isledb",
-        "programmingLanguage": "Go",
-        "runtimePlatform": "Go",
-        "license": "https://github.com/ankur-anand/isledb/blob/main/LICENSE",
-        "keywords": [
-          "embedded database",
-          "key-value database",
-          "object storage database",
-          "S3 database",
-          "Go database",
-          "tailing reader"
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://isledb.com/#website",
+            "url": "https://isledb.com/",
+            "name": "IsleDB",
+            "description": "An embedded Go key-value database for object storage."
+          },
+          {
+            "@type": "SoftwareSourceCode",
+            "@id": "https://isledb.com/#software",
+            "name": "IsleDB",
+            "alternateName": "Go key-value database for object storage",
+            "url": "https://isledb.com/",
+            "codeRepository": "https://github.com/ankur-anand/isledb",
+            "description": "An embedded key-value database written in Go for Amazon S3, Google Cloud Storage, Azure Blob Storage, MinIO, and local object storage.",
+            "programmingLanguage": {
+              "@type": "ComputerLanguage",
+              "name": "Go"
+            },
+            "runtimePlatform": "Go",
+            "license": "https://www.apache.org/licenses/LICENSE-2.0",
+            "keywords": [
+              "key-value database",
+              "Go database",
+              "Golang key-value database",
+              "object storage database",
+              "S3 database",
+              "Google Cloud Storage database",
+              "Azure Blob Storage database"
+            ]
+          }
         ]
       }
     </script>
@@ -77,39 +100,33 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
       rel="stylesheet"
     />
 
     <style>
       :root {
-        --ink-950: #0a1424;
-        --ink-900: #13233a;
-        --ink-700: #2f4662;
-        --ink-500: #56718f;
-
-        --sky-50: #eef8ff;
-        --sky-100: #d8ecff;
-        --sky-200: #bedfff;
-        --sky-500: #2f87ff;
-        --sky-600: #1f6fe0;
-
-        --teal-400: #2dc4b8;
-        --teal-500: #0fb2a4;
-
-        --amber-400: #ffbe66;
-        --green-500: #22c55e;
-
-        --slate-100: #eef3f8;
-        --slate-200: #dfe8f2;
-        --slate-300: #c7d6e4;
-        --slate-500: #6f859f;
-        --slate-700: #334b66;
-        --slate-900: #172436;
-
-        --page: #f9fbfe;
-        --panel: rgba(255, 255, 255, 0.9);
-        --shadow: 0 22px 56px rgba(15, 33, 59, 0.15);
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #f8fbf8;
+        --white: #ffffff;
+        --green-50: #eff9f3;
+        --green-100: #dcf3e6;
+        --green-200: #bde8d1;
+        --green-500: #28976d;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --blue-50: #eef6fb;
+        --blue-100: #dcecf8;
+        --blue-500: #5a9bc7;
+        --sand-50: #fbf6e9;
+        --sand-200: #efdcac;
+        --coral: #ef765e;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --shadow: 0 24px 70px rgba(27, 67, 58, 0.12);
+        --radius-xl: 30px;
         --radius-lg: 20px;
         --radius-md: 14px;
         --max: 1160px;
@@ -125,1407 +142,1757 @@
 
       body {
         margin: 0;
-        background:
-          radial-gradient(52% 40% at 8% 6%, #fff4d8 0%, transparent 70%),
-          radial-gradient(44% 32% at 92% 12%, #daf8f4 0%, transparent 70%),
-          var(--page);
-        color: var(--ink-950);
-        font-family: "Space Grotesk", sans-serif;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         line-height: 1.6;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      a:focus-visible,
+      button:focus-visible {
+        outline: 3px solid #1674a8;
+        outline-offset: 3px;
+      }
+
+      button {
+        font: inherit;
       }
 
       code,
-      pre {
-        font-family: "IBM Plex Mono", monospace;
+      pre,
+      .mono {
+        font-family: "DM Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
 
-      .wrap {
-        width: min(var(--max), calc(100% - 2rem));
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
         margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
       }
 
       nav {
         position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
+        inset: 0 0 auto;
         z-index: 100;
-        backdrop-filter: blur(12px);
-        background: rgba(255, 255, 255, 0.82);
-        border-bottom: 1px solid rgba(19, 35, 58, 0.08);
+        border-bottom: 1px solid var(--line);
+        background: rgba(248, 251, 248, 0.9);
+        backdrop-filter: blur(18px);
       }
 
       .nav-inner {
-        max-width: var(--max);
-        margin: 0 auto;
+        min-height: 70px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        height: 66px;
-        padding: 0 1rem;
+        gap: 24px;
       }
 
-      .nav-logo {
+      .brand {
         display: inline-flex;
         align-items: center;
         text-decoration: none;
-        padding: 0;
       }
 
-      .nav-logo img {
-        height: 32px;
+      .brand img {
         width: auto;
+        height: 32px;
         display: block;
+      }
+
+      .nav-brand {
+        gap: 10px;
+      }
+
+      .nav-brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .nav-brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .nav-brand-db {
+        color: var(--green-600);
       }
 
       .nav-links {
         display: flex;
         align-items: center;
-        gap: 1.2rem;
+        gap: 24px;
       }
 
       .nav-links a {
+        color: #526b67;
         text-decoration: none;
-        color: var(--ink-700);
-        font-size: 0.9rem;
-        font-weight: 600;
-      }
-
-      .nav-links a:hover {
-        color: var(--ink-900);
-      }
-
-      .nav-cta {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.45rem;
-        padding: 0.45rem 0.88rem;
-        border-radius: 10px;
-        color: #fff !important;
-        background: var(--ink-950);
-      }
-
-      .hero {
-        padding: 9rem 1rem 4.5rem;
-        position: relative;
-      }
-
-      .hero-layout {
-        max-width: 980px;
-        margin: 0 auto;
-        display: grid;
-        grid-template-columns: minmax(0, 1.18fr) minmax(0, 0.82fr);
-        align-items: center;
-        gap: 1.4rem;
-      }
-
-      .hero-copy {
-        text-align: left;
-      }
-
-      .hero-subhead {
-        max-width: 700px;
-        margin: 1rem 0 0;
-        color: var(--ink-700);
-        font-size: clamp(1rem, 2vw, 1.12rem);
-      }
-
-      .hero::after {
-        content: "";
-        position: absolute;
-        left: 0;
-        right: 0;
-        bottom: -1px;
-        height: 56px;
-        background: linear-gradient(to bottom, transparent, var(--page));
-        pointer-events: none;
-      }
-
-      .hero h1 {
-        margin: 0;
-        font-size: clamp(2.15rem, 6vw, 4.4rem);
-        line-height: 1.07;
-        letter-spacing: -0.03em;
+        font-size: 13px;
         font-weight: 700;
       }
 
-      .gradient {
-        background: linear-gradient(140deg, var(--sky-600), var(--teal-500));
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
+      .nav-links a:hover,
+      .nav-links a:focus-visible {
+        color: var(--ink);
       }
 
-      .hero-features {
-        width: 100%;
-        max-width: 430px;
-        justify-self: end;
-        border-radius: 16px;
-        border: 1px solid var(--slate-200);
-        background: rgba(255, 255, 255, 0.8);
-        padding: 1rem 1.1rem;
-      }
-
-      .hero-features h3 {
-        margin: 0;
-        font-size: 0.82rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--ink-500);
-      }
-
-      .hero-feature-list {
-        list-style: none;
-        margin: 0.7rem 0 0;
-        padding: 0;
-        display: grid;
-        gap: 0.72rem;
-      }
-
-      .hero-feature-list li {
-        display: flex;
-        align-items: flex-start;
-        gap: 0.58rem;
-        color: var(--ink-700);
-        font-size: 1rem;
-        line-height: 1.45;
-      }
-
-      .hero-feature-icon {
-        width: 1.3rem;
-        height: 1.3rem;
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
         border-radius: 999px;
+      }
+
+      .hero {
+        padding: 150px 0 92px;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 80% 18%, rgba(69, 190, 137, 0.2), transparent 28%),
+          radial-gradient(circle at 4% 92%, rgba(90, 155, 199, 0.15), transparent 32%),
+          var(--paper);
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.05fr) minmax(400px, 0.95fr);
+        align-items: center;
+        gap: 66px;
+      }
+
+      .eyebrow,
+      .section-label {
         display: inline-flex;
         align-items: center;
-        justify-content: center;
-        font-size: 0.75rem;
-        color: #fff;
-        background: linear-gradient(140deg, var(--sky-500), var(--teal-500));
-        flex: 0 0 auto;
-        margin-top: 0.08rem;
+        gap: 9px;
+        color: var(--green-600);
+        font-family: "DM Mono", monospace;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow {
+        margin-bottom: 22px;
+      }
+
+      .eyebrow::before,
+      .section-label::before {
+        content: "";
+        width: 26px;
+        height: 1px;
+        background: currentColor;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 700px;
+        margin-bottom: 25px;
+        font-size: clamp(50px, 6.2vw, 82px);
+        line-height: 0.99;
+        letter-spacing: -0.062em;
+      }
+
+      .accent {
+        color: var(--green-600);
+      }
+
+      .hero-copy > p {
+        max-width: 650px;
+        margin-bottom: 26px;
+        color: var(--ink-soft);
+        font-size: clamp(17px, 1.7vw, 20px);
       }
 
       .hero-actions {
         display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 0.72rem;
         flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
       }
 
-      .hero-cta {
-        max-width: 980px;
-        margin: 1.1rem auto 0;
-      }
-
-      .btn-primary,
-      .btn-secondary {
-        text-decoration: none;
-        font-weight: 700;
-        border-radius: 11px;
-        padding: 0.78rem 1.25rem;
-        font-size: 0.95rem;
-        transition: transform 150ms ease, box-shadow 150ms ease;
-      }
-
-      .btn-primary:hover,
-      .btn-secondary:hover {
-        transform: translateY(-1px);
-      }
-
-      .btn-primary {
-        background: linear-gradient(130deg, var(--sky-600), var(--sky-500));
-        color: #fff;
-        box-shadow: 0 12px 22px rgba(31, 111, 224, 0.25);
-      }
-
-      .btn-secondary {
-        background: #fff;
-        color: var(--ink-900);
-        border: 1.5px solid var(--slate-300);
-      }
-
-      .install-bar {
+      .button {
+        min-height: 49px;
         display: inline-flex;
         align-items: center;
-        gap: 0.58rem;
-        margin-top: 1.35rem;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 19px;
+        border: 1px solid transparent;
+        border-radius: 999px;
+        text-decoration: none;
+        font-size: 14px;
+        font-weight: 800;
+        transition: transform 160ms ease, box-shadow 160ms ease;
+      }
+
+      .button:hover {
+        transform: translateY(-2px);
+      }
+
+      .button-primary {
+        color: #fff;
+        background: var(--green-600);
+        box-shadow: 0 10px 24px rgba(24, 117, 82, 0.2);
+      }
+
+      .button-secondary {
+        color: var(--ink);
+        border-color: var(--line-strong);
+        background: rgba(255, 255, 255, 0.62);
+      }
+
+      .install {
+        margin-top: 24px;
+        display: inline-flex;
+        align-items: center;
+        gap: 11px;
+        padding: 10px 13px;
+        color: #3e5c57;
+        border: 1px solid var(--line);
         border-radius: 10px;
-        border: 0;
-        background: #0f1f33;
-        padding: 0.62rem 0.9rem;
-        color: #d7e4f2;
-        font: inherit;
+        background: rgba(255, 255, 255, 0.7);
         cursor: pointer;
       }
 
-      .install-bar:hover {
-        background: #172a42;
+      .install:hover {
+        border-color: rgba(24, 117, 82, 0.4);
       }
 
-      .install-bar:focus-visible {
-        outline: 2px solid var(--sky-500);
-        outline-offset: 2px;
+      .install .prompt {
+        color: var(--green-600);
       }
 
-      .install-bar .prompt {
-        color: #4ade80;
+      .copy-state {
+        color: #526b67;
+        font-family: "Manrope", sans-serif;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
       }
 
-      .install-bar .hint {
-        color: #7e96b0;
-        font-size: 0.72rem;
-      }
-
-      .hero-install {
-        margin-top: 1.1rem;
-        display: flex;
-        justify-content: center;
-      }
-
-      .code-hero {
-        max-width: 860px;
-        margin: 2.7rem auto 0;
-        overflow: hidden;
-        border-radius: 16px;
+      .hero-diagram {
+        position: relative;
+        padding: 22px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-xl);
+        background: rgba(255, 255, 255, 0.78);
         box-shadow: var(--shadow);
-        text-align: left;
-        background: #0d1d32;
       }
 
-      .code-bar {
+      .diagram-head {
         display: flex;
         align-items: center;
-        gap: 0.38rem;
-        padding: 0.72rem 0.9rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        background: #132640;
+        justify-content: space-between;
+        padding: 4px 4px 18px;
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
       }
 
-      .code-dot {
-        width: 11px;
-        height: 11px;
+      .live-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .live-dot::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green-500);
+        box-shadow: 0 0 0 4px rgba(40, 151, 109, 0.12);
+      }
+
+      .diagram-main {
+        display: grid;
+        grid-template-columns: 1fr 36px 1.15fr 36px 1fr;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .diagram-node {
+        min-height: 112px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 15px;
+        background: var(--white);
+      }
+
+      .diagram-node.bucket {
+        background: var(--blue-100);
+      }
+
+      .node-label {
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+
+      .diagram-node strong {
+        font-size: 15px;
+        line-height: 1.25;
+      }
+
+      .diagram-arrow {
+        color: var(--green-600);
+        text-align: center;
+        font-family: "DM Mono", monospace;
+      }
+
+      .diagram-maintenance {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 18px;
+        padding: 16px 18px;
+        border: 1px solid rgba(24, 117, 82, 0.19);
+        border-radius: 14px;
+        background: var(--green-100);
+      }
+
+      .diagram-maintenance strong {
+        display: block;
+        margin-bottom: 2px;
+        font-size: 13px;
+      }
+
+      .diagram-maintenance span {
+        color: #517269;
+        font-size: 11px;
+      }
+
+      .separate-badge {
+        padding: 6px 9px;
+        color: var(--green-700) !important;
         border-radius: 999px;
+        background: rgba(255, 255, 255, 0.65);
+        font-family: "DM Mono", monospace;
+        font-size: 10px !important;
+        text-transform: uppercase;
       }
 
-      .code-dot.r {
-        background: #ff5f57;
+      .provider-strip {
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        background: var(--white);
       }
 
-      .code-dot.y {
-        background: #febc2e;
+      .provider-row {
+        min-height: 92px;
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        align-items: center;
       }
 
-      .code-dot.g {
-        background: #28c840;
+      .provider-item {
+        padding: 10px 22px;
+        text-align: center;
+        border-left: 1px solid var(--line);
       }
 
-      .code-fname {
-        margin-left: 0.45rem;
-        color: #93a9c3;
-        font-size: 0.75rem;
+      .provider-item:first-child {
+        border-left: 0;
       }
 
-      .code-hero pre {
-        margin: 0;
-        padding: 1.2rem;
-        overflow-x: auto;
-        font-size: 0.81rem;
-        line-height: 1.72;
+      .provider-item strong {
+        display: block;
+        color: #294743;
+        font-size: 13px;
       }
 
-      .code-hero code {
-        color: #d8e4f1;
-      }
-
-      .kw {
-        color: #5cb2ff;
-      }
-
-      .fn {
-        color: #ffc978;
-      }
-
-      .str {
-        color: #67d19a;
-      }
-
-      .cm {
-        color: #7992ad;
+      .provider-item span {
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
       }
 
       section {
-        padding: 4.8rem 1rem;
+        padding: 104px 0;
       }
 
-      .section-inner {
-        max-width: var(--max);
-        margin: 0 auto;
+      .section-head {
+        max-width: 760px;
+        margin-bottom: 48px;
       }
 
       .section-label {
-        display: inline-block;
-        font-size: 0.76rem;
-        font-weight: 700;
+        margin-bottom: 14px;
+      }
+
+      .section-head h2,
+      .split-copy h2,
+      .api-copy h2,
+      .cta-panel h2 {
+        margin-bottom: 18px;
+        font-size: clamp(37px, 4.8vw, 60px);
+        line-height: 1.05;
+        letter-spacing: -0.052em;
+      }
+
+      .section-head p,
+      .split-copy > p,
+      .api-copy > p {
+        color: var(--muted);
+        font-size: 16px;
+      }
+
+      .value-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+
+      .value-card {
+        min-height: 270px;
+        display: grid;
+        grid-template-rows: 38px 1fr auto 63px;
+        padding: 26px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.7);
+      }
+
+      .value-number {
+        grid-row: 1;
+        width: 38px;
+        height: 38px;
+        display: grid;
+        place-items: center;
+        color: var(--green-700);
+        border-radius: 11px;
+        background: var(--green-100);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+      }
+
+      .value-card:nth-child(2) .value-number {
+        color: #386d91;
+        background: var(--blue-100);
+      }
+
+      .value-card:nth-child(3) .value-number {
+        color: #7b642f;
+        background: var(--sand-200);
+      }
+
+      .value-card h3 {
+        grid-row: 3;
+        align-self: end;
+        margin: 0 0 9px;
+        font-size: 22px;
+        line-height: 1.2;
+        letter-spacing: -0.034em;
+      }
+
+      .value-card p {
+        grid-row: 4;
+        align-self: start;
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .architecture-section {
+        background: var(--green-50);
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .architecture-flow {
+        display: grid;
+        grid-template-columns: 1fr 62px 1.2fr 62px 1fr;
+        align-items: stretch;
+        gap: 10px;
+      }
+
+      .architecture-card {
+        min-height: 190px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 26px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: var(--white);
+      }
+
+      .architecture-card.store {
+        background: var(--blue-100);
+      }
+
+      .architecture-card small {
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
-        letter-spacing: 0.08em;
-        color: var(--sky-600);
-        margin-bottom: 0.6rem;
       }
 
-      .section-title {
+      .architecture-card h3 {
+        margin: 0 0 7px;
+        font-size: 24px;
+        letter-spacing: -0.035em;
+      }
+
+      .architecture-card p {
         margin: 0;
-        font-size: clamp(1.7rem, 4vw, 2.45rem);
-        letter-spacing: -0.02em;
+        color: var(--muted);
+        font-size: 13px;
       }
 
-      .section-desc {
-        margin: 0.85rem 0 2rem;
-        color: var(--ink-700);
-        max-width: 700px;
-      }
-
-      .how-section {
-        background: var(--slate-100);
-      }
-
-      .how-grid {
+      .flow-arrow {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 0.7rem;
+        place-items: center;
+        color: var(--green-600);
+        font-family: "DM Mono", monospace;
+        font-size: 20px;
       }
 
-      .how-step {
-        background: #fff;
-        border: 1px solid var(--slate-200);
-        border-radius: var(--radius-md);
-        padding: 1rem;
-      }
-
-      .how-icon {
-        width: 50px;
-        height: 50px;
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 1.35rem;
-        margin-bottom: 0.75rem;
-      }
-
-      .how-step h4 {
-        margin: 0 0 0.3rem;
-        font-size: 0.96rem;
-      }
-
-      .how-step p {
-        margin: 0;
-        color: var(--ink-700);
-        font-size: 0.84rem;
-      }
-
-      .how-step code {
-        font-size: 0.72rem;
-        background: var(--slate-100);
-        border-radius: 5px;
-        padding: 0 0.35rem;
-      }
-
-      .features-grid {
+      .maintenance-rail {
+        margin-top: 16px;
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 1rem;
-      }
-
-      .f-card {
-        background: #fff;
-        border: 1px solid var(--slate-200);
-        border-radius: var(--radius-md);
-        padding: 1.2rem;
-        transition: transform 150ms ease, box-shadow 150ms ease;
-      }
-
-      .f-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 12px 24px rgba(19, 35, 58, 0.09);
-      }
-
-      .f-icon {
-        width: 42px;
-        height: 42px;
-        border-radius: 10px;
-        display: flex;
+        grid-template-columns: auto 1fr auto;
         align-items: center;
-        justify-content: center;
-        font-size: 1.2rem;
-        margin-bottom: 0.7rem;
-      }
-
-      .f-card h3 {
-        margin: 0 0 0.35rem;
-        font-size: 0.98rem;
-      }
-
-      .f-card p {
-        margin: 0;
-        font-size: 0.86rem;
-        color: var(--ink-700);
-      }
-
-      .arch-section {
-        background: var(--slate-900);
-        color: #fff;
-      }
-
-      .arch-section .section-label {
-        color: var(--teal-400);
-      }
-
-      .arch-section .section-desc {
-        color: #b8c5d3;
-      }
-
-      .arch-visual {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 1rem;
-        flex-wrap: wrap;
-      }
-
-      .arch-box {
-        min-width: 190px;
-        text-align: center;
+        gap: 18px;
+        padding: 18px 22px;
+        color: #194a39;
+        border: 1px solid rgba(24, 117, 82, 0.2);
         border-radius: var(--radius-md);
-        padding: 1.2rem 1.5rem;
+        background: var(--green-200);
       }
 
-      .arch-box h4 {
-        margin: 0 0 0.2rem;
-        font-size: 0.93rem;
+      .maintenance-rail strong {
+        font-size: 14px;
       }
 
-      .arch-box p {
-        margin: 0;
-        color: #b4c4d7;
-        font-size: 0.78rem;
+      .maintenance-rail span {
+        color: #405f55;
+        font-size: 12px;
       }
 
-      .arch-writer {
-        background: rgba(255, 190, 102, 0.12);
-        border: 1px solid rgba(255, 190, 102, 0.3);
+      .maintenance-rail .mono {
+        color: var(--green-700);
+        font-size: 10px;
+        text-transform: uppercase;
       }
 
-      .arch-writer h4 {
-        color: var(--amber-400);
+      .compaction-section {
+        background: var(--white);
       }
 
-      .arch-bucket {
-        background: linear-gradient(140deg, rgba(47, 135, 255, 0.2), rgba(15, 178, 164, 0.14));
-        border: 1px solid rgba(47, 135, 255, 0.33);
-      }
-
-      .arch-bucket h4 {
-        color: #84bfff;
-      }
-
-      .arch-readers {
-        background: rgba(45, 196, 184, 0.12);
-        border: 1px solid rgba(45, 196, 184, 0.3);
-      }
-
-      .arch-readers h4 {
-        color: var(--teal-400);
-      }
-
-      .arch-arrow {
-        color: #7f95ad;
-        font-size: 1.5rem;
-      }
-
-      .arch-details {
+      .compaction-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 0.8rem;
-        margin-top: 1.4rem;
+        grid-template-columns: 0.9fr 1.1fr;
+        gap: 64px;
+        align-items: center;
       }
 
-      .arch-detail {
-        border-radius: 10px;
-        padding: 0.88rem;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        background: rgba(255, 255, 255, 0.04);
+      .comparison {
+        display: grid;
+        gap: 13px;
       }
 
-      .arch-detail h5 {
-        margin: 0 0 0.25rem;
-        color: #90c4ff;
-        font-size: 0.8rem;
+      .comparison-card {
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: var(--paper);
       }
 
-      .arch-detail p {
-        margin: 0;
-        color: #bbcadb;
-        font-size: 0.76rem;
+      .comparison-card.isledb {
+        border-color: rgba(24, 117, 82, 0.24);
+        background: var(--green-100);
       }
 
-      .code-section {
-        background: var(--slate-100);
-      }
-
-      .code-tabs {
-        display: flex;
-        gap: 0;
-        border-bottom: 2px solid var(--slate-200);
-      }
-
-      .code-tab {
-        border: none;
-        background: none;
-        margin-bottom: -2px;
-        border-bottom: 2px solid transparent;
-        padding: 0.62rem 1rem;
-        font: inherit;
-        font-size: 0.84rem;
-        font-weight: 700;
-        color: var(--ink-500);
-        cursor: pointer;
-      }
-
-      .code-tab.active {
-        color: var(--sky-600);
-        border-bottom-color: var(--sky-600);
-      }
-
-      .code-panel {
-        display: none;
-        background: #0f2238;
-        border-radius: 0 0 var(--radius-md) var(--radius-md);
-        overflow: hidden;
-      }
-
-      .code-panel.active {
+      .comparison-card small {
         display: block;
+        margin-bottom: 14px;
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
       }
 
-      .code-panel pre {
+      .comparison-card h3 {
+        margin-bottom: 7px;
+        font-size: 20px;
+        letter-spacing: -0.03em;
+      }
+
+      .comparison-card p {
         margin: 0;
-        padding: 1.2rem;
-        overflow-x: auto;
-        font-size: 0.81rem;
-        line-height: 1.68;
+        color: var(--muted);
+        font-size: 13px;
       }
 
-      .code-panel code {
-        color: #d7e3ef;
-      }
-
-      .uc-grid {
+      .benefit-list {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 1rem;
+        gap: 11px;
+        margin-top: 27px;
       }
 
-      .uc-card {
-        background: #fff;
-        border: 1px solid var(--slate-200);
+      .benefit {
+        display: grid;
+        grid-template-columns: 24px 1fr;
+        gap: 11px;
+        color: #46635e;
+        font-size: 13px;
+      }
+
+      .benefit span:first-child {
+        color: var(--green-600);
+        font-family: "DM Mono", monospace;
+      }
+
+      .maintenance-code {
+        margin-top: 26px;
+        overflow: hidden;
         border-radius: var(--radius-md);
-        padding: 1.2rem;
+        background: #102927;
       }
 
-      .uc-card .emoji {
-        font-size: 1.8rem;
-        margin-bottom: 0.5rem;
+      .maintenance-code pre {
+        padding: 20px;
+        font-size: 10px;
       }
 
-      .uc-card h3 {
-        margin: 0 0 0.35rem;
-        font-size: 0.98rem;
+      .api-section {
+        background: var(--sand-50);
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
       }
 
-      .uc-card p {
+      .api-grid {
+        display: grid;
+        grid-template-columns: 0.72fr 1.28fr;
+        gap: 48px;
+        align-items: center;
+      }
+
+      .api-types {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        margin-top: 23px;
+      }
+
+      .api-type {
+        padding: 6px 9px;
+        color: #526a66;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.55);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+      }
+
+      .code-window {
+        overflow: hidden;
+        border-radius: var(--radius-lg);
+        background: #102927;
+        box-shadow: var(--shadow);
+      }
+
+      .code-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 13px 17px;
+        color: #839d97;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+      }
+
+      .code-dots {
+        display: flex;
+        gap: 6px;
+      }
+
+      .code-dots span {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #46625d;
+      }
+
+      .code-dots span:first-child {
+        background: var(--coral);
+      }
+
+      .code-dots span:nth-child(2) {
+        background: #e5c26f;
+      }
+
+      .code-dots span:nth-child(3) {
+        background: #57c693;
+      }
+
+      pre {
         margin: 0;
-        color: var(--ink-700);
-        font-size: 0.84rem;
+        padding: 25px;
+        overflow-x: auto;
+        color: #d9e9e5;
+        font-size: 11px;
+        line-height: 1.8;
+        tab-size: 2;
       }
 
-      .uc-card .replaces {
-        margin-top: 0.6rem;
-        color: var(--ink-500);
-        font-size: 0.76rem;
+      .comment {
+        color: #8fa9a3;
+      }
+
+      .call {
+        color: #83e5bc;
+      }
+
+      .string {
+        color: #f2ce8b;
+      }
+
+      .keyword {
+        color: #ef927e;
+      }
+
+      .feed-grid {
+        display: grid;
+        grid-template-columns: 0.9fr 1.1fr;
+        gap: 58px;
+        align-items: center;
+      }
+
+      .mode-grid {
+        display: grid;
+        gap: 12px;
+      }
+
+      .mode-card {
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .mode-card.full {
+        background: var(--green-100);
+      }
+
+      .mode-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 9px;
+      }
+
+      .mode-title h3 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: -0.03em;
+      }
+
+      .mode-title span {
+        padding: 5px 8px;
+        color: var(--green-700);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.65);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+
+      .mode-card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .feed-points {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+        margin-top: 26px;
+      }
+
+      .feed-point {
+        padding: 12px;
+        color: #47625e;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: rgba(255, 255, 255, 0.6);
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .storage-section {
+        background: var(--blue-50);
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .storage-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 13px;
+      }
+
+      .storage-card {
+        min-height: 220px;
+        display: grid;
+        grid-template-rows: 14px 58px 1fr;
+        row-gap: 12px;
+        padding: 23px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.75);
+      }
+
+      .storage-card small {
+        color: #526b67;
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        line-height: 14px;
+        text-transform: uppercase;
+      }
+
+      .storage-card h3 {
+        align-self: start;
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.28;
+        letter-spacing: -0.028em;
+      }
+
+      .storage-card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
       }
 
       .fit-grid {
         display: grid;
+        grid-template-columns: 0.72fr 1.28fr;
+        gap: 56px;
+        align-items: start;
+      }
+
+      .fit-cards {
+        display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 1rem;
+        gap: 13px;
       }
 
       .fit-card {
-        border-radius: var(--radius-md);
-        padding: 1.1rem;
-        border: 1px solid var(--slate-200);
-        background: #fff;
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: var(--white);
+      }
+
+      .fit-card.good {
+        background: var(--green-100);
       }
 
       .fit-card h3 {
-        margin: 0 0 0.6rem;
-        font-size: 0.96rem;
+        margin-bottom: 15px;
+        font-size: 18px;
+        letter-spacing: -0.025em;
       }
 
       .fit-card ul {
         margin: 0;
-        padding-left: 1rem;
+        padding: 0;
+        list-style: none;
       }
 
       .fit-card li {
-        margin: 0.55rem 0;
-        color: var(--ink-700);
-        font-size: 0.84rem;
+        position: relative;
+        padding: 10px 0 10px 18px;
+        color: var(--muted);
+        border-top: 1px solid var(--line);
+        font-size: 12px;
       }
 
-      .fit-card.bad {
-        border-color: #fecaca;
-        background: #fff7f7;
+      .fit-card li::before {
+        content: "";
+        position: absolute;
+        top: 17px;
+        left: 2px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--coral);
       }
 
-      .fit-card.good {
-        border-color: #bbf7d0;
-        background: #f3fff7;
+      .fit-card.good li::before {
+        background: var(--green-500);
       }
 
-      .quote-section {
-        background: linear-gradient(150deg, #edf7ff, #eafbf8);
-        text-align: center;
+      .faq-section {
+        background: var(--green-50);
+        border-top: 1px solid var(--line);
       }
 
-      .quote-block {
-        max-width: 740px;
-        margin: 0 auto;
+      .faq-grid {
+        display: grid;
+        grid-template-columns: 0.72fr 1.28fr;
+        gap: 56px;
+        align-items: start;
       }
 
-      .quote-block blockquote {
-        margin: 0 0 0.72rem;
-        font-size: 1.24rem;
-        font-style: italic;
-        color: var(--ink-900);
+      .faq-list {
+        display: grid;
+        gap: 11px;
       }
 
-      .quote-block cite {
-        color: var(--ink-500);
-        font-size: 0.86rem;
-        font-style: normal;
+      .faq-item {
+        padding: 21px 23px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+        background: rgba(255, 255, 255, 0.72);
       }
 
-      .cta {
-        text-align: center;
-        background: linear-gradient(to bottom, #fff, #edf6ff);
-      }
-
-      .cta h2 {
-        margin: 0;
-        font-size: clamp(1.9rem, 4vw, 3rem);
+      .faq-item h3 {
+        margin-bottom: 7px;
+        font-size: 15px;
+        line-height: 1.35;
         letter-spacing: -0.02em;
       }
 
-      .cta p {
-        max-width: 620px;
-        margin: 0.9rem auto 1.5rem;
-        color: var(--ink-700);
+      .faq-item p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
       }
 
-      .cta .hero-actions {
-        justify-content: center;
+      .cta-wrap {
+        padding: 30px 0 92px;
+        background: var(--green-50);
+      }
+
+      .cta-panel {
+        position: relative;
+        overflow: hidden;
+        padding: 65px;
+        border: 1px solid rgba(24, 117, 82, 0.15);
+        border-radius: var(--radius-xl);
+        background: linear-gradient(135deg, var(--green-100), #edf3dc);
+      }
+
+      .cta-panel::after {
+        content: "";
+        position: absolute;
+        width: 420px;
+        aspect-ratio: 1;
+        right: -180px;
+        bottom: -260px;
+        border: 65px solid rgba(24, 117, 82, 0.06);
+        border-radius: 50%;
+      }
+
+      .cta-panel h2,
+      .cta-panel p,
+      .cta-panel .hero-actions {
+        position: relative;
+        z-index: 1;
+      }
+
+      .cta-panel h2 {
+        max-width: 760px;
+      }
+
+      .cta-panel p {
+        max-width: 580px;
+        color: var(--muted);
+      }
+
+      .cta-panel .hero-actions {
+        margin-top: 25px;
       }
 
       footer {
-        background: #0e1d30;
-        color: #b0c0d3;
-        padding: 3rem 1rem 2rem;
+        padding: 44px 0 28px;
+        color: #526b67;
+        background: #e4eee8;
+        border-top: 1px solid var(--line);
       }
 
-      .footer-inner {
-        max-width: var(--max);
-        margin: 0 auto;
+      .footer-main {
         display: grid;
-        grid-template-columns: 2fr 1fr 1fr;
-        gap: 1.4rem;
-      }
-
-      .footer-brand img {
-        height: 30px;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
       }
 
       .footer-brand p {
-        margin: 0.7rem 0 0;
-        max-width: 300px;
-        font-size: 0.84rem;
-        color: #94aac2;
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 12px;
       }
 
-      .footer-col h4 {
-        margin: 0 0 0.5rem;
-        font-size: 0.75rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: #7f95ad;
-      }
-
-      .footer-col a {
+      .footer-column strong {
         display: block;
-        text-decoration: none;
-        color: #b0c0d3;
-        font-size: 0.85rem;
-        margin: 0.25rem 0;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 12px;
       }
 
-      .footer-col a:hover {
-        color: #fff;
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 12px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
       }
 
       .footer-bottom {
-        max-width: var(--max);
-        margin: 1.4rem auto 0;
-        border-top: 1px solid rgba(255, 255, 255, 0.1);
-        padding-top: 1rem;
-        font-size: 0.79rem;
         display: flex;
         justify-content: space-between;
-        gap: 1rem;
-        flex-wrap: wrap;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        text-transform: uppercase;
       }
 
-      @media (max-width: 1000px) {
-        .hero-layout {
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      .reveal {
+        opacity: 1;
+        transform: none;
+      }
+
+      .js .reveal {
+        opacity: 0;
+        transform: translateY(16px);
+        transition: opacity 450ms ease, transform 450ms ease;
+      }
+
+      .js .reveal.visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      @media (max-width: 1020px) {
+        .hero-grid,
+        .compaction-grid,
+        .api-grid,
+        .feed-grid,
+        .fit-grid,
+        .faq-grid {
           grid-template-columns: 1fr;
-          gap: 1rem;
         }
 
-        .hero-copy {
-          text-align: center;
+        .hero-grid {
+          gap: 46px;
         }
 
-        .hero-features {
-          justify-self: center;
-          max-width: 640px;
+        .value-grid {
+          grid-template-columns: 1fr 1fr;
         }
 
-        .how-grid {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
+        .value-card:last-child {
+          grid-column: 1 / -1;
+          min-height: 220px;
         }
 
-        .footer-inner {
+        .storage-grid {
           grid-template-columns: 1fr 1fr;
         }
       }
 
-      @media (max-width: 900px) {
-        .fit-grid {
+      @media (max-width: 780px) {
+        .nav-links a:not(.nav-cta) {
+          display: none;
+        }
+
+        .hero {
+          padding-top: 125px;
+        }
+
+        .provider-row {
+          grid-template-columns: 1fr 1fr;
+          padding: 13px 0;
+        }
+
+        .provider-item {
+          padding: 11px;
+          border-left: 0;
+        }
+
+        .provider-item:last-child {
+          grid-column: 1 / -1;
+        }
+
+        .architecture-flow {
+          grid-template-columns: 1fr;
+        }
+
+        .flow-arrow {
+          min-height: 34px;
+          transform: rotate(90deg);
+        }
+
+        .maintenance-rail {
+          grid-template-columns: 1fr;
+          gap: 6px;
+        }
+
+        .fit-cards {
           grid-template-columns: 1fr;
         }
       }
 
-      @media (max-width: 760px) {
-        .hero-feature-list li {
-          font-size: 0.95rem;
+      @media (max-width: 600px) {
+        .shell {
+          width: min(var(--max), calc(100% - 26px));
         }
 
-        .nav-inner {
-          height: auto;
-          min-height: 66px;
-          align-items: flex-start;
-          padding: 0.55rem 1rem;
-        }
-
-        .nav-links {
-          flex-wrap: wrap;
-          justify-content: flex-end;
-          gap: 0.45rem 0.7rem;
-          max-width: 78%;
-        }
-
-        .nav-links a {
-          font-size: 0.82rem;
-        }
-
-        .nav-logo img {
-          height: 30px;
-        }
-
-        .hero {
-          padding-top: 8.4rem;
+        h1 {
+          font-size: clamp(46px, 14vw, 62px);
         }
 
         section {
-          padding: 3.6rem 1rem;
+          padding: 78px 0;
         }
 
-        .how-grid {
+        .diagram-main {
           grid-template-columns: 1fr;
         }
 
-        .arch-arrow {
+        .diagram-arrow {
+          min-height: 24px;
           transform: rotate(90deg);
         }
 
-        .footer-inner {
+        .diagram-maintenance {
           grid-template-columns: 1fr;
+        }
+
+        .value-grid,
+        .storage-grid,
+        .feed-points {
+          grid-template-columns: 1fr;
+        }
+
+        .storage-card {
+          min-height: 0;
+          grid-template-rows: auto auto auto;
+          row-gap: 10px;
+        }
+
+        .value-card:last-child {
+          grid-column: auto;
+          min-height: 270px;
+        }
+
+        .cta-panel {
+          padding: 44px 27px;
+        }
+
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        pre {
+          padding: 20px 17px;
+          font-size: 10px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+
+        .reveal {
+          opacity: 1;
+          transform: none;
         }
       }
     </style>
   </head>
+
   <body>
-    <nav>
-      <div class="nav-inner">
-        <a href="./" class="nav-logo" aria-label="IsleDB home">
-          <img src="isledb.svg" alt="IsleDB logo" />
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand nav-brand" href="/" aria-label="IsleDB home">
+          <img src="favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="nav-brand-name">Isle<span class="nav-brand-db">DB</span></span>
         </a>
         <div class="nav-links">
-          <a href="#features">Features</a>
           <a href="#architecture">Architecture</a>
-          <a href="https://github.com/ankur-anand/isledb/blob/main/api.md">API</a>
-          <a href="#use-cases">Use Cases</a>
-          <a href="https://github.com/ankur-anand/isledb" class="nav-cta">GitHub</a>
+          <a href="https://github.com/ankur-anand/isledb/blob/main/api.md">API reference</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
         </div>
       </div>
     </nav>
 
-    <section class="hero">
-      <div class="hero-layout">
-        <div class="hero-copy">
-          <h1>
-            Embedded Go key-value<br />
-            <span class="gradient">database for object storage.</span>
-          </h1>
-          <p class="hero-subhead">
-            IsleDB is a Go database library for S3, GCS, Azure Blob, and MinIO, built for
-            writes, scans, tailing readers, compaction, and object-storage-first workloads.
-          </p>
-        </div>
-        <aside class="hero-features" aria-label="Feature highlights">
-          <h3>Feature</h3>
-          <ul class="hero-feature-list">
-            <li>
-              <span class="hero-feature-icon" aria-hidden="true">☁</span>
-              <span>Object Storage Native</span>
-            </li>
-            <li>
-              <span class="hero-feature-icon" aria-hidden="true">⚙</span>
-              <span>Separate Writer + Compactor Process</span>
-            </li>
-            <li>
-              <span class="hero-feature-icon" aria-hidden="true">⇄</span>
-              <span>Horizontal Reader Scale</span>
-            </li>
-          </ul>
-        </aside>
-      </div>
-      <div class="hero-cta">
-        <div class="hero-actions">
-          <a href="https://github.com/ankur-anand/isledb" class="btn-primary">Get Started</a>
-          <a href="#architecture" class="btn-secondary">See Architecture</a>
-        </div>
-        <div class="hero-install">
-          <button
-            class="install-bar"
-            id="copy-install-btn"
-            type="button"
-            data-copy="go get github.com/ankur-anand/isledb"
-            aria-label="Copy go get command"
-          >
-            <span class="prompt">$</span>
-            <span class="cmd">go get github.com/ankur-anand/isledb</span>
-            <span class="hint">click to copy</span>
-          </button>
-        </div>
-      </div>
-
-      <div class="code-hero">
-        <div class="code-bar">
-          <div class="code-dot r"></div>
-          <div class="code-dot y"></div>
-          <div class="code-dot g"></div>
-          <span class="code-fname">main.go</span>
-        </div>
-        <pre><code><span class="cm">// Connect to object storage</span>
-store, _ := blobstore.<span class="fn">Open</span>(ctx, <span class="str">"s3://my-bucket?region=us-east-1"</span>, <span class="str">"db1"</span>)
-db, _ := isledb.<span class="fn">OpenDB</span>(ctx, store, isledb.DBOptions{})
-
-<span class="cm">// Write</span>
-writer, _ := db.<span class="fn">OpenWriter</span>(ctx, isledb.<span class="fn">DefaultWriterOptions</span>())
-writer.<span class="fn">Put</span>([]<span class="kw">byte</span>(<span class="str">"hello"</span>), []<span class="kw">byte</span>(<span class="str">"world"</span>))
-writer.<span class="fn">Flush</span>(ctx)
-
-<span class="cm">// Read</span>
-reader, _ := isledb.<span class="fn">OpenReader</span>(ctx, store, isledb.ReaderOpenOptions{CacheDir: <span class="str">"./cache"</span>})
-val, ok, _ := reader.<span class="fn">Get</span>(ctx, []<span class="kw">byte</span>(<span class="str">"hello"</span>))
-
-<span class="cm">// Tail</span>
-tr, _ := isledb.<span class="fn">OpenTailingReader</span>(ctx, store, tailOpts)
-tr.<span class="fn">Tail</span>(ctx, opts, <span class="kw">func</span>(kv isledb.KV) <span class="kw">error</span> { <span class="kw">return</span> <span class="kw">nil</span> })</code></pre>
-      </div>
-    </section>
-
-    <section class="how-section" id="how">
-      <div class="section-inner">
-        <span class="section-label">How It Works</span>
-        <h2 class="section-title">LSM-tree ideas, adapted for object storage.</h2>
-        <p class="section-desc">
-          Memtable writes, immutable SST flushes, and reader-side caching provide predictable performance
-          while your bucket handles durability and scale.
-        </p>
-
-        <div class="how-grid">
-          <div class="how-step">
-            <div class="how-icon" style="background: var(--sky-100)">✎</div>
-            <h4>Put(key, value)</h4>
-            <p>Writes land in the memtable. Large values can be stored as blobs.</p>
+    <main id="main">
+      <header class="hero">
+        <div class="shell hero-grid">
+          <div class="hero-copy">
+            <span class="eyebrow">Embedded key-value database for Go</span>
+            <h1>
+              A key-value database
+              <span class="accent">for object storage.</span>
+            </h1>
+            <p>
+              Store durable key-value data directly in object storage. Readers scale independently;
+              compaction runs on separate compute.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="https://github.com/ankur-anand/isledb">
+                Get started <span aria-hidden="true">→</span>
+              </a>
+              <a class="button button-secondary" href="#architecture">See the architecture</a>
+            </div>
+            <button
+              class="install mono"
+              id="copy-install"
+              type="button"
+              data-copy="go get github.com/ankur-anand/isledb"
+              aria-label="Copy Go install command"
+            >
+              <span class="prompt">$</span>
+              <span>go get github.com/ankur-anand/isledb</span>
+              <span class="copy-state" role="status" aria-live="polite">copy</span>
+            </button>
           </div>
-          <div class="how-step">
-            <div class="how-icon" style="background: #fff4dc">⚡</div>
-            <h4>Flush(ctx)</h4>
-            <p>Memtable is flushed into immutable SST files on object storage.</p>
-          </div>
-          <div class="how-step">
-            <div class="how-icon" style="background: #defaf6">☁</div>
-            <h4>S3 / GCS / Azure</h4>
-            <p>Capacity and durability scale with your bucket.</p>
-          </div>
-          <div class="how-step">
-            <div class="how-icon" style="background: #e9f7ff">↠</div>
-            <h4>Tail(handler)</h4>
-            <p>Stream new writes continuously, like <code>tail -f</code> for data.</p>
+
+          <div class="hero-diagram" role="img" aria-label="One writer and many readers share an object-store database while compaction runs in a separate process">
+            <div class="diagram-head">
+              <span>One database prefix</span>
+              <span class="live-dot">shared state</span>
+            </div>
+            <div class="diagram-main">
+              <div class="diagram-node">
+                <span class="node-label">Write</span>
+                <strong>Writer<br />service</strong>
+              </div>
+              <div class="diagram-arrow" aria-hidden="true">→</div>
+              <div class="diagram-node bucket">
+                <span class="node-label">Store</span>
+                <strong>S3 · GCS<br />Azure · MinIO</strong>
+              </div>
+              <div class="diagram-arrow" aria-hidden="true">→</div>
+              <div class="diagram-node">
+                <span class="node-label">Read</span>
+                <strong>Reader<br />fleet</strong>
+              </div>
+            </div>
+            <div class="diagram-maintenance">
+              <div>
+                <strong>Compaction worker</strong>
+                <span>Optimizes the same database from separate compute.</span>
+              </div>
+              <span class="separate-badge">separate process</span>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+      </header>
 
-    <section id="features">
-      <div class="section-inner">
-        <span class="section-label">Features</span>
-        <h2 class="section-title">Complete data building blocks in one Go library.</h2>
-        <p class="section-desc">
-          IsleDB combines write/read APIs, compaction strategies, streaming tailing readers, TTL, and fence-based ownership.
-        </p>
+      <aside class="provider-strip" aria-label="Supported object stores">
+        <div class="shell provider-row">
+          <div class="provider-item"><strong>Amazon S3</strong><span>AWS</span></div>
+          <div class="provider-item"><strong>Google Cloud Storage</strong><span>GCS</span></div>
+          <div class="provider-item"><strong>Azure Blob</strong><span>Microsoft Azure</span></div>
+          <div class="provider-item"><strong>MinIO</strong><span>S3-compatible</span></div>
+          <div class="provider-item"><strong>Local files</strong><span>Development</span></div>
+        </div>
+      </aside>
 
-        <div class="features-grid">
-          <div class="f-card">
-            <div class="f-icon" style="background: var(--sky-100)">☁</div>
-            <h3>Object Storage Native</h3>
-            <p>Use S3, GCS, Azure Blob, MinIO, or local object-compatible storage.</p>
+      <section id="why-isledb">
+        <div class="shell">
+          <div class="section-head reveal">
+            <span class="section-label">Why IsleDB</span>
+            <h2>Use your bucket as the durable home for key-value data.</h2>
+            <p>
+              IsleDB is an embedded Go library. Your compute can come and go while the database stays
+              durable, shared, and available through the object store you already operate.
+            </p>
           </div>
-          <div class="f-card">
-            <div class="f-icon" style="background: #e8fbf9">↠</div>
-            <h3>Tailing Reader</h3>
-            <p>Continuously consume new writes via polling and ordered replay.</p>
-          </div>
-          <div class="f-card">
-            <div class="f-icon" style="background: #fff4dc">⇄</div>
-            <h3>Horizontal Readers</h3>
-            <p>Scale reads by adding more readers against the same prefix.</p>
-          </div>
-          <div class="f-card">
-            <div class="f-icon" style="background: #eef3ff">⚙</div>
-            <h3>Three Compaction Modes</h3>
-            <p>Merge compaction, age-based retention, and time-window retention.</p>
-          </div>
-          <div class="f-card">
-            <div class="f-icon" style="background: #e7f8ee">⏱</div>
-            <h3>Per-Key TTL</h3>
-            <p>Use TTL APIs to manage data lifetime without external schedulers.</p>
-          </div>
-          <div class="f-card">
-            <div class="f-icon" style="background: #ffecec">🔒</div>
-            <h3>Epoch Fencing</h3>
-            <p>Prevent split-brain writer/compactor ownership with manifest fencing.</p>
+
+          <div class="value-grid">
+            <article class="value-card reveal">
+              <span class="value-number">01</span>
+              <h3>Object-store durability</h3>
+              <p>Keep the complete database under one bucket prefix instead of operating a separate storage fleet.</p>
+            </article>
+            <article class="value-card reveal">
+              <span class="value-number">02</span>
+              <h3>Readers scale independently</h3>
+              <p>Add reader processes for lookups, scans, snapshots, and change consumption without moving the dataset.</p>
+            </article>
+            <article class="value-card reveal">
+              <span class="value-number">03</span>
+              <h3>Compute stays flexible</h3>
+              <p>Run writers, readers, and maintenance as separate services, scheduled jobs, or ephemeral workers.</p>
+            </article>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="arch-section" id="architecture">
-      <div class="section-inner">
-        <span class="section-label">Architecture</span>
-        <h2 class="section-title">Writer → Object Storage → Readers</h2>
-        <p class="section-desc">
-          One writer flushes SSTs, many readers serve queries, and tailers stream changes.
-          Manifest fencing protects ownership during contention.
-        </p>
+      <section class="architecture-section" id="architecture">
+        <div class="shell">
+          <div class="section-head reveal">
+            <span class="section-label">Architecture</span>
+            <h2>One writer. Many readers. Independent compaction.</h2>
+            <p>
+              One writer commits updates to shared object storage. Any number of readers open the
+              same database. Maintenance runs independently on the compute you choose.
+            </p>
+          </div>
 
-        <div class="arch-visual">
-          <div class="arch-box arch-writer">
-            <h4>✎ Writer</h4>
-            <p>Memtable → SST → Upload</p>
+          <div class="architecture-flow reveal">
+            <article class="architecture-card">
+              <small>Write</small>
+              <div>
+                <h3>One writer</h3>
+                <p>Commits key-value updates.</p>
+              </div>
+            </article>
+            <div class="flow-arrow" aria-hidden="true">→</div>
+            <article class="architecture-card store">
+              <small>Store</small>
+              <div>
+                <h3>Your object store</h3>
+                <p>Holds durable shared database state.</p>
+              </div>
+            </article>
+            <div class="flow-arrow" aria-hidden="true">→</div>
+            <article class="architecture-card">
+              <small>Read</small>
+              <div>
+                <h3>Many readers</h3>
+                <p>Scale without moving the data.</p>
+              </div>
+            </article>
           </div>
-          <div class="arch-arrow">→</div>
-          <div class="arch-box arch-bucket">
-            <h4>☁ Bucket</h4>
-            <p>SSTs + blobs + manifest</p>
-          </div>
-          <div class="arch-arrow">→</div>
-          <div class="arch-box arch-readers">
-            <h4>🔎 Readers</h4>
-            <p>Get · Scan · Tail</p>
-          </div>
-        </div>
 
-        <div class="arch-details">
-          <div class="arch-detail">
-            <h5>Memtable</h5>
-            <p>Buffers writes to reduce object-store PUT overhead.</p>
-          </div>
-          <div class="arch-detail">
-            <h5>SST Files</h5>
-            <p>Immutable sorted files that support efficient reads.</p>
-          </div>
-          <div class="arch-detail">
-            <h5>Manifest Log</h5>
-            <p>Tracks applied state and replay ordering.</p>
-          </div>
-          <div class="arch-detail">
-            <h5>Local Cache</h5>
-            <p>Readers cache SST and blocks to avoid repeated downloads.</p>
+          <div class="maintenance-rail reveal">
+            <strong>Separate maintenance worker</strong>
+            <span>Runs compaction, optional change-history retention, and storage cleanup.</span>
+            <span class="mono">continuous or scheduled</span>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="code-section" id="code">
-      <div class="section-inner">
-        <span class="section-label">Code</span>
-        <h2 class="section-title">Core flow in a few tabs.</h2>
-        <p class="section-desc">Core usage patterns in a compact view.</p>
+      <section class="compaction-section" id="compaction">
+        <div class="shell compaction-grid">
+          <div class="split-copy reveal">
+            <span class="section-label">Compaction</span>
+            <h2>Run compaction on separate compute.</h2>
+            <p>
+              A typical embedded LSM engine compacts on the same machine that serves application
+              traffic. IsleDB lets a dedicated maintenance process perform that work through shared
+              object storage.
+            </p>
+            <div class="benefit-list">
+              <div class="benefit"><span>01</span><span>Keep application CPU and memory focused on serving traffic.</span></div>
+              <div class="benefit"><span>02</span><span>Scale maintenance resources independently from writers and readers.</span></div>
+              <div class="benefit"><span>03</span><span>Run continuously or schedule compaction for quieter periods.</span></div>
+            </div>
+            <div class="maintenance-code">
+              <pre><code>m, err := db.<span class="call">OpenMaintenance</span>(ctx,
+  isledb.<span class="call">DefaultMaintenanceOptions</span>(),
+)
+<span class="keyword">if</span> err != nil { <span class="keyword">return</span> err }
 
-        <div class="code-tabs" role="tablist" aria-label="Code examples">
-          <button
-            class="code-tab active"
-            id="tab-btn-connect"
-            role="tab"
-            aria-selected="true"
-            aria-controls="tab-connect"
-            tabindex="0"
-            data-tab="connect"
-            type="button"
-          >
-            Connect
-          </button>
-          <button
-            class="code-tab"
-            id="tab-btn-write"
-            role="tab"
-            aria-selected="false"
-            aria-controls="tab-write"
-            tabindex="-1"
-            data-tab="write"
-            type="button"
-          >
-            Write
-          </button>
-          <button
-            class="code-tab"
-            id="tab-btn-read"
-            role="tab"
-            aria-selected="false"
-            aria-controls="tab-read"
-            tabindex="-1"
-            data-tab="read"
-            type="button"
-          >
-            Read
-          </button>
-          <button
-            class="code-tab"
-            id="tab-btn-tail"
-            role="tab"
-            aria-selected="false"
-            aria-controls="tab-tail"
-            tabindex="-1"
-            data-tab="tail"
-            type="button"
-          >
-            Tail
-          </button>
-          <button
-            class="code-tab"
-            id="tab-btn-compact"
-            role="tab"
-            aria-selected="false"
-            aria-controls="tab-compact"
-            tabindex="-1"
-            data-tab="compact"
-            type="button"
-          >
-            Compact
-          </button>
-        </div>
+runErr := m.<span class="call">Run</span>(ctx)
 
-        <div class="code-panel active" id="tab-connect" role="tabpanel" aria-labelledby="tab-btn-connect">
-          <pre><code>ctx := context.<span class="fn">Background</span>()
-store, err := blobstore.<span class="fn">Open</span>(ctx, <span class="str">"s3://my-bucket?region=us-east-1"</span>, <span class="str">"db1"</span>)
-db, err := isledb.<span class="fn">OpenDB</span>(ctx, store, isledb.DBOptions{})
-<span class="kw">defer</span> db.<span class="fn">Close</span>()</code></pre>
-        </div>
+closeCtx, cancel := context.<span class="call">WithTimeout</span>(
+  context.<span class="call">Background</span>(), 30*time.Second,
+)
+<span class="keyword">defer</span> cancel()
+closeErr := m.<span class="call">Close</span>(closeCtx)
 
-        <div class="code-panel" id="tab-write" role="tabpanel" aria-labelledby="tab-btn-write" hidden>
-          <pre><code>writer, _ := db.<span class="fn">OpenWriter</span>(ctx, isledb.<span class="fn">DefaultWriterOptions</span>())
-<span class="kw">defer</span> writer.<span class="fn">Close</span>()
-writer.<span class="fn">Put</span>([]<span class="kw">byte</span>(<span class="str">"k"</span>), []<span class="kw">byte</span>(<span class="str">"v"</span>))
-writer.<span class="fn">PutWithTTL</span>([]<span class="kw">byte</span>(<span class="str">"session"</span>), data, 24*time.Hour)
-writer.<span class="fn">Flush</span>(ctx)</code></pre>
-        </div>
-
-        <div class="code-panel" id="tab-read" role="tabpanel" aria-labelledby="tab-btn-read" hidden>
-          <pre><code>reader, _ := isledb.<span class="fn">OpenReader</span>(ctx, store, isledb.ReaderOpenOptions{CacheDir: <span class="str">"./cache"</span>})
-<span class="kw">defer</span> reader.<span class="fn">Close</span>()
-value, ok, _ := reader.<span class="fn">Get</span>(ctx, []<span class="kw">byte</span>(<span class="str">"k"</span>))
-rows, _ := reader.<span class="fn">Scan</span>(ctx, []<span class="kw">byte</span>(<span class="str">"a"</span>), []<span class="kw">byte</span>(<span class="str">"z"</span>))</code></pre>
-        </div>
-
-        <div class="code-panel" id="tab-tail" role="tabpanel" aria-labelledby="tab-btn-tail" hidden>
-          <pre><code>tr, _ := isledb.<span class="fn">OpenTailingReader</span>(ctx, store, isledb.TailingReaderOpenOptions{})
-<span class="kw">defer</span> tr.<span class="fn">Close</span>()
-_ = tr.<span class="fn">Start</span>()
-_ = tr.<span class="fn">Tail</span>(ctx, isledb.TailOptions{}, <span class="kw">func</span>(kv isledb.KV) <span class="kw">error</span> {
-  <span class="kw">return</span> <span class="kw">nil</span>
-})</code></pre>
-        </div>
-
-        <div class="code-panel" id="tab-compact" role="tabpanel" aria-labelledby="tab-btn-compact" hidden>
-          <pre><code><span class="cm">// Merge compactor for KV workloads</span>
-mergeCompactor, _ := db.<span class="fn">OpenCompactor</span>(ctx, isledb.<span class="fn">DefaultCompactorOptions</span>())
-mergeCompactor.<span class="fn">Start</span>()
-
-<span class="cm">// FIFO compactor for event streams (keep recent data)</span>
-fifoCompactor, _ := db.<span class="fn">OpenRetentionCompactor</span>(ctx, isledb.RetentionCompactorOptions{
-  Mode:            isledb.CompactByAge,
-  RetentionPeriod: 7 * 24 * time.Hour,
-  RetentionCount:  10,
-})
-fifoCompactor.<span class="fn">Start</span>()</code></pre>
-        </div>
-      </div>
-    </section>
-
-    <section id="use-cases">
-      <div class="section-inner">
-        <span class="section-label">Use Cases</span>
-        <h2 class="section-title">One library, many workloads.</h2>
-        <p class="section-desc">
-          One storage-and-replay model powers event ingestion, state materialization, key-value APIs,
-          and object-storage-first data pipelines.
-        </p>
-
-        <div class="uc-grid">
-          <div class="uc-card">
-            <div class="emoji">📨</div>
-            <h3>Event Hub</h3>
-            <p>Ingest app events and fan out with tailing readers.</p>
-            <div class="replaces">Common alternative: managed brokers + sinks.</div>
+<span class="keyword">return</span> errors.<span class="call">Join</span>(runErr, closeErr)</code></pre>
+            </div>
           </div>
-          <div class="uc-card">
-            <div class="emoji">📚</div>
-            <h3>Event Store</h3>
-            <p>Append ordered events and build projections from replay.</p>
-            <div class="replaces">Common alternative: dedicated event databases.</div>
-          </div>
-          <div class="uc-card">
-            <div class="emoji">🔑</div>
-            <h3>KV API Backing Store</h3>
-            <p>Serve Get/Scan workloads with object-store durability.</p>
-            <div class="replaces">Common alternative: managed key-value services.</div>
-          </div>
-          <div class="uc-card">
-            <div class="emoji">📈</div>
-            <h3>CDC Pipeline Buffer</h3>
-            <p>Stage changes in object storage before indexing and analytics.</p>
-            <div class="replaces">Common alternative: Kafka-centric pipelines.</div>
-          </div>
-          <div class="uc-card">
-            <div class="emoji">🏗️</div>
-            <h3>Lakehouse Landing Zone</h3>
-            <p>Capture bronze data on object storage, then feed Iceberg/Delta/Hudi compaction and analytics pipelines.</p>
-            <div class="replaces">Common alternative: bespoke ingestion services ahead of lakehouse tables.</div>
+
+          <div class="comparison reveal">
+            <article class="comparison-card">
+              <small>Typical embedded LSM</small>
+              <h3>Application and compaction share a machine</h3>
+              <p>Reads, writes, and background compaction compete for the same local resources.</p>
+            </article>
+            <article class="comparison-card isledb">
+              <small>IsleDB</small>
+              <h3>Compaction gets its own process</h3>
+              <p>The maintenance worker can run elsewhere while application processes continue serving traffic.</p>
+            </article>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section id="fit">
-      <div class="section-inner">
-        <span class="section-label">Decision Guide</span>
-        <h2 class="section-title">When not to use IsleDB</h2>
-        <p class="section-desc">
-          Pick the right tool for the workload. IsleDB is strongest in object-storage-first, append-heavy systems.
-        </p>
+      <section class="api-section" id="api">
+        <div class="shell api-grid">
+          <div class="api-copy reveal">
+            <span class="section-label">Go API</span>
+            <h2>A small API with explicit boundaries.</h2>
+            <p>
+              Open a database for one bucket prefix. Flush writer updates when they should become
+              visible, refresh readers when immediate freshness matters, and run maintenance where
+              it fits your deployment.
+            </p>
+            <div class="api-types" role="list" aria-label="Core IsleDB API types">
+              <span class="api-type" role="listitem">DB</span>
+              <span class="api-type" role="listitem">Writer</span>
+              <span class="api-type" role="listitem">Reader</span>
+              <span class="api-type" role="listitem">Snapshot</span>
+              <span class="api-type" role="listitem">ChangeReader</span>
+              <span class="api-type" role="listitem">Maintenance</span>
+            </div>
+          </div>
 
-        <div class="fit-grid">
-          <article class="fit-card bad">
-            <h3>❌ Better choices elsewhere</h3>
-            <ul>
-              <li><strong>Sub-10ms latency SLAs</strong><br />→ Use low-latency serving data stores</li>
-              <li><strong>High-frequency point updates to same keys</strong><br />→ Use update-optimized transactional stores</li>
-              <li><strong>Complex queries / joins / transactions</strong><br />→ Use relational transactional databases</li>
-              <li><strong>Small hot datasets (&lt;1GB)</strong><br />→ Use in-memory stores</li>
-            </ul>
-          </article>
+          <div class="code-window reveal">
+            <div class="code-head">
+              <span class="code-dots"><span></span><span></span><span></span></span>
+              <span>main.go</span>
+            </div>
+            <pre><code><span class="comment">// Open a database in one object-store prefix.</span>
+db, err := isledb.<span class="call">Open</span>(ctx,
+  <span class="string">"s3://my-bucket?region=us-east-1"</span>,
+  isledb.DBOptions{Prefix: <span class="string">"prod/users"</span>},
+)
+<span class="keyword">if</span> err != nil { <span class="keyword">return</span> err }
+<span class="keyword">defer</span> db.<span class="call">Close</span>()
 
-          <article class="fit-card good">
-            <h3>✅ Strong fit for IsleDB</h3>
-            <ul>
-              <li>Append-heavy workloads (logs, events, CDC)</li>
-              <li>Large datasets where 1–10 second read latency is acceptable</li>
-              <li>Multi-reader / fan-out architectures</li>
-              <li>Cost-sensitive storage at scale</li>
-              <li>Serverless / ephemeral compute</li>
-            </ul>
-          </article>
+w, err := db.<span class="call">OpenWriter</span>(ctx,
+  isledb.<span class="call">DefaultWriterOptions</span>(),
+)
+<span class="keyword">if</span> err != nil { <span class="keyword">return</span> err }
+<span class="keyword">defer</span> w.<span class="call">Close</span>(ctx)
+
+<span class="keyword">if</span> err := w.<span class="call">Put</span>(ctx, []byte(<span class="string">"user:42"</span>), profile); err != nil {
+  <span class="keyword">return</span> err
+}
+<span class="keyword">if</span> err := w.<span class="call">Flush</span>(ctx); err != nil { <span class="keyword">return</span> err }
+
+r, err := db.<span class="call">OpenReader</span>(ctx,
+  isledb.<span class="call">DefaultReaderOpenOptions</span>(<span class="string">"./cache"</span>),
+)
+<span class="keyword">if</span> err != nil { <span class="keyword">return</span> err }
+<span class="keyword">defer</span> r.<span class="call">Close</span>()
+
+value, found, err := r.<span class="call">Get</span>(ctx, []byte(<span class="string">"user:42"</span>))</code></pre>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="quote-section">
-      <div class="section-inner">
-        <div class="quote-block">
-          <blockquote>
-            "An isle is self-contained, durable, and reachable from anywhere. That's the model for your data on IsleDB."
-          </blockquote>
-          <cite>IsleDB philosophy — Your data island on object storage.</cite>
+      <section id="change-feed">
+        <div class="shell feed-grid">
+          <div class="mode-grid reveal">
+            <article class="mode-card">
+              <div class="mode-title">
+                <h3>Keys only</h3>
+                <span>invalidation</span>
+              </div>
+              <p>Identify the changed key and operation without storing another copy of each PUT value.</p>
+            </article>
+            <article class="mode-card full">
+              <div class="mode-title">
+                <h3>Full values</h3>
+                <span>replayable CDC</span>
+              </div>
+              <p>Include committed PUT values when consumers need to reconstruct historical mutations.</p>
+            </article>
+          </div>
+
+          <div class="split-copy reveal">
+            <span class="section-label">Optional change feed</span>
+            <h2>Consume committed changes at your own pace.</h2>
+            <p>
+              Each consumer chooses a starting point, reads an ordered page with count and byte
+              limits, saves its position, and resumes later.
+            </p>
+            <div class="feed-points">
+              <div class="feed-point">Ordered puts and deletes</div>
+              <div class="feed-point">Bounded pages</div>
+              <div class="feed-point">Independent consumers</div>
+            </div>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="cta">
-      <h2>Start with a bucket. Build anything.</h2>
-      <p>
-        One <code>go get</code>, one bucket prefix, and a pragmatic API surface for write, read, replay, and stream.
-      </p>
-      <div class="hero-actions">
-        <a href="https://github.com/ankur-anand/isledb" class="btn-primary">View on GitHub</a>
-        <a href="https://github.com/ankur-anand/isledb/blob/main/api.md" class="btn-secondary"
-          >Read the API</a
-        >
-      </div>
-    </section>
+      <section class="storage-section" id="storage">
+        <div class="shell">
+          <div class="section-head reveal">
+            <span class="section-label">Object storage backends</span>
+            <h2>One Go key-value database across S3, GCS, and Azure Blob Storage.</h2>
+            <p>
+              Deploy on AWS, Google Cloud, Azure, private S3-compatible storage, or local files
+              without changing how your application writes, reads, scans, or consumes changes.
+            </p>
+          </div>
+
+          <div class="storage-grid">
+            <article class="storage-card reveal">
+              <small>AWS + compatible</small>
+              <h3>Key-value database on Amazon S3</h3>
+              <p>Keep the database under one S3 bucket prefix or use an S3-compatible service.</p>
+            </article>
+            <article class="storage-card reveal">
+              <small>Google Cloud</small>
+              <h3>Key-value database on GCS</h3>
+              <p>Use Google Cloud Storage for durable KV data shared by many readers.</p>
+            </article>
+            <article class="storage-card reveal">
+              <small>Microsoft Azure</small>
+              <h3>Key-value database on Azure Blob</h3>
+              <p>Store the database in an Azure Blob container with the same Go API.</p>
+            </article>
+            <article class="storage-card reveal">
+              <small>Private + local</small>
+              <h3>MinIO and file-backed storage</h3>
+              <p>Develop locally or use an S3-compatible private cloud with one data model.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="fit">
+        <div class="shell fit-grid">
+          <div class="section-head reveal">
+            <span class="section-label">Workload fit</span>
+            <h2>Choose object storage on purpose.</h2>
+            <p>
+              IsleDB favors large, durable, append-shaped workloads where shared storage and
+              independently scalable compute matter more than single-digit millisecond latency.
+            </p>
+          </div>
+
+          <div class="fit-cards reveal">
+            <article class="fit-card good">
+              <h3>Strong fit</h3>
+              <ul>
+                <li>Large retained key-value state</li>
+                <li>Append-heavy events, logs, and CDC</li>
+                <li>Many readers over one durable dataset</li>
+                <li>Ephemeral or independently scaled compute</li>
+                <li>Second-scale freshness</li>
+              </ul>
+            </article>
+            <article class="fit-card">
+              <h3>Choose something else</h3>
+              <ul>
+                <li>Sub-10ms read-after-write serving</li>
+                <li>High-contention transactional updates</li>
+                <li>Joins, secondary indexes, or SQL queries</li>
+                <li>Multi-key ACID transactions</li>
+                <li>Tiny hot datasets that fit in memory</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="faq-section" id="faq">
+        <div class="shell faq-grid">
+          <div class="section-head reveal">
+            <span class="section-label">Key-value database FAQ</span>
+            <h2>Common questions about KV databases on object storage.</h2>
+            <p>IsleDB is an embedded Go library that keeps durable database state in your bucket.</p>
+          </div>
+
+          <div class="faq-list">
+            <article class="faq-item reveal">
+              <h3>What is a key-value database on object storage?</h3>
+              <p>It retrieves values by key while using an object or blob store as the durable storage layer.</p>
+            </article>
+            <article class="faq-item reveal">
+              <h3>Is IsleDB a key-value database for Go or Golang applications?</h3>
+              <p>Yes. It runs inside Go applications and provides native writer, reader, change-feed, and maintenance APIs.</p>
+            </article>
+            <article class="faq-item reveal">
+              <h3>Can IsleDB run compaction in another process?</h3>
+              <p>Yes. A maintenance process can perform compaction on separate compute against the shared database.</p>
+            </article>
+            <article class="faq-item reveal">
+              <h3>Does IsleDB work with S3, GCS, and Azure Blob Storage?</h3>
+              <p>Yes. Choose the matching bucket URL and credentials while keeping the same database API.</p>
+            </article>
+            <article class="faq-item reveal">
+              <h3>When should I use a different database?</h3>
+              <p>Choose a transactional serving database for sub-10ms latency, joins, or multi-key transactions.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="cta-wrap">
+        <div class="shell">
+          <div class="cta-panel reveal">
+            <span class="section-label">Get started</span>
+            <h2>Build a Go key-value database on your object-store bucket.</h2>
+            <p>Write your first key, add readers when you need them, and run compaction wherever it fits.</p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="https://github.com/ankur-anand/isledb">
+                View on GitHub <span aria-hidden="true">↗</span>
+              </a>
+              <a class="button button-secondary" href="https://github.com/ankur-anand/isledb/blob/main/api.md">
+                API reference
+              </a>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
 
     <footer>
-      <div class="footer-inner">
-        <div class="footer-brand">
-          <img src="isledb.svg" alt="IsleDB logo" />
-          <p>An embedded key-value engine for object storage.</p>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="isledb-v2.svg" width="93" height="32" alt="IsleDB" />
+            </a>
+            <p>An embedded Go key-value database for S3, GCS, Azure Blob Storage, MinIO, and local buckets.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/README.md">Getting started</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/api.md">API reference</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/docs/object-store-schema.md">Storage schema</a>
+            <a href="#architecture">Architecture</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
         </div>
-        <div class="footer-col">
-          <h4>Product</h4>
-          <a href="#features">Features</a>
-          <a href="#architecture">Architecture</a>
-          <a href="#code">Code</a>
-          <a href="#use-cases">Use Cases</a>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
         </div>
-        <div class="footer-col">
-          <h4>Community</h4>
-          <a href="https://github.com/ankur-anand/isledb">GitHub</a>
-          <a href="https://github.com/ankur-anand/isledb/blob/main/README.md">Documentation</a>
-          <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>© <span id="footer-year"></span> IsleDB. Apache License.</span>
-        <span>Built by <a href="https://x.com/in_aanand" style="color: #bcd0e6">@in_aanand</a></span>
       </div>
     </footer>
 
     <script>
-      const footerYear = document.getElementById("footer-year");
-      if (footerYear) {
-        footerYear.textContent = String(new Date().getFullYear());
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
       }
 
-      const tabs = Array.from(document.querySelectorAll(".code-tab"));
-      const panels = Array.from(document.querySelectorAll(".code-panel"));
+      const copyButton = document.getElementById("copy-install");
+      if (copyButton) {
+        const state = copyButton.querySelector(".copy-state");
+        const initialState = state ? state.textContent : "";
 
-      function activateTab(tab) {
-        const target = tab.getAttribute("data-tab");
-        tabs.forEach((t) => {
-          const active = t === tab;
-          t.classList.toggle("active", active);
-          t.setAttribute("aria-selected", active ? "true" : "false");
-          t.setAttribute("tabindex", active ? "0" : "-1");
-        });
-
-        panels.forEach((panel) => {
-          const active = panel.id === `tab-${target}`;
-          panel.classList.toggle("active", active);
-          panel.hidden = !active;
-        });
-      }
-
-      tabs.forEach((tab) => {
-        tab.addEventListener("click", () => activateTab(tab));
-        tab.addEventListener("keydown", (event) => {
-          const currentIndex = tabs.indexOf(tab);
-          if (currentIndex === -1) {
-            return;
-          }
-
-          let nextIndex = currentIndex;
-          if (event.key === "ArrowRight") {
-            nextIndex = (currentIndex + 1) % tabs.length;
-          } else if (event.key === "ArrowLeft") {
-            nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
-          } else if (event.key === "Home") {
-            nextIndex = 0;
-          } else if (event.key === "End") {
-            nextIndex = tabs.length - 1;
-          } else {
-            return;
-          }
-
-          event.preventDefault();
-          tabs[nextIndex].focus();
-          activateTab(tabs[nextIndex]);
-        });
-      });
-
-      if (tabs.length > 0) {
-        const initialTab = tabs.find((tab) => tab.classList.contains("active")) || tabs[0];
-        activateTab(initialTab);
-      }
-
-      const copyInstallBtn = document.getElementById("copy-install-btn");
-      if (copyInstallBtn) {
-        const copyHint = copyInstallBtn.querySelector(".hint");
-        const defaultHint = copyHint ? copyHint.textContent : "";
-
-        copyInstallBtn.addEventListener("click", async () => {
-          const copyText = copyInstallBtn.getAttribute("data-copy") || "";
+        copyButton.addEventListener("click", async () => {
+          const value = copyButton.dataset.copy || "";
           let copied = false;
-
           try {
-            if (navigator.clipboard && window.isSecureContext) {
-              await navigator.clipboard.writeText(copyText);
-              copied = true;
-            } else {
-              const tempInput = document.createElement("textarea");
-              tempInput.value = copyText;
-              tempInput.setAttribute("readonly", "");
-              tempInput.style.position = "fixed";
-              tempInput.style.top = "-1000px";
-              tempInput.style.opacity = "0";
-              document.body.appendChild(tempInput);
-              tempInput.select();
-              copied = document.execCommand("copy");
-              document.body.removeChild(tempInput);
-            }
-          } catch (_err) {
-            copied = false;
+            await navigator.clipboard.writeText(value);
+            copied = true;
+          } catch (_error) {
+            const input = document.createElement("textarea");
+            input.value = value;
+            input.setAttribute("readonly", "");
+            input.style.position = "fixed";
+            input.style.opacity = "0";
+            document.body.appendChild(input);
+            input.select();
+            copied = document.execCommand("copy");
+            input.remove();
           }
 
-          if (copyHint) {
-            copyHint.textContent = copied ? "copied" : "copy failed";
+          if (state) {
+            state.textContent = copied ? "copied" : "failed";
             window.setTimeout(() => {
-              copyHint.textContent = defaultHint;
+              state.textContent = initialState;
             }, 1400);
           }
         });
+      }
+
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const revealItems = document.querySelectorAll(".reveal");
+      if (reduceMotion || !("IntersectionObserver" in window)) {
+        revealItems.forEach((item) => item.classList.add("visible"));
+      } else {
+        const observer = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (entry.isIntersecting) {
+                entry.target.classList.add("visible");
+                observer.unobserve(entry.target);
+              }
+            });
+          },
+          { threshold: 0.12 },
+        );
+        revealItems.forEach((item) => observer.observe(item));
       }
     </script>
   </body>
