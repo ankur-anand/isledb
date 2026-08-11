@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -49,16 +50,20 @@ type snapshotCleanerOptions struct {
 	OrphanAuditEvery time.Duration
 	SafetyMargin     time.Duration
 	Now              func() time.Time
+	Deleter          objectDeleter
 }
 
 type snapshotCleaner struct {
 	store       *blobstore.Store
 	manifestLog *manifest.Store
 	opts        snapshotCleanerOptions
+	delete      objectDeleter
 
-	mu        sync.Mutex
-	nextSweep time.Time
-	nextAudit time.Time
+	mu           sync.Mutex
+	nextSweep    time.Time
+	nextAudit    time.Time
+	snapshotIter *blobstore.ListIterator
+	markerIter   *blobstore.ListIterator
 }
 
 func defaultSnapshotCleanerOptions() snapshotCleanerOptions {
@@ -98,7 +103,11 @@ func newSnapshotCleaner(store *blobstore.Store, manifestLog *manifest.Store, opt
 	if opts.Now == nil {
 		opts.Now = defaults.Now
 	}
-	return &snapshotCleaner{store: store, manifestLog: manifestLog, opts: opts}
+	deleter := opts.Deleter
+	if deleter == nil {
+		deleter = store
+	}
+	return &snapshotCleaner{store: store, manifestLog: manifestLog, opts: opts, delete: deleter}
 }
 
 func (c *snapshotCleaner) runOnce(ctx context.Context) (stats ManifestSnapshotCleanupStats, err error) {
@@ -286,20 +295,41 @@ func (c *snapshotCleaner) discoverOrphans(ctx context.Context, now time.Time) (M
 		pinnedViewAge = current.PinnedViewAge()
 	}
 
-	err = c.store.Walk(ctx, blobstore.ListOptions{Prefix: manifestSnapshotObjectPrefix + "/"}, func(object blobstore.ObjectInfo) (bool, error) {
-		if object.IsDir {
-			return true, nil
+	c.mu.Lock()
+	if c.snapshotIter == nil {
+		c.snapshotIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: manifestSnapshotObjectPrefix + "/"})
+	}
+	iter := c.snapshotIter
+	c.mu.Unlock()
+
+	for stats.ObjectsScanned < c.opts.OrphanScanLimit {
+		object, err := iter.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			c.mu.Lock()
+			if c.snapshotIter == iter {
+				c.snapshotIter = nil
+			}
+			c.mu.Unlock()
+			return stats, nil
 		}
-		if stats.ObjectsScanned >= c.opts.OrphanScanLimit {
-			return false, nil
+		if err != nil {
+			c.mu.Lock()
+			if c.snapshotIter == iter {
+				c.snapshotIter = nil
+			}
+			c.mu.Unlock()
+			return stats, err
+		}
+		if object.IsDir {
+			continue
 		}
 		stats.ObjectsScanned++
 		if !validManifestSnapshotPath(c.store, object.Key) {
-			return true, nil
+			continue
 		}
 		if _, live := protected[object.Key]; live {
 			stats.Protected++
-			return true, nil
+			continue
 		}
 		ref := manifest.ObjectRef{Path: object.Key}
 		if object.Size > 0 {
@@ -310,20 +340,19 @@ func (c *snapshotCleaner) discoverOrphans(ctx context.Context, now time.Time) (M
 		// failed create plus marker read for every already-retired snapshot.
 		markerPath := snapshotRetirementMarkerPath(c.store, ref.Path)
 		if _, err := c.store.Attributes(ctx, markerPath); err == nil {
-			return true, nil
+			continue
 		} else if !errors.Is(err, blobstore.ErrNotFound) {
-			return false, err
+			return stats, err
 		}
 		marked, err := c.markWithExistingPolicy(ctx, ref, now, pinnedViewAge, "orphan_audit", false)
 		if err != nil {
-			return false, err
+			return stats, err
 		}
 		if marked {
 			stats.SnapshotsMarked++
 		}
-		return true, nil
-	})
-	return stats, err
+	}
+	return stats, nil
 }
 
 func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSnapshotCleanupStats, error) {
@@ -333,47 +362,67 @@ func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSna
 		return stats, err
 	}
 
-	err = c.store.Walk(ctx, blobstore.ListOptions{Prefix: snapshotRetirementMarkerPrefix + "/"}, func(object blobstore.ObjectInfo) (bool, error) {
-		if object.IsDir {
-			return true, nil
+	c.mu.Lock()
+	if c.markerIter == nil {
+		c.markerIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: snapshotRetirementMarkerPrefix + "/"})
+	}
+	iter := c.markerIter
+	c.mu.Unlock()
+
+	for stats.MarkersScanned < c.opts.MarkerScanLimit && stats.DeleteAttempts < c.opts.DeleteBatchSize {
+		object, err := iter.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			c.mu.Lock()
+			if c.markerIter == iter {
+				c.markerIter = nil
+			}
+			c.mu.Unlock()
+			return stats, nil
 		}
-		if stats.MarkersScanned >= c.opts.MarkerScanLimit || stats.DeleteAttempts >= c.opts.DeleteBatchSize {
-			return false, nil
+		if err != nil {
+			c.mu.Lock()
+			if c.markerIter == iter {
+				c.markerIter = nil
+			}
+			c.mu.Unlock()
+			return stats, err
+		}
+		if object.IsDir {
+			continue
 		}
 		stats.MarkersScanned++
 		mark, err := c.readMark(ctx, object.Key)
 		if err != nil {
 			stats.Failures++
-			return true, nil
+			continue
 		}
 		if _, live := protected[mark.Path]; live {
 			stats.Protected++
-			if err := c.store.Delete(ctx, object.Key); err != nil {
+			if err := c.delete.Delete(ctx, object.Key); err != nil {
 				stats.Failures++
-				return true, nil
+				continue
 			}
 			stats.MarkersCleared++
-			return true, nil
+			continue
 		}
 		if now.Before(mark.NotBefore) {
 			stats.Deferred++
-			return true, nil
+			continue
 		}
 
 		stats.DeleteAttempts++
-		if err := c.store.Delete(ctx, mark.Path); err != nil {
+		if err := c.delete.Delete(ctx, mark.Path); err != nil {
 			stats.Failures++
-			return true, nil
+			continue
 		}
-		if err := c.store.Delete(ctx, object.Key); err != nil {
+		if err := c.delete.Delete(ctx, object.Key); err != nil {
 			stats.Failures++
-			return true, nil
+			continue
 		}
 		stats.SnapshotsDeleted++
 		stats.MarkersCleared++
-		return true, nil
-	})
-	return stats, err
+	}
+	return stats, nil
 }
 
 func (c *snapshotCleaner) readMark(ctx context.Context, markerPath string) (snapshotRetirementMark, error) {

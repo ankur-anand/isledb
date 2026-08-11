@@ -1,10 +1,14 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 
@@ -13,39 +17,39 @@ import (
 )
 
 const (
-	pendingChangeBatchDeleteSetObject = "manifest/gc/pending-change-batch/pending.json"
-	defaultChangeFeedSweepBatchSize   = 128
-	defaultChangeFeedSweepGracePeriod = 10 * time.Minute
+	changeFeedDeletionPlanPrefix           = "manifest/gc/change-feed/ready"
+	changeFeedDeletionPlanVersion          = 1
+	changeFeedDeletionPlanKind             = "change_feed_retention"
+	defaultChangeFeedSweepBatchSize        = 128
+	defaultChangeFeedSweepGracePeriod      = 10 * time.Minute
+	defaultChangeFeedDeletionPlanScanLimit = 1024
+	maxChangeFeedDeletionPlanEncodedBytes  = 2 << 20
 )
 
-type pendingChangeBatchDeleteMark struct {
-	Version int `json:"version,omitempty"`
-
-	Path string `json:"path"`
-	ID   string `json:"id,omitempty"`
-	Seq  uint64 `json:"seq"`
-
+type changeBatchDeleteCandidate struct {
+	Path     string `json:"path"`
+	ID       string `json:"id"`
+	Seq      uint64 `json:"seq"`
 	Size     int64  `json:"size,omitempty"`
 	Checksum string `json:"checksum,omitempty"`
-
-	FirstSeenUnreferencedAt time.Time `json:"first_seen_unreferenced_at,omitempty"`
-	LastSeenUnreferencedAt  time.Time `json:"last_seen_unreferenced_at,omitempty"`
-	FirstReason             string    `json:"first_reason,omitempty"`
-	LastReason              string    `json:"last_reason,omitempty"`
-	DueAt                   time.Time `json:"due_at,omitempty"`
 }
 
-type pendingChangeBatchDeleteMarkSet struct {
-	Version int                            `json:"version,omitempty"`
-	Marks   []pendingChangeBatchDeleteMark `json:"marks,omitempty"`
-}
+// changeFeedDeletionPlan is the immutable handoff between logical feed-floor
+// publication and independently paced physical deletion.
+type changeFeedDeletionPlan struct {
+	Version  int    `json:"version"`
+	Kind     string `json:"kind"`
+	PlanID   string `json:"plan_id"`
+	Checksum string `json:"plan_checksum"`
 
-type changeBatchDeleteCandidate struct {
-	Path     string
-	ID       string
-	Seq      uint64
-	Size     int64
-	Checksum string
+	TargetFloor uint64        `json:"target_floor"`
+	CreatedAt   time.Time     `json:"created_at"`
+	GracePeriod time.Duration `json:"grace_period_nanos"`
+	NotBefore   time.Time     `json:"not_before"`
+
+	TargetCount int                          `json:"target_count"`
+	TargetBytes int64                        `json:"target_bytes"`
+	Targets     []changeBatchDeleteCandidate `json:"targets"`
 }
 
 type changeFeedSweepStats struct {
@@ -53,261 +57,315 @@ type changeFeedSweepStats struct {
 	Deleted         int
 	BlockedRetained int
 	Failed          int
+	PlansScanned    int
+	PlansDeleted    int
+	Deferred        int
 }
 
-func enqueuePendingChangeBatchDeleteMarks(ctx context.Context, store *blobstore.Store, candidates []changeBatchDeleteCandidate, reason string) error {
-	now := time.Now().UTC()
+func buildChangeFeedDeletionPlan(
+	store *blobstore.Store,
+	candidates []changeBatchDeleteCandidate,
+	targetFloor uint64,
+	createdAt time.Time,
+	gracePeriod time.Duration,
+) (*changeFeedDeletionPlan, []byte, error) {
 	candidates = uniqueChangeBatchDeleteCandidates(candidates)
-	if len(candidates) == 0 {
-		return nil
+	if len(candidates) == 0 || len(candidates) > maxReclaimObjectsPerPass {
+		return nil, nil, fmt.Errorf("invalid change-feed deletion target count=%d", len(candidates))
 	}
-
-	return withGCMarkCASRetries("store pending change-batch mark set", func() error {
-		set, matchToken, exists, err := loadPendingChangeBatchDeleteMarkSetWithCAS(ctx, store)
-		if err != nil {
-			return err
-		}
-
-		byPath := pendingChangeBatchMarkMapFromSet(set)
-		if !applyPendingChangeBatchDeleteMarkUpserts(byPath, candidates, reason, now) {
-			return nil
-		}
-		pendingChangeBatchMarkMapToSet(set, byPath)
-		return storePendingChangeBatchDeleteMarkSetWithCAS(ctx, store, set, matchToken, exists)
-	})
-}
-
-func runPendingChangeBatchSweeper(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, batchSize int, gracePeriod time.Duration) (changeFeedSweepStats, error) {
-	stats := changeFeedSweepStats{}
-	if batchSize <= 0 {
-		batchSize = defaultChangeFeedSweepBatchSize
+	if targetFloor == 0 || createdAt.IsZero() {
+		return nil, nil, errors.New("incomplete change-feed deletion plan timing")
 	}
 	if gracePeriod < 0 {
 		gracePeriod = 0
 	}
+	plan := &changeFeedDeletionPlan{
+		Version:     changeFeedDeletionPlanVersion,
+		Kind:        changeFeedDeletionPlanKind,
+		TargetFloor: targetFloor,
+		CreatedAt:   createdAt.UTC(),
+		GracePeriod: gracePeriod,
+		NotBefore:   createdAt.UTC().Add(gracePeriod),
+		TargetCount: len(candidates),
+		Targets:     candidates,
+	}
+	for _, target := range candidates {
+		if target.Size > 0 && plan.TargetBytes > int64(^uint64(0)>>1)-target.Size {
+			return nil, nil, errors.New("change-feed deletion target bytes overflow")
+		}
+		plan.TargetBytes += target.Size
+	}
+	plan.PlanID = changeFeedDeletionPlanID(*plan)
+	plan.Checksum = changeFeedDeletionPlanChecksum(*plan)
+	payload, err := encodeChangeFeedDeletionPlan(store, *plan)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plan, payload, nil
+}
 
+func encodeChangeFeedDeletionPlan(store *blobstore.Store, plan changeFeedDeletionPlan) ([]byte, error) {
+	if err := validateChangeFeedDeletionPlan(store, plan); err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxChangeFeedDeletionPlanEncodedBytes {
+		return nil, fmt.Errorf("change-feed deletion plan bytes=%d max=%d", len(payload), maxChangeFeedDeletionPlanEncodedBytes)
+	}
+	return payload, nil
+}
+
+func decodeChangeFeedDeletionPlan(store *blobstore.Store, planPath string, payload []byte) (changeFeedDeletionPlan, error) {
+	if len(payload) == 0 || len(payload) > maxChangeFeedDeletionPlanEncodedBytes {
+		return changeFeedDeletionPlan{}, fmt.Errorf("invalid change-feed deletion plan bytes=%d", len(payload))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var plan changeFeedDeletionPlan
+	if err := decoder.Decode(&plan); err != nil {
+		return changeFeedDeletionPlan{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return changeFeedDeletionPlan{}, errors.New("change-feed deletion plan has trailing JSON")
+		}
+		return changeFeedDeletionPlan{}, err
+	}
+	if err := validateChangeFeedDeletionPlan(store, plan); err != nil {
+		return changeFeedDeletionPlan{}, err
+	}
+	if planPath != changeFeedDeletionPlanPath(store, plan.PlanID) {
+		return changeFeedDeletionPlan{}, fmt.Errorf("change-feed deletion plan path mismatch %q", planPath)
+	}
+	return plan, nil
+}
+
+func validateChangeFeedDeletionPlan(store *blobstore.Store, plan changeFeedDeletionPlan) error {
+	if plan.Version != changeFeedDeletionPlanVersion || plan.Kind != changeFeedDeletionPlanKind {
+		return fmt.Errorf("unsupported change-feed deletion plan version=%d kind=%q", plan.Version, plan.Kind)
+	}
+	if plan.PlanID == "" || plan.PlanID != changeFeedDeletionPlanID(plan) {
+		return errors.New("change-feed deletion plan ID mismatch")
+	}
+	if plan.Checksum == "" || plan.Checksum != changeFeedDeletionPlanChecksum(plan) {
+		return errors.New("change-feed deletion plan checksum mismatch")
+	}
+	if plan.TargetFloor == 0 || plan.CreatedAt.IsZero() || plan.GracePeriod < 0 ||
+		!plan.NotBefore.Equal(plan.CreatedAt.Add(plan.GracePeriod)) {
+		return errors.New("invalid change-feed deletion plan timing")
+	}
+	if plan.TargetCount != len(plan.Targets) || plan.TargetCount <= 0 ||
+		plan.TargetCount > maxReclaimObjectsPerPass || plan.TargetBytes < 0 {
+		return fmt.Errorf("invalid change-feed deletion target count=%d", plan.TargetCount)
+	}
+	seenPaths := make(map[string]struct{}, len(plan.Targets))
+	seenIDs := make(map[string]struct{}, len(plan.Targets))
+	var targetBytes int64
+	var previousSeq uint64
+	for i, target := range plan.Targets {
+		if target.Path == "" || target.ID == "" || target.Size < 0 || target.Seq >= plan.TargetFloor {
+			return fmt.Errorf("invalid change-feed deletion target index=%d", i)
+		}
+		if store != nil && target.Path != store.ChangeBatchPath(target.ID) {
+			return fmt.Errorf("change-feed deletion target path mismatch id=%q path=%q", target.ID, target.Path)
+		}
+		if i > 0 && target.Seq <= previousSeq {
+			return errors.New("change-feed deletion targets are not sequence ordered")
+		}
+		previousSeq = target.Seq
+		if _, ok := seenPaths[target.Path]; ok {
+			return fmt.Errorf("duplicate change-feed target path=%q", target.Path)
+		}
+		if _, ok := seenIDs[target.ID]; ok {
+			return fmt.Errorf("duplicate change-feed target id=%q", target.ID)
+		}
+		seenPaths[target.Path] = struct{}{}
+		seenIDs[target.ID] = struct{}{}
+		if target.Size > 0 && targetBytes > int64(^uint64(0)>>1)-target.Size {
+			return errors.New("change-feed deletion target bytes overflow")
+		}
+		targetBytes += target.Size
+	}
+	if targetBytes != plan.TargetBytes {
+		return errors.New("change-feed deletion target byte accounting mismatch")
+	}
+	return nil
+}
+
+func changeFeedDeletionPlanID(plan changeFeedDeletionPlan) string {
+	identity := struct {
+		Version     int                          `json:"version"`
+		Kind        string                       `json:"kind"`
+		TargetFloor uint64                       `json:"target_floor"`
+		Targets     []changeBatchDeleteCandidate `json:"targets"`
+	}{plan.Version, plan.Kind, plan.TargetFloor, plan.Targets}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		panic(fmt.Sprintf("marshal change-feed deletion plan identity: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func changeFeedDeletionPlanChecksum(plan changeFeedDeletionPlan) string {
+	plan.Checksum = ""
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		panic(fmt.Sprintf("marshal change-feed deletion plan checksum: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func changeFeedDeletionPlanPath(store *blobstore.Store, planID string) string {
+	return storeKey(store, changeFeedDeletionPlanPrefix, planID+".json")
+}
+
+func storeChangeFeedDeletionPlan(
+	ctx context.Context,
+	store *blobstore.Store,
+	plan changeFeedDeletionPlan,
+	payload []byte,
+) (bool, error) {
+	path := changeFeedDeletionPlanPath(store, plan.PlanID)
+	decoded, err := decodeChangeFeedDeletionPlan(store, path, payload)
+	if err != nil {
+		return false, fmt.Errorf("validate change-feed deletion plan payload: %w", err)
+	}
+	if decoded.Checksum != plan.Checksum {
+		return false, errors.New("validate change-feed deletion plan payload: checksum mismatch")
+	}
+	if _, err := store.WriteIfNotExist(ctx, path, payload); err == nil {
+		return true, nil
+	} else if !errors.Is(err, blobstore.ErrPreconditionFailed) {
+		return false, err
+	}
+	existingPayload, _, err := store.Read(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	existing, err := decodeChangeFeedDeletionPlan(store, path, existingPayload)
+	if err != nil {
+		return false, err
+	}
+	if existing.PlanID != plan.PlanID || existing.TargetFloor != plan.TargetFloor || existing.TargetCount != plan.TargetCount {
+		return false, fmt.Errorf("change-feed deletion plan collision id=%q", plan.PlanID)
+	}
+	for i := range existing.Targets {
+		if existing.Targets[i] != plan.Targets[i] {
+			return false, fmt.Errorf("change-feed deletion target collision id=%q index=%d", plan.PlanID, i)
+		}
+	}
+	return false, nil
+}
+
+func runChangeFeedDeletionPlanReclaimer(
+	ctx context.Context,
+	store *blobstore.Store,
+	manifestLog *manifest.Store,
+	deleteBatchSize int,
+	scanLimit int,
+	now time.Time,
+	deleter objectDeleter,
+	iter *blobstore.ListIterator,
+	cache map[string]changeFeedDeletionPlan,
+) (changeFeedSweepStats, bool, error) {
+	stats := changeFeedSweepStats{}
+	if deleteBatchSize <= 0 {
+		deleteBatchSize = defaultChangeFeedSweepBatchSize
+	}
+	if scanLimit <= 0 {
+		scanLimit = defaultChangeFeedDeletionPlanScanLimit
+	}
+	if deleter == nil {
+		deleter = store
+	}
 	current, err := manifestLog.ReadCurrentData(ctx)
 	if err != nil {
-		return stats, err
+		return stats, false, err
 	}
 	var retainedFloor uint64
 	if current != nil {
 		retainedFloor = current.ChangeFeedLogStart
 	}
-
-	var lastErr error
-	for attempt := 0; attempt < gcCASMaxRetries; attempt++ {
-		stats = changeFeedSweepStats{}
-
-		set, matchToken, exists, err := loadPendingChangeBatchDeleteMarkSetWithCAS(ctx, store)
+	remaining := deleteBatchSize
+	var reclaimErr error
+	for stats.PlansScanned < scanLimit && remaining > 0 {
+		object, err := iter.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return stats, true, reclaimErr
+		}
 		if err != nil {
-			return stats, err
+			return stats, false, errors.Join(reclaimErr, err)
 		}
-		if len(set.Marks) == 0 {
-			return stats, nil
+		if object.IsDir {
+			continue
 		}
-
-		byPath := pendingChangeBatchMarkMapFromSet(set)
-		now := time.Now().UTC()
-		deletePaths, blocked := planPendingChangeBatchDeletes(byPath, retainedFloor, now, gracePeriod, batchSize)
-		stats.BlockedRetained = blocked
-		stats.Attempted = len(deletePaths)
-
-		deleted, failed, changed := applyChangeBatchDeleteBatch(ctx, store, byPath, deletePaths)
-		stats.Deleted = deleted
-		stats.Failed = failed
-		if !changed {
-			return stats, nil
-		}
-
-		pendingChangeBatchMarkMapToSet(set, byPath)
-		if err := storePendingChangeBatchDeleteMarkSetWithCAS(ctx, store, set, matchToken, exists); err != nil {
-			if isGCMarkCASConflict(err) {
-				lastErr = err
+		stats.PlansScanned++
+		plan, ok := cache[object.Key]
+		if !ok {
+			payload, _, err := store.Read(ctx, object.Key)
+			if err != nil {
+				stats.Failed++
+				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("read change-feed deletion plan %q: %w", object.Key, err))
 				continue
 			}
-			return stats, fmt.Errorf("store pending change-batch delete marks after sweep: %w", err)
+			plan, err = decodeChangeFeedDeletionPlan(store, object.Key, payload)
+			if err != nil {
+				stats.Failed++
+				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("decode change-feed deletion plan %q: %w", object.Key, err))
+				continue
+			}
+			if cache != nil {
+				cache[object.Key] = plan
+			}
 		}
-		return stats, nil
-	}
-
-	if lastErr != nil {
-		return stats, fmt.Errorf("store pending change-batch delete marks after retries: %w", lastErr)
-	}
-	return stats, fmt.Errorf("store pending change-batch delete marks exceeded retries")
-}
-
-func planPendingChangeBatchDeletes(byPath map[string]pendingChangeBatchDeleteMark, retainedFloor uint64, now time.Time, gracePeriod time.Duration, batchSize int) ([]string, int) {
-	paths := sortedPendingChangeBatchPaths(byPath, now, gracePeriod)
-	deletePaths := make([]string, 0, batchSize)
-	blockedRetained := 0
-	for _, p := range paths {
-		if len(deletePaths) >= batchSize {
-			break
-		}
-		mark, ok := byPath[p]
-		if !ok {
+		if retainedFloor < plan.TargetFloor {
+			stats.BlockedRetained += len(plan.Targets)
 			continue
 		}
-		if mark.Path == "" {
-			delete(byPath, p)
+		if now.Before(plan.NotBefore) {
+			stats.Deferred += len(plan.Targets)
 			continue
 		}
-		if mark.Seq >= retainedFloor {
-			blockedRetained++
+		if len(plan.Targets) > remaining && stats.Attempted > 0 {
+			stats.Deferred += len(plan.Targets)
 			continue
 		}
-		if now.Before(pendingChangeBatchDueAt(mark, now, gracePeriod)) {
-			break
+		keys := make([]string, len(plan.Targets))
+		for i := range plan.Targets {
+			keys[i] = plan.Targets[i].Path
 		}
-		deletePaths = append(deletePaths, p)
-	}
-	return deletePaths, blockedRetained
-}
-
-func applyChangeBatchDeleteBatch(ctx context.Context, store *blobstore.Store, byPath map[string]pendingChangeBatchDeleteMark, deletePaths []string) (deleted, failed int, changed bool) {
-	if len(deletePaths) == 0 {
-		return 0, 0, false
-	}
-
-	failedByKey := map[string]error{}
-	if err := store.BatchDelete(ctx, deletePaths); err != nil {
-		var batchErr *blobstore.BatchDeleteError
-		if errors.As(err, &batchErr) {
-			failedByKey = batchErr.Failed
+		stats.Attempted += len(keys)
+		if len(keys) >= remaining {
+			remaining = 0
 		} else {
-			for _, key := range deletePaths {
-				failedByKey[key] = err
+			remaining -= len(keys)
+		}
+		if err := deleter.BatchDelete(ctx, keys); err != nil {
+			failed := len(keys)
+			var batchErr *blobstore.BatchDeleteError
+			if errors.As(err, &batchErr) {
+				failed = len(batchErr.Failed)
+				stats.Deleted += len(keys) - failed
 			}
-		}
-	}
-
-	for _, p := range deletePaths {
-		if _, hadFailure := failedByKey[p]; hadFailure {
-			failed++
+			stats.Failed += failed
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete change-feed plan %q targets: %w", plan.PlanID, err))
 			continue
 		}
-		delete(byPath, p)
-		deleted++
-		changed = true
-	}
-	return deleted, failed, changed
-}
-
-func loadPendingChangeBatchDeleteMarks(ctx context.Context, store *blobstore.Store) ([]pendingChangeBatchDeleteMark, error) {
-	set, err := loadPendingChangeBatchDeleteMarkSet(ctx, store)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]pendingChangeBatchDeleteMark, len(set.Marks))
-	copy(out, set.Marks)
-	return out, nil
-}
-
-func loadPendingChangeBatchDeleteMarkSet(ctx context.Context, store *blobstore.Store) (*pendingChangeBatchDeleteMarkSet, error) {
-	set, _, _, err := loadPendingChangeBatchDeleteMarkSetWithCAS(ctx, store)
-	return set, err
-}
-
-func loadPendingChangeBatchDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store) (*pendingChangeBatchDeleteMarkSet, string, bool, error) {
-	data, matchToken, exists, err := readObjectWithCAS(ctx, store, pendingChangeBatchDeleteSetPath(store))
-	if err != nil {
-		return nil, "", false, err
-	}
-	if !exists {
-		return &pendingChangeBatchDeleteMarkSet{Version: gcMarkSchemaVersion}, "", false, nil
-	}
-
-	var set pendingChangeBatchDeleteMarkSet
-	if err := json.Unmarshal(data, &set); err != nil {
-		return nil, "", false, err
-	}
-	if set.Version == 0 {
-		set.Version = gcMarkSchemaVersion
-	}
-	return &set, matchToken, true, nil
-}
-
-func storePendingChangeBatchDeleteMarkSetWithCAS(ctx context.Context, store *blobstore.Store, set *pendingChangeBatchDeleteMarkSet, matchToken string, exists bool) error {
-	if set == nil {
-		return errors.New("nil pending change-batch delete mark set")
-	}
-	set.Version = gcMarkSchemaVersion
-	payload, err := json.Marshal(set)
-	if err != nil {
-		return err
-	}
-	return writeObjectCAS(ctx, store, pendingChangeBatchDeleteSetPath(store), payload, matchToken, exists)
-}
-
-func pendingChangeBatchDeleteSetPath(store *blobstore.Store) string {
-	return storeKey(store, pendingChangeBatchDeleteSetObject)
-}
-
-func pendingChangeBatchMarkMapFromSet(set *pendingChangeBatchDeleteMarkSet) map[string]pendingChangeBatchDeleteMark {
-	byPath := make(map[string]pendingChangeBatchDeleteMark)
-	if set == nil {
-		return byPath
-	}
-	for _, mark := range set.Marks {
-		if mark.Path == "" {
+		stats.Deleted += len(keys)
+		if err := deleter.Delete(ctx, object.Key); err != nil {
+			stats.Failed++
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete completed change-feed plan %q: %w", plan.PlanID, err))
 			continue
 		}
-		byPath[mark.Path] = mark
+		delete(cache, object.Key)
+		stats.PlansDeleted++
 	}
-	return byPath
-}
-
-func pendingChangeBatchMarkMapToSet(set *pendingChangeBatchDeleteMarkSet, byPath map[string]pendingChangeBatchDeleteMark) {
-	set.Marks = set.Marks[:0]
-	for _, path := range sortedChangeBatchPaths(byPath) {
-		mark := byPath[path]
-		mark.Version = gcMarkSchemaVersion
-		set.Marks = append(set.Marks, mark)
-	}
-}
-
-func applyPendingChangeBatchDeleteMarkUpserts(byPath map[string]pendingChangeBatchDeleteMark, candidates []changeBatchDeleteCandidate, reason string, now time.Time) bool {
-	changed := false
-	for _, candidate := range candidates {
-		if candidate.Path == "" {
-			continue
-		}
-		mark, exists := byPath[candidate.Path]
-		if !exists {
-			mark = pendingChangeBatchDeleteMark{
-				Version:                 gcMarkSchemaVersion,
-				Path:                    candidate.Path,
-				ID:                      candidate.ID,
-				Seq:                     candidate.Seq,
-				Size:                    candidate.Size,
-				Checksum:                candidate.Checksum,
-				FirstSeenUnreferencedAt: now,
-				FirstReason:             reason,
-			}
-			changed = true
-		}
-		if candidate.Seq > mark.Seq {
-			mark.Seq = candidate.Seq
-			changed = true
-		}
-		if mark.ID == "" && candidate.ID != "" {
-			mark.ID = candidate.ID
-			changed = true
-		}
-		if mark.Size == 0 && candidate.Size != 0 {
-			mark.Size = candidate.Size
-			changed = true
-		}
-		if mark.Checksum == "" && candidate.Checksum != "" {
-			mark.Checksum = candidate.Checksum
-			changed = true
-		}
-		mark.LastSeenUnreferencedAt = now
-		mark.LastReason = reason
-		byPath[candidate.Path] = mark
-	}
-	return changed
+	return stats, false, reclaimErr
 }
 
 func uniqueChangeBatchDeleteCandidates(candidates []changeBatchDeleteCandidate) []changeBatchDeleteCandidate {
@@ -325,56 +383,14 @@ func uniqueChangeBatchDeleteCandidates(candidates []changeBatchDeleteCandidate) 
 		byPath[candidate.Path] = candidate
 	}
 	out := make([]changeBatchDeleteCandidate, 0, len(byPath))
-	for _, path := range sortedChangeBatchCandidates(byPath) {
-		out = append(out, byPath[path])
+	for _, candidate := range byPath {
+		out = append(out, candidate)
 	}
-	return out
-}
-
-func sortedPendingChangeBatchPaths(byPath map[string]pendingChangeBatchDeleteMark, now time.Time, gracePeriod time.Duration) []string {
-	paths := sortedChangeBatchPaths(byPath)
-	sort.Slice(paths, func(i, j int) bool {
-		li := pendingChangeBatchDueAt(byPath[paths[i]], now, gracePeriod)
-		lj := pendingChangeBatchDueAt(byPath[paths[j]], now, gracePeriod)
-		if li.Equal(lj) {
-			return paths[i] < paths[j]
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Seq == out[j].Seq {
+			return out[i].Path < out[j].Path
 		}
-		return li.Before(lj)
+		return out[i].Seq < out[j].Seq
 	})
-	return paths
-}
-
-func sortedChangeBatchPaths(byPath map[string]pendingChangeBatchDeleteMark) []string {
-	paths := make([]string, 0, len(byPath))
-	for p := range byPath {
-		if p != "" {
-			paths = append(paths, p)
-		}
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func sortedChangeBatchCandidates(byPath map[string]changeBatchDeleteCandidate) []string {
-	paths := make([]string, 0, len(byPath))
-	for p := range byPath {
-		if p != "" {
-			paths = append(paths, p)
-		}
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func pendingChangeBatchDueAt(mark pendingChangeBatchDeleteMark, now time.Time, gracePeriod time.Duration) time.Time {
-	if !mark.DueAt.IsZero() {
-		return mark.DueAt
-	}
-	if !mark.FirstSeenUnreferencedAt.IsZero() {
-		return mark.FirstSeenUnreferencedAt.Add(gracePeriod)
-	}
-	if !mark.LastSeenUnreferencedAt.IsZero() {
-		return mark.LastSeenUnreferencedAt.Add(gracePeriod)
-	}
-	return now
+	return out
 }

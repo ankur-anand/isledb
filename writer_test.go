@@ -1076,8 +1076,8 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	}
 	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
 		ID:              "same-process-wake",
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}); err != nil {
 		t.Fatalf("stageCommand: %v", err)
 	}
@@ -1097,6 +1097,77 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.CommandID != "same-process-wake" {
 		t.Fatalf("maintenance receipt=%+v, want same-process-wake", current.MaintenanceReceipt)
 	}
+}
+
+func TestWriterMaintenanceWakeDoesNotPublishBufferedMutations(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-wake-visibility")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	writerOpts := DefaultWriterOptions()
+	writerOpts.Flush.Interval = time.Hour // starts the worker; ticker will not fire during the test
+	writerOpts.Maintenance.PollInterval = time.Hour
+	w, err := db.OpenWriter(ctx, writerOpts)
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer w.Close(ctx)
+	reader, err := db.OpenReader(ctx, DefaultReaderOpenOptions(t.TempDir()))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer reader.Close()
+
+	if err := w.Put(ctx, []byte("buffered"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
+		ID:              "maintenance-only-wake",
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}); err != nil {
+		t.Fatalf("stageCommand: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, err := db.manifestStore.ReadCurrentData(ctx)
+		if err != nil {
+			t.Fatalf("ReadCurrentData: %v", err)
+		}
+		if current.MaintenanceReceipt != nil && current.MaintenanceReceipt.CommandID == "maintenance-only-wake" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background worker did not apply maintenance wake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := replayManifestForTest(t, ctx, store).L0SSTCount(); got != 0 {
+		t.Fatalf("maintenance wake published buffered mutations: L0=%d", got)
+	}
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh before explicit flush: %v", err)
+	}
+	assertReaderValue(t, ctx, reader, "buffered", "", false)
+
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("explicit Flush: %v", err)
+	}
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh after explicit flush: %v", err)
+	}
+	assertReaderValue(t, ctx, reader, "buffered", "value", true)
 }
 
 func TestSSTOutputOptionsNormalizeCompression(t *testing.T) {
@@ -1309,9 +1380,9 @@ func TestWriterFlushAppliesPendingMaintenanceWithoutUserData(t *testing.T) {
 		t.Fatalf("ClaimMaintenance: %v", err)
 	}
 	staged, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
-		ID:              "retirement-floor-1",
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		ID:              "change-feed-floor-1",
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}, token)
 	if err != nil {
 		t.Fatalf("StageMaintenance: %v", err)
@@ -1324,8 +1395,8 @@ func TestWriterFlushAppliesPendingMaintenanceWithoutUserData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadCurrentData: %v", err)
 	}
-	if current.RetirementLogStart != 1 {
-		t.Fatalf("retirement_log_start=%d, want 1", current.RetirementLogStart)
+	if current.ChangeFeedLogStart != 1 {
+		t.Fatalf("change_feed_log_start=%d, want 1", current.ChangeFeedLogStart)
 	}
 	if current.MaintenanceReceipt == nil ||
 		current.MaintenanceReceipt.CommandID != staged.Pending.ID ||
@@ -1399,8 +1470,8 @@ func TestWriterBackgroundFlushPollsMaintenanceWhenIdle(t *testing.T) {
 	}
 	staged, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
 		ID:              "idle-floor",
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}, token)
 	if err != nil {
 		t.Fatalf("StageMaintenance: %v", err)

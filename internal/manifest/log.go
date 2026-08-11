@@ -22,18 +22,16 @@ const MaxRetiredObjectsPerEntry = 128
 type RetiredObjectKind string
 
 const (
-	RetiredObjectSST         RetiredObjectKind = "sst"
-	RetiredObjectChangeBatch RetiredObjectKind = "change_batch"
+	RetiredObjectSST RetiredObjectKind = "sst"
 )
 
 // RetiredObject records one immutable object made unreachable by this
 // manifest commit. Key is the exact backend object key used for deletion.
 type RetiredObject struct {
-	Kind      RetiredObjectKind `json:"kind"`
-	ID        string            `json:"id"`
-	Key       string            `json:"key"`
-	Size      int64             `json:"size,omitempty"`
-	NotBefore time.Time         `json:"not_before"`
+	Kind RetiredObjectKind `json:"kind"`
+	ID   string            `json:"id"`
+	Key  string            `json:"key"`
+	Size int64             `json:"size,omitempty"`
 }
 
 type ManifestLogEntry struct {

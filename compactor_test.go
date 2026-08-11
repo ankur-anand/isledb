@@ -41,7 +41,6 @@ func runCompactorUntilIdle(ctx context.Context, c *compactor) error {
 			return err
 		}
 		if selected == nil {
-			c.runSSTSweeperBestEffort(ctx)
 			return nil
 		}
 		units := selected.workUnits
@@ -1267,7 +1266,7 @@ func TestCompactorCommitsRetirementRecords(t *testing.T) {
 		if !found {
 			t.Fatalf("missing retirement record for %s", sst.ID)
 		}
-		if object.Key != store.SSTPath(sst.ID) || object.NotBefore.IsZero() {
+		if object.Key != store.SSTPath(sst.ID) {
 			t.Fatalf("invalid retirement record for %s: %+v", sst.ID, object)
 		}
 	}

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -49,11 +48,10 @@ type compactionOutput struct {
 
 // compactor moves and rewrites SSTs through non-overlapping levels.
 type compactor struct {
-	store         *blobstore.Store
-	manifestLog   *manifest.Store
-	gcCursorStore manifest.GCCursorStorage
-	opts          compactorOptions
-	stageCommand  maintenanceCommandStager
+	store        *blobstore.Store
+	manifestLog  *manifest.Store
+	opts         compactorOptions
+	stageCommand maintenanceCommandStager
 
 	mu       sync.Mutex
 	manifest *manifestState
@@ -76,7 +74,7 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	opts = normalizeCompactorOptions(opts, store)
+	opts = normalizeCompactorOptions(opts)
 
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
@@ -84,12 +82,11 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 	}
 
 	c := &compactor{
-		store:         store,
-		manifestLog:   manifestLog,
-		gcCursorStore: opts.GCCursorStorage,
-		opts:          opts,
-		manifest:      m,
-		runGate:       make(chan struct{}, 1),
+		store:       store,
+		manifestLog: manifestLog,
+		opts:        opts,
+		manifest:    m,
+		runGate:     make(chan struct{}, 1),
 	}
 
 	if fence == nil {
@@ -109,7 +106,7 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 	return c, nil
 }
 
-func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) compactorOptions {
+func normalizeCompactorOptions(opts compactorOptions) compactorOptions {
 	d := defaultCompactorOptions()
 	if opts.InputReadParallelism <= 0 {
 		opts.InputReadParallelism = d.InputReadParallelism
@@ -138,12 +135,6 @@ func normalizeCompactorOptions(opts compactorOptions, store *blobstore.Store) co
 	opts.Output.Compression = cmp.Or(opts.Output.Compression, d.Output.Compression)
 	if opts.Output.TargetSSTBytes <= 0 {
 		opts.Output.TargetSSTBytes = d.Output.TargetSSTBytes
-	}
-	if opts.GCCursorStorage == nil {
-		opts.GCCursorStorage = newGCCursorStorage(store)
-	}
-	if opts.GCDeleteBatchSize <= 0 {
-		opts.GCDeleteBatchSize = d.GCDeleteBatchSize
 	}
 	return opts
 }
@@ -261,20 +252,6 @@ func (c *compactor) releaseRun() {
 	select {
 	case <-c.runGate:
 	default:
-	}
-}
-
-func (c *compactor) runSSTSweeperBestEffort(ctx context.Context) {
-	if c.stageCommand == nil {
-		if err := c.manifestLog.CheckCompactorFence(ctx); err != nil {
-			return
-		}
-	}
-	if _, err := runRetirementSweeperWithStager(ctx, c.store, c.manifestLog, c.gcCursorStore, c.fenceToken, c.opts.GCDeleteBatchSize, c.stageCommand); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		slog.Warn("isledb: compactor sst sweep failed", "error", err)
 	}
 }
 

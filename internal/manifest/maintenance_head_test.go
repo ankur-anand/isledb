@@ -96,8 +96,8 @@ func TestMaintenanceClaimPreservesPendingAndFencesOldOwner(t *testing.T) {
 	}
 	staged, err := manifestStore.StageMaintenance(ctx, MaintenanceCommand{
 		ID:              "floor-1",
-		Kind:            MaintenanceCommandRetirementFloor,
-		RetirementFloor: &AdvanceFloorCommand{Floor: 42},
+		Kind:            MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &AdvanceFloorCommand{Floor: 42},
 	}, first)
 	if err != nil {
 		t.Fatalf("StageMaintenance: %v", err)
@@ -130,7 +130,7 @@ func TestMaintenanceCommandRejectsMultiplePayloads(t *testing.T) {
 		Kind:            MaintenanceCommandCheckpoint,
 		CreatedAt:       time.Now().UTC(),
 		Checkpoint:      &CheckpointCommand{Snapshot: testObjectRef("snapshot")},
-		RetirementFloor: &AdvanceFloorCommand{Floor: 1},
+		ChangeFeedFloor: &AdvanceFloorCommand{Floor: 1},
 	}
 	if err := command.Validate(); !errors.Is(err, ErrInvalidMaintenanceCommand) {
 		t.Fatalf("Validate error=%v, want %v", err, ErrInvalidMaintenanceCommand)
@@ -204,8 +204,8 @@ func TestWriterAppliesPendingCompactionAndReceiptAtomically(t *testing.T) {
 				AddSSTables:      []SSTMeta{{ID: "c", Level: 1}},
 			},
 			RetiredObjects: []RetiredObject{
-				{Kind: RetiredObjectSST, ID: "a", Key: "sstable/a", NotBefore: time.Now().UTC().Add(time.Hour)},
-				{Kind: RetiredObjectSST, ID: "b", Key: "sstable/b", NotBefore: time.Now().UTC().Add(time.Hour)},
+				{Kind: RetiredObjectSST, ID: "a", Key: "sstable/a"},
+				{Kind: RetiredObjectSST, ID: "b", Key: "sstable/b"},
 			},
 		},
 	}, token)

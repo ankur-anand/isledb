@@ -168,7 +168,6 @@ type DB struct {
 	store           *blobstore.Store
 	closeStore      bool
 	manifestStore   *manifest.Store
-	gcCursorStorage manifest.GCCursorStorage
 	maintenanceWake chan struct{}
 	storePolicy     StorePolicy
 	sstOutput       SSTOutputOptions
@@ -217,7 +216,6 @@ var ErrStorePolicyMismatch = manifest.ErrStorePolicyMismatch
 
 type dbOpenOptions struct {
 	manifestStorage   manifest.Storage
-	gcCursorStorage   manifest.GCCursorStorage
 	changeFeedPayload manifest.ChangeFeedPayload
 	storePolicy       StorePolicy
 	sstOutput         SSTOutputOptions
@@ -233,11 +231,6 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		return nil, err
 	}
 	manifestStore := newManifestStore(store, opts.manifestStorage)
-	gcCursorStorage := opts.gcCursorStorage
-	if gcCursorStorage == nil {
-		gcCursorStorage = newGCCursorStorage(store)
-	}
-
 	if _, err := manifestStore.Replay(ctx); err != nil {
 		return nil, err
 	}
@@ -249,7 +242,6 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 	return &DB{
 		store:           store,
 		manifestStore:   manifestStore,
-		gcCursorStorage: gcCursorStorage,
 		maintenanceWake: make(chan struct{}, 1),
 		storePolicy:     storePolicy,
 		sstOutput:       sstOutput,
@@ -407,7 +399,6 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		ctx,
 		db.store,
 		db.manifestStore,
-		db.gcCursorStorage,
 		opts,
 		db.sstOutput.Compacted,
 	)

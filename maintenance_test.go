@@ -115,7 +115,7 @@ func TestMaintenanceRecordsPublicChangeFeedCleanupStats(t *testing.T) {
 	}
 	want := ChangeFeedCleanupStats{
 		EntriesRetired:  7,
-		BatchesMarked:   6,
+		BatchesPlanned:  6,
 		BatchesDeleted:  5,
 		BlockedRetained: 4,
 		FailedDeletes:   3,
@@ -493,8 +493,8 @@ func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
 	}
 	defer maintenance.Close(ctx)
 	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}); err != nil {
 		t.Fatalf("stageCommand: %v", err)
 	}
@@ -558,8 +558,8 @@ func TestNewMaintenanceOwnerClearsReceiptAfterPreviousOwnerStops(t *testing.T) {
 		t.Fatalf("OpenMaintenance(first): %v", err)
 	}
 	if err := first.stageCommand(ctx, manifest.MaintenanceCommand{
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}); err != nil {
 		t.Fatalf("stageCommand: %v", err)
 	}

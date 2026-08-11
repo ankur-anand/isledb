@@ -16,9 +16,14 @@ demo/p000/
       l01/
         <page-id>.page.zst
     gc/
-      pending-sst/
-        pending.json
-      checkpoint.json
+      sst/ready/
+        <plan-id>.json
+      change-feed/ready/
+        <plan-id>.json
+      snapshots/
+        <snapshot-path-hash>.json
+      pages/
+        <page-path-hash>.json
   maintenance/
     HEAD
   sstable/
@@ -31,7 +36,7 @@ demo/p000/
 
 ## Serialization Notes
 
-- `manifest/CURRENT`, `maintenance/HEAD`, and `manifest/gc/*.json` are UTF-8 JSON.
+- `manifest/CURRENT`, `maintenance/HEAD`, and objects below `manifest/gc/` are UTF-8 JSON.
 - `manifest/snapshots/*.manifest.zst` and `manifest/pages/**/*.page.zst` use the
   versioned `ISLM` binary envelope. Their payload is UTF-8 JSON compressed with
   zstd. References carry the exact encoded size and SHA-256 of the complete
@@ -80,10 +85,18 @@ This is a representative JSON-style view of the object families under one prefix
         }
       },
       "gc": {
-        "pending-sst": {
-          "pending.json": "{...json...}"
+        "sst": { "ready": {
+          "<plan-id>.json": "{...json...}"
+        }},
+        "change-feed": { "ready": {
+          "<plan-id>.json": "{...json...}"
+        }},
+        "snapshots": {
+          "<snapshot-path-hash>.json": "{...json...}"
         },
-        "checkpoint.json": "{...json...}"
+        "pages": {
+          "<page-path-hash>.json": "{...json...}"
+        }
       }
     },
     "maintenance": {
@@ -404,14 +417,15 @@ Common `ManifestLogEntry` header fields:
 }
 ```
 
-## `manifest/gc/pending-sst/pending.json`
+## `manifest/gc/sst/ready/<plan-id>.json`
 
-Pending-delete mark set for SST cleanup.
+Immutable, bounded deletion plan for SSTs already retired by committed
+manifest entries.
 
 Path:
 
 ```text
-demo/p000/manifest/gc/pending-sst/pending.json
+demo/p000/manifest/gc/sst/ready/9db6....json
 ```
 
 Example:
@@ -419,43 +433,53 @@ Example:
 ```json
 {
   "version": 1,
-  "marks": [
+  "kind": "sst_retirement",
+  "plan_id": "9db6...",
+  "checksum": "sha256:abc",
+  "source": {
+    "command_id": "compact-414",
+    "epoch": 8,
+    "generation": 41
+  },
+  "applied_at": "2026-04-15T10:14:11Z",
+  "observed_at": "2026-04-15T10:14:12Z",
+  "pinned_view_age_nanos": 3600000000000,
+  "safety_margin_nanos": 60000000000,
+  "not_before": "2026-04-15T11:15:12Z",
+  "target_count": 1,
+  "target_bytes": 67108864,
+  "targets": [
     {
-      "version": 1,
-      "sst_id": "sst-old-001",
-      "first_seen_unreferenced_at": "2026-04-15T09:40:00Z",
-      "last_seen_unreferenced_at": "2026-04-15T09:40:00Z",
-      "first_seen_seq": 414,
-      "last_seen_seq": 414,
-      "first_reason": "retention_fifo",
-      "last_reason": "retention_fifo",
-      "has_blob_refs": false,
-      "due_at": "2026-04-15T09:50:00Z"
+      "id": "sst-old-001",
+      "key": "demo/p000/sstable/a3/sst-old-001",
+      "size": 67108864
     }
   ]
 }
 ```
 
-## `manifest/gc/checkpoint.json`
+## `manifest/gc/change-feed/ready/<plan-id>.json`
 
-Replay checkpoint for GC mark catch-up.
+Immutable checksummed plan containing a bounded, sequence-ordered list of exact
+change-batch targets, the proposed feed floor, byte accounting, and a grace
+deadline. It is written before the floor command is staged. Physical deletion
+reloads `CURRENT` and requires `change_feed_log_start` to reach the complete
+target floor. The plan is deleted only after every target delete succeeds.
 
-Path:
+## `manifest/gc/snapshots/<snapshot-path-hash>.json`
 
-```text
-demo/p000/manifest/gc/checkpoint.json
-```
+Per-snapshot retirement marker. It records the exact snapshot path and object
+identity, retirement reason, and an absolute `not_before` deadline derived
+from the persisted pinned-view policy. The manifest reclaimer reloads CURRENT
+and the pending checkpoint before deleting the snapshot and then its marker.
 
-Example:
+## `manifest/gc/pages/<page-path-hash>.json`
 
-```json
-{
-  "version": 1,
-  "last_applied_seq": 428,
-  "last_seen_log_seq_start": 412,
-  "updated_at": "2026-04-15T10:15:00Z"
-}
-```
+Per-page quarantine marker containing the complete checksummed `PageRef`, the
+observation time, retained floor, reason, and absolute deadline. A due delete
+reloads CURRENT, follows only the candidate's containing index branch, and
+requires the page to remain unreachable and completely below the committed
+replay floor. Corrupt or ambiguous candidates are retained.
 
 ## `sstable/<bucket>/<sst-id>`
 

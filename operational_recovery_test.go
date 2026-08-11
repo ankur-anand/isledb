@@ -514,29 +514,47 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 func assertOperationalStorageHealthy(t testing.TB, ctx context.Context, store *blobstore.Store) {
 	t.Helper()
 
-	current := readCurrentForTest(t, ctx, store)
-	if current.RetirementLogStart != current.NextSeq {
-		t.Fatalf("retirement backlog: retained_from=%d head=%d",
-			current.RetirementLogStart, current.NextSeq)
-	}
-
 	live := replayManifestForTest(t, ctx, store)
 	physical, err := store.ListSSTFiles(ctx)
 	if err != nil {
 		t.Fatalf("list physical SSTs: %v", err)
 	}
 	liveIDs := live.AllSSTIDs()
-	if got, want := len(physical), len(liveIDs); got != want {
-		t.Fatalf("physical SST amplification: physical=%d live=%d", got, want)
-	}
 	liveKeys := make(map[string]struct{}, len(liveIDs))
 	for _, id := range liveIDs {
 		liveKeys[store.SSTPath(id)] = struct{}{}
 	}
+	plannedKeys := make(map[string]struct{})
+	planObjects, err := store.List(ctx, blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"})
+	if err != nil {
+		t.Fatalf("list SST deletion plans: %v", err)
+	}
+	for _, object := range planObjects.Objects {
+		if object.IsDir {
+			continue
+		}
+		payload, _, err := store.Read(ctx, object.Key)
+		if err != nil {
+			t.Fatalf("read SST deletion plan %q: %v", object.Key, err)
+		}
+		plan, err := decodeSSTDeletionPlan(store, object.Key, payload)
+		if err != nil {
+			t.Fatalf("decode SST deletion plan %q: %v", object.Key, err)
+		}
+		for _, target := range plan.Targets {
+			if _, stillLive := liveKeys[target.Key]; stillLive {
+				t.Fatalf("deletion plan targets live SST: %s", target.Key)
+			}
+			plannedKeys[target.Key] = struct{}{}
+		}
+	}
+
 	var physicalBytes int64
 	for _, object := range physical {
-		if _, ok := liveKeys[object.Key]; !ok {
-			t.Fatalf("unreachable physical SST remains: %s", object.Key)
+		_, live := liveKeys[object.Key]
+		_, planned := plannedKeys[object.Key]
+		if !live && !planned {
+			t.Fatalf("unreachable physical SST has no durable deletion plan: %s", object.Key)
 		}
 		physicalBytes += object.Size
 	}
@@ -549,8 +567,8 @@ func assertOperationalStorageHealthy(t testing.TB, ctx context.Context, store *b
 			livePhysicalBytes += physicalSSTBytes(sst)
 		}
 	}
-	if physicalBytes != livePhysicalBytes {
-		t.Fatalf("physical byte amplification: physical=%d live=%d", physicalBytes, livePhysicalBytes)
+	if physicalBytes < livePhysicalBytes {
+		t.Fatalf("physical bytes=%d smaller than live bytes=%d", physicalBytes, livePhysicalBytes)
 	}
 }
 

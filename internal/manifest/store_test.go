@@ -998,7 +998,6 @@ func TestCheckpointPrunesRefsBelowChangeFeedFloor(t *testing.T) {
 		NextEpoch:          1,
 		LogSeqStart:        0,
 		ChangeFeedLogStart: 2,
-		RetirementLogStart: 2,
 		NextSeq:            4,
 		ActiveEntries: []ManifestLogEntry{
 			testManifestEntry(1),
@@ -1044,7 +1043,6 @@ func TestCheckpointAdvancesDefaultChangeFeedFloor(t *testing.T) {
 		NextEpoch:          1,
 		LogSeqStart:        0,
 		ChangeFeedLogStart: 0,
-		RetirementLogStart: 2,
 		NextSeq:            2,
 		ActiveEntries: []ManifestLogEntry{
 			testManifestEntry(0),
@@ -1078,7 +1076,6 @@ func TestCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 		ChangeFeedEnabled:  true,
 		ChangeFeedPayload:  ChangeFeedPayloadFullValues,
 		ChangeFeedLogStart: 0,
-		RetirementLogStart: 2,
 		NextSeq:            2,
 		ActiveEntries: []ManifestLogEntry{
 			testManifestEntry(0),
@@ -1097,35 +1094,6 @@ func TestCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 	}
 	if len(current.ActiveEntries) != 2 {
 		t.Fatalf("retained active entries=%d want=2", len(current.ActiveEntries))
-	}
-}
-
-func TestCheckpointKeepsRefsAtUnconsumedRetirementFloor(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("test")
-	defer store.Close()
-
-	backend := NewBlobStoreBackend(store)
-	writeCurrentForTest(t, ctx, backend, &Current{
-		NextEpoch:          1,
-		LogSeqStart:        0,
-		ChangeFeedLogStart: 2,
-		RetirementLogStart: 0,
-		NextSeq:            2,
-		ActiveEntries: []ManifestLogEntry{
-			testManifestEntry(0),
-			testManifestEntry(1),
-		},
-	})
-
-	ms := NewStoreWithStorage(backend)
-	applyManifestCheckpointForTest(t, ctx, ms, &Manifest{NextEpoch: 1, LogSeq: 1})
-	current, err := ms.ReadCurrentData(ctx)
-	if err != nil {
-		t.Fatalf("read current: %v", err)
-	}
-	if got := len(current.ActiveEntries); got != 2 {
-		t.Fatalf("active entries=%d, want 2 while retirement floor is unconsumed", got)
 	}
 }
 
