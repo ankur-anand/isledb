@@ -113,6 +113,9 @@ func newSnapshotCleaner(store *blobstore.Store, manifestLog *manifest.Store, opt
 func (c *snapshotCleaner) runOnce(ctx context.Context) (stats ManifestSnapshotCleanupStats, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
+	if err := checkContext(ctx); err != nil {
+		return stats, err
+	}
 
 	now := c.opts.Now().UTC()
 	c.mu.Lock()
@@ -130,6 +133,9 @@ func (c *snapshotCleaner) runOnce(ctx context.Context) (stats ManifestSnapshotCl
 		audit, auditErr := c.discoverOrphans(ctx, now)
 		mergeManifestSnapshotCleanupStats(&stats, audit)
 		if auditErr != nil {
+			if cancelErr := reclamationCancellation(ctx, auditErr); cancelErr != nil {
+				return stats, fmt.Errorf("audit manifest snapshots: %w", cancelErr)
+			}
 			stats.Failures++
 			err = errors.Join(err, fmt.Errorf("audit manifest snapshots: %w", auditErr))
 		}
@@ -138,6 +144,9 @@ func (c *snapshotCleaner) runOnce(ctx context.Context) (stats ManifestSnapshotCl
 		sweep, sweepErr := c.sweep(ctx, now)
 		mergeManifestSnapshotCleanupStats(&stats, sweep)
 		if sweepErr != nil {
+			if cancelErr := reclamationCancellation(ctx, sweepErr); cancelErr != nil {
+				return stats, fmt.Errorf("sweep manifest snapshots: %w", cancelErr)
+			}
 			stats.Failures++
 			err = errors.Join(err, fmt.Errorf("sweep manifest snapshots: %w", sweepErr))
 		}
@@ -393,12 +402,20 @@ func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSna
 		stats.MarkersScanned++
 		mark, err := c.readMark(ctx, object.Key)
 		if err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
 		if _, live := protected[mark.Path]; live {
 			stats.Protected++
 			if err := c.delete.Delete(ctx, object.Key); err != nil {
+				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+					c.resetMarkerIterator(iter)
+					return stats, cancelErr
+				}
 				stats.Failures++
 				continue
 			}
@@ -412,10 +429,18 @@ func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSna
 
 		stats.DeleteAttempts++
 		if err := c.delete.Delete(ctx, mark.Path); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
 		if err := c.delete.Delete(ctx, object.Key); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				c.resetMarkerIterator(iter)
+				return stats, cancelErr
+			}
 			stats.Failures++
 			continue
 		}
@@ -423,6 +448,14 @@ func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSna
 		stats.MarkersCleared++
 	}
 	return stats, nil
+}
+
+func (c *snapshotCleaner) resetMarkerIterator(iter *blobstore.ListIterator) {
+	c.mu.Lock()
+	if c.markerIter == iter {
+		c.markerIter = nil
+	}
+	c.mu.Unlock()
 }
 
 func (c *snapshotCleaner) readMark(ctx context.Context, markerPath string) (snapshotRetirementMark, error) {

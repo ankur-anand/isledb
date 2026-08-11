@@ -126,6 +126,24 @@ func (d *blockingObjectDeleter) BatchDelete(ctx context.Context, _ []string) err
 	return ctx.Err()
 }
 
+type cancelingObjectDeleter struct {
+	cancel      context.CancelFunc
+	deleteCalls int
+	batchCalls  int
+}
+
+func (d *cancelingObjectDeleter) Delete(ctx context.Context, _ string) error {
+	d.deleteCalls++
+	d.cancel()
+	return ctx.Err()
+}
+
+func (d *cancelingObjectDeleter) BatchDelete(ctx context.Context, _ []string) error {
+	d.batchCalls++
+	d.cancel()
+	return ctx.Err()
+}
+
 func TestMaintenanceRunControlLaneProgressesWhileSSTDeleteIsBlocked(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("maintenance-independent-reclaim-lanes")

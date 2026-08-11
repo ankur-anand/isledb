@@ -2,9 +2,22 @@ package isledb
 
 import (
 	"context"
+	"errors"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
+
+func reclamationCancellation(ctx context.Context, err error) error {
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
+}
 
 // objectDeleter is deliberately narrower than blobstore.Store. Physical
 // reclamation must not gain write or CAS authority merely because it needs to

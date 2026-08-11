@@ -83,9 +83,10 @@ type sstCleaner struct {
 	opts   sstCleanerOptions
 	delete objectDeleter
 
-	mu       sync.Mutex
-	planIter *blobstore.ListIterator
-	cache    map[string]sstDeletionPlan
+	mu             sync.Mutex
+	planIter       *blobstore.ListIterator
+	pendingPlanKey string
+	cache          *boundedPlanCache[sstDeletionPlan]
 }
 
 func defaultSSTCleanerOptions() sstCleanerOptions {
@@ -120,7 +121,7 @@ func newSSTCleaner(store *blobstore.Store, opts sstCleanerOptions) *sstCleaner {
 	if deleter == nil {
 		deleter = store
 	}
-	return &sstCleaner{store: store, opts: opts, delete: deleter, cache: make(map[string]sstDeletionPlan)}
+	return &sstCleaner{store: store, opts: opts, delete: deleter, cache: newDeletionPlanCache[sstDeletionPlan]()}
 }
 
 func (c *sstCleaner) markCommandOutcome(
@@ -408,6 +409,9 @@ func storeSSTDeletionPlan(ctx context.Context, store *blobstore.Store, plan sstD
 }
 
 func (c *sstCleaner) runOnce(ctx context.Context) (sstCleanupWorkStats, error) {
+	if err := checkContext(ctx); err != nil {
+		return sstCleanupWorkStats{}, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.planIter == nil {
@@ -415,9 +419,12 @@ func (c *sstCleaner) runOnce(ctx context.Context) (sstCleanupWorkStats, error) {
 	}
 	stats, exhausted, err := reclaimSSTDeletionPlans(
 		ctx, c.store, c.delete, c.opts.DeleteBatchSize, c.opts.PlanScanLimit,
-		c.opts.Now().UTC(), c.planIter, c.cache)
+		c.opts.Now().UTC(), c.planIter, c.cache, &c.pendingPlanKey)
 	if exhausted || err != nil {
 		c.planIter = nil
+	}
+	if exhausted {
+		c.pendingPlanKey = ""
 	}
 	return stats, err
 }
@@ -445,7 +452,7 @@ func runSSTDeletionPlanReclaimer(
 	}
 
 	iter := store.NewListIterator(blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"})
-	stats, _, err := reclaimSSTDeletionPlans(ctx, store, deleteObjects, deleteBatchSize, scanLimit, now, iter, nil)
+	stats, _, err := reclaimSSTDeletionPlans(ctx, store, deleteObjects, deleteBatchSize, scanLimit, now, iter, nil, nil)
 	return stats, err
 }
 
@@ -457,27 +464,40 @@ func reclaimSSTDeletionPlans(
 	scanLimit int,
 	now time.Time,
 	iter *blobstore.ListIterator,
-	cache map[string]sstDeletionPlan,
+	cache *boundedPlanCache[sstDeletionPlan],
+	pendingPlanKey *string,
 ) (sstCleanupWorkStats, bool, error) {
 	stats := sstCleanupWorkStats{}
 	remaining := deleteBatchSize
 	var reclaimErr error
 	for stats.PlansScanned < scanLimit && remaining > 0 {
-		object, err := iter.Next(ctx)
-		if errors.Is(err, io.EOF) {
-			return stats, true, reclaimErr
-		}
-		if err != nil {
-			return stats, false, errors.Join(reclaimErr, err)
+		var object blobstore.ObjectInfo
+		if pendingPlanKey != nil && *pendingPlanKey != "" {
+			// Next already advanced the provider iterator past this plan in the
+			// preceding pass. Consume the carried key before listing more work.
+			object.Key = *pendingPlanKey
+			*pendingPlanKey = ""
+		} else {
+			var err error
+			object, err = iter.Next(ctx)
+			if errors.Is(err, io.EOF) {
+				return stats, true, reclaimErr
+			}
+			if err != nil {
+				return stats, false, errors.Join(reclaimErr, err)
+			}
 		}
 		if object.IsDir {
 			continue
 		}
 		stats.PlansScanned++
-		plan, ok := cache[object.Key]
+		plan, ok := cache.get(object.Key)
 		if !ok {
 			payload, _, err := store.Read(ctx, object.Key)
 			if err != nil {
+				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+					return stats, false, errors.Join(reclaimErr, cancelErr)
+				}
 				stats.Failed++
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("read SST deletion plan %q: %w", object.Key, err))
 				continue
@@ -488,9 +508,7 @@ func reclaimSSTDeletionPlans(
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("decode SST deletion plan %q: %w", object.Key, err))
 				continue
 			}
-			if cache != nil {
-				cache[object.Key] = plan
-			}
+			cache.put(object.Key, plan, len(payload))
 		}
 		if now.Before(plan.NotBefore) {
 			stats.Deferred++
@@ -498,7 +516,12 @@ func reclaimSSTDeletionPlans(
 		}
 		if len(plan.Targets) > remaining && stats.Attempted > 0 {
 			stats.Deferred++
-			continue
+			if pendingPlanKey != nil {
+				// Preserve the item already consumed from the iterator. The next
+				// pass can complete the independently bounded plan atomically.
+				*pendingPlanKey = object.Key
+			}
+			return stats, false, reclaimErr
 		}
 
 		keys := make([]string, len(plan.Targets))
@@ -512,6 +535,9 @@ func reclaimSSTDeletionPlans(
 			remaining -= len(keys)
 		}
 		if err := deleteObjects.BatchDelete(ctx, keys); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, errors.Join(reclaimErr, cancelErr)
+			}
 			failed := len(keys)
 			var batchErr *blobstore.BatchDeleteError
 			if errors.As(err, &batchErr) {
@@ -524,11 +550,14 @@ func reclaimSSTDeletionPlans(
 		}
 		stats.Deleted += len(keys)
 		if err := deleteObjects.Delete(ctx, object.Key); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, errors.Join(reclaimErr, cancelErr)
+			}
 			stats.Failed++
 			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete completed SST plan %q: %w", plan.PlanID, err))
 			continue
 		}
-		delete(cache, object.Key)
+		cache.remove(object.Key)
 		stats.PlansDeleted++
 	}
 	return stats, false, reclaimErr

@@ -344,6 +344,126 @@ func TestSSTDeletionPlanCleanerRetainsListCursorPastDeferredPlan(t *testing.T) {
 	requireObjectExists(t, ctx, store, built[0].target.Key, true)
 }
 
+func TestSSTDeletionPlanCleanerCarriesBudgetDeferredPlan(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("sst-plan-budget-carry")
+	defer store.Close()
+	now := time.Now().UTC()
+
+	type builtPlan struct {
+		targets []sstDeletionTarget
+		path    string
+	}
+	buildPlan := func(label string, targetCount int) builtPlan {
+		t.Helper()
+		current, command, receipt, firstTarget := writeSSTDeletionPlanFixture(t, ctx, store, label)
+		retired := append([]manifest.RetiredObject(nil), command.Compaction.RetiredObjects...)
+		targets := []sstDeletionTarget{firstTarget}
+		for i := 1; i < targetCount; i++ {
+			id := fmt.Sprintf("retired-%s-%03d.sst", label, i)
+			key := store.SSTPath(id)
+			payload := []byte(fmt.Sprintf("%s-target-%03d", label, i))
+			if _, err := store.Write(ctx, key, payload); err != nil {
+				t.Fatalf("write %s target %d: %v", label, i, err)
+			}
+			retired = append(retired, manifest.RetiredObject{
+				Kind: manifest.RetiredObjectSST, ID: id, Key: key, Size: int64(len(payload)),
+			})
+			targets = append(targets, sstDeletionTarget{ID: id, Key: key, Size: int64(len(payload))})
+		}
+		receipt.AppliedAt = now.Add(-4 * time.Hour)
+		plan, payload, err := buildSSTDeletionPlan(
+			store, current, command, receipt, retired, now.Add(-3*time.Hour), 0)
+		if err != nil {
+			t.Fatalf("build %s plan: %v", label, err)
+		}
+		if created, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
+			t.Fatalf("store %s plan created=%v error=%v", label, created, err)
+		}
+		return builtPlan{targets: targets, path: sstDeletionPlanPath(store, plan.PlanID)}
+	}
+	left := buildPlan("budget-left", 64)
+	right := buildPlan("budget-right", 65)
+	firstPlan, deferredPlan := left, right
+	if right.path < left.path {
+		firstPlan, deferredPlan = right, left
+	}
+	deleteBudget := len(firstPlan.targets) + 1
+
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		DeleteBatchSize: deleteBudget,
+		PlanScanLimit:   defaultSSTDeletionPlanScanLimit,
+		Now:             func() time.Time { return now },
+	})
+	first, err := cleaner.runOnce(ctx)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if first.Attempted != len(firstPlan.targets) || first.Deleted != len(firstPlan.targets) ||
+		first.PlansDeleted != 1 || first.Deferred != 1 {
+		t.Fatalf("first run stats=%+v", first)
+	}
+	if cleaner.pendingPlanKey != deferredPlan.path {
+		t.Fatalf("pending plan=%q want=%q", cleaner.pendingPlanKey, deferredPlan.path)
+	}
+	if cleaner.planIter == nil {
+		t.Fatal("list iterator was discarded while carrying a plan")
+	}
+
+	second, err := cleaner.runOnce(ctx)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.Attempted != len(deferredPlan.targets) || second.Deleted != len(deferredPlan.targets) || second.PlansDeleted != 1 {
+		t.Fatalf("second run stats=%+v", second)
+	}
+	if cleaner.pendingPlanKey != "" {
+		t.Fatalf("pending plan after reclaim=%q", cleaner.pendingPlanKey)
+	}
+	for _, built := range []builtPlan{left, right} {
+		for _, target := range built.targets {
+			requireObjectExists(t, ctx, store, target.Key, false)
+		}
+	}
+	if plans := listSSTDeletionPlans(t, ctx, store); len(plans) != 0 {
+		t.Fatalf("remaining plans=%d want=0", len(plans))
+	}
+}
+
+func TestSSTDeletionPlanReclaimerStopsOnCancellation(t *testing.T) {
+	baseCtx := context.Background()
+	store, current, command, receipt, target := newSSTDeletionPlanFixture(t, baseCtx, "cancel")
+	defer store.Close()
+	now := time.Now().UTC()
+	receipt.AppliedAt = now.Add(-4 * time.Hour)
+	plan, payload, err := buildSSTDeletionPlan(
+		store, current, command, receipt, command.Compaction.RetiredObjects,
+		now.Add(-3*time.Hour), 0)
+	if err != nil {
+		t.Fatalf("build plan: %v", err)
+	}
+	if created, err := storeSSTDeletionPlan(baseCtx, store, *plan, payload); err != nil || !created {
+		t.Fatalf("store plan created=%v error=%v", created, err)
+	}
+
+	ctx, cancel := context.WithCancel(baseCtx)
+	deleter := &cancelingObjectDeleter{cancel: cancel}
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		Now: func() time.Time { return now }, Deleter: deleter,
+	})
+	stats, err := cleaner.runOnce(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error=%v want context canceled", err)
+	}
+	if stats.Attempted != 1 || stats.Deleted != 0 || stats.Failed != 0 || deleter.batchCalls != 1 {
+		t.Fatalf("canceled reclaim stats=%+v batch_calls=%d", stats, deleter.batchCalls)
+	}
+	if cleaner.planIter != nil {
+		t.Fatal("canceled reclaim retained a terminal list iterator")
+	}
+	requireObjectExists(t, baseCtx, store, target.Key, true)
+}
+
 func TestSSTDeletionPlanCorruptionFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	store, current, command, receipt, target := newSSTDeletionPlanFixture(t, ctx, "corrupt")

@@ -130,6 +130,42 @@ func TestSnapshotCleanerExtendsExistingRetirementDeadline(t *testing.T) {
 	}
 }
 
+func TestSnapshotCleanerSweepStopsOnCancellation(t *testing.T) {
+	baseCtx := context.Background()
+	store := blobstore.NewMemory("snapshot-cleaner-cancel")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(baseCtx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	now := time.Now().UTC()
+	ref := manifest.ObjectRef{Path: store.ManifestSnapshotPath("cancel")}
+	if _, err := store.Write(baseCtx, ref.Path, []byte("snapshot")); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(baseCtx)
+	deleter := &cancelingObjectDeleter{cancel: cancel}
+	cleaner := newSnapshotCleaner(store, manifestStore, snapshotCleanerOptions{
+		SafetyMargin: -1,
+		Deleter:      deleter,
+	})
+	if marked, err := cleaner.mark(baseCtx, ref, now.Add(-time.Hour), time.Nanosecond, "cancel_test"); err != nil || !marked {
+		t.Fatalf("mark snapshot=(%v, %v), want (true, nil)", marked, err)
+	}
+	stats, err := cleaner.sweep(ctx, now)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("sweep error=%v want context canceled", err)
+	}
+	if stats.DeleteAttempts != 1 || stats.Failures != 0 || deleter.deleteCalls != 1 {
+		t.Fatalf("canceled sweep stats=%+v delete_calls=%d", stats, deleter.deleteCalls)
+	}
+	if cleaner.markerIter != nil {
+		t.Fatal("canceled sweep retained a terminal marker iterator")
+	}
+	requireObjectExists(t, baseCtx, store, ref.Path, true)
+}
+
 func TestSnapshotCleanerRetiresRejectedCheckpointCandidate(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("snapshot-cleaner-rejected-checkpoint")

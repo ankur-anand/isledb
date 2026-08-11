@@ -437,8 +437,17 @@ func (s *Store) BatchDelete(ctx context.Context, keys []string) error {
 func (s *Store) batchDeleteFallback(ctx context.Context, keys []string) error {
 	failed := make(map[string]error)
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := s.Delete(ctx, key); err != nil {
 			failed[key] = err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errors.Join(ctxErr, &BatchDeleteError{Failed: failed})
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return errors.Join(err, &BatchDeleteError{Failed: failed})
+			}
 		}
 	}
 	if len(failed) == 0 {

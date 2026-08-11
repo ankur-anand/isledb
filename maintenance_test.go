@@ -31,6 +31,14 @@ func TestMaintenanceDefaultsUseExplicitUnits(t *testing.T) {
 	}
 }
 
+func TestMaintenanceCompleteCycleStatsWithoutActiveCycle(t *testing.T) {
+	maintenance := &Maintenance{}
+	stats := maintenance.completeCycleStats(time.Now())
+	if stats.Duration < 0 {
+		t.Fatalf("cycle duration=%v", stats.Duration)
+	}
+}
+
 func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 	opts := MaintenanceOptions{
 		SSTCompaction: SSTCompactionOptions{L0TriggerSSTs: 12},

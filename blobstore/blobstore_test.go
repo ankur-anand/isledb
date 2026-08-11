@@ -676,6 +676,16 @@ func TestBatchDelete(t *testing.T) {
 	})
 }
 
+func TestBatchDeleteReturnsCancellation(t *testing.T) {
+	store := NewMemory("batch-delete-canceled")
+	defer store.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.BatchDelete(ctx, []string{"a", "b", "c"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BatchDelete error=%v want context canceled", err)
+	}
+}
+
 func TestWalkStopsWithoutMaterializingRemainder(t *testing.T) {
 	forEachStore(t, "walk-test", func(t *testing.T, h storeHarness) {
 		ctx := context.Background()
