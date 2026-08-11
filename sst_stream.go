@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -233,19 +232,6 @@ func writeSSTStreaming(
 		CreatedAt: ts,
 	}
 
-	if opts.Signer != nil {
-		sig, err := opts.Signer.SignHash(hashBytes)
-		if err != nil {
-			return result, err
-		}
-		result.Meta.Signature = &manifest.SSTSignature{
-			Algorithm: opts.Signer.Algorithm(),
-			KeyID:     opts.Signer.KeyID(),
-			Hash:      hashStr,
-			Signature: sig,
-		}
-	}
-
 	return result, nil
 }
 
@@ -380,19 +366,6 @@ func writeMultipleSSTsStreaming(
 				},
 				CreatedAt: ts,
 			},
-		}
-
-		if opts.Signer != nil {
-			sig, err := opts.Signer.SignHash(hashBytes)
-			if err != nil {
-				return err
-			}
-			result.Meta.Signature = &manifest.SSTSignature{
-				Algorithm: opts.Signer.Algorithm(),
-				KeyID:     opts.Signer.KeyID(),
-				Hash:      hashStr,
-				Signature: sig,
-			}
 		}
 
 		results = append(results, result)

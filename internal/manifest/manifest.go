@@ -33,13 +33,6 @@ type Level struct {
 	SSTs   []SSTMeta `json:"ssts,omitempty"`
 }
 
-type SSTSignature struct {
-	Algorithm string `json:"algorithm"`
-	KeyID     string `json:"key_id"`
-	Hash      string `json:"hash"`
-	Signature []byte `json:"signature"`
-}
-
 type BloomMeta struct {
 	BitsPerKey int   `json:"bits_per_key"`
 	K          int   `json:"k"`
@@ -48,17 +41,16 @@ type BloomMeta struct {
 }
 
 type SSTMeta struct {
-	ID        string        `json:"id"`
-	Epoch     uint64        `json:"epoch"`
-	SeqLo     uint64        `json:"seq_lo"`
-	SeqHi     uint64        `json:"seq_hi"`
-	MinKey    []byte        `json:"min_key"`
-	MaxKey    []byte        `json:"max_key"`
-	Size      int64         `json:"size"`
-	Checksum  string        `json:"checksum"`
-	Signature *SSTSignature `json:"signature,omitempty"`
-	Bloom     BloomMeta     `json:"bloom"`
-	CreatedAt time.Time     `json:"created_at"`
+	ID        string    `json:"id"`
+	Epoch     uint64    `json:"epoch"`
+	SeqLo     uint64    `json:"seq_lo"`
+	SeqHi     uint64    `json:"seq_hi"`
+	MinKey    []byte    `json:"min_key"`
+	MaxKey    []byte    `json:"max_key"`
+	Size      int64     `json:"size"`
+	Checksum  string    `json:"checksum"`
+	Bloom     BloomMeta `json:"bloom"`
+	CreatedAt time.Time `json:"created_at"`
 
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
