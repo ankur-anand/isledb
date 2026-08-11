@@ -80,8 +80,15 @@ type Store struct {
 	mu       sync.Mutex
 	nextSeq  uint64
 
-	current     *Current
-	currentETag string
+	// current is the latest CURRENT observed by any read and backs
+	// CurrentData. commitCurrent/currentETag are a matched read-modify-CAS
+	// pair. Read-only replay must never replace that pair: some storage
+	// adapters obtain object bytes and the match token with separate requests,
+	// so a concurrent publication can otherwise produce old bytes paired with
+	// a new token and let the next append overwrite a committed entry.
+	current       *Current
+	commitCurrent *Current
+	currentETag   string
 
 	writerFence    *FenceToken
 	compactorFence *FenceToken
@@ -294,7 +301,7 @@ func (s *Store) CheckCompactorFence(ctx context.Context) error {
 // CheckCompactorFenceToken verifies that token is still the current compactor
 // fence without relying on mutable process-local Store state.
 func (s *Store) CheckCompactorFenceToken(ctx context.Context, token *FenceToken) error {
-	current, _, err := s.readCurrentWithETag(ctx)
+	current, err := s.readCurrentData(ctx)
 	if err != nil {
 		return err
 	}
@@ -319,7 +326,7 @@ func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
 		return ErrFenced
 	}
 
-	current, _, err := s.readCurrentWithETag(ctx)
+	current, err := s.readCurrentData(ctx)
 	if err != nil {
 		return err
 	}
@@ -398,7 +405,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		var err error
 		if attempt == 0 {
 			s.mu.Lock()
-			current = s.current.Clone()
+			current = s.commitCurrent.Clone()
 			etag = s.currentETag
 			s.mu.Unlock()
 		}
@@ -1530,7 +1537,7 @@ func (s *Store) writeSnapshotObject(ctx context.Context, m *Manifest) (ObjectRef
 // PrepareCheckpoint writes an immutable snapshot candidate and returns the
 // command needed to publish it. It does not mutate CURRENT.
 func (s *Store) PrepareCheckpoint(ctx context.Context) (CheckpointCommand, error) {
-	current, _, err := s.readCurrentWithETag(ctx)
+	current, err := s.readCurrentData(ctx)
 	if err != nil {
 		return CheckpointCommand{}, err
 	}
@@ -1801,8 +1808,7 @@ func validateCommitPage(page *CommitPage, path string) error {
 }
 
 func (s *Store) readCurrent(ctx context.Context) (*Current, error) {
-	current, _, err := s.readCurrentWithETag(ctx)
-	return current, err
+	return s.readCurrentData(ctx)
 }
 
 // ReadCurrentData reads and decodes CURRENT using the most direct storage path available.
@@ -1814,13 +1820,13 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 	data, _, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			s.clearCurrentCache()
+			s.clearObservedCurrent()
 			return nil, nil
 		}
 		return nil, err
 	}
 	if len(data) == 0 {
-		s.clearCurrentCache()
+		s.clearObservedCurrent()
 		return nil, nil
 	}
 	current, err := DecodeCurrent(data)
@@ -1828,6 +1834,9 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 		return nil, err
 	}
 	normalizeCurrent(current)
+	s.mu.Lock()
+	s.current = current.Clone()
+	s.mu.Unlock()
 	return current, nil
 }
 
@@ -1851,6 +1860,7 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	normalizeCurrent(current)
 	s.mu.Lock()
 	s.current = current.Clone()
+	s.commitCurrent = current.Clone()
 	s.currentETag = etag
 	s.mu.Unlock()
 	return current, etag, nil
@@ -1859,7 +1869,14 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 func (s *Store) clearCurrentCache() {
 	s.mu.Lock()
 	s.current = nil
+	s.commitCurrent = nil
 	s.currentETag = ""
+	s.mu.Unlock()
+}
+
+func (s *Store) clearObservedCurrent() {
+	s.mu.Lock()
+	s.current = nil
 	s.mu.Unlock()
 }
 
@@ -1879,6 +1896,7 @@ func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag 
 	}
 	s.mu.Lock()
 	s.current = current.Clone()
+	s.commitCurrent = current.Clone()
 	s.currentETag = newETag
 	s.mu.Unlock()
 	return nil

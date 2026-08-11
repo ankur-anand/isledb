@@ -32,8 +32,13 @@ type changeFeedCleanerOptions struct {
 	SweepBatchSize int
 
 	// SweepGracePeriod is persisted in each plan as its physical deletion
-	// delay. Deletion also requires CURRENT to reach the plan's target floor.
+	// delay. The pinned-view deadline starts only after CURRENT reaches the
+	// plan's target floor.
 	SweepGracePeriod time.Duration
+
+	// DeletionSafetyMargin is added after CURRENT.MaxPinnedViewAge. A negative
+	// value disables the margin in tests; zero selects the production default.
+	DeletionSafetyMargin time.Duration
 
 	OnCleanup func(ChangeFeedCleanupStats)
 }
@@ -44,6 +49,7 @@ func defaultChangeFeedCleanerOptions() changeFeedCleanerOptions {
 		KeepAtLeastManifestEntries: 1024,
 		SweepBatchSize:             defaultChangeFeedSweepBatchSize,
 		SweepGracePeriod:           defaultChangeFeedSweepGracePeriod,
+		DeletionSafetyMargin:       defaultChangeFeedDeletionSafetyMargin,
 	}
 }
 
@@ -79,8 +85,16 @@ func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, 
 	if opts.SweepBatchSize <= 0 {
 		opts.SweepBatchSize = defaults.SweepBatchSize
 	}
+	if opts.SweepBatchSize > manifest.MaxChangeFeedDeleteTargetsPerCommand {
+		opts.SweepBatchSize = manifest.MaxChangeFeedDeleteTargetsPerCommand
+	}
 	if opts.SweepGracePeriod == 0 {
 		opts.SweepGracePeriod = defaults.SweepGracePeriod
+	}
+	if opts.DeletionSafetyMargin < 0 {
+		opts.DeletionSafetyMargin = 0
+	} else if opts.DeletionSafetyMargin == 0 {
+		opts.DeletionSafetyMargin = defaults.DeletionSafetyMargin
 	}
 	if fence == nil {
 		ownerID := fmt.Sprintf("change-feed-cleaner-%d", time.Now().UnixNano())
@@ -125,8 +139,9 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 }
 
 // runControlOnce performs only logical retention work: it discovers retired
-// batches, persists one bounded immutable plan, and stages the new feed floor.
-// It never waits for physical object deletion.
+// batches and stages the exact targets with the new feed floor. A matching
+// writer receipt turns that command into one reclaimable plan. This method
+// never waits for physical object deletion.
 func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFeedCleanupStats, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
@@ -156,26 +171,40 @@ func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFee
 		return stats, err
 	}
 
-	if len(candidates) > 0 {
-		plan, payload, err := buildChangeFeedDeletionPlan(c.store, candidates, floor, now, c.opts.SweepGracePeriod)
-		if err != nil {
-			return stats, fmt.Errorf("build change-feed deletion plan: %w", err)
-		}
-		if _, err := storeChangeFeedDeletionPlan(ctx, c.store, *plan, payload); err != nil {
-			return stats, fmt.Errorf("store change-feed deletion plan: %w", err)
-		}
-	}
-
 	var entriesRetired int
 	if floor > view.RetainedFrom() {
 		var err error
 		if c.stageCommand != nil {
+			var gracePeriod time.Duration
+			if len(candidates) > 0 {
+				gracePeriod = max(c.opts.SweepGracePeriod, 0)
+			}
 			err = c.stageCommand(ctx, manifest.MaintenanceCommand{
-				Kind:            manifest.MaintenanceCommandChangeFeedFloor,
-				ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: floor},
+				Kind: manifest.MaintenanceCommandChangeFeedFloor,
+				ChangeFeedFloor: &manifest.AdvanceFloorCommand{
+					Floor:           floor,
+					GracePeriod:     gracePeriod,
+					DeletionTargets: changeFeedDeleteTargetsForManifest(candidates),
+				},
 			})
 		} else {
-			_, err = c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken)
+			var updated *manifest.Current
+			updated, err = c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken)
+			if err == nil && len(candidates) > 0 {
+				observedAt := time.Now().UTC()
+				if updated == nil || updated.ChangeFeedLogStart < floor {
+					err = errors.New("change-feed floor publication was not observable")
+				} else {
+					var plan *changeFeedDeletionPlan
+					var payload []byte
+					plan, payload, err = buildChangeFeedDeletionPlan(
+						c.store, candidates, floor, now, c.opts.SweepGracePeriod,
+						observedAt, updated.PinnedViewAge(), c.opts.DeletionSafetyMargin)
+					if err == nil {
+						_, err = storeChangeFeedDeletionPlan(ctx, c.store, *plan, payload)
+					}
+				}
+			}
 		}
 		if err != nil {
 			return stats, fmt.Errorf("advance change-feed floor: %w", err)

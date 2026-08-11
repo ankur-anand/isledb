@@ -461,10 +461,12 @@ Example:
 ## `manifest/gc/change-feed/ready/<plan-id>.json`
 
 Immutable checksummed plan containing a bounded, sequence-ordered list of exact
-change-batch targets, the proposed feed floor, byte accounting, and a grace
-deadline. It is written before the floor command is staged. Physical deletion
-reloads `CURRENT` and requires `change_feed_log_start` to reach the complete
-target floor. The plan is deleted only after every target delete succeeds.
+change-batch targets, the committed feed floor, byte accounting, and an
+absolute deletion deadline. Before publication, those targets live in the
+existing `maintenance/HEAD` floor command. After the writer receipt proves the
+floor was applied, maintenance writes this plan with a deadline that honors
+`MaxPinnedViewAge`. Physical deletion reloads `CURRENT`, requires the complete
+target floor, and removes the plan only after every target delete succeeds.
 
 ## `manifest/gc/snapshots/<snapshot-path-hash>.json`
 

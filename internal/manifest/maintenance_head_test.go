@@ -137,6 +137,30 @@ func TestMaintenanceCommandRejectsMultiplePayloads(t *testing.T) {
 	}
 }
 
+func TestChangeFeedFloorCommandValidatesDeletionTargets(t *testing.T) {
+	command := &MaintenanceCommand{
+		ID:         "change-feed-floor",
+		Epoch:      1,
+		Generation: 1,
+		Kind:       MaintenanceCommandChangeFeedFloor,
+		CreatedAt:  time.Now().UTC(),
+		ChangeFeedFloor: &AdvanceFloorCommand{
+			Floor:       42,
+			GracePeriod: time.Minute,
+			DeletionTargets: []ChangeFeedDeleteTarget{{
+				Path: "changes/abc", ID: "abc", Seq: 41, Size: 128,
+			}},
+		},
+	}
+	if err := command.Validate(); err != nil {
+		t.Fatalf("Validate valid deletion target: %v", err)
+	}
+	command.ChangeFeedFloor.DeletionTargets[0].Seq = command.ChangeFeedFloor.Floor
+	if err := command.Validate(); !errors.Is(err, ErrInvalidMaintenanceCommand) {
+		t.Fatalf("Validate invalid deletion target error=%v, want %v", err, ErrInvalidMaintenanceCommand)
+	}
+}
+
 func TestMaintenanceCheckpointPreservesEnabledChangeFeedFloor(t *testing.T) {
 	current := &Current{
 		Snapshot:           testObjectRefPtr("old-snapshot"),
