@@ -516,7 +516,7 @@ maintenance handle opened from the same `DB`.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | Run | `(ctx context.Context) error` | Run cycles until cancellation, fencing, or `Close` |
-| RunOnce | `(ctx context.Context) (MaintenanceStats, error)` | Perform one serialized cycle |
+| RunOnce | `(ctx context.Context) (MaintenanceStats, error)` | Perform one deterministic control pass and one bounded pass from each reclaimer |
 | Close | `(ctx context.Context) error` | Stop scheduling, wait for active work, and release ownership |
 
 ```go
@@ -525,8 +525,27 @@ type MaintenanceOptions struct {
     SSTCompaction       SSTCompactionOptions
     ManifestCheckpoint ManifestCheckpointOptions
     ChangeFeedRetention *ChangeFeedRetentionOptions
+    Reclamation         ReclamationOptions
     OnCycle             func(MaintenanceStats)
+    OnReclamationCycle  func(ReclamationCycleStats)
     OnError             func(error)
+}
+
+type ReclamationOptions struct {
+    MaxConcurrentDeletes int
+    SST                  DeleterOptions
+    ChangeFeed           DeleterOptions
+    Manifest             ManifestDeleterOptions
+}
+
+type DeleterOptions struct {
+    PollInterval      time.Duration
+    MaxObjectsPerPass int
+}
+
+type ManifestDeleterOptions struct {
+    DeleterOptions
+    AuditInterval time.Duration
 }
 
 type ChangeFeedRetentionOptions struct {
@@ -552,10 +571,35 @@ type MaintenanceStats struct {
     State                   MaintenanceState
     Scheduling              MaintenanceScheduleStats
     SSTCompaction           SSTCompactionStats
+    SSTCleanup              SSTCleanupStats
     ChangeFeedRetention     ChangeFeedCleanupStats
     ManifestCheckpoint      ManifestCheckpointStats
-    ManifestSnapshotCleanup ManifestSnapshotCleanupStats
+    ManifestCleanup         ManifestCleanupStats
     Duration                time.Duration
+}
+
+type ReclamationCycleStats struct {
+    Family     ReclamationFamily
+    SST        SSTCleanupStats
+    ChangeFeed ChangeFeedCleanupStats
+    Manifest   ManifestCleanupStats
+    Duration   time.Duration
+}
+
+type ManifestCleanupStats struct {
+    Snapshots ManifestSnapshotCleanupStats
+    Pages     ManifestPageCleanupStats
+}
+
+type SSTCleanupStats struct {
+    SSTsPlanned    int
+    PlansPrepared  int
+    PlansScanned   int
+    PlansCompleted int
+    DeleteAttempts int
+    SSTsDeleted    int
+    DeferredPlans  int
+    Failures       int
 }
 
 type ManifestSnapshotCleanupStats struct {
@@ -568,6 +612,20 @@ type ManifestSnapshotCleanupStats struct {
     MarkersScanned   int
     MarkersCleared   int
     ObjectsScanned   int
+    Duration         time.Duration
+}
+
+type ManifestPageCleanupStats struct {
+    PagesMarked      int
+    PagesDeleted     int
+    Protected        int
+    Deferred         int
+    Failures         int
+    MarkersScanned   int
+    MarkersCleared   int
+    ObjectsScanned   int
+    DeleteAttempts   int
+    ReachabilityGETs int
     Duration         time.Duration
 }
 
@@ -604,7 +662,7 @@ type ManifestCheckpointStats struct {
 
 type ChangeFeedCleanupStats struct {
     EntriesRetired  int
-    BatchesMarked   int
+    BatchesPlanned  int
     BatchesDeleted  int
     BlockedRetained int
     FailedDeletes   int
@@ -612,9 +670,12 @@ type ChangeFeedCleanupStats struct {
 }
 ```
 
-`DefaultMaintenanceOptions` enables compaction, checkpoints, and retired-SST
-garbage collection. Scheduler burst limits, level cursors, urgent thresholds,
-and garbage-collection safeguards remain internal. Change-feed retention
+`DefaultMaintenanceOptions` enables compaction, checkpoints, and three physical
+reclamation lanes. `Maintenance.Run` executes the serialized control lane
+independently from SST, change-feed, and manifest-metadata reclaimers. All
+three reclaimers share `MaxConcurrentDeletes`, retain provider listing cursors
+between bounded passes, and cannot change logical visibility. Scheduler burst
+limits and deletion safety margins remain internal. Change-feed retention
 remains disabled. Use
 `DefaultChangeFeedRetentionOptions` before enabling feed-history cleanup.
 
@@ -627,14 +688,21 @@ indefinitely.
 maintenance mailbox. The active writer must publish or reject it before the
 next maintenance command can be staged.
 
-Checkpoint snapshot cleanup is automatic and has no public tuning surface. An
+Checkpoint snapshot cleanup is automatic. An
 applied checkpoint durably marks its previous snapshot as retired before the
 mailbox command is cleared; a rejected checkpoint marks its candidate instead.
 Deletion waits for the persisted maximum pinned-view age plus an internal
 safety margin, rechecks both `CURRENT` and a pending checkpoint, and is bounded
-per cycle. A periodic bounded audit finds candidates created before a crash or
-an ambiguous staging failure. Manifest-page reclamation is separate work and
-is not included in `ManifestSnapshotCleanupStats`.
+per pass. A periodic bounded audit finds candidates created before a crash or
+an ambiguous staging failure.
+
+Manifest pages use per-page quarantine markers. A candidate must be
+structurally valid and unreachable from fresh `CURRENT`. Physical deletion
+also requires monotonic proof that a paused publication cannot later succeed:
+the page's complete sequence range is below the committed retained-entry
+floor. The deleter waits through the pinned-view deadline and orphan grace,
+reloads `CURRENT`, traverses only the candidate's containing index branch, and
+fails closed on corruption or ambiguous overlap.
 
 ```go
 opts := isledb.DefaultMaintenanceOptions()
@@ -645,6 +713,9 @@ opts.SSTCompaction.MaxInputBytesPerJob = 512 << 20
 opts.SSTCompaction.TargetSSTBytes = 64 << 20
 opts.ManifestCheckpoint.TargetReplayPages = 64
 opts.ManifestCheckpoint.TargetReplayBytes = 32 << 20
+opts.Reclamation.MaxConcurrentDeletes = 4
+opts.Reclamation.SST.MaxObjectsPerPass = 128
+opts.Reclamation.Manifest.AuditInterval = time.Hour
 
 feedRetention := isledb.DefaultChangeFeedRetentionOptions()
 feedRetention.RetainFor = 24 * time.Hour

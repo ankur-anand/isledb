@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
@@ -279,10 +278,9 @@ func TestIncrementalReplay_WithCompaction(t *testing.T) {
 	retired := make([]RetiredObject, 0, len(removeIDs))
 	for _, id := range removeIDs {
 		retired = append(retired, RetiredObject{
-			Kind:      RetiredObjectSST,
-			ID:        id,
-			Key:       "sstable/" + id,
-			NotBefore: time.Now().UTC().Add(time.Hour),
+			Kind: RetiredObjectSST,
+			ID:   id,
+			Key:  "sstable/" + id,
 		})
 	}
 	if _, err := ms.AppendCompactionWithFence(ctx, compactionPayload, retired); err != nil {

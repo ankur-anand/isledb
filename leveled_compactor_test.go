@@ -92,7 +92,7 @@ func TestLevelPlannerBoundsRewriteByInputBytes(t *testing.T) {
 }
 
 func plannerOnlyCompactor() *compactor {
-	return &compactor{opts: normalizeCompactorOptions(defaultCompactorOptions(), nil)}
+	return &compactor{opts: normalizeCompactorOptions(defaultCompactorOptions())}
 }
 
 func plannedCandidateForLevel(c *compactor, m *manifestState, sourceLevel uint32) (*levelCompactionPlan, error) {

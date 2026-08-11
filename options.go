@@ -169,9 +169,6 @@ type compactorOptions struct {
 
 	OnCompactionStart func(compactionJob)
 	OnCompactionEnd   func(compactionJob, error)
-
-	GCCursorStorage   manifest.GCCursorStorage
-	GCDeleteBatchSize int
 }
 
 type compactionTriggerOptions struct {
@@ -218,7 +215,6 @@ type compactionSafetyOptions struct {
 func defaultCompactorOptions() compactorOptions {
 	return compactorOptions{
 		InputReadParallelism: 4,
-		GCDeleteBatchSize:    defaultSSTSweepBatchSize,
 		Trigger: compactionTriggerOptions{
 			L0SSTCount:          8,
 			BaseLevelBytes:      512 * 1024 * 1024,

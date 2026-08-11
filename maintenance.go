@@ -26,9 +26,15 @@ const (
 	// immutable page reads between snapshots.
 	defaultCheckpointReplayPages uint64 = 64
 	// defaultCheckpointReplayBytes also bounds unusually large replay pages.
-	defaultCheckpointReplayBytes   uint64 = 32 << 20
-	defaultMaintenanceIdleInterval        = 5 * time.Second
-	maintenanceActiveInterval             = 100 * time.Millisecond
+	defaultCheckpointReplayBytes       uint64 = 32 << 20
+	defaultMaintenanceIdleInterval            = 5 * time.Second
+	maintenanceActiveInterval                 = 100 * time.Millisecond
+	defaultReclaimDeleteConcurrency           = 4
+	defaultSSTReclaimPollInterval             = time.Second
+	defaultChangeReclaimPollInterval          = 5 * time.Second
+	defaultManifestReclaimPollInterval        = time.Minute
+	maxReclaimDeleteConcurrency               = 256
+	maxReclaimObjectsPerPass                  = 4096
 )
 
 // MaintenanceOptions configures one fenced maintenance owner for a DB.
@@ -51,11 +57,45 @@ type MaintenanceOptions struct {
 	// batches without affecting KV state.
 	ChangeFeedRetention *ChangeFeedRetentionOptions
 
+	// Reclamation controls the independently scheduled SST, change-feed, and
+	// manifest-metadata physical deletion lanes. Zero fields select defaults.
+	Reclamation ReclamationOptions
+
 	// OnCycle is called synchronously by Run after each successful cycle.
 	OnCycle func(MaintenanceStats)
+	// OnReclamationCycle is called independently after a successful bounded
+	// physical deletion pass.
+	OnReclamationCycle func(ReclamationCycleStats)
 	// OnError is called synchronously by Run when a cycle fails with a
 	// recoverable error.
 	OnError func(error)
+}
+
+// ReclamationOptions controls physical deletion without changing logical
+// visibility or retention floors.
+type ReclamationOptions struct {
+	// MaxConcurrentDeletes is shared by all physical deletion lanes.
+	MaxConcurrentDeletes int
+
+	SST        DeleterOptions
+	ChangeFeed DeleterOptions
+	Manifest   ManifestDeleterOptions
+}
+
+// DeleterOptions controls one independently paced physical deletion lane.
+type DeleterOptions struct {
+	PollInterval time.Duration
+	// MaxObjectsPerPass bounds normal work. One immutable SST retirement plan
+	// can exceed it because a plan is completed atomically and is independently
+	// bounded by MaxRetiredObjectsPerEntry.
+	MaxObjectsPerPass int
+}
+
+// ManifestDeleterOptions controls the shared snapshot and manifest-page lane.
+type ManifestDeleterOptions struct {
+	DeleterOptions
+	// AuditInterval controls low-frequency orphan object discovery.
+	AuditInterval time.Duration
 }
 
 // SSTCompactionOptions controls the workload and resource tradeoffs of L0 and
@@ -96,19 +136,19 @@ type ChangeFeedRetentionOptions struct {
 }
 
 type maintenanceOptions struct {
-	idleInterval                 time.Duration
-	sstCompaction                SSTCompactionOptions
-	manifestCheckpoint           ManifestCheckpointOptions
-	changeFeedRetention          *changeFeedRetentionOptions
-	onCycle                      func(MaintenanceStats)
-	onError                      func(error)
-	retiredObjectDeletesPerCycle int
+	idleInterval        time.Duration
+	sstCompaction       SSTCompactionOptions
+	manifestCheckpoint  ManifestCheckpointOptions
+	changeFeedRetention *changeFeedRetentionOptions
+	onCycle             func(MaintenanceStats)
+	onReclamationCycle  func(ReclamationCycleStats)
+	onError             func(error)
+	reclamation         ReclamationOptions
 }
 
 type changeFeedRetentionOptions struct {
 	retainFor             time.Duration
 	minimumHistoryEntries uint64
-	deletesPerCycle       int
 	deleteGracePeriod     time.Duration
 }
 
@@ -116,11 +156,30 @@ type changeFeedRetentionOptions struct {
 // cleanup pass.
 type ChangeFeedCleanupStats struct {
 	EntriesRetired  int
-	BatchesMarked   int
+	BatchesPlanned  int
 	BatchesDeleted  int
 	BlockedRetained int
 	FailedDeletes   int
 	Duration        time.Duration
+}
+
+// ReclamationFamily identifies one independently scheduled physical deletion
+// lane.
+type ReclamationFamily string
+
+const (
+	ReclamationSST        ReclamationFamily = "sst"
+	ReclamationChangeFeed ReclamationFamily = "change_feed"
+	ReclamationManifest   ReclamationFamily = "manifest"
+)
+
+// ReclamationCycleStats reports one bounded physical deletion pass.
+type ReclamationCycleStats struct {
+	Family     ReclamationFamily
+	SST        SSTCleanupStats
+	ChangeFeed ChangeFeedCleanupStats
+	Manifest   ManifestCleanupStats
+	Duration   time.Duration
 }
 
 // MaintenanceState describes whether another maintenance step can make
@@ -155,6 +214,19 @@ type SSTCompactionStats struct {
 	OutputBytes int64
 }
 
+// SSTCleanupStats describes durable retirement handoff and bounded physical
+// deletion work completed in one maintenance cycle.
+type SSTCleanupStats struct {
+	SSTsPlanned    int
+	PlansPrepared  int
+	PlansScanned   int
+	PlansCompleted int
+	DeleteAttempts int
+	SSTsDeleted    int
+	DeferredPlans  int
+	Failures       int
+}
+
 // ManifestCheckpointStats describes a manifest checkpoint staged in one cycle.
 type ManifestCheckpointStats struct {
 	Staged      bool
@@ -176,6 +248,29 @@ type ManifestSnapshotCleanupStats struct {
 	MarkersCleared   int
 	ObjectsScanned   int
 	Duration         time.Duration
+}
+
+// ManifestPageCleanupStats describes bounded page discovery, quarantine, and
+// physical reclamation.
+type ManifestPageCleanupStats struct {
+	PagesMarked      int
+	PagesDeleted     int
+	Protected        int
+	Deferred         int
+	Failures         int
+	MarkersScanned   int
+	MarkersCleared   int
+	ObjectsScanned   int
+	DeleteAttempts   int
+	ReachabilityGETs int
+	Duration         time.Duration
+}
+
+// ManifestCleanupStats combines snapshot and manifest-page work from their
+// shared physical deletion lane.
+type ManifestCleanupStats struct {
+	Snapshots ManifestSnapshotCleanupStats
+	Pages     ManifestPageCleanupStats
 }
 
 // MaintenanceTask identifies the expensive primary work selected for a cycle.
@@ -216,13 +311,14 @@ type MaintenanceScheduleStats struct {
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
 // Command-producing work is not visible until the writer applies it.
 type MaintenanceStats struct {
-	State                   MaintenanceState
-	Scheduling              MaintenanceScheduleStats
-	SSTCompaction           SSTCompactionStats
-	ChangeFeedRetention     ChangeFeedCleanupStats
-	ManifestCheckpoint      ManifestCheckpointStats
-	ManifestSnapshotCleanup ManifestSnapshotCleanupStats
-	Duration                time.Duration
+	State               MaintenanceState
+	Scheduling          MaintenanceScheduleStats
+	SSTCompaction       SSTCompactionStats
+	SSTCleanup          SSTCleanupStats
+	ChangeFeedRetention ChangeFeedCleanupStats
+	ManifestCheckpoint  ManifestCheckpointStats
+	ManifestCleanup     ManifestCleanupStats
+	Duration            time.Duration
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
@@ -243,6 +339,24 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 		ManifestCheckpoint: ManifestCheckpointOptions{
 			TargetReplayPages: defaultCheckpointReplayPages,
 			TargetReplayBytes: defaultCheckpointReplayBytes,
+		},
+		Reclamation: ReclamationOptions{
+			MaxConcurrentDeletes: defaultReclaimDeleteConcurrency,
+			SST: DeleterOptions{
+				PollInterval:      defaultSSTReclaimPollInterval,
+				MaxObjectsPerPass: defaultSSTDeletionPlanBatchSize,
+			},
+			ChangeFeed: DeleterOptions{
+				PollInterval:      defaultChangeReclaimPollInterval,
+				MaxObjectsPerPass: defaultChangeFeedSweepBatchSize,
+			},
+			Manifest: ManifestDeleterOptions{
+				DeleterOptions: DeleterOptions{
+					PollInterval:      defaultManifestReclaimPollInterval,
+					MaxObjectsPerPass: defaultSnapshotDeleteBatchSize,
+				},
+				AuditInterval: defaultSnapshotOrphanAuditEvery,
+			},
 		},
 	}
 }
@@ -265,7 +379,10 @@ type Maintenance struct {
 	opts        maintenanceOptions
 	compactor   *compactor
 	changeFeed  *changeFeedCleaner
+	sstGC       *sstCleaner
 	snapshotGC  *snapshotCleaner
+	pageGC      *manifestPageCleaner
+	deleter     *limitedObjectDeleter
 	fenceToken  *manifest.FenceToken
 
 	lifecycleMu   sync.Mutex
@@ -274,7 +391,9 @@ type Maintenance struct {
 	loopWG        sync.WaitGroup
 	activeRuns    sync.WaitGroup
 	runGate       chan struct{}
+	reclaimGates  map[ReclamationFamily]chan struct{}
 	enginesClosed bool
+	callbackMu    sync.Mutex
 
 	statsMu       sync.Mutex
 	currentStats  *MaintenanceStats
@@ -294,7 +413,6 @@ func newMaintenance(
 	ctx context.Context,
 	store *blobstore.Store,
 	manifestLog *manifest.Store,
-	gcCursor manifest.GCCursorStorage,
 	opts MaintenanceOptions,
 	sstOutput SSTEncodingOptions,
 ) (*Maintenance, error) {
@@ -325,16 +443,38 @@ func newMaintenance(
 		return nil, fmt.Errorf("claim maintenance fence: %w", err)
 	}
 
+	deleter := newLimitedObjectDeleter(store, normalized.reclamation.MaxConcurrentDeletes)
 	m := &Maintenance{
 		manifestLog: manifestLog,
 		opts:        normalized,
-		snapshotGC:  newSnapshotCleaner(store, manifestLog, snapshotCleanerOptions{}),
-		fenceToken:  token,
-		runGate:     make(chan struct{}, 1),
-		sstOutput:   sstOutput,
+		sstGC: newSSTCleaner(store, sstCleanerOptions{
+			DeleteBatchSize: normalized.reclamation.SST.MaxObjectsPerPass,
+			Deleter:         deleter,
+		}),
+		snapshotGC: newSnapshotCleaner(store, manifestLog, snapshotCleanerOptions{
+			DeleteBatchSize:  normalized.reclamation.Manifest.MaxObjectsPerPass,
+			SweepInterval:    normalized.reclamation.Manifest.PollInterval,
+			OrphanAuditEvery: normalized.reclamation.Manifest.AuditInterval,
+			Deleter:          deleter,
+		}),
+		pageGC: newManifestPageCleaner(store, manifestLog, manifestPageCleanerOptions{
+			DeleteBatchSize:  normalized.reclamation.Manifest.MaxObjectsPerPass,
+			SweepInterval:    normalized.reclamation.Manifest.PollInterval,
+			OrphanAuditEvery: normalized.reclamation.Manifest.AuditInterval,
+			Deleter:          deleter,
+		}),
+		deleter:    deleter,
+		fenceToken: token,
+		runGate:    make(chan struct{}, 1),
+		reclaimGates: map[ReclamationFamily]chan struct{}{
+			ReclamationSST:        make(chan struct{}, 1),
+			ReclamationChangeFeed: make(chan struct{}, 1),
+			ReclamationManifest:   make(chan struct{}, 1),
+		},
+		sstOutput: sstOutput,
 	}
 
-	compactorOpts := m.compactorOptions(gcCursor)
+	compactorOpts := m.compactorOptions()
 	m.compactor, err = newCompactorWithFence(ctx, store, manifestLog, compactorOpts, token)
 	if err != nil {
 		return nil, fmt.Errorf("open compaction stage: %w", err)
@@ -373,6 +513,10 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (maintenanceOptions, e
 	if checkpoint.TargetReplayBytes == 0 {
 		checkpoint.TargetReplayBytes = defaults.ManifestCheckpoint.TargetReplayBytes
 	}
+	reclamation, err := normalizeReclamationOptions(opts.Reclamation, defaults.Reclamation)
+	if err != nil {
+		return maintenanceOptions{}, err
+	}
 	var retention *changeFeedRetentionOptions
 	if opts.ChangeFeedRetention != nil {
 		normalizedRetention, err := normalizeChangeFeedRetentionOptions(*opts.ChangeFeedRetention)
@@ -382,14 +526,61 @@ func normalizeMaintenanceOptions(opts MaintenanceOptions) (maintenanceOptions, e
 		retention = &normalizedRetention
 	}
 	return maintenanceOptions{
-		idleInterval:                 opts.IdleInterval,
-		sstCompaction:                compaction,
-		manifestCheckpoint:           checkpoint,
-		changeFeedRetention:          retention,
-		onCycle:                      opts.OnCycle,
-		onError:                      opts.OnError,
-		retiredObjectDeletesPerCycle: defaultCompactorOptions().GCDeleteBatchSize,
+		idleInterval:        opts.IdleInterval,
+		sstCompaction:       compaction,
+		manifestCheckpoint:  checkpoint,
+		changeFeedRetention: retention,
+		onCycle:             opts.OnCycle,
+		onReclamationCycle:  opts.OnReclamationCycle,
+		onError:             opts.OnError,
+		reclamation:         reclamation,
 	}, nil
+}
+
+func normalizeReclamationOptions(opts, defaults ReclamationOptions) (ReclamationOptions, error) {
+	if opts.MaxConcurrentDeletes < 0 ||
+		opts.SST.PollInterval < 0 || opts.SST.MaxObjectsPerPass < 0 ||
+		opts.ChangeFeed.PollInterval < 0 || opts.ChangeFeed.MaxObjectsPerPass < 0 ||
+		opts.Manifest.PollInterval < 0 || opts.Manifest.MaxObjectsPerPass < 0 || opts.Manifest.AuditInterval < 0 {
+		return ReclamationOptions{}, fmt.Errorf("%w: negative reclamation option", ErrInvalidMaintenanceOptions)
+	}
+	if opts.MaxConcurrentDeletes > maxReclaimDeleteConcurrency {
+		return ReclamationOptions{}, fmt.Errorf("%w: max concurrent deletes=%d exceeds %d",
+			ErrInvalidMaintenanceOptions, opts.MaxConcurrentDeletes, maxReclaimDeleteConcurrency)
+	}
+	if opts.MaxConcurrentDeletes == 0 {
+		opts.MaxConcurrentDeletes = defaults.MaxConcurrentDeletes
+	}
+	var err error
+	if opts.SST, err = normalizeDeleterOptions("SST", opts.SST, defaults.SST); err != nil {
+		return ReclamationOptions{}, err
+	}
+	if opts.ChangeFeed, err = normalizeDeleterOptions("change-feed", opts.ChangeFeed, defaults.ChangeFeed); err != nil {
+		return ReclamationOptions{}, err
+	}
+	manifestOpts, err := normalizeDeleterOptions("manifest", opts.Manifest.DeleterOptions, defaults.Manifest.DeleterOptions)
+	if err != nil {
+		return ReclamationOptions{}, err
+	}
+	opts.Manifest.DeleterOptions = manifestOpts
+	if opts.Manifest.AuditInterval == 0 {
+		opts.Manifest.AuditInterval = defaults.Manifest.AuditInterval
+	}
+	return opts, nil
+}
+
+func normalizeDeleterOptions(name string, opts, defaults DeleterOptions) (DeleterOptions, error) {
+	if opts.MaxObjectsPerPass > maxReclaimObjectsPerPass {
+		return DeleterOptions{}, fmt.Errorf("%w: %s max objects per pass=%d exceeds %d",
+			ErrInvalidMaintenanceOptions, name, opts.MaxObjectsPerPass, maxReclaimObjectsPerPass)
+	}
+	if opts.PollInterval == 0 {
+		opts.PollInterval = defaults.PollInterval
+	}
+	if opts.MaxObjectsPerPass == 0 {
+		opts.MaxObjectsPerPass = defaults.MaxObjectsPerPass
+	}
+	return opts, nil
 }
 
 func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTCompactionOptions, error) {
@@ -441,12 +632,11 @@ func normalizeChangeFeedRetentionOptions(opts ChangeFeedRetentionOptions) (chang
 	return changeFeedRetentionOptions{
 		retainFor:             opts.RetainFor,
 		minimumHistoryEntries: defaults.KeepAtLeastManifestEntries,
-		deletesPerCycle:       defaults.SweepBatchSize,
 		deleteGracePeriod:     defaults.SweepGracePeriod,
 	}, nil
 }
 
-func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compactorOptions {
+func (m *Maintenance) compactorOptions() compactorOptions {
 	p := m.opts.sstCompaction
 	return compactorOptions{
 		OwnerID:              m.fenceToken.Owner,
@@ -464,9 +654,7 @@ func (m *Maintenance) compactorOptions(gcCursor manifest.GCCursorStorage) compac
 			BlockBytes:      m.sstOutput.BlockBytes,
 			Compression:     m.sstOutput.Compression,
 		},
-		OnCompactionEnd:   m.recordCompaction,
-		GCCursorStorage:   gcCursor,
-		GCDeleteBatchSize: m.opts.retiredObjectDeletesPerCycle,
+		OnCompactionEnd: m.recordCompaction,
 	}
 }
 
@@ -475,7 +663,7 @@ func (m *Maintenance) changeFeedOptions() changeFeedCleanerOptions {
 	return changeFeedCleanerOptions{
 		RetentionPeriod:            p.retainFor,
 		KeepAtLeastManifestEntries: p.minimumHistoryEntries,
-		SweepBatchSize:             p.deletesPerCycle,
+		SweepBatchSize:             m.opts.reclamation.ChangeFeed.MaxObjectsPerPass,
 		SweepGracePeriod:           p.deleteGracePeriod,
 		OnCleanup:                  m.recordChangeFeed,
 	}
@@ -502,8 +690,21 @@ func (m *Maintenance) Run(ctx context.Context) error {
 	m.loopWG.Add(1)
 	m.lifecycleMu.Unlock()
 
+	var reclaimWG sync.WaitGroup
+	for _, family := range []ReclamationFamily{ReclamationSST, ReclamationChangeFeed, ReclamationManifest} {
+		family := family
+		reclaimWG.Add(1)
+		m.loopWG.Add(1)
+		go func() {
+			defer reclaimWG.Done()
+			defer m.loopWG.Done()
+			m.runReclamationLoop(runCtx, family)
+		}()
+	}
+
 	defer func() {
 		cancel()
+		reclaimWG.Wait()
 		m.lifecycleMu.Lock()
 		m.runCancel = nil
 		m.running.Store(false)
@@ -512,7 +713,7 @@ func (m *Maintenance) Run(ctx context.Context) error {
 	}()
 
 	for {
-		stats, err := m.RunOnce(runCtx)
+		stats, err := m.runControlOnce(runCtx)
 		if err != nil {
 			if m.closed.Load() && (errors.Is(err, context.Canceled) || errors.Is(err, ErrMaintenanceClosed)) {
 				return nil
@@ -526,12 +727,12 @@ func (m *Maintenance) Run(ctx context.Context) error {
 			if errors.Is(err, manifest.ErrFenceConflict) {
 				slog.Debug("isledb: maintenance cycle skipped after concurrent manifest update")
 			} else if m.opts.onError != nil {
-				m.opts.onError(err)
+				m.reportError(err)
 			} else {
 				slog.Error("isledb: maintenance cycle failed", "error", err)
 			}
 		} else if m.opts.onCycle != nil {
-			m.opts.onCycle(stats)
+			m.reportControlCycle(stats)
 		}
 
 		delay := m.opts.idleInterval
@@ -551,8 +752,29 @@ func (m *Maintenance) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnce performs one serialized maintenance cycle.
+// RunOnce performs one deterministic bounded control pass followed by one
+// pass from every physical reclamation lane. Run uses the same operations but
+// schedules the physical passes independently so slow deletes cannot block
+// compaction, checkpointing, or logical feed retention.
 func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
+	stats, err := m.runControlOnce(ctx)
+	if err != nil {
+		return stats, err
+	}
+
+	sst, sstErr := m.runReclamationOnce(ctx, ReclamationSST)
+	mergeSSTCleanupStats(&stats.SSTCleanup, sst.SST)
+	change, changeErr := m.runReclamationOnce(ctx, ReclamationChangeFeed)
+	stats.ChangeFeedRetention = mergeChangeFeedCleanupStats(stats.ChangeFeedRetention, change.ChangeFeed)
+	metadata, metadataErr := m.runReclamationOnce(ctx, ReclamationManifest)
+	mergeManifestSnapshotCleanupStats(&stats.ManifestCleanup.Snapshots, metadata.Manifest.Snapshots)
+	mergeManifestPageCleanupStats(&stats.ManifestCleanup.Pages, metadata.Manifest.Pages)
+	stats.Duration += sst.Duration + change.Duration + metadata.Duration
+	return stats, errors.Join(sstErr, changeErr, metadataErr)
+}
+
+// runControlOnce performs one serialized logical/control cycle.
+func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, error) {
 	if err := checkContext(ctx); err != nil {
 		return MaintenanceStats{}, err
 	}
@@ -576,16 +798,6 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 	waiting, err := m.reconcilePendingCommand(ctx)
 	if err != nil {
 		return m.completeCycleStats(start), fmt.Errorf("reconcile maintenance command: %w", err)
-	}
-	if m.snapshotGC != nil {
-		cleanup, err := m.snapshotGC.runOnce(ctx)
-		m.recordManifestSnapshotCleanup(cleanup)
-		if err != nil {
-			// Snapshot cleanup is retryable auxiliary work. Receipt retirement
-			// above remains fail-closed, but a transient audit/list failure must
-			// not starve compaction, checkpointing, or retention.
-			slog.Error("isledb: manifest snapshot cleanup failed", "error", err)
-		}
 	}
 	if waiting {
 		return m.completeCycleStats(start), nil
@@ -616,14 +828,11 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 		if m.hasStagedCommand() {
 			return m.completeCycleStats(start), nil
 		}
-	} else {
-		m.compactor.runSSTSweeperBestEffort(ctx)
-		if m.hasStagedCommand() {
-			return m.completeCycleStats(start), nil
-		}
 	}
 	if m.changeFeed != nil {
-		if err := m.changeFeed.RunOnce(ctx); err != nil {
+		cleanup, err := m.changeFeed.runControlOnce(ctx)
+		m.recordChangeFeed(cleanup)
+		if err != nil {
 			return m.completeCycleStats(start), fmt.Errorf("change-feed retention: %w", err)
 		}
 		if m.hasStagedCommand() {
@@ -631,6 +840,157 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 		}
 	}
 	return m.completeCycleStats(start), nil
+}
+
+func (m *Maintenance) runReclamationLoop(ctx context.Context, family ReclamationFamily) {
+	interval := m.reclamationInterval(family)
+	for {
+		stats, err := m.runReclamationOnce(ctx, family)
+		if err != nil {
+			if ctx.Err() != nil || m.closed.Load() {
+				return
+			}
+			m.reportError(fmt.Errorf("%s reclamation: %w", family, err))
+		} else if m.opts.onReclamationCycle != nil {
+			m.reportReclamationCycle(stats)
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			stopMaintenanceTimer(timer)
+			return
+		}
+	}
+}
+
+func (m *Maintenance) reclamationInterval(family ReclamationFamily) time.Duration {
+	switch family {
+	case ReclamationSST:
+		return m.opts.reclamation.SST.PollInterval
+	case ReclamationChangeFeed:
+		return m.opts.reclamation.ChangeFeed.PollInterval
+	case ReclamationManifest:
+		return m.opts.reclamation.Manifest.PollInterval
+	default:
+		return m.opts.idleInterval
+	}
+}
+
+func (m *Maintenance) runReclamationOnce(ctx context.Context, family ReclamationFamily) (stats ReclamationCycleStats, err error) {
+	stats.Family = family
+	start := time.Now()
+	defer func() { stats.Duration = time.Since(start) }()
+	if err := m.beginReclamation(ctx, family); err != nil {
+		return stats, err
+	}
+	defer m.finishReclamation(family)
+
+	switch family {
+	case ReclamationSST:
+		if m.sstGC == nil {
+			return stats, nil
+		}
+		work, err := m.sstGC.runOnce(ctx)
+		stats.SST = publicSSTCleanupStats(work)
+		return stats, err
+	case ReclamationChangeFeed:
+		if m.changeFeed == nil {
+			return stats, nil
+		}
+		stats.ChangeFeed, err = m.changeFeed.runReclaimOnce(ctx, m.deleter)
+		return stats, err
+	case ReclamationManifest:
+		var snapshotErr, pageErr error
+		if m.snapshotGC != nil {
+			stats.Manifest.Snapshots, snapshotErr = m.snapshotGC.runOnce(ctx)
+		}
+		if m.pageGC != nil {
+			stats.Manifest.Pages, pageErr = m.pageGC.runOnce(ctx)
+		}
+		return stats, errors.Join(snapshotErr, pageErr)
+	default:
+		return stats, fmt.Errorf("unknown reclamation family %q", family)
+	}
+}
+
+func (m *Maintenance) beginReclamation(ctx context.Context, family ReclamationFamily) error {
+	if m.closed.Load() {
+		return ErrMaintenanceClosed
+	}
+	gate := m.reclaimGates[family]
+	if gate == nil {
+		return fmt.Errorf("unknown reclamation family %q", family)
+	}
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	m.lifecycleMu.Lock()
+	if m.closed.Load() {
+		m.lifecycleMu.Unlock()
+		<-gate
+		return ErrMaintenanceClosed
+	}
+	m.activeRuns.Add(1)
+	m.lifecycleMu.Unlock()
+	return nil
+}
+
+func (m *Maintenance) finishReclamation(family ReclamationFamily) {
+	m.activeRuns.Done()
+	<-m.reclaimGates[family]
+}
+
+func (m *Maintenance) reportError(err error) {
+	if m.opts.onError == nil {
+		slog.Error("isledb: maintenance operation failed", "error", err)
+		return
+	}
+	m.callbackMu.Lock()
+	m.opts.onError(err)
+	m.callbackMu.Unlock()
+}
+
+func (m *Maintenance) reportControlCycle(stats MaintenanceStats) {
+	m.callbackMu.Lock()
+	m.opts.onCycle(stats)
+	m.callbackMu.Unlock()
+}
+
+func (m *Maintenance) reportReclamationCycle(stats ReclamationCycleStats) {
+	m.callbackMu.Lock()
+	m.opts.onReclamationCycle(stats)
+	m.callbackMu.Unlock()
+}
+
+func publicSSTCleanupStats(stats sstCleanupWorkStats) SSTCleanupStats {
+	return SSTCleanupStats{
+		SSTsPlanned:    stats.TargetsPlanned,
+		PlansPrepared:  stats.PlansPrepared,
+		PlansScanned:   stats.PlansScanned,
+		PlansCompleted: stats.PlansDeleted,
+		DeleteAttempts: stats.Attempted,
+		SSTsDeleted:    stats.Deleted,
+		DeferredPlans:  stats.Deferred,
+		Failures:       stats.Failed,
+	}
+}
+
+func mergeSSTCleanupStats(dst *SSTCleanupStats, src SSTCleanupStats) {
+	if dst == nil {
+		return
+	}
+	dst.SSTsPlanned += src.SSTsPlanned
+	dst.PlansPrepared += src.PlansPrepared
+	dst.PlansScanned += src.PlansScanned
+	dst.PlansCompleted += src.PlansCompleted
+	dst.DeleteAttempts += src.DeleteAttempts
+	dst.SSTsDeleted += src.SSTsDeleted
+	dst.DeferredPlans += src.DeferredPlans
+	dst.Failures += src.Failures
 }
 
 func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
@@ -761,6 +1121,13 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		}
 		if marked {
 			m.recordManifestSnapshotMarked()
+		}
+	}
+	if m.sstGC != nil {
+		cleanup, err := m.sstGC.markCommandOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
+		m.recordSSTCleanup(cleanup)
+		if err != nil {
+			return false, fmt.Errorf("record SST retirement plan: %w", err)
 		}
 	}
 
@@ -897,18 +1264,26 @@ func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
 	m.statsMu.Unlock()
 }
 
-func (m *Maintenance) recordManifestSnapshotMarked() {
+func (m *Maintenance) recordSSTCleanup(stats sstCleanupWorkStats) {
 	m.statsMu.Lock()
 	if m.currentStats != nil {
-		m.currentStats.ManifestSnapshotCleanup.SnapshotsMarked++
+		cleanup := &m.currentStats.SSTCleanup
+		cleanup.SSTsPlanned += stats.TargetsPlanned
+		cleanup.PlansPrepared += stats.PlansPrepared
+		cleanup.PlansScanned += stats.PlansScanned
+		cleanup.PlansCompleted += stats.PlansDeleted
+		cleanup.DeleteAttempts += stats.Attempted
+		cleanup.SSTsDeleted += stats.Deleted
+		cleanup.DeferredPlans += stats.Deferred
+		cleanup.Failures += stats.Failed
 	}
 	m.statsMu.Unlock()
 }
 
-func (m *Maintenance) recordManifestSnapshotCleanup(stats ManifestSnapshotCleanupStats) {
+func (m *Maintenance) recordManifestSnapshotMarked() {
 	m.statsMu.Lock()
 	if m.currentStats != nil {
-		mergeManifestSnapshotCleanupStats(&m.currentStats.ManifestSnapshotCleanup, stats)
+		m.currentStats.ManifestCleanup.Snapshots.SnapshotsMarked++
 	}
 	m.statsMu.Unlock()
 }

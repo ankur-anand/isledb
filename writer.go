@@ -399,22 +399,22 @@ func (w *writer) ensureCapacityLocked() error {
 }
 
 func (w *writer) flush(ctx context.Context) error {
-	return w.flushInternal(ctx, false, false)
+	return w.flushInternal(ctx, false, false, false)
 }
 
 func (w *writer) flushBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true, false)
+	return w.flushInternal(ctx, true, false, false)
 }
 
 func (w *writer) flushMaintenanceBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true, true)
+	return w.flushInternal(ctx, true, true, true)
 }
 
 func (w *writer) flushFinal(ctx context.Context) error {
-	return w.flushInternal(ctx, false, true)
+	return w.flushInternal(ctx, false, true, false)
 }
 
-func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMaintenancePoll bool) error {
+func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMaintenancePoll, maintenanceOnly bool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -436,6 +436,13 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			w.fenced.Store(true)
 		}
 		return fmt.Errorf("apply maintenance command: %w", err)
+	}
+	if maintenanceOnly {
+		// A process-local mailbox wake publishes only the maintenance command.
+		// User mutations retain the same visibility boundary as when no
+		// maintenance handle exists: explicit Flush, configured background
+		// flush, or Close.
+		return nil
 	}
 
 	w.mu.Lock()

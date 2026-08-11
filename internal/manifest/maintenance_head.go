@@ -28,7 +28,6 @@ const (
 	MaintenanceCommandCompaction      MaintenanceCommandKind = "compaction"
 	MaintenanceCommandRemoveSSTables  MaintenanceCommandKind = "remove_sstables"
 	MaintenanceCommandChangeFeedFloor MaintenanceCommandKind = "change_feed_floor"
-	MaintenanceCommandRetirementFloor MaintenanceCommandKind = "retirement_floor"
 )
 
 type MaintenanceHead struct {
@@ -52,7 +51,6 @@ type MaintenanceCommand struct {
 	Compaction      *CompactionCommand     `json:"compaction,omitempty"`
 	RemoveSSTables  *RemoveSSTablesCommand `json:"remove_sstables,omitempty"`
 	ChangeFeedFloor *AdvanceFloorCommand   `json:"change_feed_floor,omitempty"`
-	RetirementFloor *AdvanceFloorCommand   `json:"retirement_floor,omitempty"`
 }
 
 // MaintenanceScheduling records the bounded cost of a primary maintenance
@@ -158,9 +156,6 @@ func (c *MaintenanceCommand) Validate() error {
 	if c.ChangeFeedFloor != nil {
 		payloads++
 	}
-	if c.RetirementFloor != nil {
-		payloads++
-	}
 	if payloads != 1 {
 		return fmt.Errorf("%w: payload count=%d", ErrInvalidMaintenanceCommand, payloads)
 	}
@@ -188,6 +183,13 @@ func (c *MaintenanceCommand) Validate() error {
 			return fmt.Errorf("%w: compaction work_units=%d max=%d",
 				ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits, maxMaintenanceSchedulingWorkUnits)
 		}
+		if err := validateRetiredObjects(&ManifestLogEntry{
+			Op:             LogOpCompaction,
+			Compaction:     &c.Compaction.Payload,
+			RetiredObjects: c.Compaction.RetiredObjects,
+		}); err != nil {
+			return fmt.Errorf("%w: invalid compaction retirement: %v", ErrInvalidMaintenanceCommand, err)
+		}
 	case MaintenanceCommandRemoveSSTables:
 		if c.Scheduling.WorkUnits != 0 {
 			return fmt.Errorf("%w: remove SST work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
@@ -195,19 +197,19 @@ func (c *MaintenanceCommand) Validate() error {
 		if c.RemoveSSTables == nil || len(c.RemoveSSTables.SSTableIDs) == 0 {
 			return fmt.Errorf("%w: missing removed SSTs", ErrInvalidMaintenanceCommand)
 		}
+		if err := validateRetiredObjects(&ManifestLogEntry{
+			Op:               LogOpRemoveSSTable,
+			RemoveSSTableIDs: c.RemoveSSTables.SSTableIDs,
+			RetiredObjects:   c.RemoveSSTables.RetiredObjects,
+		}); err != nil {
+			return fmt.Errorf("%w: invalid removed-SST retirement: %v", ErrInvalidMaintenanceCommand, err)
+		}
 	case MaintenanceCommandChangeFeedFloor:
 		if c.Scheduling.WorkUnits != 0 {
 			return fmt.Errorf("%w: change-feed floor work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
 		}
 		if c.ChangeFeedFloor == nil {
 			return fmt.Errorf("%w: missing change-feed floor", ErrInvalidMaintenanceCommand)
-		}
-	case MaintenanceCommandRetirementFloor:
-		if c.Scheduling.WorkUnits != 0 {
-			return fmt.Errorf("%w: retirement floor work_units=%d", ErrInvalidMaintenanceCommand, c.Scheduling.WorkUnits)
-		}
-		if c.RetirementFloor == nil {
-			return fmt.Errorf("%w: missing retirement floor", ErrInvalidMaintenanceCommand)
 		}
 	default:
 		return fmt.Errorf("%w: kind=%q", ErrInvalidMaintenanceCommand, c.Kind)
@@ -543,18 +545,6 @@ func (s *Store) applyMaintenanceCommand(
 		current.ChangeFeedLogStart = floor
 		pruneRetainedManifestRefs(current)
 		return nil
-
-	case MaintenanceCommandRetirementFloor:
-		floor := command.RetirementFloor.Floor
-		if floor < current.RetirementLogStart {
-			floor = current.RetirementLogStart
-		}
-		if floor > current.NextSeq {
-			floor = current.NextSeq
-		}
-		current.RetirementLogStart = floor
-		pruneRetainedManifestRefs(current)
-		return nil
 	default:
 		return fmt.Errorf("%w: kind=%q", ErrInvalidMaintenanceCommand, command.Kind)
 	}
@@ -632,7 +622,7 @@ func (s *Store) appendWriterOwnedMaintenanceEntry(ctx context.Context, current *
 	entry.Role = FenceRoleWriter
 	entry.Epoch = current.WriterFence.Epoch
 	entry.Timestamp = time.Now().UTC()
-	if err := stampRetiredObjects(entry, current); err != nil {
+	if err := validateRetiredObjects(entry); err != nil {
 		return err
 	}
 	if current.LogSeqStart == current.NextSeq {

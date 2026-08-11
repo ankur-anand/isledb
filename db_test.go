@@ -386,18 +386,6 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 	}
 }
 
-type testGCCursorStorage struct{}
-
-func (t *testGCCursorStorage) LoadGCCursor(context.Context) ([]byte, string, bool, error) {
-	return nil, "", false, nil
-}
-
-func (t *testGCCursorStorage) StoreGCCursor(context.Context, []byte, string, bool) error {
-	return nil
-}
-
-var _ manifest.GCCursorStorage = (*testGCCursorStorage)(nil)
-
 func TestOpenDBSharesManifestStore(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-test")
@@ -488,28 +476,5 @@ func TestDBCloseClosesHandles(t *testing.T) {
 	}
 	if !maintenance.compactor.closed.Load() {
 		t.Fatal("expected maintenance compactor to be closed by DB.Close")
-	}
-}
-
-func TestOpenDBPropagatesGCCursorStorageToMaintenance(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("db-gc-mark-storage")
-	defer store.Close()
-
-	custom := &testGCCursorStorage{}
-	db, err := openDB(ctx, store, dbOpenOptions{gcCursorStorage: custom})
-	if err != nil {
-		t.Fatalf("OpenDB: %v", err)
-	}
-	defer db.Close()
-
-	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
-	if err != nil {
-		t.Fatalf("OpenMaintenance: %v", err)
-	}
-	defer maintenance.Close(ctx)
-
-	if maintenance.compactor.gcCursorStore != custom {
-		t.Fatal("compactor did not inherit db gc cursor storage")
 	}
 }

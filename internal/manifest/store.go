@@ -28,7 +28,6 @@ var (
 	ErrChangeFeedHistory         = errors.New("change feed history unavailable")
 	ErrChangeFeedPosition        = errors.New("invalid change feed position")
 	ErrInvalidRetirement         = errors.New("invalid retired object batch")
-	ErrRetirementHistory         = errors.New("retirement history unavailable")
 	ErrInvalidManifest           = errors.New("invalid manifest topology")
 	ErrStorePolicyMismatch       = errors.New("store policy mismatch")
 )
@@ -451,7 +450,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if nextEntry.Timestamp.IsZero() {
 			nextEntry.Timestamp = time.Now().UTC()
 		}
-		if err := stampRetiredObjects(&nextEntry, current); err != nil {
+		if err := validateRetiredObjects(&nextEntry); err != nil {
 			return err
 		}
 
@@ -760,22 +759,20 @@ func validateRetiredObjects(entry *ManifestLogEntry) error {
 	retiredSSTs := make(map[string]struct{}, len(entry.RetiredObjects))
 	seenKeys := make(map[string]struct{}, len(entry.RetiredObjects))
 	for _, retired := range entry.RetiredObjects {
-		if retired.Kind != RetiredObjectSST && retired.Kind != RetiredObjectChangeBatch {
+		if retired.Kind != RetiredObjectSST {
 			return fmt.Errorf("%w: unsupported kind=%q", ErrInvalidRetirement, retired.Kind)
 		}
-		if retired.ID == "" || retired.Key == "" || retired.NotBefore.IsZero() || retired.Size < 0 {
+		if retired.ID == "" || retired.Key == "" || retired.Size < 0 {
 			return fmt.Errorf("%w: incomplete object kind=%q id=%q key=%q", ErrInvalidRetirement, retired.Kind, retired.ID, retired.Key)
 		}
 		if _, exists := seenKeys[retired.Key]; exists {
 			return fmt.Errorf("%w: duplicate key=%q", ErrInvalidRetirement, retired.Key)
 		}
 		seenKeys[retired.Key] = struct{}{}
-		if retired.Kind == RetiredObjectSST {
-			if _, exists := removed[retired.ID]; !exists {
-				return fmt.Errorf("%w: sst id=%q is not removed by entry", ErrInvalidRetirement, retired.ID)
-			}
-			retiredSSTs[retired.ID] = struct{}{}
+		if _, exists := removed[retired.ID]; !exists {
+			return fmt.Errorf("%w: sst id=%q is not removed by entry", ErrInvalidRetirement, retired.ID)
 		}
+		retiredSSTs[retired.ID] = struct{}{}
 	}
 
 	for id := range removed {
@@ -784,23 +781,6 @@ func validateRetiredObjects(entry *ManifestLogEntry) error {
 		}
 	}
 	return nil
-}
-
-func stampRetiredObjects(entry *ManifestLogEntry, current *Current) error {
-	if entry == nil {
-		return fmt.Errorf("%w: nil manifest entry", ErrInvalidRetirement)
-	}
-	if len(entry.RetiredObjects) == 0 {
-		return validateRetiredObjects(entry)
-	}
-	entry.RetiredObjects = append([]RetiredObject(nil), entry.RetiredObjects...)
-	notBefore := entry.Timestamp.Add(current.PinnedViewAge()).Add(retirementSafetyMargin)
-	for i := range entry.RetiredObjects {
-		if entry.RetiredObjects[i].NotBefore.IsZero() || entry.RetiredObjects[i].NotBefore.Before(notBefore) {
-			entry.RetiredObjects[i].NotBefore = notBefore
-		}
-	}
-	return validateRetiredObjects(entry)
 }
 
 func (s *Store) activeLimit() int {
@@ -1534,41 +1514,6 @@ func (s *Store) ReadEntry(ctx context.Context, seq uint64) (*ManifestLogEntry, e
 	return entries[0], nil
 }
 
-// ReadRetirementEntries returns a bounded contiguous manifest range used by
-// deterministic object reclamation. head is the first uncommitted sequence.
-func (s *Store) ReadRetirementEntries(ctx context.Context, start uint64, limit int) (entries []*ManifestLogEntry, head uint64, err error) {
-	if limit <= 0 {
-		limit = MaxRetiredObjectsPerEntry
-	}
-	if limit > 1024 {
-		limit = 1024
-	}
-
-	current, err := s.readCurrent(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	if current == nil {
-		return nil, 0, nil
-	}
-	if start < current.RetirementLogStart {
-		return nil, current.NextSeq, fmt.Errorf("%w: start=%d retained_from=%d", ErrRetirementHistory, start, current.RetirementLogStart)
-	}
-	if start >= current.NextSeq {
-		return nil, current.NextSeq, nil
-	}
-
-	end := start + uint64(limit)
-	if end < start || end > current.NextSeq {
-		end = current.NextSeq
-	}
-	entries, err = s.entriesInRange(ctx, current, start, end)
-	if err != nil {
-		return nil, current.NextSeq, err
-	}
-	return entries, current.NextSeq, nil
-}
-
 func (s *Store) writeSnapshotObject(ctx context.Context, m *Manifest) (ObjectRef, error) {
 	data, err := EncodeSnapshot(m)
 	if err != nil {
@@ -1660,9 +1605,6 @@ func retainedEntryFloor(current *Current) uint64 {
 	floor := current.LogSeqStart
 	if current.ChangeFeedLogStart < floor {
 		floor = current.ChangeFeedLogStart
-	}
-	if current.RetirementLogStart < floor {
-		floor = current.RetirementLogStart
 	}
 	return floor
 }
@@ -1977,57 +1919,6 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, tok
 		}
 
 		updated.ChangeFeedLogStart = floor
-		retainedFrom := retainedEntryFloor(updated)
-		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, retainedFrom)
-		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, retainedFrom)
-
-		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
-			if errors.Is(err, ErrPreconditionFailed) {
-				if attempt+1 < currentCASMaxRetries {
-					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
-						return nil, err
-					}
-				}
-				continue
-			}
-			return nil, err
-		}
-		return updated, nil
-	}
-
-	return nil, ErrFenceConflict
-}
-
-// AdvanceRetirementLogStart records that deterministic GC has consumed every
-// manifest entry below floor. It never moves the floor backwards.
-func (s *Store) AdvanceRetirementLogStart(ctx context.Context, floor uint64, token *FenceToken) (*Current, error) {
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-
-	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
-		current, etag, err := s.readCurrentWithETag(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if current == nil {
-			return nil, nil
-		}
-		if err := checkFenceToken(token, current.CompactorFence); err != nil {
-			return nil, err
-		}
-
-		updated := current.Clone()
-		if floor < updated.RetirementLogStart {
-			floor = updated.RetirementLogStart
-		}
-		if floor > updated.NextSeq {
-			floor = updated.NextSeq
-		}
-		if floor == updated.RetirementLogStart {
-			return updated, nil
-		}
-
-		updated.RetirementLogStart = floor
 		retainedFrom := retainedEntryFloor(updated)
 		updated.ActiveEntries = filterEntriesAtOrAfter(updated.ActiveEntries, retainedFrom)
 		updated.IndexFrontier = filterPageRefsAtOrAfter(updated.IndexFrontier, retainedFrom)

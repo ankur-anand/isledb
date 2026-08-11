@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -11,7 +12,10 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
-const changeFeedCleanerScanBatchSize = 1024
+const (
+	changeFeedCleanerScanBatchSize     = 1024
+	changeFeedCleanerMaxEntriesPerPass = 1024
+)
 
 type changeFeedCleanerOptions struct {
 	// RetentionPeriod is the minimum age retained for change-feed entries.
@@ -23,12 +27,12 @@ type changeFeedCleanerOptions struct {
 	// entries retained for change-feed readers. Zero uses the default.
 	KeepAtLeastManifestEntries uint64
 
-	// SweepBatchSize limits physical change-batch deletes per RunOnce.
+	// SweepBatchSize bounds both the targets placed in one immutable deletion
+	// plan and normal physical deletes in one reclaim pass.
 	SweepBatchSize int
 
-	// SweepGracePeriod is the delay between first marking a change batch and
-	// physically deleting it. Physical delete still requires CURRENT to have
-	// advanced beyond the marked manifest seq.
+	// SweepGracePeriod is persisted in each plan as its physical deletion
+	// delay. Deletion also requires CURRENT to reach the plan's target floor.
 	SweepGracePeriod time.Duration
 
 	OnCleanup func(ChangeFeedCleanupStats)
@@ -49,6 +53,10 @@ type changeFeedCleaner struct {
 	opts         changeFeedCleanerOptions
 	fenceToken   *manifest.FenceToken
 	stageCommand maintenanceCommandStager
+
+	reclaimMu sync.Mutex
+	planIter  *blobstore.ListIterator
+	planCache map[string]changeFeedDeletionPlan
 
 	closed atomic.Bool
 }
@@ -83,7 +91,10 @@ func newChangeFeedCleanerWithFence(ctx context.Context, store *blobstore.Store, 
 		fence = token
 	}
 	token := *fence
-	return &changeFeedCleaner{store: store, manifestLog: manifestLog, opts: opts, fenceToken: &token}, nil
+	return &changeFeedCleaner{
+		store: store, manifestLog: manifestLog, opts: opts, fenceToken: &token,
+		planCache: make(map[string]changeFeedDeletionPlan),
+	}, nil
 }
 
 func (c *changeFeedCleaner) Close(ctx context.Context) error {
@@ -101,43 +112,57 @@ func (c *changeFeedCleaner) closeDB() error {
 }
 
 func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
-	if err := checkContext(ctx); err != nil {
+	control, err := c.runControlOnce(ctx)
+	if err != nil {
 		return err
 	}
+	reclaim, err := c.runReclaimOnce(ctx)
+	stats := mergeChangeFeedCleanupStats(control, reclaim)
+	if c.opts.OnCleanup != nil && hasChangeFeedCleanupWork(stats) {
+		c.opts.OnCleanup(stats)
+	}
+	return err
+}
+
+// runControlOnce performs only logical retention work: it discovers retired
+// batches, persists one bounded immutable plan, and stages the new feed floor.
+// It never waits for physical object deletion.
+func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFeedCleanupStats, err error) {
+	start := time.Now()
+	defer func() { stats.Duration = time.Since(start) }()
+	if err := checkContext(ctx); err != nil {
+		return stats, err
+	}
 	if c.closed.Load() {
-		return errors.New("change feed cleaner closed")
+		return stats, errors.New("change feed cleaner closed")
 	}
 	if c.stageCommand == nil {
 		if err := c.manifestLog.CheckCompactorFenceToken(ctx, c.fenceToken); err != nil {
-			return err
+			return stats, err
 		}
 	}
-	start := time.Now()
 
 	view, err := c.manifestLog.LoadChangeFeedView(ctx)
 	if err != nil {
-		return fmt.Errorf("load change-feed view: %w", err)
+		return stats, fmt.Errorf("load change-feed view: %w", err)
 	}
 	if view.Head() <= view.RetainedFrom() {
-		stats, err := runPendingChangeBatchSweeper(ctx, c.store, c.manifestLog, c.opts.SweepBatchSize, c.opts.SweepGracePeriod)
-		if err != nil {
-			return err
-		}
-		if c.opts.OnCleanup != nil && stats.Deleted > 0 {
-			c.opts.OnCleanup(ChangeFeedCleanupStats{BatchesDeleted: stats.Deleted, BlockedRetained: stats.BlockedRetained, FailedDeletes: stats.Failed, Duration: time.Since(start)})
-		}
-		return nil
+		return stats, nil
 	}
 
 	now := time.Now().UTC()
 	floor, candidates, err := c.planRetentionFloor(ctx, view, now)
 	if err != nil {
-		return err
+		return stats, err
 	}
 
 	if len(candidates) > 0 {
-		if err := enqueuePendingChangeBatchDeleteMarks(ctx, c.store, candidates, "change_feed_retention"); err != nil {
-			return fmt.Errorf("enqueue change-batch delete marks: %w", err)
+		plan, payload, err := buildChangeFeedDeletionPlan(c.store, candidates, floor, now, c.opts.SweepGracePeriod)
+		if err != nil {
+			return stats, fmt.Errorf("build change-feed deletion plan: %w", err)
+		}
+		if _, err := storeChangeFeedDeletionPlan(ctx, c.store, *plan, payload); err != nil {
+			return stats, fmt.Errorf("store change-feed deletion plan: %w", err)
 		}
 	}
 
@@ -153,28 +178,66 @@ func (c *changeFeedCleaner) RunOnce(ctx context.Context) error {
 			_, err = c.manifestLog.AdvanceChangeFeedLogStart(ctx, floor, c.fenceToken)
 		}
 		if err != nil {
-			return fmt.Errorf("advance change-feed floor: %w", err)
+			return stats, fmt.Errorf("advance change-feed floor: %w", err)
 		}
 		entriesRetired = int(floor - view.RetainedFrom())
 	}
+	stats = ChangeFeedCleanupStats{
+		EntriesRetired: entriesRetired,
+		BatchesPlanned: len(candidates),
+	}
+	return stats, nil
+}
 
-	sweepStats, err := runPendingChangeBatchSweeper(ctx, c.store, c.manifestLog, c.opts.SweepBatchSize, c.opts.SweepGracePeriod)
-	if err != nil {
-		return fmt.Errorf("sweep pending change batches: %w", err)
+// runReclaimOnce performs only bounded physical deletion from durable plans.
+// It is intentionally fence-independent: CURRENT remains the authority that
+// proves whether every planned change batch is below the committed feed floor.
+func (c *changeFeedCleaner) runReclaimOnce(ctx context.Context, deleter ...objectDeleter) (stats ChangeFeedCleanupStats, err error) {
+	start := time.Now()
+	defer func() { stats.Duration = time.Since(start) }()
+	if err := checkContext(ctx); err != nil {
+		return stats, err
 	}
+	if c.closed.Load() {
+		return stats, errors.New("change feed cleaner closed")
+	}
+	deleteObjects := objectDeleter(c.store)
+	if len(deleter) > 0 && deleter[0] != nil {
+		deleteObjects = deleter[0]
+	}
+	c.reclaimMu.Lock()
+	defer c.reclaimMu.Unlock()
+	if c.planIter == nil {
+		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"})
+	}
+	sweep, exhausted, sweepErr := runChangeFeedDeletionPlanReclaimer(
+		ctx, c.store, c.manifestLog, c.opts.SweepBatchSize,
+		defaultChangeFeedDeletionPlanScanLimit, time.Now().UTC(), deleteObjects, c.planIter, c.planCache)
+	if exhausted || sweepErr != nil {
+		c.planIter = nil
+	}
+	stats.BatchesDeleted = sweep.Deleted
+	stats.BlockedRetained = sweep.BlockedRetained
+	stats.FailedDeletes = sweep.Failed
+	if sweepErr != nil {
+		return stats, fmt.Errorf("reclaim change-feed deletion plans: %w", sweepErr)
+	}
+	return stats, nil
+}
 
-	stats := ChangeFeedCleanupStats{
-		EntriesRetired:  entriesRetired,
-		BatchesMarked:   len(candidates),
-		BatchesDeleted:  sweepStats.Deleted,
-		BlockedRetained: sweepStats.BlockedRetained,
-		FailedDeletes:   sweepStats.Failed,
-		Duration:        time.Since(start),
+func mergeChangeFeedCleanupStats(a, b ChangeFeedCleanupStats) ChangeFeedCleanupStats {
+	return ChangeFeedCleanupStats{
+		EntriesRetired:  a.EntriesRetired + b.EntriesRetired,
+		BatchesPlanned:  a.BatchesPlanned + b.BatchesPlanned,
+		BatchesDeleted:  a.BatchesDeleted + b.BatchesDeleted,
+		BlockedRetained: a.BlockedRetained + b.BlockedRetained,
+		FailedDeletes:   a.FailedDeletes + b.FailedDeletes,
+		Duration:        a.Duration + b.Duration,
 	}
-	if c.opts.OnCleanup != nil && (stats.EntriesRetired > 0 || stats.BatchesMarked > 0 || stats.BatchesDeleted > 0 || stats.FailedDeletes > 0) {
-		c.opts.OnCleanup(stats)
-	}
-	return nil
+}
+
+func hasChangeFeedCleanupWork(stats ChangeFeedCleanupStats) bool {
+	return stats.EntriesRetired > 0 || stats.BatchesPlanned > 0 || stats.BatchesDeleted > 0 || stats.FailedDeletes > 0
 }
 
 func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, view *manifest.ChangeFeedView, now time.Time) (uint64, []changeBatchDeleteCandidate, error) {
@@ -197,10 +260,14 @@ func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, view *manife
 	cutoff := now.Add(-c.opts.RetentionPeriod)
 	floor := start
 	candidates := make([]changeBatchDeleteCandidate, 0)
-	for floor < maxFloor {
+	entriesScanned := 0
+	for floor < maxFloor && entriesScanned < changeFeedCleanerMaxEntriesPerPass {
 		limit := changeFeedCleanerScanBatchSize
 		if remaining := maxFloor - floor; remaining < uint64(limit) {
 			limit = int(remaining)
+		}
+		if remaining := changeFeedCleanerMaxEntriesPerPass - entriesScanned; limit > remaining {
+			limit = remaining
 		}
 		entries, err := c.manifestLog.ReadChangeEntriesFromView(ctx, view, floor, false, limit)
 		if err != nil {
@@ -210,6 +277,7 @@ func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, view *manife
 			return floor, nil, fmt.Errorf("manifest scan made no progress at seq=%d", floor)
 		}
 		for _, entry := range entries {
+			entriesScanned++
 			if entry == nil {
 				return floor, nil, fmt.Errorf("manifest scan returned nil entry at seq=%d", floor)
 			}
@@ -230,6 +298,9 @@ func (c *changeFeedCleaner) planRetentionFloor(ctx context.Context, view *manife
 				})
 			}
 			floor = entry.Seq + 1
+			if len(candidates) >= c.opts.SweepBatchSize || entriesScanned >= changeFeedCleanerMaxEntriesPerPass {
+				return floor, candidates, nil
+			}
 		}
 	}
 

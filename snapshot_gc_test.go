@@ -280,8 +280,8 @@ func TestSnapshotCleanerRetirementSurvivesMaintenanceRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry RunOnce: %v", err)
 	}
-	if stats.ManifestSnapshotCleanup.SnapshotsMarked != 1 {
-		t.Fatalf("SnapshotsMarked=%d, want 1", stats.ManifestSnapshotCleanup.SnapshotsMarked)
+	if stats.ManifestCleanup.Snapshots.SnapshotsMarked != 1 {
+		t.Fatalf("SnapshotsMarked=%d, want 1", stats.ManifestCleanup.Snapshots.SnapshotsMarked)
 	}
 	head, _, err = db.manifestStore.ReadMaintenanceHead(ctx)
 	if err != nil {

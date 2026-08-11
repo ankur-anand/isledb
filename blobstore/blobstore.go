@@ -481,6 +481,39 @@ type ObjectInfo struct {
 	IsDir bool
 }
 
+// ListIterator retains the provider continuation state for a bounded,
+// incremental object scan. It is not safe for concurrent use.
+type ListIterator struct {
+	iter *blob.ListIterator
+}
+
+// NewListIterator starts an incremental scan. The returned iterator keeps the
+// provider cursor in memory, so callers can consume bounded pages without
+// restarting the listing from the prefix on every pass.
+func (s *Store) NewListIterator(opts ListOptions) *ListIterator {
+	prefix := s.prefix
+	if opts.Prefix != "" {
+		prefix = s.path(opts.Prefix)
+	}
+	return &ListIterator{iter: s.bucket.List(&blob.ListOptions{
+		Prefix:    prefix,
+		Delimiter: opts.Delimiter,
+	})}
+}
+
+// Next returns the next object in provider listing order. It returns io.EOF
+// after the current scan is exhausted.
+func (it *ListIterator) Next(ctx context.Context) (ObjectInfo, error) {
+	if it == nil || it.iter == nil {
+		return ObjectInfo{}, io.EOF
+	}
+	object, err := it.iter.Next(ctx)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Key: object.Key, Size: object.Size, IsDir: object.IsDir}, nil
+}
+
 func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error) {
 	var result ListResult
 	if err := s.Walk(ctx, opts, func(object ObjectInfo) (bool, error) {
@@ -498,14 +531,7 @@ func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInf
 	if visit == nil {
 		return errors.New("nil object visitor")
 	}
-	prefix := s.prefix
-	if opts.Prefix != "" {
-		prefix = s.path(opts.Prefix)
-	}
-	iter := s.bucket.List(&blob.ListOptions{
-		Prefix:    prefix,
-		Delimiter: opts.Delimiter,
-	})
+	iter := s.NewListIterator(opts)
 	for {
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
@@ -514,11 +540,7 @@ func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInf
 		if err != nil {
 			return err
 		}
-		keepGoing, err := visit(ObjectInfo{
-			Key:   obj.Key,
-			Size:  obj.Size,
-			IsDir: obj.IsDir,
-		})
+		keepGoing, err := visit(obj)
 		if err != nil {
 			return err
 		}

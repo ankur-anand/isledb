@@ -176,8 +176,8 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 
 	command := manifest.MaintenanceCommand{
 		ID:              "mailbox-recovery-command",
-		Kind:            manifest.MaintenanceCommandRetirementFloor,
-		RetirementFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
 	}
 
 	if phase == "stage" {
@@ -236,9 +236,9 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 		current.MaintenanceReceipt.Status != manifest.MaintenanceStatusApplied {
 		t.Fatalf("CURRENT maintenance receipt=%+v", current)
 	}
-	if current.RetirementLogStart < command.RetirementFloor.Floor {
-		t.Fatalf("retirement_log_start=%d, want at least %d",
-			current.RetirementLogStart, command.RetirementFloor.Floor)
+	if current.ChangeFeedLogStart < command.ChangeFeedFloor.Floor {
+		t.Fatalf("change_feed_log_start=%d, want at least %d",
+			current.ChangeFeedLogStart, command.ChangeFeedFloor.Floor)
 	}
 
 	if err := writer.Put(ctx, []byte("after-recovery"), []byte("visible")); err != nil {

@@ -105,6 +105,37 @@ func TestWriteIfMatch_CreateOnly(t *testing.T) {
 	})
 }
 
+func TestListIteratorRetainsPositionAcrossBoundedConsumption(t *testing.T) {
+	forEachStore(t, "list-iterator", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		for _, key := range []string{"scan/a", "scan/b", "scan/c", "unrelated/d"} {
+			if _, err := h.store.Write(ctx, h.store.path(key), []byte(key)); err != nil {
+				t.Fatalf("write %q: %v", key, err)
+			}
+		}
+
+		iter := h.store.NewListIterator(ListOptions{Prefix: "scan/"})
+		first, err := iter.Next(ctx)
+		if err != nil {
+			t.Fatalf("first Next: %v", err)
+		}
+		second, err := iter.Next(ctx)
+		if err != nil {
+			t.Fatalf("second Next: %v", err)
+		}
+		third, err := iter.Next(ctx)
+		if err != nil {
+			t.Fatalf("third Next: %v", err)
+		}
+		if first.Key == second.Key || second.Key == third.Key || first.Key == third.Key {
+			t.Fatalf("iterator repeated keys: %q %q %q", first.Key, second.Key, third.Key)
+		}
+		if _, err := iter.Next(ctx); !errors.Is(err, io.EOF) {
+			t.Fatalf("Next after prefix exhaustion error=%v want io.EOF", err)
+		}
+	})
+}
+
 func TestWriteIfMatch_UpdateWithETag(t *testing.T) {
 	forEachStore(t, "test", func(t *testing.T, h storeHarness) {
 		ctx := context.Background()
