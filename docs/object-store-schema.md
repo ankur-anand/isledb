@@ -288,7 +288,6 @@ Decompressed JSON payload example:
       "max_key": "AAAAAAAAAW0=",
       "size": 1048576,
       "checksum": "sha256:abc",
-      "signature": null,
       "bloom": {
         "bits_per_key": 0,
         "k": 0,
@@ -312,7 +311,6 @@ Decompressed JSON payload example:
           "max_key": "AAAAAAAAARc=",
           "size": 8388608,
           "checksum": "sha256:def",
-          "signature": null,
           "bloom": {
             "bits_per_key": 0,
             "k": 0,

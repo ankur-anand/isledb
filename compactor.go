@@ -341,7 +341,7 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 			destination = level.OverlappingSSTs(minKey, maxKey)
 		}
 		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source) &&
-			!c.opts.Safety.ValidateSSTChecksum && c.opts.Safety.SSTHashVerifier == nil
+			!c.opts.Safety.ValidateSSTChecksum
 		if metadataOnly || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
 			plan := &levelCompactionPlan{
 				sourceLevel:      sourceLevel,
@@ -595,7 +595,7 @@ func (c *compactor) openOneSST(ctx context.Context, sst sstMetadata) openSSTResu
 	if err != nil {
 		return openSSTResult{err: fmt.Errorf("read sst %s: %w", sst.ID, err)}
 	}
-	if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum, c.opts.Safety.SSTHashVerifier); err != nil {
+	if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum); err != nil {
 		return openSSTResult{err: err}
 	}
 
@@ -629,13 +629,8 @@ func cleanupOpenResults(results []openSSTResult) {
 	}
 }
 
-func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool, verifier SSTHashVerifier) error {
-	if verifier != nil && meta.Signature == nil {
-		return fmt.Errorf("sst %s: missing signature", meta.ID)
-	}
-
-	needHash := verify || verifier != nil
-	if !needHash {
+func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool) error {
+	if !verify {
 		return nil
 	}
 
@@ -648,31 +643,15 @@ func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool, ve
 	sum := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(sum[:])
 
-	if verify {
-		if meta.Checksum == "" {
-			return fmt.Errorf("sst %s: missing checksum", meta.ID)
-		}
-		algo, expected, ok := strings.Cut(meta.Checksum, ":")
-		if !ok || algo != "sha256" {
-			return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
-		}
-		if expected != hashHex {
-			return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
-		}
+	if meta.Checksum == "" {
+		return fmt.Errorf("sst %s: missing checksum", meta.ID)
 	}
-
-	if verifier != nil {
-		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
-			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
-		}
-		if err := verifier.VerifyHash(sum[:], SSTSignature{
-			Algorithm: meta.Signature.Algorithm,
-			KeyID:     meta.Signature.KeyID,
-			Hash:      meta.Signature.Hash,
-			Signature: meta.Signature.Signature,
-		}); err != nil {
-			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
-		}
+	algo, expected, ok := strings.Cut(meta.Checksum, ":")
+	if !ok || algo != "sha256" {
+		return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
+	}
+	if expected != hashHex {
+		return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
 	}
 
 	return nil

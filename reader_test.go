@@ -379,43 +379,6 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 }
 
-type noopSSTVerifier struct{}
-
-func (noopSSTVerifier) VerifyHash(_ []byte, _ SSTSignature) error {
-	return nil
-}
-
-func TestReader_VerifierRequiresSignature(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("reader-verify")
-	ms := manifest.NewStore(store)
-
-	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
-	}
-	writeTestSST(t, ctx, store, ms, entries, 0, 1)
-
-	cacheDir := t.TempDir()
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:        cacheDir,
-		SSTHashVerifier: noopSSTVerifier{},
-	})
-	if err != nil {
-		_ = store.Close()
-		t.Fatalf("newReader: %v", err)
-	}
-	defer func() {
-		_ = reader.Close()
-		_ = store.Close()
-	}()
-
-	if _, _, err := reader.Get(ctx, []byte("a")); err == nil {
-		t.Fatalf("expected missing signature error")
-	} else if !strings.Contains(err.Error(), "missing signature") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestReader_ChecksumMismatch(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-checksum")

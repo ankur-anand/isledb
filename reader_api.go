@@ -45,7 +45,7 @@ type ReaderOpenOptions struct {
 	BlockCacheSize int64
 
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
-	// full-file checksums or signatures.
+	// full-file checksums.
 	AllowUnverifiedRangeRead bool
 
 	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
@@ -55,10 +55,6 @@ type ReaderOpenOptions struct {
 	// ValidateSSTChecksum verifies SST checksums on first download.
 	// If enabled and checksum is missing or mismatched, reads fail.
 	ValidateSSTChecksum bool
-
-	// SSTHashVerifier verifies SST signatures when present.
-	// If provided and the SST has a signature, verification is enforced.
-	SSTHashVerifier SSTHashVerifier
 
 	// Views controls manifest freshness. Read-view lifetime is a store policy
 	// loaded from the manifest and cannot be extended by a reader.
@@ -91,7 +87,6 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
-		SSTHashVerifier:          opts.SSTHashVerifier,
 		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,
 	}, nil

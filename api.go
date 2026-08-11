@@ -12,14 +12,6 @@ type manifestState = manifest.Manifest
 type sstMetadata = manifest.SSTMeta
 type bloomMetadata = manifest.BloomMeta
 
-// SSTSignature is the signature metadata passed to SSTHashVerifier.
-type SSTSignature struct {
-	Algorithm string
-	KeyID     string
-	Hash      string
-	Signature []byte
-}
-
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {
 		return storage

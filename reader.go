@@ -39,7 +39,6 @@ type Reader struct {
 	manifestLoads singleflight.Group
 
 	verifySST                bool
-	verifier                 SSTHashVerifier
 	allowUnverifiedRangeRead bool
 	rangeReadMinSSTSize      int64
 
@@ -119,7 +118,6 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		sstCache:                 sstCache,
 		blockCache:               blockCache,
 		verifySST:                opts.ValidateSSTChecksum,
-		verifier:                 opts.SSTHashVerifier,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ownsSSTCache:             ownsSSTCache,
@@ -771,7 +769,7 @@ func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, int64, error) {
 	if r.blockCache == nil {
 		return false, 0, nil
 	}
-	if !r.allowUnverifiedRangeRead && (r.verifySST || r.verifier != nil) {
+	if !r.allowUnverifiedRangeRead && r.verifySST {
 		return false, 0, nil
 	}
 
@@ -877,8 +875,7 @@ func (it *sstIterWithClose) Close() error {
 }
 
 func (r *Reader) validateSSTData(meta sstMetadata, data []byte) error {
-	needHash := r.verifySST || r.verifier != nil
-	if !needHash {
+	if !r.verifySST {
 		return nil
 	}
 
@@ -889,46 +886,24 @@ func (r *Reader) validateSSTData(meta sstMetadata, data []byte) error {
 	}
 
 	sum := sha256.Sum256(data)
-	return r.validateSSTHash(meta, sum)
+	return r.validateSSTChecksum(meta, sum)
 }
 
-func (r *Reader) validateSSTHash(meta sstMetadata, sum [32]byte) error {
-	if r.verifier != nil && meta.Signature == nil {
-		return fmt.Errorf("sst %s: missing signature", meta.ID)
-	}
-
-	needHash := r.verifySST || r.verifier != nil
-	if !needHash {
+func (r *Reader) validateSSTChecksum(meta sstMetadata, sum [32]byte) error {
+	if !r.verifySST {
 		return nil
 	}
 
 	hashHex := hex.EncodeToString(sum[:])
-
-	if r.verifySST {
-		if meta.Checksum == "" {
-			return fmt.Errorf("sst %s: missing checksum", meta.ID)
-		}
-		algo, expected, ok := strings.Cut(meta.Checksum, ":")
-		if !ok || algo != "sha256" {
-			return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
-		}
-		if expected != hashHex {
-			return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
-		}
+	if meta.Checksum == "" {
+		return fmt.Errorf("sst %s: missing checksum", meta.ID)
 	}
-
-	if r.verifier != nil {
-		if meta.Signature.Hash != "" && meta.Signature.Hash != hashHex {
-			return fmt.Errorf("sst %s: signature hash mismatch", meta.ID)
-		}
-		if err := r.verifier.VerifyHash(sum[:], SSTSignature{
-			Algorithm: meta.Signature.Algorithm,
-			KeyID:     meta.Signature.KeyID,
-			Hash:      meta.Signature.Hash,
-			Signature: meta.Signature.Signature,
-		}); err != nil {
-			return fmt.Errorf("sst %s: signature verify: %w", meta.ID, err)
-		}
+	algo, expected, ok := strings.Cut(meta.Checksum, ":")
+	if !ok || algo != "sha256" {
+		return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
+	}
+	if expected != hashHex {
+		return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
 	}
 
 	return nil
@@ -1023,7 +998,7 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 	}
 	defer stream.Close()
 
-	needHash := meta != nil && (r.verifySST || r.verifier != nil)
+	needHash := meta != nil && r.verifySST
 	var hasher hash.Hash
 	writer := io.Writer(tmpFile)
 	if needHash {
@@ -1046,7 +1021,7 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 	if needHash {
 		var sum [32]byte
 		copy(sum[:], hasher.Sum(nil))
-		if err := r.validateSSTHash(*meta, sum); err != nil {
+		if err := r.validateSSTChecksum(*meta, sum); err != nil {
 			_ = os.Remove(tmpPath)
 			return fmt.Errorf("validate sst %s: %w", path, err)
 		}

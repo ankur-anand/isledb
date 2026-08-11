@@ -3,8 +3,6 @@ package isledb
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/hex"
 	"errors"
 	"io"
 	"testing"
@@ -274,55 +272,6 @@ func TestWriteSST_DeleteEntry(t *testing.T) {
 	}
 	if decoded.Kind != internal.OpDelete {
 		t.Fatalf("expected delete, got %v", decoded.Kind)
-	}
-}
-
-type ed25519Signer struct {
-	priv  ed25519.PrivateKey
-	keyID string
-}
-
-func (s *ed25519Signer) Algorithm() string { return "ed25519" }
-func (s *ed25519Signer) KeyID() string     { return s.keyID }
-func (s *ed25519Signer) SignHash(hash []byte) ([]byte, error) {
-	return ed25519.Sign(s.priv, hash), nil
-}
-
-func TestWriteSST_Signature(t *testing.T) {
-	entries := []internal.MemEntry{
-		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("v")},
-	}
-	it := &sliceSSTIter{entries: entries}
-	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
-	priv := ed25519.NewKeyFromSeed(seed)
-	pub := priv.Public().(ed25519.PublicKey)
-	signer := &ed25519Signer{
-		priv:  priv,
-		keyID: hex.EncodeToString(pub),
-	}
-
-	res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none", Signer: signer}, 1)
-	if err != nil {
-		t.Fatalf("writeSST error: %v", err)
-	}
-	if res.Meta.Signature == nil {
-		t.Fatalf("expected signature")
-	}
-	if res.Meta.Signature.Algorithm != "ed25519" {
-		t.Fatalf("algorithm mismatch: got %s, want ed25519", res.Meta.Signature.Algorithm)
-	}
-	if res.Meta.Signature.KeyID != signer.keyID {
-		t.Fatalf("key id mismatch: got %s, want %s", res.Meta.Signature.KeyID, signer.keyID)
-	}
-	if res.Meta.Signature.Hash == "" {
-		t.Fatalf("expected hash")
-	}
-	hashBytes, err := hex.DecodeString(res.Meta.Signature.Hash)
-	if err != nil {
-		t.Fatalf("hash decode error: %v", err)
-	}
-	if !ed25519.Verify(pub, hashBytes, res.Meta.Signature.Signature) {
-		t.Fatalf("signature verify failed")
 	}
 }
 

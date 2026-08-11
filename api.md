@@ -319,7 +319,6 @@ type ReaderOpenOptions struct {
     AllowUnverifiedRangeRead bool                 // Allow range reads without checksum verification
     RangeReadMinSSTSize      int64                // Minimum SST size for range-read optimization
     ValidateSSTChecksum      bool                 // Verify SST checksums on read
-    SSTHashVerifier          SSTHashVerifier      // SST signature verifier
     Views                    ReaderViewPolicy     // Manifest freshness policy
 }
 
@@ -734,54 +733,6 @@ For a scheduled job:
 
 ```go
 stats, err := m.RunOnce(ctx)
-```
-
----
-
-## Integrity
-
-### SSTSignature
-
-```go
-type SSTSignature struct {
-    Algorithm string
-    KeyID     string
-    Hash      string
-    Signature []byte
-}
-```
-
-| Field | Type |
-|-------|------|
-| Algorithm | `string` |
-| KeyID | `string` |
-| Hash | `string` |
-| Signature | `[]byte` |
-
----
-
-## Interfaces
-
-### SSTHashSigner
-
-Signs SST hashes for integrity verification.
-
-```go
-type SSTHashSigner interface {
-    Algorithm() string
-    KeyID() string
-    SignHash(hash []byte) ([]byte, error)
-}
-```
-
-### SSTHashVerifier
-
-Verifies SST hash signatures.
-
-```go
-type SSTHashVerifier interface {
-    VerifyHash(hash []byte, sig SSTSignature) error
-}
 ```
 
 ## Blob Storage
