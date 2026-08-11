@@ -1,388 +1,481 @@
-# isledb API Reference
+# IsleDB Go API Guide
 
-## Quick Start
+This guide documents the public API most applications use. It focuses on
+behavior that affects correctness: durability, visibility, handle ownership,
+read-view lifetime, change-feed cursors, and maintenance running in a separate
+process.
 
 ```go
+import "github.com/ankur-anand/isledb"
+```
+
+## Contents
+
+- [Mental model](#mental-model)
+- [Quick start](#quick-start)
+- [Open and close a database](#open-and-close-a-database)
+- [SST output policy](#sst-output-policy)
+- [Write key-value data](#write-key-value-data)
+- [Read key-value data](#read-key-value-data)
+- [Enable and consume the change feed](#enable-and-consume-the-change-feed)
+- [Run maintenance separately](#run-maintenance-separately)
+- [Prometheus metrics](#prometheus-metrics)
+- [Error reference](#error-reference)
+- [Advanced blobstore package](#advanced-blobstore-package)
+
+## Mental model
+
+An IsleDB database is one object-store bucket or container plus a prefix. The
+`DB` value owns the local runtime for that prefix.
+
+| Handle | Per `DB` | Concurrency contract | Purpose |
+|---|---:|---|---|
+| `Writer` | One | Serialize calls made to one writer | Buffer and publish KV mutations |
+| `Reader` | One | Safe for concurrent reads | Serve point and range reads |
+| `ChangeReader` | Any number | Safe for concurrent use; callers own cursors | Consume the durable mutation feed |
+| `Maintenance` | One | `Close` may run concurrently with `Run` or `RunOnce` | Compact, checkpoint, retain, and reclaim |
+
+Writer and maintenance ownership are also fenced through the object store, so
+different processes cannot safely act as the same owner at the same time.
+Readers and change readers can scale independently by opening the same database
+prefix from additional processes.
+
+The main visibility rule is simple:
+
+```text
+Put / Delete
+    -> buffered in the writer
+    -> Flush, background flush, or Close
+    -> committed to the manifest
+    -> visible to a newly opened or refreshed reader
+```
+
+## Quick start
+
+The example disables timed background flushing and uses an explicit `Flush` as
+the durability and visibility boundary.
+
+```go
+package main
+
 import (
     "context"
+    "fmt"
     "log"
-    "time"
 
     "github.com/ankur-anand/isledb"
 )
 
-ctx := context.Background()
-
-// 1. Open the database and its object-store connection.
-db, err := isledb.Open(ctx, "s3://my-bucket?region=us-east-1", isledb.DBOptions{
-    Prefix: "mydb",
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer db.Close()
-
-// 2. Write data. Flush is the synchronous visibility boundary.
-w, err := db.OpenWriter(ctx, isledb.DefaultWriterOptions())
-if err != nil {
-    log.Fatal(err)
-}
-defer w.Close(ctx)
-
-if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
-    log.Fatal(err)
-}
-if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), time.Hour); err != nil {
-    log.Fatal(err)
-}
-if err := w.Flush(ctx); err != nil {
-    log.Fatal(err)
+func main() {
+    if err := run(context.Background()); err != nil {
+        log.Fatal(err)
+    }
 }
 
-// 3. Read data. Refresh discovers newly committed SSTs.
-r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
-if err != nil {
-    log.Fatal(err)
-}
-defer r.Close()
+func run(ctx context.Context) error {
+    db, err := isledb.Open(
+        ctx,
+        "s3://my-bucket?region=us-east-1",
+        isledb.DBOptions{Prefix: "accounts"},
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = db.Close() }()
 
-if err := r.Refresh(ctx); err != nil {
-    log.Fatal(err)
+    writerOptions := isledb.DefaultWriterOptions()
+    writerOptions.Flush.Interval = 0
+
+    writer, err := db.OpenWriter(ctx, writerOptions)
+    if err != nil {
+        return err
+    }
+    if err := writer.Put(ctx, []byte("user:1"), []byte("Ankur")); err != nil {
+        return err
+    }
+    if err := writer.Flush(ctx); err != nil {
+        return err
+    }
+    if err := writer.Close(ctx); err != nil {
+        return err
+    }
+
+    reader, err := db.OpenReader(
+        ctx,
+        isledb.DefaultReaderOpenOptions("./isledb-cache"),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = reader.Close() }()
+
+    value, found, err := reader.Get(ctx, []byte("user:1"))
+    if err != nil {
+        return err
+    }
+    if found {
+        fmt.Printf("user:1 = %s\n", value)
+    }
+    return nil
 }
-val, found, err := r.Get(ctx, []byte("user:1"))
-_ = val
-_ = found
-_ = err
 ```
 
----
+`Open` uses [Go Cloud bucket URLs](https://gocloud.dev/howto/blob/). Typical
+schemes include `s3://`, `gs://`, `azblob://`, and `file://`. Provider
+credentials come from the corresponding Go Cloud driver and cloud SDK.
 
-## Core Types
-
-### DB
-
-Entry point for database operations. Manages one writer, one shared concurrent
-KV reader, one maintenance owner, any number of change readers, and shared
-manifest state.
+## Open and close a database
 
 ```go
-func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error)
-func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opts DBOptions) (*DB, error)
+func Open(
+    ctx context.Context,
+    bucketURL string,
+    opts DBOptions,
+) (*DB, error)
+
+func OpenBucket(
+    ctx context.Context,
+    bucket *blob.Bucket,
+    bucketName string,
+    opts DBOptions,
+) (*DB, error)
 ```
 
-| Method | Signature |
-|--------|-----------|
-| OpenWriter | `(ctx context.Context, opts WriterOptions) (*Writer, error)` |
-| OpenReader | `(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)` |
-| OpenChangeReader | `(ctx context.Context) (*ChangeReader, error)` |
-| OpenMaintenance | `(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)` |
-| Close | `() error` |
+`Open` creates and owns the Go Cloud bucket connection. `DB.Close` closes that
+connection. `OpenBucket` borrows an existing `*blob.Bucket`; the caller remains
+responsible for closing it.
 
 ```go
 type DBOptions struct {
     Prefix     string
-    ChangeFeed *ChangeFeedOptions // nil leaves a new feed disabled
-    SSTOutput  SSTOutputOptions   // zero fields select production defaults
+    ChangeFeed *ChangeFeedOptions
+    SSTOutput  SSTOutputOptions
     Policy     StorePolicy
 }
 
+type StorePolicy struct {
+    MaxPinnedViewAge time.Duration
+}
+```
+
+`Prefix` is the database root inside the bucket. Use a dedicated prefix for
+each database.
+
+`MaxPinnedViewAge` is the longest time a loaded manifest view may remain usable.
+Zero selects `DefaultMaxPinnedViewAge`, currently one hour. The first writer
+persists this policy. Later writers must present the same value or opening the
+writer fails with `ErrStorePolicyMismatch`. KV read views and physical
+reclamation deadlines—including change-feed reclamation—use this policy to
+agree on when an old view can no longer refer to retired objects.
+
+### Database methods
+
+```go
+func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, error)
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
+func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error)
+func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)
+func (db *DB) Close() error
+```
+
+`DB.Close` closes handles still registered with that `DB`. Close application
+handles explicitly when their errors matter; use `DB.Close` as the final
+process-level cleanup.
+
+## SST output policy
+
+SST encoding is runtime output policy. It affects newly written files and is
+not persisted in `manifest/CURRENT`. Existing files are self-describing, so a
+reader can read a mixture of encodings.
+
+```go
 type SSTOutputOptions struct {
-    L0        SSTEncodingOptions // writer flush output
-    Compacted SSTEncodingOptions // maintenance compaction output
+    L0        SSTEncodingOptions
+    Compacted SSTEncodingOptions
 }
 
 type SSTEncodingOptions struct {
-    Compression     string // "none", "snappy", or "zstd"
+    Compression     string
     BlockBytes      int
     BloomBitsPerKey int
 }
 
 func DefaultSSTOutputOptions() SSTOutputOptions
-
-type ChangeFeedPayload uint8
-
-const (
-    ChangeFeedKeysOnly ChangeFeedPayload = iota + 1
-    ChangeFeedFullValues
-)
-
-type ChangeFeedOptions struct {
-    Payload ChangeFeedPayload
-}
-
-type StorePolicy struct {
-    MaxPinnedViewAge time.Duration // Default: 1 hour
-}
 ```
 
-`Open` owns the bucket connection and closes it from `DB.Close`. `OpenBucket`
-borrows an existing Go Cloud bucket and leaves its lifecycle with the caller.
-The change-feed payload is explicit, persisted in the manifest, and cannot be
-changed or disabled after enablement. `ChangeFeedKeysOnly` is an invalidation
-feed; `ChangeFeedFullValues` is replayable CDC. Enabling an existing database
-starts the feed at its current manifest head. Reopening with `ChangeFeed == nil`
-adopts an already-persisted configuration.
-`MaxPinnedViewAge` is persisted by the first writer. Later writers must present
-the same value. Readers and SST garbage collection both derive their safety
-deadline from this one store policy.
+Supported compression values are `"none"`, `"snappy"`, and `"zstd"`.
+Zero fields select the current defaults:
 
-`SSTOutput` is the single encoding policy used by all writers and maintenance
-handles opened from the `DB`. It affects only newly created SSTs and is not
-persisted in `manifest/CURRENT`. SST files are self-describing, so readers can
-open a mixture of old and new encodings without receiving this configuration.
-The current zero-value default is Snappy compression, 4 KiB data blocks, and
-10 Bloom-filter bits per key for both L0 and compacted SSTs.
+| SST class | Compression | Data block target | Bloom bits/key |
+|---|---|---:|---:|
+| Writer L0 output | Snappy | 4 KiB | 10 |
+| Compacted output | Snappy | 4 KiB | 10 |
 
-For example, foreground flushes can remain inexpensive while maintenance
-produces denser, larger-block SSTs:
+Writer flushes and maintenance may use different settings:
 
 ```go
-SSTOutput: isledb.SSTOutputOptions{
-    L0: isledb.SSTEncodingOptions{
-        Compression:     "snappy",
-        BlockBytes:      4 << 10,
-        BloomBitsPerKey: 10,
+dbOptions := isledb.DBOptions{
+    Prefix: "accounts",
+    SSTOutput: isledb.SSTOutputOptions{
+        L0: isledb.SSTEncodingOptions{
+            Compression:     "snappy",
+            BlockBytes:      4 << 10,
+            BloomBitsPerKey: 10,
+        },
+        Compacted: isledb.SSTEncodingOptions{
+            Compression:     "zstd",
+            BlockBytes:      16 << 10,
+            BloomBitsPerKey: 10,
+        },
     },
-    Compacted: isledb.SSTEncodingOptions{
-        Compression:     "zstd",
-        BlockBytes:      16 << 10,
-        BloomBitsPerKey: 10,
-    },
-},
+}
 ```
 
----
+Separate writer and maintenance processes each receive their own `DBOptions`.
+They may safely use different output settings, although using one deployment
+configuration makes performance more predictable.
 
-### Writer
+## Write key-value data
 
-Provides write access to the database. A writer buffers mutations in memory,
-flushes full memtables into immutable SST files, and commits those SSTs through
-the manifest.
+### Writer methods
 
-`Writer` uses internal locks to protect state and coordinate with background
-flushing. Those locks are not a concurrent API contract: concurrent public calls
-do not have documented ordering or Close/Flush semantics. Serialize `Put`,
-`Delete`, `Flush`, and `Close` for one writer.
+```go
+func (w *Writer) Put(ctx context.Context, key, value []byte) error
+func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error
+func (w *Writer) Delete(ctx context.Context, key []byte) error
+func (w *Writer) Flush(ctx context.Context) error
+func (w *Writer) Close(ctx context.Context) error
+```
 
-Visibility contract:
+- `Put`, `PutWithTTL`, and `Delete` return after buffering the mutation locally.
+- `ttl <= 0` means no expiration.
+- Expired values are filtered by readers. TTL expiration is not an immediate
+  object deletion operation.
+- `Flush` publishes all currently buffered and frozen memtables.
+- A successful background flush also publishes buffered data.
+- `Close` stops background flushing and flushes pending writes.
 
-- `Put` and `Delete` return after the mutation is buffered locally.
-- `PutWithTTL` stores an expiry with the value. `ttl <= 0` means no expiration.
-- `Flush` is the synchronous publish boundary. It writes pending memtables as
-  SST files and commits manifest entries.
-- A retry of an explicit `Flush` reuses the same uploaded SST, change batch,
-  and logical commit ID. An uncertain `CURRENT` response is reconciled before
-  another manifest entry can be appended.
-- `Close` stops background flushing and flushes pending writes before returning.
-- Readers see newly flushed data after they open or call `Reader.Refresh`.
+One writer uses internal locks for correctness, but public call ordering is not
+defined under concurrent use. Serialize `Put`, `PutWithTTL`, `Delete`, `Flush`,
+and `Close` for one writer.
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Put | `(ctx context.Context, key, value []byte) error` | Buffer a key-value mutation |
-| PutWithTTL | `(ctx context.Context, key, value []byte, ttl time.Duration) error` | Buffer a key-value mutation with time-to-live |
-| Delete | `(ctx context.Context, key []byte) error` | Buffer a tombstone |
-| Flush | `(ctx context.Context) error` | Publish all currently buffered writes |
-| Close | `(ctx context.Context) error` | Stop background flushing and publish pending writes |
+### Writer options and defaults
 
 ```go
 type WriterOptions struct {
     OwnerID       string
-    Memtable     WriterMemtableOptions
-    Flush        WriterFlushOptions
-    Maintenance  WriterMaintenanceOptions
-    Values       ValueOptions
-    OnFlushError func(error)
-    Metrics      *WriterMetrics
+    Memtable      WriterMemtableOptions
+    Flush         WriterFlushOptions
+    Maintenance   WriterMaintenanceOptions
+    Values        ValueOptions
+    OnFlushError  func(error)
+    Metrics       *WriterMetrics
 }
 
 type WriterMemtableOptions struct {
-    TargetBytes int64 // Approximate active memtable size before rotation. Zero selects the default.
-    MaxPendingMemtables int // Max queued or flushing memtables. Zero selects the default.
+    TargetBytes         int64
+    MaxPendingMemtables int
 }
 
 type WriterFlushOptions struct {
-    Interval time.Duration // Background flush cadence. Zero disables auto-flush.
+    Interval time.Duration
 }
 
 type WriterMaintenanceOptions struct {
-    PollInterval time.Duration // Minimum interval between maintenance mailbox reads.
+    PollInterval time.Duration
 }
 
 type ValueOptions struct {
-    MaxKeyBytes   int   // Largest accepted key size. Default: 64 KiB.
-    MaxValueBytes int64 // Largest accepted value size. Default: 16 MiB.
+    MaxKeyBytes   int
+    MaxValueBytes int64
 }
 
 func DefaultWriterOptions() WriterOptions
 ```
 
-**Errors:**
-- `ErrBackpressure` - writer hit `Memtable.MaxPendingMemtables`; caller should retry after a delay or flush.
-- `ErrInvalidWriterOptions` - writer configuration contains a negative size or
-  interval, oversized identity, invalid value limit, or a memtable
-  configuration that exceeds the arena format limit.
-- `ErrWriterFailed` - background flushing failed. The writer is terminal and the error wraps the original cause.
+`DefaultWriterOptions` returns:
 
-Background flush:
+| Option | Default | Meaning |
+|---|---:|---|
+| `OwnerID` | Generated | Stable identity stored in the writer fence |
+| `Memtable.TargetBytes` | 16 MiB | Approximate active memtable rotation target |
+| `Memtable.MaxPendingMemtables` | 4 | Queued or flushing memtables before backpressure |
+| `Flush.Interval` | 1 second | Timed background flush cadence |
+| `Maintenance.PollInterval` | 1 second | Mailbox polling in a separate writer process |
+| `Values.MaxKeyBytes` | 64 KiB | Largest accepted key |
+| `Values.MaxValueBytes` | 16 MiB | Largest accepted value |
+| `OnFlushError` | `nil` | Optional terminal background-error callback |
+| `Metrics` | `nil` | Optional Prometheus observations |
 
-- `Flush.Interval > 0` starts a background flush loop.
-- The first background flush error makes the writer terminal. It is delivered
-  once to `WriterOptions.OnFlushError` after the background worker stops,
-  otherwise it is logged. The callback may call `Writer.Close`.
-- Later mutations, `Flush`, and `Close` return the stored `ErrWriterFailed`
-  value wrapping the original failure.
-- Explicit `Flush` and `Close` return flush errors directly.
-- An explicit `Flush` failure remains retryable because the caller observes it
-  synchronously.
+`Flush.Interval` is intentionally different from most zero-valued options:
+setting it to zero disables timed background flushing. Call
+`DefaultWriterOptions` first when you want all defaults.
 
-Example:
+When `MaxPendingMemtables` is reached, a mutation that would require another
+rotation returns `ErrBackpressure` before accepting the mutation. Retry after a
+delay or call `Flush` from the serialized writer owner.
 
-```go
-opts := isledb.DefaultWriterOptions()
-opts.Flush.Interval = time.Second
-opts.Memtable.TargetBytes = 16 << 20
-opts.Memtable.MaxPendingMemtables = 4
+The first background flush error makes the writer terminal. `OnFlushError` is
+called once after the background worker stops; later mutations, `Flush`, and
+`Close` return `ErrWriterFailed` wrapping the original error. A synchronous
+`Flush` error is returned directly and remains retryable.
 
-w, err := db.OpenWriter(ctx, opts)
-if err != nil {
-    return err
-}
-defer w.Close(ctx)
+## Read key-value data
 
-if err := w.Put(ctx, []byte("user:1"), []byte("ankur")); err != nil {
-    return err
-}
-if err := w.PutWithTTL(ctx, []byte("session:1"), []byte("active"), 30*time.Minute); err != nil {
-    return err
-}
-if err := w.Delete(ctx, []byte("lock:1")); err != nil {
-    return err
-}
-return w.Flush(ctx)
-```
-
----
-
-### Snapshot
-
-Immutable read handle over one loaded reader state. A snapshot does not refresh.
-It keeps reading the same visible state even if its parent `Reader` is refreshed
-later. A snapshot and every iterator created from it inherit the absolute
-deadline of the loaded manifest view. Creating a handle does not extend that
-deadline.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Version | `() Version` | Return an opaque identifier for the loaded visible state |
-| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve value for key from this fixed view |
-| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Create a bounded iterator over this fixed view |
-| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Read up to limit records from this fixed view |
-| Close | `() error` | Release the caller reference to the view |
-
-```go
-type Version struct { ... }
-type Snapshot struct { ... }
-```
-
-### Reader
-
-Read-only handle for database access. Supports point lookups, range scans, and iteration.
-
-Readers are opened from the database that owns the object-store prefix:
-
-```go
-func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
-```
-
-Opening a reader loads a view. Reads refresh it when `Views.RefreshAfter` has
-elapsed; concurrent refreshes are coalesced. `Refresh` remains available when
-the caller needs an immediate visibility check.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Refresh | `(ctx context.Context) error` | Reload manifest and invalidate removed SSTs |
-| Get | `(ctx context.Context, key []byte) ([]byte, bool, error)` | Retrieve one key from the current view |
-| Scan | `(ctx context.Context, minKey, maxKey []byte) ([]KV, error)` | Scan a key range into memory |
-| ScanLimit | `(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)` | Scan a bounded number of records |
-| NewIterator | `(ctx context.Context, opts IteratorOptions) (*Iterator, error)` | Stream a bounded key range |
-| Snapshot | `(ctx context.Context) (*Snapshot, error)` | Load a fresh state and pin it for bounded consistent reads |
-| Prefetch | `(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)` | Warm SST cache for the current manifest view |
-| Close | `() error` | Close reader and caches. Existing snapshots become invalid. |
-| SSTCacheStats | `() CacheStats` | SST cache statistics |
-| ManifestPageCacheStats | `() CacheStats` | Manifest commit-page cache statistics |
+### Open a reader
 
 ```go
 type ReaderOpenOptions struct {
-    CacheDir                 string               // Required disk cache directory.
-    SSTCacheSize             int64                // Default: 1GB
-    BlockCacheSize           int64                // Range-read block cache (0 = disabled)
-    AllowUnverifiedRangeRead bool                 // Allow range reads without checksum verification
-    RangeReadMinSSTSize      int64                // Minimum SST size for range-read optimization
-    ValidateSSTChecksum      bool                 // Verify SST checksums on read
-    Views                    ReaderViewPolicy     // Manifest freshness policy
+    CacheDir                 string
+    SSTCacheSize             int64
+    BlockCacheSize           int64
+    AllowUnverifiedRangeRead bool
+    RangeReadMinSSTSize      int64
+    ValidateSSTChecksum      bool
+    Views                    ReaderViewPolicy
+    Metrics                  *ReaderMetrics
 }
 
-type CacheStats struct {
-    Hits       int64
-    Misses     int64
-    Bytes      int64
-    MaxBytes   int64
-    EntryCount int
-    MaxEntries int
+type ReaderViewPolicy struct {
+    RefreshAfter time.Duration
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
-
-type ReaderViewPolicy struct {
-    RefreshAfter time.Duration // Default: 1 minute
-}
 ```
 
-`Prefetch` first applies the same freshness policy as a read, then downloads
-selected SSTs from that manifest into the local cache. It does not force an
-object-store refresh while the loaded view is still fresh.
+`CacheDir` is required. `DefaultReaderOpenOptions` returns:
 
-Example:
+| Option | Default | Meaning |
+|---|---:|---|
+| `SSTCacheSize` | 1 GiB | Maximum on-disk SST cache size |
+| `BlockCacheSize` | 0 | In-memory range-read block cache disabled |
+| `RangeReadMinSSTSize` | 0 | No minimum SST size |
+| `ValidateSSTChecksum` | `false` | Do not hash full SST downloads |
+| `AllowUnverifiedRangeRead` | `false` | Do not bypass requested full-file validation |
+| `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
+| `Metrics` | `nil` | Optional Prometheus observations |
+
+Every newly written SST records a SHA-256 checksum. With
+`ValidateSSTChecksum`, the reader validates the full SST on its first download.
+Range reads require `BlockCacheSize > 0`. If checksum validation is enabled,
+the reader uses a full download unless `AllowUnverifiedRangeRead` explicitly
+permits range reads without validating the full-file checksum.
+
+### Reader methods
 
 ```go
-r, err := db.OpenReader(ctx, isledb.DefaultReaderOpenOptions("./cache"))
-if err != nil {
-    return err
-}
-defer r.Close()
-
-if err := r.Refresh(ctx); err != nil {
-    return err
-}
-
-value, ok, err := r.Get(ctx, []byte("user:1"))
-if err != nil {
-    return err
-}
-_ = value
-_ = ok
-
-items, err := r.ScanLimit(ctx, []byte("user:"), []byte("user;"), 100)
-if err != nil {
-    return err
-}
-_ = items
+func (r *Reader) Refresh(ctx context.Context) error
+func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error)
+func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error)
+func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
+func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
+func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
+func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
+func (r *Reader) SSTCacheStats() CacheStats
+func (r *Reader) ManifestPageCacheStats() CacheStats
+func (r *Reader) Close() error
 ```
+
+`Get` returns `found == false` for a missing, deleted, or expired key.
+
+`Scan`, `ScanLimit`, `IteratorOptions`, and `Snapshot.ScanLimit` use an inclusive
+range: `[minKey, maxKey]`. A nil or empty bound leaves that side unbounded.
+
+`Scan` allocates and returns the complete result. `ScanLimit` also materializes
+its result, but stops after a positive `limit`. A zero or negative limit has the
+current API meaning of no limit. Prefer an iterator when the result can be
+large.
+
+```go
+type KV struct {
+    Key   []byte
+    Value []byte
+}
+
+type IteratorOptions struct {
+    MinKey []byte // Inclusive; nil means beginning
+    MaxKey []byte // Inclusive; nil means end
+}
+```
+
+### Iterate without materializing the range
+
+```go
+iter, err := reader.NewIterator(ctx, isledb.IteratorOptions{
+    MinKey: []byte("user:"),
+    MaxKey: []byte("user;"),
+})
+if err != nil {
+    return err
+}
+defer func() { _ = iter.Close() }()
+
+for iter.Next() {
+    key := iter.Key()
+    value := iter.Value()
+    _ = key
+    _ = value
+}
+if err := iter.Err(); err != nil {
+    return err
+}
+```
+
+Iterator methods are:
+
+```go
+func (it *Iterator) Next() bool
+func (it *Iterator) SeekGE(target []byte) bool
+func (it *Iterator) Key() []byte
+func (it *Iterator) Value() []byte
+func (it *Iterator) Valid() bool
+func (it *Iterator) Err() error
+func (it *Iterator) Close() error
+```
+
+### Consistent snapshots
+
+A snapshot pins one loaded manifest view. It does not refresh when its parent
+reader refreshes.
+
+```go
+type Version struct { /* opaque */ }
+
+func (v Version) String() string
+func (v Version) IsZero() bool
+
+func (s *Snapshot) Version() Version
+func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error)
+func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
+func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
+func (s *Snapshot) Close() error
+```
+
+Snapshots and their iterators inherit the absolute deadline of the loaded view.
+Creating another handle does not extend that deadline. An expired operation
+returns `ErrSnapshotExpired`, `ErrIteratorExpired`, or `ErrReadViewExpired`.
+Refresh or create a new snapshot instead of retrying against the expired view.
+
+Closing the parent reader invalidates its snapshots and iterators.
+
+### Prefetch selected SSTs
+
+Prefetch uses a half-open `KeyRange`, unlike the inclusive scan APIs.
 
 ```go
 type KeyRange struct {
-    Min []byte // inclusive; nil means beginning
-    Max []byte // exclusive; nil means end
+    Min []byte // Inclusive; nil means beginning
+    Max []byte // Exclusive; nil means end
 }
 
 func PrefixRange(prefix []byte) KeyRange
 
 type PrefetchOptions struct {
-    Range       KeyRange // Select SSTs overlapping this half-open range.
-    All         bool     // Required for whole-database prefetch.
-    MaxSSTs     int      // 0 = no limit
-    MaxBytes    int64    // 0 = no limit
-    Concurrency int      // 0 = default
+    Range       KeyRange
+    All         bool
+    MaxSSTs     int
+    MaxBytes    int64
+    Concurrency int
 }
 
 type PrefetchStats struct {
@@ -393,130 +486,278 @@ type PrefetchStats struct {
 }
 ```
 
-Prefetch example:
+Use `All: true` to opt into prefetching the complete keyspace. A zero
+`MaxSSTs` or `MaxBytes` means no limit.
 
 ```go
-if err := r.Refresh(ctx); err != nil {
-    return err
-}
-
-stats, err := r.Prefetch(ctx, isledb.PrefetchOptions{
+stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{
     Range:       isledb.PrefixRange([]byte("user:")),
     MaxBytes:    256 << 20,
     Concurrency: 4,
 })
-if err != nil {
-    return err
-}
-_ = stats
 ```
 
-#### KV
+`Prefetch` applies the normal freshness policy. It does not force a manifest
+refresh while the loaded view is still fresh; call `Refresh` first when an
+immediate visibility check is required.
+
+### Cache statistics
 
 ```go
-type KV struct {
-    Key   []byte
-    Value []byte
-}
-```
-
-#### Iterator
-
-Bounded range traversal over the database.
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Next | `() bool` | Advance to next entry |
-| Key | `() []byte` | Current key |
-| Value | `() []byte` | Current value |
-| Valid | `() bool` | Whether iterator is positioned at a valid entry |
-| Err | `() error` | Any iteration error |
-| SeekGE | `(target []byte) bool` | Seek to first key >= target |
-| Close | `() error` | Close iterator |
-
-```go
-type IteratorOptions struct {
-    MinKey []byte // Inclusive lower bound
-    MaxKey []byte // Inclusive upper bound
+type CacheStats struct {
+    Hits       int64
+    Misses     int64
+    Bytes      int64
+    MaxBytes   int64
+    EntryCount int
+    MaxEntries int
 }
 ```
 
-### ChangeReader
+Byte-bounded caches report `MaxEntries == 0`. Entry-bounded caches report
+`MaxBytes == 0`.
 
-Reads the optional durable mutation feed without object-store listing. Open it
-after `DBOptions.ChangeFeed` has been persisted for the database prefix.
-Any number of independent change readers may be opened from one `DB`.
+## Enable and consume the change feed
+
+The change feed is optional. Enable it while opening the database:
 
 ```go
-func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error)
+db, err := isledb.Open(ctx, bucketURL, isledb.DBOptions{
+    Prefix: "accounts",
+    ChangeFeed: &isledb.ChangeFeedOptions{
+        Payload: isledb.ChangeFeedFullValues,
+    },
+})
 ```
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Bounds | `(ctx context.Context) (ChangeBounds, error)` | Return oldest retained and current head cursors |
-| Read | `(ctx context.Context, from ChangeCursor, opts ChangeReadOptions) (ChangePage, error)` | Return a bounded ordered page |
-| Close | `() error` | Release this reader |
+```go
+type ChangeFeedPayload uint8
+
+const (
+    ChangeFeedKeysOnly ChangeFeedPayload = iota + 1
+    ChangeFeedFullValues
+)
+
+type ChangeFeedOptions struct {
+    Payload ChangeFeedPayload
+}
+```
+
+- `ChangeFeedKeysOnly` records operation, key, sequence, and expiry metadata.
+  It is suitable for invalidation and “fetch current value” consumers.
+- `ChangeFeedFullValues` also records PUT values and supports historical CDC
+  replay.
+
+The payload mode is persisted and immutable after enablement. Reopening with a
+different mode returns `ErrChangeFeedPayloadMismatch`. Reopening with
+`ChangeFeed == nil` adopts an already-enabled configuration. Enabling a feed on
+an existing database starts it at the current manifest head; it does not invent
+changes for older KV history.
+
+### Change-feed types
 
 ```go
+type ChangeOperation uint8
+
+const (
+    ChangePut ChangeOperation = iota + 1
+    ChangeDelete
+)
+
 type Change struct {
     Sequence  uint64
-    Operation ChangeOperation // ChangePut or ChangeDelete
+    Operation ChangeOperation
     Key       []byte
-    Value     []byte          // nil when omitted or for deletes
-    HasValue  bool            // true for full-value PUTs, including empty values
-    ExpiresAt time.Time       // zero when no TTL applies
+    Value     []byte
+    HasValue  bool
+    ExpiresAt time.Time
 }
 
+type ChangeCursor struct { /* opaque */ }
+
+func ParseChangeCursor(value string) (ChangeCursor, error)
+func (c ChangeCursor) String() string
+func (c ChangeCursor) IsZero() bool
+func (c ChangeCursor) MarshalText() ([]byte, error)
+func (c *ChangeCursor) UnmarshalText(text []byte) error
+
 type ChangeBounds struct {
-    Oldest ChangeCursor
-    Head   ChangeCursor
+    Oldest  ChangeCursor
+    Head    ChangeCursor
     Payload ChangeFeedPayload
 }
 
+type ChangePage struct {
+    Changes []Change
+    Next    ChangeCursor
+    Head    ChangeCursor
+}
+
+func (p ChangePage) CaughtUp() bool
+```
+
+For a PUT in keys-only mode, `HasValue` is false and `Value` is nil. In
+full-values mode, `HasValue` distinguishes an omitted value from a present but
+empty value. Delete records do not carry values.
+
+### Read bounded pages
+
+```go
 type ChangeReadOptions struct {
     MaxChanges int
     MaxBytes   int64
 }
 
 func DefaultChangeReadOptions() ChangeReadOptions
-func ParseChangeCursor(value string) (ChangeCursor, error)
-func (c ChangeCursor) String() string
-func (p ChangePage) CaughtUp() bool
+
+func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error)
+func (r *ChangeReader) Read(
+    ctx context.Context,
+    from ChangeCursor,
+    opts ChangeReadOptions,
+) (ChangePage, error)
+func (r *ChangeReader) Close() error
 ```
 
-The cursor points to the next change, including a position inside a large flush
-batch. Save `page.Next.String()` only after processing the returned changes.
-Use `bounds.Oldest` for retained replay or `bounds.Head` for future commits.
-A zero cursor also starts at the oldest retained change.
-In keys-only mode, PUT records have `HasValue == false`; a later KV `Get` returns
-current state and is not a historical reconstruction of that mutation.
+The default page limits are 1,024 changes and 16 MiB. `MaxChanges` is capped at
+65,536. `MaxBytes` counts key plus value bytes, not the Go allocation overhead
+of the returned `[]Change`. A single change larger than `MaxBytes` is returned
+alone so its cursor can make progress. Negative limits return
+`ErrInvalidChangeReadOptions`; zero fields select defaults.
 
-`Read` performs no polling. An empty page can still advance `Next` over
-manifest entries that contain no user mutations; continue until `CaughtUp`
-returns true. When retention has passed a saved cursor, `Read` returns
-`ErrChangeCursorExpired`.
+A cursor identifies the next change. Persist `page.Next`, and only persist it
+after the page has been processed successfully.
 
-Each `ChangeReader` owns its manifest view. A `Read` beginning at a manifest
-entry boundary refreshes `manifest/CURRENT`, then reads from that immutable
-view. Change batches are indexed collections of independently compressed and
-checksummed blocks. `Read` range-fetches only the blocks needed by
-`MaxChanges` and `MaxBytes`; continuation reads can reuse decoded blocks from a
-bounded 16 MiB cache without another `CURRENT` or manifest-page read. The next
-call beginning at an entry boundary refreshes the view and revalidates the
-retention floor.
+```go
+func drainChanges(
+    ctx context.Context,
+    reader *isledb.ChangeReader,
+    savedCursor string,
+    apply func(isledb.Change) error,
+    saveCursor func(string) error,
+) error {
+    cursor, err := isledb.ParseChangeCursor(savedCursor)
+    if err != nil {
+        return err
+    }
 
-### Maintenance
+    if cursor.IsZero() {
+        bounds, err := reader.Bounds(ctx)
+        if err != nil {
+            return err
+        }
+        cursor = bounds.Oldest // use bounds.Head to consume only future changes
+    }
 
-Owns one fenced maintenance session for a database prefix. It runs compaction,
-optional change-feed retention, checkpoints, and garbage collection through a
-bounded fair scheduler. `DB.OpenMaintenance` rejects a second active
-maintenance handle opened from the same `DB`.
+    options := isledb.DefaultChangeReadOptions()
+    for {
+        page, err := reader.Read(ctx, cursor, options)
+        if err != nil {
+            return err
+        }
+        for _, change := range page.Changes {
+            if err := apply(change); err != nil {
+                return err
+            }
+        }
+        if err := saveCursor(page.Next.String()); err != nil {
+            return err
+        }
+        cursor = page.Next
+        if page.CaughtUp() {
+            return nil
+        }
+    }
+}
+```
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Run | `(ctx context.Context) error` | Run cycles until cancellation, fencing, or `Close` |
-| RunOnce | `(ctx context.Context) (MaintenanceStats, error)` | Perform one deterministic control pass and one bounded pass from each reclaimer |
-| Close | `(ctx context.Context) error` | Stop scheduling, wait for active work, and release ownership |
+`Read` does not poll or wait for future writes. An empty page may still advance
+the cursor over manifest entries without user mutations. Continue until
+`CaughtUp` is true, then let the application choose its polling interval.
+
+When retention passes a saved cursor, `Read` refreshes its view and returns
+`ErrChangeCursorExpired`. The caller must choose whether to restart from
+`Bounds().Oldest`, rebuild from a KV snapshot, or fail the consumer.
+
+Change batches contain independently compressed and checksummed blocks. A read
+range-fetches only the blocks needed for the requested page and reuses decoded
+blocks from a bounded internal cache.
+
+## Run maintenance separately
+
+Maintenance is designed to run outside application reader and writer processes.
+All processes open the same bucket and prefix:
+
+```text
+writer process       -> buffers writes and publishes manifest changes
+reader processes     -> load immutable views and read independently
+maintenance process  -> prepares compaction, checkpoints, and retention
+reclamation workers  -> delete retired objects at bounded independent rates
+```
+
+Compaction, checkpointing, and logical change-feed retention stage fenced
+commands. The active writer publishes or rejects those commands through its
+normal `CURRENT` update path. A separate writer process discovers commands at
+`WriterOptions.Maintenance.PollInterval`, which defaults to one second.
+
+Physical SST, change-feed, snapshot, and manifest-page deletion proceeds in
+independently paced reclamation lanes. Slow object deletion does not hold the
+serialized control lane open.
+
+### Maintenance API
+
+```go
+func (db *DB) OpenMaintenance(
+    ctx context.Context,
+    opts MaintenanceOptions,
+) (*Maintenance, error)
+
+func (m *Maintenance) Run(ctx context.Context) error
+func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error)
+func (m *Maintenance) Close(ctx context.Context) error
+```
+
+`Run` continues until its context is cancelled, `Close` is called, or the
+maintenance fence is lost. `RunOnce` performs one deterministic control pass
+and one bounded pass from each physical reclamation family.
+
+Use a fresh shutdown context when `Run` returns. The run context is commonly
+already cancelled:
+
+```go
+func runMaintenance(ctx context.Context, db *isledb.DB) error {
+    options := isledb.DefaultMaintenanceOptions()
+
+    maintenance, err := db.OpenMaintenance(ctx, options)
+    if err != nil {
+        return err
+    }
+
+    runErr := maintenance.Run(ctx)
+
+    closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    closeErr := maintenance.Close(closeCtx)
+
+    if errors.Is(runErr, context.Canceled) {
+        runErr = nil
+    }
+    return errors.Join(runErr, closeErr)
+}
+```
+
+For a scheduled job:
+
+```go
+stats, err := maintenance.RunOnce(ctx)
+```
+
+A `RunOnce` that returns `MaintenanceWaitingForWriter` has staged a command.
+The writer must poll and publish or reject it. A later maintenance run observes
+the receipt and continues. One scheduled invocation is therefore a bounded
+unit of progress, not a promise to drain all maintenance backlog.
+
+### Maintenance options and defaults
 
 ```go
 type MaintenanceOptions struct {
@@ -530,6 +771,58 @@ type MaintenanceOptions struct {
     OnError             func(error)
 }
 
+func DefaultMaintenanceOptions() MaintenanceOptions
+```
+
+Control-lane defaults:
+
+| Option | Default |
+|---|---:|
+| `IdleInterval` | 5 seconds |
+| `SSTCompaction.ReadConcurrency` | 4 |
+| `SSTCompaction.L0TriggerSSTs` | 8 |
+| `SSTCompaction.BaseLevelBytes` | 512 MiB |
+| `SSTCompaction.LevelGrowthFactor` | 8 |
+| `SSTCompaction.MaxInputSSTsPerJob` | 128 |
+| `SSTCompaction.MaxInputBytesPerJob` | 512 MiB soft limit |
+| `SSTCompaction.TargetSSTBytes` | 64 MiB |
+| `ManifestCheckpoint.TargetReplayPages` | 64 pages |
+| `ManifestCheckpoint.TargetReplayBytes` | 32 MiB |
+| `ChangeFeedRetention` | `nil`, history retained indefinitely |
+
+```go
+type SSTCompactionOptions struct {
+    ReadConcurrency     int
+    L0TriggerSSTs       int
+    BaseLevelBytes      int64
+    LevelGrowthFactor   int
+    MaxInputSSTsPerJob  int
+    MaxInputBytesPerJob int64
+    TargetSSTBytes      int64
+}
+
+type ManifestCheckpointOptions struct {
+    TargetReplayPages uint64
+    TargetReplayBytes uint64
+}
+```
+
+One indivisible compaction plan may exceed `MaxInputBytesPerJob`.
+`MaxInputSSTsPerJob` cannot exceed 128. Compacted SST encoding comes from
+`DBOptions.SSTOutput.Compacted`.
+
+Physical reclamation defaults:
+
+| Lane | Poll interval | Maximum objects/pass |
+|---|---:|---:|
+| SST | 1 second | 128 |
+| Change feed | 5 seconds | 128 |
+| Manifest snapshots and pages | 1 minute | 128 |
+
+The shared delete concurrency defaults to four. Manifest orphan auditing
+defaults to once per hour.
+
+```go
 type ReclamationOptions struct {
     MaxConcurrentDeletes int
     SST                  DeleterOptions
@@ -546,35 +839,73 @@ type ManifestDeleterOptions struct {
     DeleterOptions
     AuditInterval time.Duration
 }
+```
 
+`MaxObjectsPerPass` bounds normal work. One already-bounded immutable SST
+retirement plan may be completed atomically even when it exceeds the remaining
+per-pass budget.
+
+### Enable change-feed retention
+
+Feed retention remains disabled until `ChangeFeedRetention` is non-nil.
+
+```go
 type ChangeFeedRetentionOptions struct {
     RetainFor time.Duration
 }
 
-type SSTCompactionOptions struct {
-    ReadConcurrency     int
-    L0TriggerSSTs       int
-    BaseLevelBytes      int64
-    LevelGrowthFactor   int
-    MaxInputSSTsPerJob  int
-    MaxInputBytesPerJob int64
-    TargetSSTBytes      int64
-}
+func DefaultChangeFeedRetentionOptions() ChangeFeedRetentionOptions
 
-type ManifestCheckpointOptions struct {
-    TargetReplayPages uint64
-    TargetReplayBytes uint64
-}
+options := isledb.DefaultMaintenanceOptions()
+retention := isledb.DefaultChangeFeedRetentionOptions() // seven days
+retention.RetainFor = 15 * 24 * time.Hour
+options.ChangeFeedRetention = &retention
+```
 
+`RetainFor` is a minimum age, not an exact deletion time. Logical retention,
+writer publication, pinned-view safety, and bounded physical deletion may keep
+objects longer. Omitting retention preserves change history indefinitely.
+
+### Maintenance state and statistics
+
+```go
+type MaintenanceState uint8
+
+const (
+    MaintenanceIdle MaintenanceState = iota
+    MaintenanceWaitingForWriter
+)
+
+type MaintenanceTask uint8
+
+const (
+    MaintenanceTaskNone MaintenanceTask = iota
+    MaintenanceTaskSSTCompaction
+    MaintenanceTaskManifestCheckpoint
+)
+
+type ReclamationFamily string
+
+const (
+    ReclamationSST        ReclamationFamily = "sst"
+    ReclamationChangeFeed ReclamationFamily = "change_feed"
+    ReclamationManifest   ReclamationFamily = "manifest"
+)
+```
+
+`MaintenanceState`, `MaintenanceTask`, `ChangeOperation`, and
+`ChangeFeedPayload` implement `String`.
+
+```go
 type MaintenanceStats struct {
-    State                   MaintenanceState
-    Scheduling              MaintenanceScheduleStats
-    SSTCompaction           SSTCompactionStats
-    SSTCleanup              SSTCleanupStats
-    ChangeFeedRetention     ChangeFeedCleanupStats
-    ManifestCheckpoint      ManifestCheckpointStats
-    ManifestCleanup         ManifestCleanupStats
-    Duration                time.Duration
+    State               MaintenanceState
+    Scheduling          MaintenanceScheduleStats
+    SSTCompaction       SSTCompactionStats
+    SSTCleanup          SSTCleanupStats
+    ChangeFeedRetention ChangeFeedCleanupStats
+    ManifestCheckpoint  ManifestCheckpointStats
+    ManifestCleanup     ManifestCleanupStats
+    Duration            time.Duration
 }
 
 type ReclamationCycleStats struct {
@@ -585,9 +916,22 @@ type ReclamationCycleStats struct {
     Duration   time.Duration
 }
 
-type ManifestCleanupStats struct {
-    Snapshots ManifestSnapshotCleanupStats
-    Pages     ManifestPageCleanupStats
+type MaintenanceScheduleStats struct {
+    Selected              MaintenanceTask
+    CompactionSourceLevel uint32
+    CompactionWorkUnits   uint32
+    CompactionCritical    bool
+    CheckpointEligible    bool
+    CheckpointUrgent      bool
+    ReplayPages           uint64
+    ReplayBytes           uint64
+}
+
+type SSTCompactionStats struct {
+    Jobs        int
+    InputSSTs   int
+    OutputSSTs  int
+    OutputBytes int64
 }
 
 type SSTCleanupStats struct {
@@ -599,6 +943,26 @@ type SSTCleanupStats struct {
     SSTsDeleted    int
     DeferredPlans  int
     Failures       int
+}
+
+type ManifestCheckpointStats struct {
+    Staged      bool
+    ReplayPages uint64
+    ReplayBytes uint64
+}
+
+type ChangeFeedCleanupStats struct {
+    EntriesRetired  int
+    BatchesPlanned  int
+    BatchesDeleted  int
+    BlockedRetained int
+    FailedDeletes   int
+    Duration        time.Duration
+}
+
+type ManifestCleanupStats struct {
+    Snapshots ManifestSnapshotCleanupStats
+    Pages     ManifestPageCleanupStats
 }
 
 type ManifestSnapshotCleanupStats struct {
@@ -627,161 +991,166 @@ type ManifestPageCleanupStats struct {
     ReachabilityGETs int
     Duration         time.Duration
 }
-
-type MaintenanceScheduleStats struct {
-    Selected              MaintenanceTask
-    CompactionSourceLevel uint32
-    CompactionWorkUnits   uint32
-    CompactionCritical    bool
-    CheckpointEligible    bool
-    CheckpointUrgent      bool
-    ReplayPages           uint64
-    ReplayBytes           uint64
-}
-
-type MaintenanceState uint8
-
-const (
-    MaintenanceIdle MaintenanceState = iota
-    MaintenanceWaitingForWriter
-)
-
-type SSTCompactionStats struct {
-    Jobs        int
-    InputSSTs   int
-    OutputSSTs  int
-    OutputBytes int64
-}
-
-type ManifestCheckpointStats struct {
-    Staged      bool
-    ReplayPages uint64
-    ReplayBytes uint64
-}
-
-type ChangeFeedCleanupStats struct {
-    EntriesRetired  int
-    BatchesPlanned  int
-    BatchesDeleted  int
-    BlockedRetained int
-    FailedDeletes   int
-    Duration        time.Duration
-}
 ```
 
-`DefaultMaintenanceOptions` enables compaction, checkpoints, and three physical
-reclamation lanes. `Maintenance.Run` executes the serialized control lane
-independently from SST, change-feed, and manifest-metadata reclaimers. All
-three reclaimers share `MaxConcurrentDeletes`, retain provider listing cursors
-between bounded passes, and cannot change logical visibility. Scheduler burst
-limits and deletion safety margins remain internal. Change-feed retention
-remains disabled. Use
-`DefaultChangeFeedRetentionOptions` before enabling feed-history cleanup.
+Use `OnCycle` for serialized control work and `OnReclamationCycle` for the
+independent physical lanes.
 
-Change-feed retention requires an enabled feed and runs only while maintenance
-runs. The setting is runtime maintenance configuration, not part of the
-persisted immutable payload choice. Omitting it preserves feed history
-indefinitely.
-
-`MaintenanceWaitingForWriter` means the cycle staged a command in the
-maintenance mailbox. The active writer must publish or reject it before the
-next maintenance command can be staged.
-
-Checkpoint snapshot cleanup is automatic. An
-applied checkpoint durably marks its previous snapshot as retired before the
-mailbox command is cleared; a rejected checkpoint marks its candidate instead.
-Deletion waits for the persisted maximum pinned-view age plus an internal
-safety margin, rechecks both `CURRENT` and a pending checkpoint, and is bounded
-per pass. A periodic bounded audit finds candidates created before a crash or
-an ambiguous staging failure.
-
-Manifest pages use per-page quarantine markers. A candidate must be
-structurally valid and unreachable from fresh `CURRENT`. Physical deletion
-also requires monotonic proof that a paused publication cannot later succeed:
-the page's complete sequence range is below the committed retained-entry
-floor. The deleter waits through the pinned-view deadline and orphan grace,
-reloads `CURRENT`, traverses only the candidate's containing index branch, and
-fails closed on corruption or ambiguous overlap.
+## Prometheus metrics
 
 ```go
-opts := isledb.DefaultMaintenanceOptions()
-opts.IdleInterval = 5 * time.Second
-opts.SSTCompaction.L0TriggerSSTs = 8
-opts.SSTCompaction.ReadConcurrency = 4
-opts.SSTCompaction.MaxInputBytesPerJob = 512 << 20
-opts.SSTCompaction.TargetSSTBytes = 64 << 20
-opts.ManifestCheckpoint.TargetReplayPages = 64
-opts.ManifestCheckpoint.TargetReplayBytes = 32 << 20
-opts.Reclamation.MaxConcurrentDeletes = 4
-opts.Reclamation.SST.MaxObjectsPerPass = 128
-opts.Reclamation.Manifest.AuditInterval = time.Hour
+func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics
+func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics
+```
 
-feedRetention := isledb.DefaultChangeFeedRetentionOptions()
-feedRetention.RetainFor = 24 * time.Hour
-opts.ChangeFeedRetention = &feedRetention
+Assign the returned values to `WriterOptions.Metrics` or
+`ReaderOpenOptions.Metrics`. The constructors create Prometheus counters and
+histograms but do not register them. Register the exported collectors with the
+application's `prometheus.Registerer`.
 
-m, err := db.OpenMaintenance(ctx, opts)
-if err != nil {
-    return err
+Writer metrics cover puts, deletes, backpressure, flush count, errors, latency,
+and bytes. Reader metrics cover refreshes, point reads, scans, SST cache use,
+downloads, and range reads.
+
+## Error reference
+
+Use `errors.Is` for exported sentinel errors:
+
+```go
+if errors.Is(err, isledb.ErrBackpressure) {
+    // Retry according to the application's admission policy.
 }
-defer m.Close(ctx)
-
-return m.Run(ctx)
 ```
 
-For a scheduled job:
+### Database and configuration
+
+| Error | Meaning |
+|---|---|
+| `ErrInvalidDBOptions` | Invalid store policy, feed mode, SST encoding, or `OpenBucket` input |
+| `ErrWriterAlreadyOpen` | This `DB` already owns a writer |
+| `ErrReaderAlreadyOpen` | This `DB` already owns a KV reader |
+| `ErrChangeFeedDisabled` | `OpenChangeReader` was called for a disabled feed |
+| `ErrChangeFeedPayloadMismatch` | Requested payload differs from persisted mode |
+| `ErrStorePolicyMismatch` | Writer policy differs from persisted store policy |
+
+### Writer
+
+| Error | Meaning |
+|---|---|
+| `ErrBackpressure` | Pending memtable limit reached before accepting the mutation |
+| `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or arena configuration |
+| `ErrWriterFailed` | Terminal background flush failure; wraps the cause |
+| `ErrNilContext` | A nil context was supplied |
+
+### Reader and snapshots
+
+| Error | Meaning |
+|---|---|
+| `ErrInvalidReaderOptions` | Negative manifest refresh interval |
+| `ErrReaderClosed` | Operation attempted after reader close |
+| `ErrReadViewExpired` | The reader's loaded manifest view reached its store deadline |
+| `ErrSnapshotClosed` | Operation attempted on a closed snapshot |
+| `ErrSnapshotExpired` | Snapshot reached its inherited view deadline |
+| `ErrIteratorExpired` | Iterator reached its inherited view deadline |
+
+### Change feed
+
+| Error | Meaning |
+|---|---|
+| `ErrChangeReaderClosed` | Operation attempted after close |
+| `ErrInvalidChangeCursor` | Cursor text is malformed or unsupported |
+| `ErrChangeCursorExpired` | Retention passed the requested cursor |
+| `ErrInvalidChangeReadOptions` | Negative page limit |
+| `ErrCorruptChangeFeed` | Manifest feed metadata is inconsistent |
+| `ErrCorruptChangeBatch` | Change-batch index, block, or checksum is invalid |
+
+### Maintenance
+
+| Error | Meaning |
+|---|---|
+| `ErrMaintenanceAlreadyOpen` | This `DB` already owns maintenance |
+| `ErrMaintenanceClosed` | Operation attempted after close |
+| `ErrMaintenanceRunning` | `Run` or `RunOnce` already owns the run gate |
+| `ErrInvalidMaintenanceOptions` | Invalid interval, concurrency, or work bound |
+
+Provider and context errors can also be returned and wrapped. Always preserve
+the complete error for logging.
+
+## Advanced: `blobstore` package
+
+Most applications should use `isledb.Open` or `isledb.OpenBucket`. The
+`github.com/ankur-anand/isledb/blobstore` package is for storage adapters,
+integration tests, and operational tooling.
 
 ```go
-stats, err := m.RunOnce(ctx)
+func blobstore.Open(ctx context.Context, bucketURL, prefix string) (*blobstore.Store, error)
+func blobstore.New(bucket *blob.Bucket, bucketName, prefix string) *blobstore.Store
+func blobstore.NewMemory(prefix string) *blobstore.Store
 ```
 
-## Blob Storage
-
-### blobstore.Store
-
-Abstraction over cloud object storage (S3, GCS, Azure Blob).
+Object operations:
 
 ```go
-// Open with bucket URL
-func Open(ctx context.Context, bucketURL, prefix string) (*Store, error)
-
-// Wrap existing bucket
-func New(bkt *blob.Bucket, bucketName, prefix string) *Store
-
-// In-memory store for testing
-func NewMemory(prefix string) *Store
+func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error)
+func (s *Store) ReadStream(ctx context.Context, key string) (*blob.Reader, error)
+func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+func (s *Store) ReadRangeStream(ctx context.Context, key string, offset, length int64) (*blob.Reader, error)
+func (s *Store) Attributes(ctx context.Context, key string) (Attributes, error)
+func (s *Store) Exists(ctx context.Context, key string) (bool, error)
+func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes, error)
+func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *blob.WriterOptions) (Attributes, error)
+func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, etag string) (Attributes, error)
+func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) (Attributes, error)
+func (s *Store) Delete(ctx context.Context, key string) error
+func (s *Store) BatchDelete(ctx context.Context, keys []string) error
 ```
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| Close | `() error` | Close the store |
-| Prefix | `() string` | Storage prefix |
-| SSTPath | `(id string) string` | Path for SST file |
-| ChangeBatchPath | `(id string) string` | Path for change batch file |
-| BlobPath | `(blobID string) string` | Path for blob file |
-| Read | `(ctx, key) ([]byte, Attributes, error)` | Read object |
-| ReadRange | `(ctx, key, offset, length) ([]byte, error)` | Read byte range |
-| Write | `(ctx, key, data) (Attributes, error)` | Write object |
-| WriteIfMatch | `(ctx, key, data, ifMatch) (Attributes, error)` | CAS write |
-| WriteIfNotExist | `(ctx, key, data) (Attributes, error)` | Create-only write |
-| Delete | `(ctx, key) error` | Delete object |
-| BatchDelete | `(ctx, keys) error` | Batch delete |
-| Exists | `(ctx, key) (bool, error)` | Check existence |
-| Attributes | `(ctx, key) (Attributes, error)` | Get object attributes |
-| List | `(ctx, ListOptions) (*ListResult, error)` | List objects |
-| ListSSTFiles | `(ctx) ([]ObjectInfo, error)` | List SST files |
-| ListBlobFiles | `(ctx) ([]ObjectInfo, error)` | List blob files |
+Listing operations:
+
+```go
+type ListOptions struct {
+    Prefix    string
+    Delimiter string
+}
+
+type ObjectInfo struct {
+    Key   string
+    Size  int64
+    IsDir bool
+}
+
+type ListResult struct {
+    Objects []ObjectInfo
+}
+
+func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error)
+func (s *Store) NewListIterator(opts ListOptions) *ListIterator
+func (it *ListIterator) Next(ctx context.Context) (ObjectInfo, error)
+func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInfo) (bool, error)) error
+```
+
+`List` materializes every matching object. Prefer `NewListIterator` or `Walk`
+for bounded operational scans.
 
 ```go
 type Attributes struct {
     Size       int64
     ETag       string
     ModTime    time.Time
-    Generation int64 // GCS only
+    Generation int64
+}
+
+type BatchDeleteError struct {
+    Failed map[string]error
 }
 ```
 
-**Errors:**
-- `blobstore.ErrNotFound` - Object does not exist
-- `blobstore.ErrPreconditionFailed` - CAS condition not met
-- `blobstore.BatchDeleteError` - Partial batch delete failure (`.Failed` map)
+Blobstore sentinel errors are `blobstore.ErrNotFound`,
+`blobstore.ErrPreconditionFailed`, and `blobstore.ErrBucketNameRequired`.
+`Delete` is idempotent for a missing object. `BatchDeleteError` identifies
+individual failed keys.
+
+## Related documentation
+
+- [Project overview](README.md)
+- [Object-store schema](docs/object-store-schema.md)

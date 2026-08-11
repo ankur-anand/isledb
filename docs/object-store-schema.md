@@ -1,8 +1,14 @@
-# Object Store Schema
+# IsleDB object-store layout
 
-`isledb` stores all durable state under one object-store prefix.
+IsleDB stores one database below one object-store prefix. For example, a
+database opened with the prefix `demo/p000` owns the objects below
+`demo/p000/`.
 
-If the prefix is `demo/p000`, the object layout can include:
+Applications use the IsleDB API rather than reading these objects directly.
+This document is for operators who need to understand backups, permissions,
+storage usage, retention, and recovery.
+
+## Layout at a glance
 
 ```text
 demo/p000/
@@ -15,6 +21,7 @@ demo/p000/
         <page-id>.page.zst
       l01/
         <page-id>.page.zst
+      ...
     gc/
       sst/ready/
         <plan-id>.json
@@ -34,531 +41,255 @@ demo/p000/
       <change-batch-id>
 ```
 
-## Serialization Notes
+`changes/` is present only when the change feed is enabled. Empty directories
+usually do not exist because object stores expose keys, not real directories.
 
-- `manifest/CURRENT`, `maintenance/HEAD`, and objects below `manifest/gc/` are UTF-8 JSON.
-- `manifest/snapshots/*.manifest.zst` and `manifest/pages/**/*.page.zst` use the
-  versioned `ISLM` binary envelope. Their payload is UTF-8 JSON compressed with
-  zstd. References carry the exact encoded size and SHA-256 of the complete
-  stored envelope; its header carries the bounded raw size.
-- `sstable/*` and `changes/*` are binary objects, not JSON.
-- `changes/*` stores mutation batches opened by the public `ChangeReader`.
-- `MinKey`, `MaxKey`, and any other `[]byte` fields are base64-encoded by Go's JSON encoder.
-- Manifest log `role` is `0` for writer-owned publication. Applied maintenance
-  entries are also writer-owned because only the writer updates `CURRENT`.
-- Top-level manifest fields use explicit `snake_case` JSON tags.
-- Manifest fields use explicit `snake_case` JSON tags. `Level` uses explicit
-  `number` and `ssts` fields.
+| Object family | Purpose | Lifecycle |
+| --- | --- | --- |
+| `manifest/CURRENT` | Authoritative database head and visibility boundary | Updated with conditional writes; never deleted during normal operation |
+| `manifest/snapshots/` | Complete metadata checkpoints used to bound database-open work | Immutable; old snapshots are reclaimed by maintenance |
+| `manifest/pages/` | Immutable pages of committed manifest history | Immutable; unreachable pages are reclaimed by maintenance |
+| `maintenance/HEAD` | Coordination mailbox between maintenance and the writer | Bounded mutable object; never swept as ordinary data |
+| `sstable/` | Immutable key-value data files | Reclaimed after compaction or explicit history removal makes them unreachable |
+| `changes/` | Immutable ordered mutation batches | Reclaimed according to configured change-feed retention |
+| `manifest/gc/` | Durable, bounded proof and work records for safe physical deletion | Created and removed by maintenance |
 
-The fixed 16-byte `ISLM` envelope is:
+## What makes data visible
 
-| Offset | Bytes | Field |
-| --- | ---: | --- |
-| 0 | 4 | Magic `ISLM` |
-| 4 | 1 | Envelope version (`1`) |
-| 5 | 1 | Object kind (`1` snapshot, `2` page) |
-| 6 | 1 | Codec (`1` zstd) |
-| 7 | 1 | Reserved flags (`0`) |
-| 8 | 8 | Uncompressed JSON length, unsigned big-endian |
+Object existence does not make data visible. `manifest/CURRENT` is the only
+authoritative database head.
 
-Readers verify the reference's encoded size and SHA-256 before decompressing,
-then enforce the declared raw length as the decoder's output limit.
+A normal write is published in this order:
 
-## Directory View
+1. The writer uploads a new SST object.
+2. If the change feed is enabled, it uploads the matching change-batch object.
+3. The writer conditionally updates `manifest/CURRENT` to reference the new
+   objects.
+4. Readers see the write after loading that committed `CURRENT` generation.
 
-This is a representative JSON-style view of the object families under one prefix:
+The SST and change batch can therefore exist before they are visible. A failed
+or interrupted publication can also leave an unreferenced immutable object.
+Readers ignore such objects because they do not discover data by listing
+`sstable/` or `changes/`.
 
-```json
-{
-  "demo/p000": {
-    "manifest": {
-      "CURRENT": "{...json...}",
-      "snapshots": {
-        "<id>.manifest.zst": "<ISLM envelope + zstd JSON>"
-      },
-      "pages": {
-        "l00": {
-          "<page-id>.page.zst": "<ISLM envelope + zstd JSON>"
-        },
-        "l01": {
-          "<page-id>.page.zst": "<ISLM envelope + zstd JSON>"
-        }
-      },
-      "gc": {
-        "sst": { "ready": {
-          "<plan-id>.json": "{...json...}"
-        }},
-        "change-feed": { "ready": {
-          "<plan-id>.json": "{...json...}"
-        }},
-        "snapshots": {
-          "<snapshot-path-hash>.json": "{...json...}"
-        },
-        "pages": {
-          "<page-path-hash>.json": "{...json...}"
-        }
-      }
-    },
-    "maintenance": {
-      "HEAD": "{...json...}"
-    },
-    "sstable": {
-      "<bucket>": {
-        "<sst-id>": "<binary>"
-      }
-    },
-    "changes": {
-      "<bucket>": {
-        "<change-batch-id>": "<binary>"
-      }
-    },
-    "blobs": {
-      "<prefix>": {
-        "<blob-id>.blob": "<binary>"
-      }
-    }
-  }
-}
-```
+The same rule applies to metadata. A snapshot or page becomes usable only when
+the committed head references it.
 
 ## `manifest/CURRENT`
 
-Hot control record and visibility boundary. It points to the current snapshot, the committed sequence window, bounded active entries, and immutable commit-page refs.
+`manifest/CURRENT` is a small JSON object and the root of the database. It
+contains:
 
-Path:
+- the object-layout version and manifest format;
+- the next database epoch and manifest sequence;
+- an optional snapshot reference;
+- recent manifest entries and references to older manifest pages;
+- writer and maintenance fencing state;
+- the change-feed mode and retained feed floor, when enabled;
+- the maximum lifetime of a reader's pinned view;
+- bounded receipts used to make writer and maintenance retries idempotent.
 
-```text
-demo/p000/manifest/CURRENT
-```
-
-Example:
-
-```json
-{
-  "layout_version": 2,
-  "format": "isledb-manifest-v2",
-  "snapshot": {
-    "path": "demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest.zst",
-    "encoded_bytes": 65168,
-    "checksum": "sha256:abc",
-    "created_at": "2026-04-15T10:14:11Z"
-  },
-  "log_seq_start": 412,
-  "change_feed_enabled": true,
-  "change_feed_payload": "full_values",
-  "change_feed_log_start": 412,
-  "next_seq": 428,
-  "next_epoch": 19,
-  "index_frontier": [
-    {
-      "level": 0,
-      "seq_lo": 412,
-      "seq_hi": 419,
-      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.page.zst",
-      "count": 8,
-      "encoded_bytes": 6350,
-      "checksum": "sha256:abc",
-      "created_at": "2026-04-15T10:14:11Z"
-    }
-  ],
-  "active_entries": [
-    {
-      "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
-      "commit_id": "39xAPN6YtrMhPX69wjUb4V3S3xA",
-      "seq": 420,
-      "role": 0,
-      "epoch": 18,
-      "ts": "2026-04-15T10:14:11Z",
-      "op": "add_sstable",
-      "change_batch": {
-        "id": "18-9001-9256-1776257651000000000.chg",
-        "path": "demo/p000/changes/9f3/18-9001-9256-1776257651000000000.chg",
-        "epoch": 18,
-        "seq_lo": 9001,
-        "seq_hi": 9256,
-        "count": 256,
-        "block_count": 1,
-        "size": 118420,
-        "raw_size": 276520,
-        "checksum": "sha256:def",
-        "index_checksum": "sha256:abc",
-        "version": 1,
-        "compression": "zstd",
-        "payload": "full_values"
-      }
-    }
-  ],
-  "writer_fence": {
-    "epoch": 18,
-    "owner": "writer-p000",
-    "claimed_at": "2026-04-15T10:12:01Z"
-  },
-  "last_writer_commit": {
-    "commit_id": "39xAPN6YtrMhPX69wjUb4V3S3xA",
-    "fingerprint": "sha256:8e5d8f3b9f2c7ad9b143f602b54abdc3c5166c118ad6e52f63caed592a9b45fe",
-    "entry_id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
-    "manifest_seq": 420,
-    "writer_epoch": 18,
-    "seq_lo": 9001,
-    "seq_hi": 9256,
-    "committed_at": "2026-04-15T10:14:11Z"
-  },
-  "maintenance_receipt": {
-    "command_id": "2YCueqzBfVBMErstfm3QxW8PbXQ",
-    "epoch": 7,
-    "generation": 42,
-    "status": "applied",
-    "applied_at": "2026-04-15T10:14:12Z"
-  }
-}
-```
-
-`last_writer_commit` is a bounded receipt for the newest writer commit. A
-writer keeps one stable `commit_id` while retrying a memtable publication. If a
-`CURRENT` CAS succeeds but its response is lost, the retry compares the receipt
-and metadata fingerprint and returns the already committed entry instead of
-appending a duplicate. Maintenance publication preserves this receipt.
-
-`maintenance_receipt` identifies the latest command applied from
-`maintenance/HEAD`. The command effect and receipt share one `CURRENT` CAS.
-
-## `maintenance/HEAD`
-
-Bounded maintenance mailbox. Maintenance owns this CAS object; the writer
-polls it on the flush path. It contains at most one pending command.
-
-```json
-{
-  "layout_version": 2,
-  "epoch": 7,
-  "owner_id": "maintenance-p000",
-  "claimed_at": "2026-04-15T10:13:11Z",
-  "generation": 42,
-  "pending": {
-    "id": "2YCueqzBfVBMErstfm3QxW8PbXQ",
-    "epoch": 7,
-    "generation": 42,
-    "kind": "compaction",
-    "created_at": "2026-04-15T10:14:12Z",
-    "compaction": {
-      "payload": {
-        "remove_sstable_ids": ["sst-a100", "sst-a101"],
-        "source_level": 0,
-        "destination_level": 1,
-        "add_sstables": []
-      }
-    }
-  }
-}
-```
-
-Readers never fetch this object. See
-[Maintenance Publication](maintenance-publication.md) for ownership and crash
-recovery.
-
-## `manifest/snapshots/<id>.manifest.zst`
-
-Optional full manifest snapshot describing the complete visible SST topology at a point in time.
-
-Path:
+The current format is:
 
 ```text
-demo/p000/manifest/snapshots/0ujsszwN8NRY24YaXiTIE2VWDTS.manifest.zst
+layout_version: 2
+format: isledb-manifest-v2
 ```
 
-Decompressed JSON payload example:
+`MaxPinnedViewAge` is a persisted store policy. It defaults to one hour and
+defines how long an already-loaded reader view can remain usable. Later writers
+must use the same value. This setting is a physical-deletion safety window; it
+does not determine how much change-feed history is retained.
 
-```json
-{
-  "version": 2,
-  "next_epoch": 19,
-  "log_seq": 411,
-  "writer_fence": {
-    "epoch": 18,
-    "owner": "writer-p000",
-    "claimed_at": "2026-04-15T10:12:01Z"
-  },
-  "l0_ssts": [
-    {
-      "id": "sst-a100",
-      "epoch": 18,
-      "seq_lo": 400,
-      "seq_hi": 405,
-      "min_key": "AAAAAAAAAWg=",
-      "max_key": "AAAAAAAAAW0=",
-      "size": 1048576,
-      "checksum": "sha256:abc",
-      "bloom": {
-        "bits_per_key": 0,
-        "k": 0,
-        "offset": 0,
-        "length": 0
-      },
-      "created_at": "2026-04-15T10:14:01Z",
-      "level": 0
-    }
-  ],
-  "levels": [
-    {
-      "number": 1,
-      "ssts": [
-        {
-          "id": "sst-b010",
-          "epoch": 17,
-          "seq_lo": 290,
-          "seq_hi": 320,
-          "min_key": "AAAAAAAAAPA=",
-          "max_key": "AAAAAAAAARc=",
-          "size": 8388608,
-          "checksum": "sha256:def",
-          "bloom": {
-            "bits_per_key": 0,
-            "k": 0,
-            "offset": 0,
-            "length": 0
-          },
-          "created_at": "2026-04-15T09:58:00Z",
-          "level": 1
-        }
-      ]
-    }
-  ]
-}
-```
+IsleDB updates this object with provider conditional-write semantics. A writer
+must not replace it with an unconditional PUT, and operators must not edit it
+by hand.
 
-Notes:
+### Immutable object references
 
-- `MinKey` and `MaxKey` are raw key bytes encoded as base64 in JSON.
-- If your workload uses monotonic 8-byte big-endian keys, those bytes can be decoded into numeric positions or offsets.
+References from `CURRENT`, manifest pages, and maintenance commands identify an
+immutable metadata object using:
 
-## `manifest/pages/l<level>/<id>.page.zst`
+| Field | Meaning |
+| --- | --- |
+| `path` | Exact object key, including the database prefix |
+| `encoded_bytes` | Exact stored-object length |
+| `checksum` | `sha256:` followed by 64 lowercase hexadecimal digits |
+| `created_at` | UTC creation timestamp |
 
-Immutable committed manifest pages. A page is visible only when
-`manifest/CURRENT` references it through `index_frontier`. Candidate pages left
-behind by a failed CURRENT CAS are ignored by readers and can be cleaned by GC.
+Readers verify the encoded length and SHA-256 before decoding a referenced
+snapshot or manifest page.
 
-Level `0` pages contain actual `ManifestLogEntry` objects. Higher levels contain
-`PageRef` children that point at lower-level pages. This keeps `CURRENT` bounded
-while allowing the committed history to grow. A level `0` page normally holds
-up to the active-entry limit, but it may contain fewer entries when `CURRENT`
-crosses its byte limit. If one entry is larger than that limit, the complete
-active tail, including that entry, is stored in a level `0` page rather than
-directly in `CURRENT`.
+Because references store exact object keys, a raw bucket copy should be
+restored under the same database prefix. Copying the objects to a different
+prefix does not rewrite embedded references.
 
-Path:
+## Manifest snapshots and pages
+
+Snapshots and pages let IsleDB open large databases without placing the full
+manifest history in `CURRENT`.
 
 ```text
-demo/p000/manifest/pages/l00/412-419-2YBx.page.zst
-demo/p000/manifest/pages/l01/412-1435-7Kq9.page.zst
+manifest/snapshots/<id>.manifest.zst
+manifest/pages/l<level>/<page-id>.page.zst
 ```
 
-Decompressed level 0 page example:
+Both object types are immutable. They use a versioned `ISLM` envelope around a
+zstd-compressed JSON payload. The envelope distinguishes snapshots from pages
+and records the uncompressed size before decompression begins.
 
-```json
-{
-  "layout_version": 2,
-  "page_type": "commit_l00",
-  "level": 0,
-  "seq_lo": 412,
-  "seq_hi": 419,
-  "count": 8,
-  "entries": [
-    {
-      "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
-      "seq": 412,
-      "role": 0,
-      "epoch": 18,
-      "ts": "2026-04-15T10:14:11Z",
-      "op": "add_sstable"
-    }
-  ],
-  "created_at": "2026-04-15T10:14:11Z"
-}
-```
+The current decoder limits are:
 
-Index page example:
+| Object | Maximum uncompressed payload |
+| --- | ---: |
+| Manifest page | 32 MiB |
+| Manifest snapshot | 512 MiB |
 
-```json
-{
-  "layout_version": 2,
-  "page_type": "commit_index",
-  "level": 1,
-  "seq_lo": 412,
-  "seq_hi": 1435,
-  "count": 1024,
-  "children": [
-    {
-      "level": 0,
-      "seq_lo": 412,
-      "seq_hi": 419,
-      "path": "demo/p000/manifest/pages/l00/412-419-2YBx.page.zst",
-      "count": 8,
-      "encoded_bytes": 6350,
-      "checksum": "sha256:abc",
-      "created_at": "2026-04-15T10:14:11Z"
-    }
-  ],
-  "created_at": "2026-04-15T10:30:00Z"
-}
-```
+Level `l00` pages contain committed manifest entries. Higher levels contain
+references to lower-level pages. This hierarchy keeps `CURRENT` bounded as
+history grows.
 
-Common `ManifestLogEntry` header fields:
+These objects are implementation-managed metadata. Operators should copy them
+during backup, but should not decode, rewrite, rename, or delete them manually.
 
-```json
-{
-  "id": "2YBxg5dN8nH4A4Z6Q8v6V8sC7rT",
-  "seq": 412,
-  "role": 0,
-  "epoch": 18,
-  "ts": "2026-04-15T10:14:11Z",
-  "op": "add_sstable"
-}
-```
-
-## `manifest/gc/sst/ready/<plan-id>.json`
-
-Immutable, bounded deletion plan for SSTs already retired by committed
-manifest entries.
-
-Path:
+## SST objects
 
 ```text
-demo/p000/manifest/gc/sst/ready/9db6....json
+sstable/<bucket>/<sst-id>
 ```
 
-Example:
+SSTs are immutable binary files containing keys, values, tombstones, sequence
+numbers, and TTL metadata. Values are stored directly in SSTs; IsleDB does not
+create a separate large-value blob object family.
 
-```json
-{
-  "version": 1,
-  "kind": "sst_retirement",
-  "plan_id": "9db6...",
-  "checksum": "sha256:abc",
-  "source": {
-    "command_id": "compact-414",
-    "epoch": 8,
-    "generation": 41
-  },
-  "applied_at": "2026-04-15T10:14:11Z",
-  "observed_at": "2026-04-15T10:14:12Z",
-  "pinned_view_age_nanos": 3600000000000,
-  "safety_margin_nanos": 60000000000,
-  "not_before": "2026-04-15T11:15:12Z",
-  "target_count": 1,
-  "target_bytes": 67108864,
-  "targets": [
-    {
-      "id": "sst-old-001",
-      "key": "demo/p000/sstable/a3/sst-old-001",
-      "size": 67108864
-    }
-  ]
-}
-```
+The three-character hexadecimal bucket is derived deterministically from the
+SST ID. Sharding prevents every SST from sharing one flat object-store prefix.
+The manifest records the SST ID, and IsleDB computes the exact key without
+listing the directory.
 
-## `manifest/gc/change-feed/ready/<plan-id>.json`
+Depending on reader configuration, an SST may be downloaded into the local
+cache or read through bounded range requests. The on-object checksum can be
+validated when an SST is downloaded in full. Existing SSTs remain
+self-describing and readable when compression or block-size settings change for
+new output.
 
-Immutable checksummed plan containing a bounded, sequence-ordered list of exact
-change-batch targets, the committed feed floor, byte accounting, and an
-absolute deletion deadline. Before publication, those targets live in the
-existing `maintenance/HEAD` floor command. After the writer receipt proves the
-floor was applied, maintenance writes this plan with a deadline that honors
-`MaxPinnedViewAge`. Physical deletion reloads `CURRENT`, requires the complete
-target floor, and removes the plan only after every target delete succeeds.
+Compaction writes replacement SSTs before publishing the new topology through
+`CURRENT`. Replaced SSTs remain physically present until the pinned-view safety
+window has passed and maintenance deletes them.
 
-## `manifest/gc/snapshots/<snapshot-path-hash>.json`
-
-Per-snapshot retirement marker. It records the exact snapshot path and object
-identity, retirement reason, and an absolute `not_before` deadline derived
-from the persisted pinned-view policy. The manifest reclaimer reloads CURRENT
-and the pending checkpoint before deleting the snapshot and then its marker.
-
-## `manifest/gc/pages/<page-path-hash>.json`
-
-Per-page quarantine marker containing the complete checksummed `PageRef`, the
-observation time, retained floor, reason, and absolute deadline. A due delete
-reloads CURRENT, follows only the candidate's containing index branch, and
-requires the page to remain unreachable and completely below the committed
-replay floor. Corrupt or ambiguous candidates are retained.
-
-## `sstable/<bucket>/<sst-id>`
-
-Immutable SST data file. This object is binary, not JSON.
-
-The bucket is deterministically derived from the SST ID using IsleDB's
-`blobstore.SSTBucket` function. Readers do not list `sstable/` to find files;
-they read the manifest, get `SSTMeta.ID`, compute `SSTPath(ID)`, and range-read
-the SST object directly.
-
-Path:
+## Change-feed objects
 
 ```text
-demo/p000/sstable/9e6/seg1.sst
+changes/<bucket>/<change-batch-id>
 ```
 
-JSON-style descriptor:
+Change batches exist only when the database is opened with change-feed support.
+Each writer flush publishes one mutation batch alongside its SST. The batch
+preserves mutation order, PUT and DELETE operations, and TTL metadata.
 
-```json
-{
-  "path": "demo/p000/sstable/9e6/seg1.sst",
-  "encoding": "binary",
-  "written_by": [
-    "writer",
-    "compactor"
-  ],
-  "read_by": [
-    "reader",
-    "compactor",
-    "retention_compactor"
-  ],
-  "contents": "immutable sstable bytes"
-}
-```
+The configured payload mode controls PUT values:
 
-## `changes/<bucket>/<change-batch-id>`
+| Mode | Stored in the change batch |
+| --- | --- |
+| `keys_only` | Key, operation, sequence, and TTL metadata; PUT value omitted |
+| `full_values` | Key, operation, sequence, TTL metadata, and complete PUT value |
 
-Immutable, seq-ordered mutation batch opened by `ChangeReader`. This object is
-an indexed binary file, not JSON. It preserves puts, deletes, TTL metadata, and
-mutation order. A `full_values` feed embeds complete values, including values
-stored externally by the KV path. A `keys_only` feed stores PUT keys and
-operation metadata with an explicit value-omitted flag.
+The payload mode is persisted in `CURRENT` and cannot be changed after the feed
+has been enabled for that database prefix.
 
-Indexed format version 1 layout:
+Change batches use independently compressed zstd blocks. A block normally
+closes at 512 records or 1 MiB of uncompressed record data, whichever comes
+first. A single record larger than the byte target is stored as one oversized
+block so the record remains intact.
+
+An index and trailer at the end of the object let `ChangeReader` range-read only
+the blocks needed for the requested page. Each decoded block has its own
+SHA-256 integrity check. Normal feed reads use the exact path recorded in the
+manifest and do not list `changes/`.
+
+Change-feed retention first advances the logical feed floor in `CURRENT`.
+Physical deletion happens later, after existing pinned readers have had time to
+expire. A cursor below the committed feed floor returns
+`ErrChangeCursorExpired` even if an old batch object still exists physically.
+
+## Maintenance coordination
 
 ```text
-independent zstd frame: records 0-511
-independent zstd frame: records 512-1023
-...
-fixed-size block index entries
-96-byte trailer
+maintenance/HEAD
 ```
 
-A block closes at 512 records or 1 MiB of uncompressed record data, whichever
-comes first; one oversized record remains independently decodable. Each index
-entry stores the first record index, record count, first sequence, object
-offset, compressed size, raw size, and SHA-256 of the raw block. The trailer
-stores the batch identity, payload policy, and a SHA-256 of the complete block
-index; the same payload policy and index checksum are anchored in the committed
-manifest metadata.
+`maintenance/HEAD` is a bounded JSON mailbox. A maintenance process can prepare
+compaction, checkpoint, and retention work, but only the fenced writer publishes
+the resulting database state through `manifest/CURRENT`.
 
-`ChangeReader` first range-reads the index and trailer, then coalesces the
-contiguous block frames needed by `MaxChanges` and `MaxBytes` into a range GET.
-It verifies the index and every decompressed block without downloading or
-decoding unrelated blocks.
+The mailbox holds at most one pending command. The writer applies or rejects
+that command and records the result in `CURRENT` in the same conditional update
+as the command's effect. Maintenance then reconciles the result and clears the
+mailbox.
 
-The bucket is deterministically derived from the change-batch ID. Readers use
-the exact path committed in the manifest; normal feed reads never list this
-prefix.
+Readers never need `maintenance/HEAD`. Users normally interact with this flow
+through the public maintenance API described in the [API guide](../api.md), not
+through the JSON object.
 
-Path:
+## Garbage-collection records
+
+The JSON objects below `manifest/gc/` are durable deletion work, not user data
+and not temporary files:
 
 ```text
-demo/p000/changes/9f3/18-412-417-1776257651000000000.chg
+manifest/gc/sst/ready/<plan-id>.json
+manifest/gc/change-feed/ready/<plan-id>.json
+manifest/gc/snapshots/<snapshot-path-hash>.json
+manifest/gc/pages/<page-path-hash>.json
 ```
 
-Visibility rule:
+SST and change-feed plans contain bounded lists of exact deletion targets.
+Snapshot and page records track one candidate each. The records carry safety
+deadlines so slow physical deletion cannot race readers holding an older,
+still-valid view.
 
-```text
-The SST and change batch upload concurrently and may exist before commit.
-They become visible only when manifest/CURRENT commits the add_sstable entry.
-```
+Each reclaim lane progresses independently. A slow SST delete does not prevent
+change-feed or metadata cleanup from making progress, and deletion does not
+block ordinary reads and writes.
+
+Do not delete GC records manually. Removing a record before its targets are
+deleted can leave unreachable data in the bucket indefinitely.
+
+## Backup and restore
+
+A database backup must include the complete database prefix, including
+`manifest/`, `maintenance/`, `sstable/`, `changes/`, and `manifest/gc/`.
+
+For a simple consistent backup:
+
+1. Stop every writer using the database prefix.
+2. Stop maintenance and physical reclamation.
+3. Copy the complete prefix.
+4. Restore all objects under the same prefix.
+
+Provider snapshots or versioned-bucket tooling can avoid a long application
+pause, but the captured view must contain `CURRENT` and every immutable object
+referenced by that generation. Copying only `CURRENT` is not a backup.
+
+Provider object versioning, soft-delete, and incomplete multipart uploads are
+outside IsleDB's logical object graph. Configure provider lifecycle rules for
+those provider-owned versions or uploads separately.
+
+## Operational rules
+
+- Give normal readers GET access to manifest metadata, SSTs, and change batches.
+- Give the writer read and conditional-write access to `manifest/CURRENT`, read
+  access to `maintenance/HEAD`, and create access to SST, change-batch, and
+  manifest-page objects.
+- Give maintenance read access to the database, conditional-write access to
+  `maintenance/HEAD`, and the list, create, and delete permissions required by
+  its configured compaction and reclamation work.
+- Do not apply a generic age-based delete rule to live IsleDB prefixes.
+- Do not rename, rewrite, or manually remove immutable objects.
+- Treat a missing object referenced by `CURRENT` as corruption or premature
+  external deletion; an unreferenced object is not automatically corruption.
+- Keep independent databases under independent prefixes.
+
+Logical retention is controlled through IsleDB. Physical object count can lag
+logical retention because deletion deliberately waits for pinned readers and
+proceeds in bounded batches.
