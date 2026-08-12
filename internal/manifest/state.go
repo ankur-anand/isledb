@@ -194,13 +194,28 @@ func insertLevelSSTs(existing, additions []SSTMeta) []SSTMeta {
 	if len(existing) == 0 {
 		return additions
 	}
-	insertAt := sort.Search(len(existing), func(i int) bool {
-		return bytes.Compare(existing[i].MinKey, additions[0].MinKey) >= 0
-	})
+	if len(additions) == 0 {
+		return existing
+	}
+
+	// Both inputs are ordered by MinKey. New compaction outputs may fall into
+	// more than one gap between surviving SSTs, so they cannot be inserted as a
+	// single block at the position of additions[0]. Merge the two ordered runs
+	// instead, preserving the ordering that FindSST and OverlappingSSTs require.
 	combined := make([]SSTMeta, len(existing)+len(additions))
-	copy(combined, existing[:insertAt])
-	copy(combined[insertAt:], additions)
-	copy(combined[insertAt+len(additions):], existing[insertAt:])
+	existingIndex, additionIndex, outputIndex := 0, 0, 0
+	for existingIndex < len(existing) && additionIndex < len(additions) {
+		if bytes.Compare(existing[existingIndex].MinKey, additions[additionIndex].MinKey) <= 0 {
+			combined[outputIndex] = existing[existingIndex]
+			existingIndex++
+		} else {
+			combined[outputIndex] = additions[additionIndex]
+			additionIndex++
+		}
+		outputIndex++
+	}
+	outputIndex += copy(combined[outputIndex:], existing[existingIndex:])
+	copy(combined[outputIndex:], additions[additionIndex:])
 	return combined
 }
 
