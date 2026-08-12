@@ -368,9 +368,7 @@ func writeChangeBatchStreamingWithOptions(
 	}()
 
 	uploadErr := uploadFn(ctx, id, reader)
-	if uploadErr != nil {
-		_ = reader.CloseWithError(uploadErr)
-	}
+	_ = reader.CloseWithError(uploadErr)
 	producerErr := <-producerDone
 	if uploadErr != nil {
 		return changeBatchStreamResult{}, uploadErr

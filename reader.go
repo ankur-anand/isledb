@@ -743,9 +743,16 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		release := func() {
 			r.sstCache.Release(path)
 		}
-		return r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		if err == nil {
+			return reader, iter, nil
+		}
+		// Cached bytes are not authoritative. If they cannot be opened, release
+		// and evict them, then make one attempt against object storage below.
+		r.sstCache.Remove(path)
+	} else {
+		r.metrics.ObserveSSTCacheLookup(false)
 	}
-	r.metrics.ObserveSSTCacheLookup(false)
 
 	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
 		return nil, nil, err
@@ -760,7 +767,13 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		release := func() {
 			r.sstCache.Release(path)
 		}
-		return r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		if err != nil {
+			// Do not let a failed download poison later reads. This is the only
+			// object-store attempt in this call, so return the error after eviction.
+			r.sstCache.Remove(path)
+		}
+		return reader, iter, err
 	}
 	return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
 }
@@ -875,14 +888,13 @@ func (it *sstIterWithClose) Close() error {
 }
 
 func (r *Reader) validateSSTData(meta sstMetadata, data []byte) error {
-	if !r.verifySST {
-		return nil
-	}
-
 	var err error
 	data, err = trimSSTData(meta, data)
 	if err != nil {
 		return err
+	}
+	if !r.verifySST {
+		return nil
 	}
 
 	sum := sha256.Sum256(data)
@@ -1012,6 +1024,10 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 		return fmt.Errorf("download sst %s: %w", path, err)
 	}
 	downloadedBytes = written
+	if meta != nil && meta.Size > 0 && written < meta.Size {
+		cleanup()
+		return fmt.Errorf("validate sst %s: short read: %d < %d", path, written, meta.Size)
+	}
 
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmpPath)

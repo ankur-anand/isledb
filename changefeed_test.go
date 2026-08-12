@@ -73,6 +73,28 @@ func TestChangeBatchBufferStreamsInAppendOrder(t *testing.T) {
 	}
 }
 
+func TestWriteChangeBatchStreaming_ReturnsWhenUploaderStopsReadingSuccessfully(t *testing.T) {
+	buffer := &changeBatchBuffer{}
+	if err := buffer.appendPut(1, []byte("a"), bytes.Repeat([]byte("x"), 8192), 0); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeChangeBatchStreamingWithOptions(context.Background(), buffer, 1, time.Now().UTC(),
+			changeBatchBlockOptions{MaxRecords: 1, TargetRawBytes: 1},
+			func(context.Context, string, io.Reader) error { return nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("uploader returned without consuming the change batch, but the incomplete upload was accepted")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writeChangeBatchStreamingWithOptions remained blocked after the uploader returned")
+	}
+}
+
 func TestChangeBatchKeysOnlyOmitsPutValues(t *testing.T) {
 	buffer := &changeBatchBuffer{payload: ChangeFeedKeysOnly}
 	if err := buffer.appendPutForPayload(

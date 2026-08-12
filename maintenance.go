@@ -1127,6 +1127,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		current,
 		head.Pending,
 		current.MaintenanceReceipt,
+		time.Now().UTC(),
 		changeFeedSafetyMargin,
 	); err != nil {
 		return false, fmt.Errorf("publish change-feed deletion plan: %w", err)

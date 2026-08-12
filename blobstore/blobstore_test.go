@@ -9,8 +9,33 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/smithy-go"
 	"gocloud.dev/blob"
 )
+
+func TestMapErrorClassifiesS3ConditionalRequestConflictAsPreconditionFailure(t *testing.T) {
+	awsConflict := &smithy.GenericAPIError{
+		Code:    "ConditionalRequestConflict",
+		Message: "a conflicting conditional operation is currently in progress",
+	}
+	err := (&Store{}).mapError(fmt.Errorf("conditional PUT: %w", awsConflict))
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("mapError(%q)=%v, want ErrPreconditionFailed so manifest CAS retries",
+			awsConflict.ErrorCode(), err)
+	}
+}
+
+func TestMapErrorDoesNotClassifyUnrelatedS3ConflictAsPreconditionFailure(t *testing.T) {
+	awsConflict := &smithy.GenericAPIError{
+		Code:    "BucketAlreadyExists",
+		Message: "the requested bucket name is not available",
+	}
+	err := (&Store{}).mapError(awsConflict)
+	if errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("mapError(%q)=%v, unrelated S3 conflict must remain fatal",
+			awsConflict.ErrorCode(), err)
+	}
+}
 
 type storeHarness struct {
 	store   *Store

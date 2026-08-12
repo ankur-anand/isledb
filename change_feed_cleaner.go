@@ -200,7 +200,7 @@ func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFee
 					var payload []byte
 					plan, payload, err = buildChangeFeedDeletionPlan(
 						c.store, candidates, floor, now, c.opts.SweepGracePeriod,
-						observedAt, updated.PinnedViewAge(), c.opts.DeletionSafetyMargin)
+						observedAt, observedAt, updated.PinnedViewAge(), c.opts.DeletionSafetyMargin)
 					if err == nil {
 						_, err = storeChangeFeedDeletionPlan(ctx, c.store, *plan, payload)
 					}
@@ -240,11 +240,11 @@ func (c *changeFeedCleaner) runReclaimOnce(ctx context.Context, deleter ...objec
 	if c.planIter == nil {
 		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"})
 	}
-	sweep, exhausted, sweepErr := reclaimChangeFeedDeletionPlans(
+	sweep, exhausted, restartIterator, sweepErr := reclaimChangeFeedDeletionPlans(
 		ctx, c.store, c.manifestLog, c.opts.SweepBatchSize,
 		defaultChangeFeedDeletionPlanScanLimit, time.Now().UTC(), deleteObjects,
 		c.planIter, c.planCache, &c.pendingPlanKey)
-	if exhausted || sweepErr != nil {
+	if exhausted || restartIterator {
 		c.planIter = nil
 	}
 	if exhausted {

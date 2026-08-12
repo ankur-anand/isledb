@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -14,6 +15,34 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
+
+func TestChangeKeyAndValueDoNotAliasWritablePageCapacity(t *testing.T) {
+	build := func() (Change, Change) {
+		pageData := make([]byte, 0, 128)
+		first := publicChange(changeRecord{Seq: 1, Kind: changePut, Key: []byte("first"), Value: []byte("value-one")}, &pageData)
+		second := publicChange(changeRecord{Seq: 2, Kind: changePut, Key: []byte("second"), Value: []byte("value-two")}, &pageData)
+		return first, second
+	}
+
+	t.Run("key append cannot overwrite its value", func(t *testing.T) {
+		first, _ := build()
+		wantValue := append([]byte(nil), first.Value...)
+		_ = append(first.Key, '!')
+		if !bytes.Equal(first.Value, wantValue) {
+			t.Fatalf("append to Change.Key mutated its Value: got=%q want=%q", first.Value, wantValue)
+		}
+	})
+
+	t.Run("value append cannot overwrite next key", func(t *testing.T) {
+		first, second := build()
+		wantSecondKey := append([]byte(nil), second.Key...)
+		_ = append(first.Value, '!')
+		if !bytes.Equal(second.Key, wantSecondKey) {
+			t.Fatalf("append to first Change.Value mutated neighboring Change.Key: got=%q want=%q",
+				second.Key, wantSecondKey)
+		}
+	})
+}
 
 func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

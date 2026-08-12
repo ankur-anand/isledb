@@ -964,13 +964,19 @@ func changePageDataCapacityForIndex(
 func publicChange(change changeRecord, pageData *[]byte) Change {
 	keyStart := len(*pageData)
 	*pageData = append(*pageData, change.Key...)
-	key := (*pageData)[keyStart:len(*pageData)]
+	keyEnd := len(*pageData)
+	// Key and Value share the page's backing allocation, but callers must not
+	// be able to append through one field into the bytes of the next field.
+	// Limiting capacity to length makes append allocate while preserving the
+	// zero-copy slices used for ordinary reads.
+	key := (*pageData)[keyStart:keyEnd:keyEnd]
 	var value []byte
 	hasValue := change.Kind == changePut && !change.ValueOmitted
 	if hasValue {
 		valueStart := len(*pageData)
 		*pageData = append(*pageData, change.Value...)
-		value = (*pageData)[valueStart:len(*pageData)]
+		valueEnd := len(*pageData)
+		value = (*pageData)[valueStart:valueEnd:valueEnd]
 		if value == nil {
 			value = []byte{}
 		}
