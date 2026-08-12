@@ -46,6 +46,49 @@ func TestSSTCache_RefCounting(t *testing.T) {
 	require.LessOrEqual(t, stats.Size, int64(100))
 }
 
+func TestSSTCache_OpenReconcilesFilesLeftByPreviousProcess(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, cacheFileName("sstable/old.sst"))
+	temp := filepath.Join(dir, "sst-interrupted-download")
+	unrelated := filepath.Join(dir, "keep-me")
+	unrelatedDir := filepath.Join(dir, "sst-unrelated-directory")
+	require.NoError(t, os.WriteFile(orphan, []byte("orphan"), 0o644))
+	require.NoError(t, os.WriteFile(temp, []byte("partial"), 0o644))
+	require.NoError(t, os.WriteFile(unrelated, []byte("unrelated"), 0o644))
+	require.NoError(t, os.Mkdir(unrelatedDir, 0o755))
+
+	cache, err := NewSSTCache(SSTCacheOptions{Dir: dir, MaxSize: 1 << 20})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	_, err = os.Stat(orphan)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(temp)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	contents, err := os.ReadFile(unrelated)
+	require.NoError(t, err)
+	require.Equal(t, []byte("unrelated"), contents)
+	info, err := os.Stat(unrelatedDir)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+	require.Equal(t, Stats{MaxSize: 1 << 20}, cache.Stats())
+}
+
+func TestSSTCacheArtifactNames(t *testing.T) {
+	for name, want := range map[string]bool{
+		cacheFileName("key"):               true,
+		"sst-12345":                        true,
+		"sst-temp-download":                true,
+		"keep-me":                          false,
+		"ABCDEF0123456789ABCDEF0123456789": false,
+		"0000000000000000000000000000000g": false,
+	} {
+		if got := isSSTCacheArtifact(name); got != want {
+			t.Errorf("isSSTCacheArtifact(%q)=%t want=%t", name, got, want)
+		}
+	}
+}
+
 func TestSSTCache_CloseDefersPinnedEntryRemoval(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewSSTCache(SSTCacheOptions{Dir: dir})

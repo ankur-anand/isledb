@@ -251,6 +251,114 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	}
 }
 
+func TestReader_TruncatedSSTCacheSelfHealsAfterOriginRecovers(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	writer, err := newWriterWithMaintenanceWake(ctx, store, manifestStore, opts, nil,
+		StorePolicy{MaxPinnedViewAge: DefaultMaxPinnedViewAge},
+		SSTEncodingOptions{Compression: "none", BlockBytes: 4096, BloomBitsPerKey: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m := replayManifestForTest(t, ctx, store)
+	if len(m.L0SSTs) != 1 {
+		t.Fatalf("L0 SST count=%d, want 1", len(m.L0SSTs))
+	}
+	path := store.SSTPath(m.L0SSTs[0].ID)
+	valid, _, err := store.Read(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Write(ctx, path, valid[:len(valid)/2]); err != nil {
+		t.Fatal(err)
+	}
+
+	ropts := defaultReaderOptions()
+	ropts.CacheDir = t.TempDir()
+	reader, err := newReader(ctx, store, ropts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, _, err := reader.Get(ctx, []byte("key")); err == nil {
+		t.Fatal("first read of truncated SST unexpectedly succeeded")
+	}
+	if got := reader.SSTCacheStats().EntryCount; got != 0 {
+		t.Fatalf("truncated SST was retained in cache; entries=%d", got)
+	}
+	if _, err := store.Write(ctx, path, valid); err != nil {
+		t.Fatal(err)
+	}
+	value, found, err := reader.Get(ctx, []byte("key"))
+	if err != nil || !found || len(value) != 4096 {
+		t.Fatalf("reader did not evict and redownload poisoned SST: found=%t bytes=%d err=%v",
+			found, len(value), err)
+	}
+}
+
+func TestReader_EvictsInvalidCachedSSTAndRedownloads(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	writer, err := newWriterWithMaintenanceWake(ctx, store, manifestStore, opts, nil,
+		StorePolicy{MaxPinnedViewAge: DefaultMaxPinnedViewAge},
+		SSTEncodingOptions{Compression: "none", BlockBytes: 4096, BloomBitsPerKey: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m := replayManifestForTest(t, ctx, store)
+	if len(m.L0SSTs) != 1 {
+		t.Fatalf("L0 SST count=%d, want 1", len(m.L0SSTs))
+	}
+	path := store.SSTPath(m.L0SSTs[0].ID)
+	valid, _, err := store.Read(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ropts := defaultReaderOptions()
+	ropts.CacheDir = t.TempDir()
+	reader, err := newReader(ctx, store, ropts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if err := reader.sstCache.Set(path, valid[:len(valid)/2]); err != nil {
+		t.Fatal(err)
+	}
+
+	value, found, err := reader.Get(ctx, []byte("key"))
+	if err != nil || !found || len(value) != 4096 {
+		t.Fatalf("reader did not replace invalid cached SST: found=%t bytes=%d err=%v",
+			found, len(value), err)
+	}
+}
+
 func newPrefetchTestWriter(t *testing.T, ctx context.Context, store *blobstore.Store, manifestStore *manifest.Store) *writer {
 	t.Helper()
 

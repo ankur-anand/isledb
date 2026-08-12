@@ -49,6 +49,7 @@ type changeFeedDeletionPlan struct {
 	GracePeriod time.Duration `json:"grace_period_nanos"`
 
 	FloorPublishedAt time.Time     `json:"floor_published_at"`
+	ObservedAt       time.Time     `json:"observed_at"`
 	PinnedViewAge    time.Duration `json:"pinned_view_age_nanos"`
 	SafetyMargin     time.Duration `json:"safety_margin_nanos"`
 	NotBefore        time.Time     `json:"not_before"`
@@ -75,6 +76,7 @@ func buildChangeFeedDeletionPlan(
 	createdAt time.Time,
 	gracePeriod time.Duration,
 	floorPublishedAt time.Time,
+	observedAt time.Time,
 	pinnedViewAge time.Duration,
 	safetyMargin time.Duration,
 ) (*changeFeedDeletionPlan, []byte, error) {
@@ -82,7 +84,7 @@ func buildChangeFeedDeletionPlan(
 	if len(candidates) == 0 || len(candidates) > manifest.MaxChangeFeedDeleteTargetsPerCommand {
 		return nil, nil, fmt.Errorf("invalid change-feed deletion target count=%d", len(candidates))
 	}
-	if targetFloor == 0 || createdAt.IsZero() || floorPublishedAt.IsZero() ||
+	if targetFloor == 0 || createdAt.IsZero() || floorPublishedAt.IsZero() || observedAt.IsZero() ||
 		pinnedViewAge <= 0 || safetyMargin < 0 {
 		return nil, nil, errors.New("incomplete change-feed deletion timing")
 	}
@@ -96,6 +98,7 @@ func buildChangeFeedDeletionPlan(
 		CreatedAt:        createdAt.UTC(),
 		GracePeriod:      gracePeriod,
 		FloorPublishedAt: floorPublishedAt.UTC(),
+		ObservedAt:       observedAt.UTC(),
 		PinnedViewAge:    pinnedViewAge,
 		SafetyMargin:     safetyMargin,
 		TargetCount:      len(candidates),
@@ -107,8 +110,12 @@ func buildChangeFeedDeletionPlan(
 		}
 		plan.TargetBytes += target.Size
 	}
-	plan.NotBefore = plan.CreatedAt.Add(plan.GracePeriod)
-	if viewDeadline := plan.FloorPublishedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin); viewDeadline.After(plan.NotBefore) {
+	// Physical deletion is safe only after this process has observed the new
+	// floor and every view that could predate that observation has expired.
+	// The writer's publication timestamp is retained for diagnosis but cannot
+	// be used as a deadline anchor because the two hosts' clocks may differ.
+	plan.NotBefore = plan.ObservedAt.Add(plan.GracePeriod)
+	if viewDeadline := plan.ObservedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin); viewDeadline.After(plan.NotBefore) {
 		plan.NotBefore = viewDeadline
 	}
 	plan.PlanID = changeFeedDeletionPlanID(*plan)
@@ -170,11 +177,12 @@ func validateChangeFeedDeletionPlan(store *blobstore.Store, plan changeFeedDelet
 		return errors.New("change-feed deletion plan checksum mismatch")
 	}
 	if plan.TargetFloor == 0 || plan.CreatedAt.IsZero() || plan.GracePeriod < 0 ||
-		plan.FloorPublishedAt.IsZero() || plan.PinnedViewAge <= 0 || plan.SafetyMargin < 0 {
+		plan.FloorPublishedAt.IsZero() || plan.ObservedAt.IsZero() ||
+		plan.PinnedViewAge <= 0 || plan.SafetyMargin < 0 {
 		return errors.New("invalid change-feed deletion plan timing")
 	}
-	wantNotBefore := plan.CreatedAt.Add(plan.GracePeriod)
-	if viewDeadline := plan.FloorPublishedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin); viewDeadline.After(wantNotBefore) {
+	wantNotBefore := plan.ObservedAt.Add(plan.GracePeriod)
+	if viewDeadline := plan.ObservedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin); viewDeadline.After(wantNotBefore) {
 		wantNotBefore = viewDeadline
 	}
 	if !plan.NotBefore.Equal(wantNotBefore) {
@@ -302,6 +310,7 @@ func recordChangeFeedDeletionPlan(
 	current *manifest.Current,
 	command *manifest.MaintenanceCommand,
 	receipt *manifest.MaintenanceReceipt,
+	observedAt time.Time,
 	safetyMargin time.Duration,
 ) (bool, error) {
 	if command == nil || command.Kind != manifest.MaintenanceCommandChangeFeedFloor ||
@@ -325,6 +334,7 @@ func recordChangeFeedDeletionPlan(
 		command.CreatedAt,
 		command.ChangeFeedFloor.GracePeriod,
 		receipt.AppliedAt,
+		observedAt,
 		current.PinnedViewAge(),
 		safetyMargin,
 	)
@@ -367,9 +377,10 @@ func runChangeFeedDeletionPlanReclaimer(
 	iter *blobstore.ListIterator,
 	cache *boundedPlanCache[changeFeedDeletionPlan],
 ) (changeFeedSweepStats, bool, error) {
-	return reclaimChangeFeedDeletionPlans(
+	stats, exhausted, _, err := reclaimChangeFeedDeletionPlans(
 		ctx, store, manifestLog, deleteBatchSize, scanLimit, now,
 		deleter, iter, cache, nil)
+	return stats, exhausted, err
 }
 
 func reclaimChangeFeedDeletionPlans(
@@ -383,8 +394,10 @@ func reclaimChangeFeedDeletionPlans(
 	iter *blobstore.ListIterator,
 	cache *boundedPlanCache[changeFeedDeletionPlan],
 	pendingPlanKey *string,
-) (changeFeedSweepStats, bool, error) {
-	stats := changeFeedSweepStats{}
+) (stats changeFeedSweepStats, exhausted, restartIterator bool, err error) {
+	// A bad plan is an object-level failure: Next already advanced past it, so
+	// restartIterator stays false and the next pass keeps that progress. Only a
+	// LIST failure or cancellation makes the provider cursor unsafe to reuse.
 	if deleteBatchSize <= 0 {
 		deleteBatchSize = defaultChangeFeedSweepBatchSize
 	}
@@ -396,7 +409,7 @@ func reclaimChangeFeedDeletionPlans(
 	}
 	current, err := manifestLog.ReadCurrentData(ctx)
 	if err != nil {
-		return stats, false, err
+		return stats, false, reclamationCancellation(ctx, err) != nil, err
 	}
 	var retainedFloor uint64
 	if current != nil {
@@ -415,10 +428,10 @@ func reclaimChangeFeedDeletionPlans(
 			var err error
 			object, err = iter.Next(ctx)
 			if errors.Is(err, io.EOF) {
-				return stats, true, reclaimErr
+				return stats, true, false, reclaimErr
 			}
 			if err != nil {
-				return stats, false, errors.Join(reclaimErr, err)
+				return stats, false, true, errors.Join(reclaimErr, err)
 			}
 		}
 		if object.IsDir {
@@ -430,7 +443,7 @@ func reclaimChangeFeedDeletionPlans(
 			payload, _, err := store.Read(ctx, object.Key)
 			if err != nil {
 				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-					return stats, false, errors.Join(reclaimErr, cancelErr)
+					return stats, false, true, errors.Join(reclaimErr, cancelErr)
 				}
 				stats.Failed++
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("read change-feed deletion plan %q: %w", object.Key, err))
@@ -459,7 +472,7 @@ func reclaimChangeFeedDeletionPlans(
 				// plans cannot overtake it merely because of this pass's budget.
 				*pendingPlanKey = object.Key
 			}
-			return stats, false, reclaimErr
+			return stats, false, false, reclaimErr
 		}
 		keys := make([]string, len(plan.Targets))
 		for i := range plan.Targets {
@@ -473,7 +486,7 @@ func reclaimChangeFeedDeletionPlans(
 		}
 		if err := deleter.BatchDelete(ctx, keys); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-				return stats, false, errors.Join(reclaimErr, cancelErr)
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}
 			failed := len(keys)
 			var batchErr *blobstore.BatchDeleteError
@@ -488,7 +501,7 @@ func reclaimChangeFeedDeletionPlans(
 		stats.Deleted += len(keys)
 		if err := deleter.Delete(ctx, object.Key); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-				return stats, false, errors.Join(reclaimErr, cancelErr)
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}
 			stats.Failed++
 			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete completed change-feed plan %q: %w", plan.PlanID, err))
@@ -497,7 +510,7 @@ func reclaimChangeFeedDeletionPlans(
 		cache.remove(object.Key)
 		stats.PlansDeleted++
 	}
-	return stats, false, reclaimErr
+	return stats, false, false, reclaimErr
 }
 
 func uniqueChangeBatchDeleteCandidates(candidates []changeBatchDeleteCandidate) []changeBatchDeleteCandidate {

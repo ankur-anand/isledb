@@ -100,6 +100,44 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 	}
 }
 
+func TestWriteSSTStreaming_ReturnsWhenUploaderStopsReadingSuccessfully(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeSSTStreaming(context.Background(),
+			&sliceSSTIter{entries: []internal.MemEntry{{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: bytes.Repeat([]byte("x"), 8192)}}},
+			sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 1,
+			func(context.Context, string, io.Reader) error { return nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("uploader returned without consuming the SST, but the incomplete upload was accepted")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writeSSTStreaming remained blocked after the uploader returned")
+	}
+}
+
+func TestWriteMultipleSSTsStreaming_ReturnsWhenUploaderStopsReadingSuccessfully(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeMultipleSSTsStreaming(context.Background(),
+			&sliceSSTIter{entries: []internal.MemEntry{{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: bytes.Repeat([]byte("x"), 8192)}}},
+			sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20,
+			func(context.Context, string, io.Reader) error { return nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("uploader returned without consuming the SST, but the incomplete upload was accepted")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writeMultipleSSTsStreaming remained blocked after the uploader returned")
+	}
+}
+
 func TestWriteSSTStreaming_UploadError(t *testing.T) {
 	entries := []internal.MemEntry{
 		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},

@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -59,6 +61,9 @@ func NewSSTCache(opts SSTCacheOptions) (RefCountedCache, error) {
 	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
 		return nil, err
 	}
+	if err := reconcileSSTCacheDir(opts.Dir); err != nil {
+		return nil, err
+	}
 
 	return &sstCache{
 		dir:     opts.Dir,
@@ -67,6 +72,42 @@ func NewSSTCache(opts SSTCacheOptions) (RefCountedCache, error) {
 		order:   list.New(),
 		pending: make(map[string]struct{}),
 	}, nil
+}
+
+// reconcileSSTCacheDir removes files left by a previous cache process. Cache
+// filenames contain only a truncated hash, so a new in-memory index cannot
+// recover the object key needed to reuse them. Keeping such files would also
+// put their bytes outside size accounting and eviction.
+func reconcileSSTCacheDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("diskcache: read cache directory: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !isSSTCacheArtifact(name) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("diskcache: remove stale cache file %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func isSSTCacheArtifact(name string) bool {
+	if strings.HasPrefix(name, "sst-") {
+		return true
+	}
+	if len(name) != hex.EncodedLen(16) {
+		return false
+	}
+	for _, char := range name {
+		if !('0' <= char && char <= '9') && !('a' <= char && char <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *sstCache) CacheDir() string {

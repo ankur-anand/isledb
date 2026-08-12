@@ -588,7 +588,7 @@ func (s *Store) mapError(err error) error {
 		switch apiErr.ErrorCode() {
 		case "NotFound", "NoSuchKey":
 			return ErrNotFound
-		case "PreconditionFailed":
+		case "PreconditionFailed", "ConditionalRequestConflict":
 			return ErrPreconditionFailed
 		}
 	}

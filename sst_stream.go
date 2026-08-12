@@ -82,6 +82,7 @@ func writeSSTStreaming(
 			_ = pr.CloseWithError(err)
 			return fmt.Errorf("sst upload: %w", err)
 		}
+		_ = pr.Close()
 		return nil
 	})
 
@@ -294,10 +295,11 @@ func writeMultipleSSTsStreaming(
 
 		go func(id string, reader *io.PipeReader, done chan struct{}, errVal *atomic.Value) {
 			defer close(done)
-			if err := uploadFn(ctx, id, reader); err != nil {
+			err := uploadFn(ctx, id, reader)
+			if err != nil {
 				errVal.Store(err)
-				reader.CloseWithError(err)
 			}
+			_ = reader.CloseWithError(err)
 		}(sstID, pr, uploadDone, &uploadErr)
 		return nil
 	}

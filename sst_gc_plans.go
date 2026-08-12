@@ -417,10 +417,10 @@ func (c *sstCleaner) runOnce(ctx context.Context) (sstCleanupWorkStats, error) {
 	if c.planIter == nil {
 		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"})
 	}
-	stats, exhausted, err := reclaimSSTDeletionPlans(
+	stats, exhausted, restartIterator, err := reclaimSSTDeletionPlans(
 		ctx, c.store, c.delete, c.opts.DeleteBatchSize, c.opts.PlanScanLimit,
 		c.opts.Now().UTC(), c.planIter, c.cache, &c.pendingPlanKey)
-	if exhausted || err != nil {
+	if exhausted || restartIterator {
 		c.planIter = nil
 	}
 	if exhausted {
@@ -452,7 +452,7 @@ func runSSTDeletionPlanReclaimer(
 	}
 
 	iter := store.NewListIterator(blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"})
-	stats, _, err := reclaimSSTDeletionPlans(ctx, store, deleteObjects, deleteBatchSize, scanLimit, now, iter, nil, nil)
+	stats, _, _, err := reclaimSSTDeletionPlans(ctx, store, deleteObjects, deleteBatchSize, scanLimit, now, iter, nil, nil)
 	return stats, err
 }
 
@@ -466,8 +466,10 @@ func reclaimSSTDeletionPlans(
 	iter *blobstore.ListIterator,
 	cache *boundedPlanCache[sstDeletionPlan],
 	pendingPlanKey *string,
-) (sstCleanupWorkStats, bool, error) {
-	stats := sstCleanupWorkStats{}
+) (stats sstCleanupWorkStats, exhausted, restartIterator bool, err error) {
+	// A bad plan is an object-level failure: Next already advanced past it, so
+	// restartIterator stays false and the next pass keeps that progress. Only a
+	// LIST failure or cancellation makes the provider cursor unsafe to reuse.
 	remaining := deleteBatchSize
 	var reclaimErr error
 	for stats.PlansScanned < scanLimit && remaining > 0 {
@@ -481,10 +483,10 @@ func reclaimSSTDeletionPlans(
 			var err error
 			object, err = iter.Next(ctx)
 			if errors.Is(err, io.EOF) {
-				return stats, true, reclaimErr
+				return stats, true, false, reclaimErr
 			}
 			if err != nil {
-				return stats, false, errors.Join(reclaimErr, err)
+				return stats, false, true, errors.Join(reclaimErr, err)
 			}
 		}
 		if object.IsDir {
@@ -496,7 +498,7 @@ func reclaimSSTDeletionPlans(
 			payload, _, err := store.Read(ctx, object.Key)
 			if err != nil {
 				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-					return stats, false, errors.Join(reclaimErr, cancelErr)
+					return stats, false, true, errors.Join(reclaimErr, cancelErr)
 				}
 				stats.Failed++
 				reclaimErr = errors.Join(reclaimErr, fmt.Errorf("read SST deletion plan %q: %w", object.Key, err))
@@ -521,7 +523,7 @@ func reclaimSSTDeletionPlans(
 				// pass can complete the independently bounded plan atomically.
 				*pendingPlanKey = object.Key
 			}
-			return stats, false, reclaimErr
+			return stats, false, false, reclaimErr
 		}
 
 		keys := make([]string, len(plan.Targets))
@@ -536,7 +538,7 @@ func reclaimSSTDeletionPlans(
 		}
 		if err := deleteObjects.BatchDelete(ctx, keys); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-				return stats, false, errors.Join(reclaimErr, cancelErr)
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}
 			failed := len(keys)
 			var batchErr *blobstore.BatchDeleteError
@@ -551,7 +553,7 @@ func reclaimSSTDeletionPlans(
 		stats.Deleted += len(keys)
 		if err := deleteObjects.Delete(ctx, object.Key); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
-				return stats, false, errors.Join(reclaimErr, cancelErr)
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}
 			stats.Failed++
 			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete completed SST plan %q: %w", plan.PlanID, err))
@@ -560,5 +562,5 @@ func reclaimSSTDeletionPlans(
 		cache.remove(object.Key)
 		stats.PlansDeleted++
 	}
-	return stats, false, reclaimErr
+	return stats, false, false, reclaimErr
 }

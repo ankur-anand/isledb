@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,7 @@ const (
 	snapshotRetirementMarkerPrefix = "manifest/gc/snapshots"
 	manifestSnapshotObjectPrefix   = "manifest/snapshots"
 	snapshotRetirementMarkVersion  = 1
+	snapshotRetirementMarkMaxBytes = 16 << 10
 
 	defaultSnapshotDeleteBatchSize  = 128
 	defaultSnapshotMarkerScanLimit  = 1024
@@ -467,9 +469,20 @@ func (c *snapshotCleaner) readMark(ctx context.Context, markerPath string) (snap
 }
 
 func decodeSnapshotRetirementMark(store *blobstore.Store, markerPath string, data []byte) (snapshotRetirementMark, error) {
+	if len(data) == 0 || len(data) > snapshotRetirementMarkMaxBytes {
+		return snapshotRetirementMark{}, fmt.Errorf("invalid snapshot retirement marker bytes=%d", len(data))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	var mark snapshotRetirementMark
-	if err := json.Unmarshal(data, &mark); err != nil {
+	if err := decoder.Decode(&mark); err != nil {
 		return snapshotRetirementMark{}, fmt.Errorf("decode snapshot retirement marker %q: %w", markerPath, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return snapshotRetirementMark{}, fmt.Errorf("decode snapshot retirement marker %q: trailing JSON", markerPath)
+		}
+		return snapshotRetirementMark{}, fmt.Errorf("decode snapshot retirement marker %q trailer: %w", markerPath, err)
 	}
 	if err := validateSnapshotRetirementMark(store, mark); err != nil {
 		return snapshotRetirementMark{}, fmt.Errorf("snapshot retirement marker %q: %w", markerPath, err)

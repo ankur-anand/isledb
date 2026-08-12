@@ -181,6 +181,41 @@ func TestSSTDeletionPlanEndToEndUsesOneWriterPublication(t *testing.T) {
 	assertReaderValue(t, ctx, freshReader, "a", "two", true)
 }
 
+func TestSSTReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
+	ctx := context.Background()
+	store, current, command, receipt, target := newSSTDeletionPlanFixture(t, ctx, "cursor-reset")
+	defer store.Close()
+
+	firstNow := receipt.AppliedAt.Add(time.Hour)
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		DeleteBatchSize: 1,
+		PlanScanLimit:   1,
+		SafetyMargin:    -1,
+		Now:             func() time.Time { return firstNow },
+	})
+	if _, err := cleaner.markCommandOutcome(ctx, current, command, receipt); err != nil {
+		t.Fatal(err)
+	}
+	cleaner.opts.Now = func() time.Time { return firstNow.Add(24 * time.Hour) }
+	badPath := storeKey(store, sstDeletionPlanPrefix, "000-unreadable.json")
+	if _, err := store.Write(ctx, badPath, []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A one-object scan budget makes cursor loss unambiguous. The first pass
+	// reports the bad object; the second must continue from the next object
+	// instead of restarting the listing at the same bad plan.
+	if _, err := cleaner.runOnce(ctx); err == nil {
+		t.Fatal("first pass did not report the unreadable plan")
+	}
+	if _, err := cleaner.runOnce(ctx); err != nil {
+		t.Fatalf("second pass did not continue past the unreadable plan: %v", err)
+	}
+	if _, _, err := store.Read(ctx, target.Key); err == nil {
+		t.Fatalf("valid due plan after unreadable object was starved across passes; target %q still exists", target.Key)
+	}
+}
+
 func TestSSTDeletionPlanReceiptHandoffIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store, current, command, receipt, target := newSSTDeletionPlanFixture(t, ctx, "idempotent")
