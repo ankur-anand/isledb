@@ -1191,6 +1191,7 @@ func (it *Iterator) Next() bool {
 	done, err := it.beginReaderOperation()
 	if err != nil {
 		it.mu.Lock()
+		it.current = nil
 		it.err = err
 		it.mu.Unlock()
 		return false
@@ -1202,6 +1203,10 @@ func (it *Iterator) Next() bool {
 }
 
 func (it *Iterator) next() bool {
+	// A failed move leaves the iterator unpositioned. Clear the previous entry
+	// before checking exhaustion, bounds, cancellation, or read errors; a
+	// successful move installs the new current entry below.
+	it.current = nil
 	if it.closed || it.err != nil {
 		return false
 	}
@@ -1347,6 +1352,7 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	done, err := it.beginReaderOperation()
 	if err != nil {
 		it.mu.Lock()
+		it.current = nil
 		it.err = err
 		it.mu.Unlock()
 		return false
@@ -1355,6 +1361,7 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
+	it.current = nil
 	if it.closed || it.err != nil {
 		return false
 	}
@@ -1362,7 +1369,6 @@ func (it *Iterator) SeekGE(target []byte) bool {
 		it.err = err
 		return false
 	}
-	it.current = nil
 	if it.mergeIter == nil {
 		return false
 	}

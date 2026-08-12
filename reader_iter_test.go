@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -163,6 +164,70 @@ func TestReader_Iterator(t *testing.T) {
 	}
 	if count != 10 {
 		t.Errorf("Expected 10 entries, got %d", count)
+	}
+}
+
+func TestReaderIteratorInvalidatesCurrentEntryAfterNextReturnsFalse(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	writer, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.close(ctx)
+	if err := writer.put(ctx, []byte("only"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	ropts := defaultReaderOptions()
+	ropts.CacheDir = t.TempDir()
+	reader, err := newReader(ctx, store, ropts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	it, err := reader.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	if !it.Next() || string(it.Key()) != "only" {
+		t.Fatalf("first Next did not produce the only entry: key=%q err=%v", it.Key(), it.Err())
+	}
+	if it.Next() {
+		t.Fatal("second Next unexpectedly produced an entry")
+	}
+	if it.Valid() || it.Key() != nil || it.Value() != nil {
+		t.Fatalf("exhausted iterator retained stale entry: valid=%t key=%q value=%q err=%v",
+			it.Valid(), it.Key(), it.Value(), it.Err())
+	}
+
+	iterationCtx, cancel := context.WithCancel(ctx)
+	errorIt, err := reader.NewIterator(iterationCtx, IteratorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer errorIt.Close()
+	if !errorIt.Next() {
+		t.Fatalf("error-path iterator did not produce its first entry: %v", errorIt.Err())
+	}
+	cancel()
+	if errorIt.Next() {
+		t.Fatal("Next succeeded after its context was canceled")
+	}
+	if errorIt.Valid() || errorIt.Key() != nil || errorIt.Value() != nil {
+		t.Fatalf("failed iterator retained stale entry: valid=%t key=%q value=%q err=%v",
+			errorIt.Valid(), errorIt.Key(), errorIt.Value(), errorIt.Err())
+	}
+	if err := errorIt.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Err()=%v, want context.Canceled", err)
 	}
 }
 
