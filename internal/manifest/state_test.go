@@ -69,6 +69,33 @@ func TestManifestAddLevelSSTsInsertsIntoSortedGap(t *testing.T) {
 	}
 }
 
+func straddlingLevelForTest() *Manifest {
+	m := &Manifest{}
+	m.AddLevelSSTs(1, []SSTMeta{
+		{ID: "survivor", MinKey: []byte("d"), MaxKey: []byte("f")},
+	})
+	m.AddLevelSSTs(1, []SSTMeta{
+		{ID: "left", MinKey: []byte("a"), MaxKey: []byte("b")},
+		{ID: "right", MinKey: []byte("g"), MaxKey: []byte("h")},
+	})
+	return m
+}
+
+func TestManifestAddLevelSSTsKeepsStraddlingAdditionsSorted(t *testing.T) {
+	m := straddlingLevelForTest()
+	if err := m.ValidateLevels(); err != nil {
+		t.Fatalf("a batch inserted on both sides of a survivor corrupted level ordering: %v; level=%v",
+			err, []string{m.Levels[0].SSTs[0].ID, m.Levels[0].SSTs[1].ID, m.Levels[0].SSTs[2].ID})
+	}
+}
+
+func TestLevelFindSSTFindsSurvivorAfterStraddlingInsert(t *testing.T) {
+	level := straddlingLevelForTest().Level(1)
+	if got := level.FindSST([]byte("e")); got == nil || got.ID != "survivor" {
+		t.Fatalf("FindSST(e)=%+v, want surviving SST covering [d,f]", got)
+	}
+}
+
 func TestLevelFindAndOverlap(t *testing.T) {
 	level := Level{Number: 1, SSTs: []SSTMeta{
 		{ID: "a", MinKey: []byte("a"), MaxKey: []byte("c")},
