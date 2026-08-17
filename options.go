@@ -114,6 +114,10 @@ type readerOptions struct {
 	// when range-reading SSTs. Default 0 disables the block cache.
 	BlockCacheSize int64
 
+	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
+	// filters. Zero selects the default (64 MiB).
+	BloomCacheSize int64
+
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
 	// full-file checksums.
 	AllowUnverifiedRangeRead bool
@@ -139,7 +143,8 @@ type readerOptions struct {
 
 func defaultReaderOptions() readerOptions {
 	return readerOptions{
-		SSTCacheSize: defaultSSTCacheSize,
+		SSTCacheSize:   defaultSSTCacheSize,
+		BloomCacheSize: defaultBloomCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},

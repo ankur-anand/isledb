@@ -33,7 +33,7 @@ type Reader struct {
 	manifestStore *manifest.Store
 	sstCache      diskcache.RefCountedCache
 	blockCache    *ristretto.Cache[string, []byte]
-	bloomCache    sync.Map
+	bloomCache    *bloomFilterCache
 	bloomLoads    singleflight.Group
 	sstLoads      singleflight.Group
 	manifestLoads singleflight.Group
@@ -117,6 +117,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		viewExpiresAt:            viewExpiresAt,
 		sstCache:                 sstCache,
 		blockCache:               blockCache,
+		bloomCache:               newBloomFilterCache(opts.BloomCacheSize),
 		verifySST:                opts.ValidateSSTChecksum,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
@@ -276,7 +277,7 @@ func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *manifestState) 
 		if _, exists := newIDs[id]; !exists {
 			path := r.store.SSTPath(id)
 			r.sstCache.Remove(path)
-			r.bloomCache.Delete(id)
+			r.bloomCache.delete(id)
 		}
 	}
 }
@@ -306,6 +307,7 @@ func (r *Reader) Close() error {
 	if r.blockCache != nil && r.ownsBlockCache {
 		r.blockCache.Close()
 	}
+	r.bloomCache.clear()
 
 	return firstErr
 }
@@ -633,8 +635,8 @@ func keyInRange(key, minKey, maxKey []byte) bool {
 
 func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte) ([]byte, bool, bool, error) {
 	if sstMeta.Bloom.Length > 0 {
-		if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
-			if !filter.(*z.Bloom).Has(bloomHashKey(key)) {
+		if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
+			if !filter.Has(bloomHashKey(key)) {
 				return nil, false, false, nil
 			}
 		} else if !r.sstCached(sstMeta.ID) {
@@ -688,12 +690,12 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 }
 
 func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) (bool, error) {
-	if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
-		return filter.(*z.Bloom).Has(bloomHashKey(key)), nil
+	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
+		return filter.Has(bloomHashKey(key)), nil
 	}
 
 	value, err, _ := r.bloomLoads.Do(sstMeta.ID, func() (interface{}, error) {
-		if filter, ok := r.bloomCache.Load(sstMeta.ID); ok {
+		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
 			return filter, nil
 		}
 
@@ -706,7 +708,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if err != nil {
 			return nil, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
 		}
-		r.bloomCache.Store(sstMeta.ID, filter)
+		r.bloomCache.put(sstMeta.ID, filter)
 		return filter, nil
 	})
 	if err != nil {
@@ -1053,6 +1055,11 @@ func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedC
 
 func (r *Reader) SSTCacheStats() CacheStats {
 	return cacheStatsFromDisk(r.sstCache.Stats())
+}
+
+// BloomCacheStats reports the decoded bloom-filter cache occupancy.
+func (r *Reader) BloomCacheStats() CacheStats {
+	return r.bloomCache.stats()
 }
 
 func (r *Reader) ManifestPageCacheStats() CacheStats {
