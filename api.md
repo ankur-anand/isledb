@@ -329,6 +329,7 @@ type ReaderOpenOptions struct {
     CacheDir                 string
     SSTCacheSize             int64
     BlockCacheSize           int64
+    BloomCacheSize           int64
     AllowUnverifiedRangeRead bool
     RangeReadMinSSTSize      int64
     ValidateSSTChecksum      bool
@@ -349,6 +350,7 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 |---|---:|---|
 | `SSTCacheSize` | 1 GiB | Maximum on-disk SST cache size |
 | `BlockCacheSize` | 0 | In-memory range-read block cache disabled |
+| `BloomCacheSize` | 64 MiB | Maximum accounted size of decoded SST bloom filters |
 | `RangeReadMinSSTSize` | 0 | No minimum SST size |
 | `ValidateSSTChecksum` | `false` | Do not hash full SST downloads |
 | `AllowUnverifiedRangeRead` | `false` | Do not bypass requested full-file validation |
@@ -372,6 +374,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) SSTCacheStats() CacheStats
+func (r *Reader) BloomCacheStats() CacheStats
 func (r *Reader) ManifestPageCacheStats() CacheStats
 func (r *Reader) Close() error
 ```

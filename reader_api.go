@@ -44,6 +44,10 @@ type ReaderOpenOptions struct {
 	// when range-reading SSTs. Default 0 disables the block cache.
 	BlockCacheSize int64
 
+	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
+	// filters. Zero selects the default (64 MiB).
+	BloomCacheSize int64
+
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
 	// full-file checksums.
 	AllowUnverifiedRangeRead bool
@@ -68,13 +72,18 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
-		CacheDir:     cacheDir,
-		SSTCacheSize: defaults.SSTCacheSize,
-		Views:        defaults.ViewPolicy,
+		CacheDir:       cacheDir,
+		SSTCacheSize:   defaults.SSTCacheSize,
+		BloomCacheSize: defaults.BloomCacheSize,
+		Views:          defaults.ViewPolicy,
 	}
 }
 
 func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
+	if opts.BloomCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: bloom_cache_size=%d", ErrInvalidReaderOptions, opts.BloomCacheSize)
+	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
 		return readerOptions{}, err
@@ -84,6 +93,7 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		CacheDir:                 opts.CacheDir,
 		SSTCacheSize:             opts.SSTCacheSize,
 		BlockCacheSize:           opts.BlockCacheSize,
+		BloomCacheSize:           opts.BloomCacheSize,
 		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
