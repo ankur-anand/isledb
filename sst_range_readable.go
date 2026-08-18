@@ -8,6 +8,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/dgraph-io/ristretto/v2"
+	"golang.org/x/sync/singleflight"
 )
 
 type sstRangeReadable struct {
@@ -16,17 +17,26 @@ type sstRangeReadable struct {
 	sstID string
 	size  int64
 	cache *ristretto.Cache[string, []byte]
+	loads *singleflight.Group
 	m     *ReaderMetrics
 	rh    objstorage.NoopReadHandle
 }
 
-func newSSTRangeReadable(store *blobstore.Store, path, sstID string, size int64, cache *ristretto.Cache[string, []byte], metrics *ReaderMetrics) *sstRangeReadable {
+func newSSTRangeReadable(
+	store *blobstore.Store,
+	path, sstID string,
+	size int64,
+	cache *ristretto.Cache[string, []byte],
+	loads *singleflight.Group,
+	metrics *ReaderMetrics,
+) *sstRangeReadable {
 	r := &sstRangeReadable{
 		store: store,
 		path:  path,
 		sstID: sstID,
 		size:  size,
 		cache: cache,
+		loads: loads,
 		m:     metrics,
 	}
 	r.rh = objstorage.MakeNoopReadHandle(r)
@@ -49,27 +59,60 @@ func (r *sstRangeReadable) ReadAt(ctx context.Context, p []byte, off int64) erro
 		r.m.ObserveSSTRangeBlockCacheLookup(false)
 	}
 
+	if r.cache != nil && r.loads != nil {
+		result := r.loads.DoChan(key, func() (any, error) {
+			// A preceding load may have filled the cache after this caller's
+			// first lookup but before it joined the singleflight group.
+			if cached, ok := r.cache.Get(key); ok {
+				return cached, nil
+			}
+			data, err := r.readRange(ctx, off, len(p))
+			if err != nil {
+				return nil, err
+			}
+			r.cache.Set(key, data, int64(len(data)))
+			return data, nil
+		})
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case loaded := <-result:
+			if loaded.Err != nil {
+				return loaded.Err
+			}
+			copy(p, loaded.Val.([]byte))
+			return nil
+		}
+	}
+
+	data, err := r.readRange(ctx, off, len(p))
+	if err != nil {
+		return err
+	}
+	if r.cache != nil {
+		r.cache.Set(key, data, int64(len(data)))
+	}
+	copy(p, data)
+	return nil
+}
+
+func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int) ([]byte, error) {
 	start := time.Now()
-	reader, err := r.store.ReadRangeStream(ctx, r.path, off, int64(len(p)))
+	reader, err := r.store.ReadRangeStream(ctx, r.path, off, int64(length))
 	if err != nil {
 		r.m.ObserveSSTRangeRead(time.Since(start), 0, err)
-		return err
+		return nil, err
 	}
 	defer reader.Close()
 
-	n, err := io.ReadFull(reader, p)
+	data := make([]byte, length)
+	n, err := io.ReadFull(reader, data)
 	r.m.ObserveSSTRangeRead(time.Since(start), int64(n), err)
-
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	if r.cache != nil {
-		cached := make([]byte, len(p))
-		copy(cached, p)
-		r.cache.Set(key, cached, int64(len(p)))
-	}
-	return nil
+	return data, nil
 }
 
 // Close is a no-op because sstRangeReadable does not hold open resources.
