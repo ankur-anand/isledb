@@ -41,6 +41,17 @@ type Snapshot struct {
 	closed    atomic.Bool
 }
 
+// BootstrapView binds an immutable KV snapshot to the first change-feed
+// position not represented by that snapshot. Version identifies the same
+// loaded CURRENT for checkpoint metadata and diagnostics.
+//
+// Close Snapshot when the view is no longer needed.
+type BootstrapView struct {
+	Snapshot *Snapshot
+	Cursor   ChangeCursor
+	Version  Version
+}
+
 func newSnapshot(reader *Reader, m *manifestState, version Version, expiresAt time.Time) *Snapshot {
 	return &Snapshot{
 		reader:    reader,
