@@ -690,6 +690,78 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	}
 }
 
+func TestWriter_FlushReconcilesAppliedManifestCASAfterMultipleSuccessors(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-ambiguous-manifest-cas-successors")
+	defer store.Close()
+
+	base := manifest.NewBlobStoreBackend(store)
+	lostResponse := errors.New("lost CURRENT response")
+	storage := &applyThenFailOnceStorage{
+		Storage:     base,
+		failOnWrite: 3,
+		failErr:     lostResponse,
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
+		t.Fatalf("first flush error=%v, want %v", err, lostResponse)
+	}
+
+	w.mu.Lock()
+	commitID := w.immQueue[0].commitID
+	w.mu.Unlock()
+
+	for i, commit := range []manifest.WriterCommit{
+		{
+			ID:      "successor-1",
+			SSTable: manifest.SSTMeta{ID: "successor-sst-1", SeqLo: 2, SeqHi: 2},
+		},
+		{
+			ID:      "successor-2",
+			SSTable: manifest.SSTMeta{ID: "successor-sst-2", SeqLo: 3, SeqHi: 3},
+		},
+	} {
+		successor := manifest.NewStoreWithStorage(base)
+		ownerID := fmt.Sprintf("successor-writer-%d", i+1)
+		if _, err := successor.ClaimWriter(ctx, ownerID); err != nil {
+			t.Fatalf("ClaimWriter(%s): %v", ownerID, err)
+		}
+		if _, err := successor.AppendWriterCommit(ctx, commit); err != nil {
+			t.Fatalf("AppendWriterCommit(%s): %v", commit.ID, err)
+		}
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush retry after successor publications: %v", err)
+	}
+	seqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	commits := 0
+	for _, seq := range seqs {
+		entry, err := manifestStore.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID == commitID {
+			commits++
+		}
+	}
+	if commits != 1 {
+		t.Fatalf("manifest entries with commit_id=%q: got=%d want=1", commitID, commits)
+	}
+}
+
 func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-background-failure")

@@ -35,6 +35,14 @@ type appliedThenErrorStorage struct {
 	failErr  error
 }
 
+type unappliedThenErrorStorage struct {
+	Storage
+
+	mu       sync.Mutex
+	failNext bool
+	failErr  error
+}
+
 type trackingCASStorage struct {
 	Storage
 
@@ -131,6 +139,27 @@ func (s *appliedThenErrorStorage) WriteCurrentCAS(ctx context.Context, data []by
 		return "", failErr
 	}
 	return etag, nil
+}
+
+func (s *unappliedThenErrorStorage) arm(err error) {
+	s.mu.Lock()
+	s.failNext = true
+	s.failErr = err
+	s.mu.Unlock()
+}
+
+func (s *unappliedThenErrorStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	s.mu.Lock()
+	fail := s.failNext
+	failErr := s.failErr
+	if fail {
+		s.failNext = false
+	}
+	s.mu.Unlock()
+	if fail {
+		return "", failErr
+	}
+	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
 func (s *casInjectStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
@@ -339,6 +368,270 @@ func TestAppendWriterCommitReconcilesAppliedCASAfterLostResponse(t *testing.T) {
 	conflict.SSTable.Checksum = "sha256:different"
 	if _, err := manifestStore.AppendWriterCommit(ctx, conflict); !errors.Is(err, ErrWriterCommitConflict) {
 		t.Fatalf("conflicting retry error=%v, want %v", err, ErrWriterCommitConflict)
+	}
+}
+
+func TestAppendWriterCommitReconcilesAppliedCASAfterSuccessorPublishes(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-lost-response-successor-publish")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	storage := &appliedThenErrorStorage{Storage: base}
+	original := NewStoreWithStorage(storage)
+	if _, err := original.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter(writer-1): %v", err)
+	}
+
+	commit := WriterCommit{
+		ID: "commit-1",
+		SSTable: SSTMeta{
+			ID:    "sst-1",
+			SeqLo: 10,
+			SeqHi: 20,
+			Level: 0,
+		},
+	}
+	lostResponse := errors.New("lost CURRENT response")
+	storage.arm(lostResponse)
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, lostResponse) {
+		t.Fatalf("first AppendWriterCommit error=%v, want %v", err, lostResponse)
+	}
+
+	successor := NewStoreWithStorage(base)
+	if _, err := successor.ClaimWriter(ctx, "writer-2"); err != nil {
+		t.Fatalf("ClaimWriter(writer-2): %v", err)
+	}
+	if _, err := successor.AppendWriterCommit(ctx, WriterCommit{
+		ID: "commit-2",
+		SSTable: SSTMeta{
+			ID:    "sst-2",
+			SeqLo: 21,
+			SeqHi: 30,
+			Level: 0,
+		},
+	}); err != nil {
+		t.Fatalf("successor AppendWriterCommit: %v", err)
+	}
+	data, _, err := base.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	current, err := DecodeCurrent(data)
+	if err != nil {
+		t.Fatalf("DecodeCurrent: %v", err)
+	}
+	if current.LastWriterCommit == nil || current.LastWriterCommit.CommitID != "commit-2" {
+		t.Fatalf("current writer commit=%+v, want commit-2", current.LastWriterCommit)
+	}
+
+	entry, err := original.AppendWriterCommit(ctx, commit)
+	if err != nil {
+		t.Fatalf("retry original AppendWriterCommit after successor publication: %v", err)
+	}
+	if entry.CommitID != commit.ID || entry.SSTable == nil || entry.SSTable.ID != commit.SSTable.ID {
+		t.Fatalf("reconciled entry=%+v", entry)
+	}
+
+	seqs, err := original.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	commits := make(map[string]int)
+	for _, seq := range seqs {
+		entry, err := original.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID != "" {
+			commits[entry.CommitID]++
+		}
+	}
+	if commits[commit.ID] != 1 || commits["commit-2"] != 1 {
+		t.Fatalf("writer commit counts=%v, want commit-1=1 commit-2=1", commits)
+	}
+}
+
+func TestAppendWriterCommitReconcilesAppliedCASAfterMultipleSuccessors(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-lost-response-multiple-successors")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	storage := &appliedThenErrorStorage{Storage: base}
+	original := NewStoreWithStorage(storage)
+	if _, err := original.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter(writer-1): %v", err)
+	}
+
+	commit := WriterCommit{
+		ID: "commit-1",
+		SSTable: SSTMeta{
+			ID:    "sst-1",
+			SeqLo: 10,
+			SeqHi: 20,
+			Level: 0,
+		},
+	}
+	lostResponse := errors.New("lost CURRENT response")
+	storage.arm(lostResponse)
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, lostResponse) {
+		t.Fatalf("first AppendWriterCommit error=%v, want %v", err, lostResponse)
+	}
+
+	for i, successorCommit := range []WriterCommit{
+		{
+			ID: "commit-2",
+			SSTable: SSTMeta{
+				ID:    "sst-2",
+				SeqLo: 21,
+				SeqHi: 30,
+				Level: 0,
+			},
+		},
+		{
+			ID: "commit-3",
+			SSTable: SSTMeta{
+				ID:    "sst-3",
+				SeqLo: 31,
+				SeqHi: 40,
+				Level: 0,
+			},
+		},
+	} {
+		successor := NewStoreWithStorage(base)
+		ownerID := fmt.Sprintf("writer-%d", i+2)
+		if _, err := successor.ClaimWriter(ctx, ownerID); err != nil {
+			t.Fatalf("ClaimWriter(%s): %v", ownerID, err)
+		}
+		if _, err := successor.AppendWriterCommit(ctx, successorCommit); err != nil {
+			t.Fatalf("AppendWriterCommit(%s): %v", successorCommit.ID, err)
+		}
+	}
+
+	entry, err := original.AppendWriterCommit(ctx, commit)
+	if err != nil {
+		t.Fatalf("retry original AppendWriterCommit after multiple successor publications: %v", err)
+	}
+	if entry.CommitID != commit.ID || entry.SSTable == nil || entry.SSTable.ID != commit.SSTable.ID {
+		t.Fatalf("reconciled entry=%+v", entry)
+	}
+
+	seqs, err := original.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	commits := make(map[string]int)
+	for _, seq := range seqs {
+		entry, err := original.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID != "" {
+			commits[entry.CommitID]++
+		}
+	}
+	if commits[commit.ID] != 1 || commits["commit-2"] != 1 || commits["commit-3"] != 1 {
+		t.Fatalf("writer commit counts=%v, want each commit exactly once", commits)
+	}
+}
+
+func TestAppendWriterCommitDoesNotReconcileDifferentEntryAtAttemptedSequence(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-unapplied-response")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	storage := &unappliedThenErrorStorage{Storage: base}
+	original := NewStoreWithStorage(storage)
+	if _, err := original.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter(writer-1): %v", err)
+	}
+
+	commit := WriterCommit{
+		ID:      "commit-1",
+		SSTable: SSTMeta{ID: "sst-1", SeqLo: 10, SeqHi: 20, Level: 0},
+	}
+	lostResponse := errors.New("CURRENT request outcome unknown")
+	storage.arm(lostResponse)
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, lostResponse) {
+		t.Fatalf("first AppendWriterCommit error=%v, want %v", err, lostResponse)
+	}
+
+	// The failed request did not publish. The successor's fence claim occupies
+	// the exact manifest sequence the original writer attempted to use.
+	successor := NewStoreWithStorage(base)
+	if _, err := successor.ClaimWriter(ctx, "writer-2"); err != nil {
+		t.Fatalf("ClaimWriter(writer-2): %v", err)
+	}
+
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, ErrFenced) {
+		t.Fatalf("retry original AppendWriterCommit error=%v, want %v", err, ErrFenced)
+	}
+
+	entries, err := successor.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	for _, seq := range entries {
+		entry, err := successor.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.CommitID == commit.ID {
+			t.Fatalf("unapplied commit unexpectedly appeared at manifest seq=%d", seq)
+		}
+	}
+}
+
+func TestAppendWriterCommitReportsIndeterminateAfterEvidenceIsRetired(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-retired-evidence")
+	defer store.Close()
+
+	base := NewBlobStoreBackend(store)
+	storage := &appliedThenErrorStorage{Storage: base}
+	original := NewStoreWithStorage(storage)
+	if _, err := original.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter(writer-1): %v", err)
+	}
+
+	commit := WriterCommit{
+		ID:      "commit-1",
+		SSTable: SSTMeta{ID: "sst-1", SeqLo: 10, SeqHi: 20, Level: 0},
+	}
+	lostResponse := errors.New("lost CURRENT response")
+	storage.arm(lostResponse)
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, lostResponse) {
+		t.Fatalf("first AppendWriterCommit error=%v, want %v", err, lostResponse)
+	}
+
+	data, etag, err := base.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	current, err := DecodeCurrent(data)
+	if err != nil {
+		t.Fatalf("DecodeCurrent: %v", err)
+	}
+	if current.LastWriterCommit == nil {
+		t.Fatal("missing committed writer marker")
+	}
+	floor := current.LastWriterCommit.ManifestSeq + 1
+	current.LogSeqStart = floor
+	current.ChangeFeedLogStart = floor
+	current.LastWriterCommit = nil
+	current.ActiveEntries = filterEntriesAtOrAfter(current.ActiveEntries, floor)
+	encoded, err := EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("EncodeCurrent: %v", err)
+	}
+	if _, err := base.WriteCurrentCAS(ctx, encoded, etag); err != nil {
+		t.Fatalf("retire manifest evidence: %v", err)
+	}
+
+	if _, err := original.AppendWriterCommit(ctx, commit); !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("retry after evidence retirement error=%v, want %v", err, ErrCommitIndeterminate)
 	}
 }
 
