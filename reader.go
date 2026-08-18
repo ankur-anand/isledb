@@ -36,6 +36,7 @@ type Reader struct {
 	bloomCache    *bloomFilterCache
 	bloomLoads    singleflight.Group
 	sstLoads      singleflight.Group
+	sstRangeLoads singleflight.Group
 	manifestLoads singleflight.Group
 
 	verifySST                bool
@@ -880,7 +881,8 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 			return nil, nil, err
 		}
 	}
-	readable := newSSTRangeReadable(r.store, path, sstMeta.ID, size, r.blockCache, r.metrics)
+	readable := newSSTRangeReadable(
+		r.store, path, sstMeta.ID, size, r.blockCache, &r.sstRangeLoads, r.metrics)
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil)
 }
 

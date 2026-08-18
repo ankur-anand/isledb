@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"golang.org/x/sync/singleflight"
 )
 
 func TestSSTRangeReadable_ReadAt_CachesBlocks(t *testing.T) {
@@ -36,7 +41,7 @@ func TestSSTRangeReadable_ReadAt_CachesBlocks(t *testing.T) {
 	t.Cleanup(func() { cache.Close() })
 
 	metrics := DefaultReaderMetrics(nil)
-	rr := newSSTRangeReadable(store, path, "sst-1", int64(len(data)), cache, metrics)
+	rr := newSSTRangeReadable(store, path, "sst-1", int64(len(data)), cache, nil, metrics)
 
 	buf := make([]byte, 5)
 	if err := rr.ReadAt(ctx, buf, 2); err != nil {
@@ -76,6 +81,87 @@ func TestSSTRangeReadable_ReadAt_CachesBlocks(t *testing.T) {
 	}
 }
 
+func TestSSTRangeReadable_ReadAt_CoalescesConcurrentCacheMisses(t *testing.T) {
+	const callers = 32
+
+	ctx := context.Background()
+	var remoteReads atomic.Int64
+	bucketURL := setupFakeS3BucketURLWithObserver(t, func(request *http.Request) {
+		if request.Method != http.MethodGet {
+			return
+		}
+		remoteReads.Add(1)
+		// Keep the first range request in flight until every caller has had a
+		// chance to miss the cache and join the same load.
+		time.Sleep(20 * time.Millisecond)
+	})
+	store, err := blobstore.Open(ctx, bucketURL, "range-singleflight")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	data := []byte("abcdefghijklmnopqrstuvwxyz")
+	path := store.SSTPath("sst-shared")
+	if _, err := store.Write(ctx, path, data); err != nil {
+		t.Fatalf("write sst: %v", err)
+	}
+
+	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters:        1024,
+		MaxCost:            1 << 20,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+	})
+	if err != nil {
+		t.Fatalf("new cache: %v", err)
+	}
+	t.Cleanup(func() { cache.Close() })
+
+	metrics := DefaultReaderMetrics(nil)
+	loads := &singleflight.Group{}
+	rr := newSSTRangeReadable(
+		store, path, "sst-shared", int64(len(data)), cache, loads, metrics)
+
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var group sync.WaitGroup
+	group.Add(callers)
+	for range callers {
+		go func() {
+			defer group.Done()
+			<-start
+			buf := make([]byte, 5)
+			if err := rr.ReadAt(ctx, buf, 2); err != nil {
+				errs <- err
+				return
+			}
+			if got := string(buf); got != "cdefg" {
+				errs <- errors.New("unexpected range data: " + got)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	close(start)
+	group.Wait()
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Fatalf("ReadAt: %v", err)
+		}
+	}
+
+	if got := remoteReads.Load(); got != 1 {
+		t.Fatalf("remote range reads=%d want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTRangeReadTotal); got != 1 {
+		t.Fatalf("sst_range_read_total=%v want=1", got)
+	}
+	if got := testutil.ToFloat64(metrics.SSTRangeBlockCacheMisses); got != callers {
+		t.Fatalf("sst_range_block_cache_misses_total=%v want=%d", got, callers)
+	}
+}
+
 func TestSSTRangeReadable_ReadAt_NoCache(t *testing.T) {
 	t.Parallel()
 
@@ -90,7 +176,7 @@ func TestSSTRangeReadable_ReadAt_NoCache(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	rr := newSSTRangeReadable(store, path, "sst-2", int64(len(data)), nil, metrics)
+	rr := newSSTRangeReadable(store, path, "sst-2", int64(len(data)), nil, nil, metrics)
 
 	buf := make([]byte, 3)
 	if err := rr.ReadAt(ctx, buf, 1); err != nil {
@@ -131,7 +217,7 @@ func TestSSTRangeReadable_ReadAt_OutOfBounds(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	rr := newSSTRangeReadable(store, path, "sst-3", int64(len(data)), nil, metrics)
+	rr := newSSTRangeReadable(store, path, "sst-3", int64(len(data)), nil, nil, metrics)
 
 	buf := make([]byte, 5)
 	if err := rr.ReadAt(ctx, buf, int64(len(data))-2); !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -164,7 +250,7 @@ func TestSSTRangeReadable_ReadAt_MetricsReadError(t *testing.T) {
 	}
 
 	metrics := DefaultReaderMetrics(nil)
-	rr := newSSTRangeReadable(store, path, "sst-4", int64(len(data)), nil, metrics)
+	rr := newSSTRangeReadable(store, path, "sst-4", int64(len(data)), nil, nil, metrics)
 
 	buf := make([]byte, 4)
 	if err := rr.ReadAt(ctx, buf, 0); err == nil {
