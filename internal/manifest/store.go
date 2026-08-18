@@ -22,6 +22,7 @@ var (
 	ErrCurrentTooLarge           = errors.New("manifest CURRENT exceeds size limit")
 	ErrInvalidWriterCommit       = errors.New("invalid writer commit")
 	ErrWriterCommitConflict      = errors.New("writer commit identity conflict")
+	ErrCommitIndeterminate       = errors.New("writer commit outcome indeterminate")
 	ErrChangeFeedRequired        = errors.New("change feed batch required")
 	ErrInvalidChangeFeedPayload  = errors.New("invalid change feed payload")
 	ErrChangeFeedPayloadMismatch = errors.New("change feed payload mismatch")
@@ -92,6 +93,12 @@ type Store struct {
 
 	writerFence    *FenceToken
 	compactorFence *FenceToken
+
+	// pendingWriterCommit records the exact immutable manifest position used
+	// by a writer CAS whose outcome was not acknowledged. commitMu protects it.
+	// A Store can have only one such append in flight because appends are
+	// serialized by commitMu.
+	pendingWriterCommit *WriterCommitMarker
 
 	rcache *replayCache
 
@@ -420,6 +427,11 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		}
 		normalizeCurrent(current)
 
+		if role == FenceRoleWriter && entry.CommitID != "" && entry.Op == LogOpAddSSTable {
+			if applied, err := s.reconcilePendingWriterCommit(ctx, current, entry); applied || err != nil {
+				return err
+			}
+		}
 		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
 			return err
 		}
@@ -480,19 +492,28 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
 		updated.NextSeq = nextEntry.Seq + 1
 		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
+		var writerMarker *WriterCommitMarker
 		if nextEntry.Role == FenceRoleWriter && nextEntry.Op == LogOpAddSSTable && nextEntry.CommitID != "" {
-			marker, err := writerCommitMarker(&nextEntry)
+			writerMarker, err = writerCommitMarker(&nextEntry)
 			if err != nil {
 				return err
 			}
-			updated.LastWriterCommit = marker
+			updated.LastWriterCommit = writerMarker
 		}
 		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
 			return err
 		}
 
-		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
+		data, err := s.encodeCurrentForCAS(updated)
+		if err != nil {
+			return err
+		}
+		if writerMarker != nil {
+			s.pendingWriterCommit = writerMarker.Clone()
+		}
+		if err := s.writeEncodedCurrentWithCAS(ctx, updated, data, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
+				s.pendingWriterCommit = nil
 				if attempt+1 < currentCASMaxRetries {
 					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {
 						return err
@@ -502,6 +523,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			}
 			return err
 		}
+		s.pendingWriterCommit = nil
 		*entry = nextEntry
 
 		s.mu.Lock()
@@ -596,6 +618,89 @@ func reconcileWriterCommit(current *Current, entry *ManifestLogEntry) (bool, err
 	if marker == nil || marker.CommitID != entry.CommitID {
 		return false, nil
 	}
+	return reconcileWriterCommitMarker(marker, entry)
+}
+
+// reconcilePendingWriterCommit resolves an unacknowledged writer CAS from the
+// immutable manifest entry at the exact sequence used by that CAS. The
+// sequence locates the committed position; equality of the full marker proves
+// that the position contains this writer's exact commit.
+func (s *Store) reconcilePendingWriterCommit(
+	ctx context.Context,
+	current *Current,
+	entry *ManifestLogEntry,
+) (bool, error) {
+	marker := s.pendingWriterCommit
+	if marker == nil {
+		return false, nil
+	}
+	if entry == nil || entry.SSTable == nil || entry.CommitID != marker.CommitID {
+		return true, fmt.Errorf("%w: pending commit_id=%q retry commit_id=%q",
+			ErrWriterCommitConflict, marker.CommitID, entry.CommitID)
+	}
+	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	if err != nil {
+		return true, err
+	}
+	if fingerprint != marker.Fingerprint {
+		return true, fmt.Errorf("%w: commit_id=%q metadata mismatch",
+			ErrWriterCommitConflict, entry.CommitID)
+	}
+
+	retainedFrom := retainedEntryFloor(current)
+	if marker.ManifestSeq < retainedFrom {
+		return true, fmt.Errorf("%w: commit_id=%q manifest_seq=%d retained_from=%d",
+			ErrCommitIndeterminate, marker.CommitID, marker.ManifestSeq, retainedFrom)
+	}
+	if current == nil || marker.ManifestSeq >= current.NextSeq {
+		// The attempted position has not been committed. A later CAS may safely
+		// reuse the logical commit at the current head.
+		s.pendingWriterCommit = nil
+		return false, nil
+	}
+
+	entries, err := s.entriesInRange(ctx, current, marker.ManifestSeq, marker.ManifestSeq+1)
+	if err != nil {
+		return true, fmt.Errorf("read uncertain writer commit at manifest seq=%d: %w",
+			marker.ManifestSeq, err)
+	}
+	committed := entries[0]
+	if committed.Role != FenceRoleWriter || committed.Op != LogOpAddSSTable || committed.CommitID == "" {
+		s.pendingWriterCommit = nil
+		return false, nil
+	}
+	committedMarker, err := writerCommitMarker(committed)
+	if err != nil {
+		return true, err
+	}
+	if !writerCommitMarkersEqual(committedMarker, marker) {
+		// A different immutable entry owns the attempted sequence, proving this
+		// CAS did not publish. Normal fence validation decides whether retrying
+		// at the new head is still allowed.
+		s.pendingWriterCommit = nil
+		return false, nil
+	}
+
+	*entry = *committed
+	s.pendingWriterCommit = nil
+	return true, nil
+}
+
+func writerCommitMarkersEqual(a, b *WriterCommitMarker) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.CommitID == b.CommitID &&
+		a.Fingerprint == b.Fingerprint &&
+		a.EntryID == b.EntryID &&
+		a.ManifestSeq == b.ManifestSeq &&
+		a.WriterEpoch == b.WriterEpoch &&
+		a.SeqLo == b.SeqLo &&
+		a.SeqHi == b.SeqHi &&
+		a.CommittedAt.Equal(b.CommittedAt)
+}
+
+func reconcileWriterCommitMarker(marker *WriterCommitMarker, entry *ManifestLogEntry) (bool, error) {
 	if entry.SSTable == nil {
 		return true, fmt.Errorf("%w: commit_id=%q", ErrWriterCommitConflict, entry.CommitID)
 	}
@@ -1881,14 +1986,35 @@ func (s *Store) clearObservedCurrent() {
 }
 
 func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag string) error {
-	normalizeCurrent(current)
-	data, err := EncodeCurrent(current)
+	data, err := s.encodeCurrentForCAS(current)
 	if err != nil {
 		return err
 	}
-	if limit := s.currentByteLimit(); len(data) > limit {
-		return fmt.Errorf("%w: size=%d limit=%d", ErrCurrentTooLarge, len(data), limit)
+	return s.writeEncodedCurrentWithCAS(ctx, current, data, etag)
+}
+
+// encodeCurrentForCAS completes every local operation that can fail before a
+// request is issued. Writer reconciliation records an uncertain attempt only
+// after this succeeds, so a local encoding or size error cannot be mistaken
+// for an ambiguous provider response.
+func (s *Store) encodeCurrentForCAS(current *Current) ([]byte, error) {
+	normalizeCurrent(current)
+	data, err := EncodeCurrent(current)
+	if err != nil {
+		return nil, err
 	}
+	if limit := s.currentByteLimit(); len(data) > limit {
+		return nil, fmt.Errorf("%w: size=%d limit=%d", ErrCurrentTooLarge, len(data), limit)
+	}
+	return data, nil
+}
+
+func (s *Store) writeEncodedCurrentWithCAS(
+	ctx context.Context,
+	current *Current,
+	data []byte,
+	etag string,
+) error {
 	newETag, err := s.storage.WriteCurrentCAS(ctx, data, etag)
 	if err != nil {
 		s.clearCurrentCache()

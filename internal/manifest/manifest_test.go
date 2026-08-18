@@ -114,7 +114,12 @@ func TestManifestSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCurrentRoundTrip(t *testing.T) {
-	c := &Current{LayoutVersion: LayoutVersion, Format: CurrentFormat, NextSeq: 8, NextEpoch: 2}
+	c := &Current{
+		LayoutVersion: LayoutVersion, Format: CurrentFormat, NextSeq: 8, NextEpoch: 2,
+		LastWriterCommit: &WriterCommitMarker{
+			CommitID: "current-commit",
+		},
+	}
 	normalizeCurrent(c)
 	body, err := EncodeCurrent(c)
 	if err != nil {

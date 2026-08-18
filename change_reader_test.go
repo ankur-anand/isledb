@@ -155,6 +155,67 @@ func TestChangeReaderReadsAndResumesAcrossFlushes(t *testing.T) {
 	_ = store
 }
 
+func TestChangeReaderCrossesManifestEntryScanLimit(t *testing.T) {
+	ctx := context.Background()
+	_, db, writer := openChangeReaderTestDB(t, "change-reader-manifest-scan-limit")
+
+	if _, err := db.manifestStore.ClaimCompactor(ctx, "change-reader-scan-limit-compactor"); err != nil {
+		t.Fatalf("claim compactor: %v", err)
+	}
+	// Fill more than one ChangeReader manifest scan with entries that do not
+	// contain change batches. The reader must return an empty page whose cursor
+	// advances to the next manifest range, rather than treating the boundary as
+	// the end of the feed or failing a progress check.
+	for i := 0; i < maxChangeManifestEntries; i++ {
+		if _, err := db.manifestStore.AppendRemoveSSTablesWithFence(ctx, nil, nil); err != nil {
+			t.Fatalf("append non-change manifest entry %d: %v", i, err)
+		}
+	}
+
+	if err := writer.Put(ctx, []byte("beyond-boundary"), []byte("value")); err != nil {
+		t.Fatalf("put change beyond boundary: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush change beyond boundary: %v", err)
+	}
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+
+	bounds, err := reader.Bounds(ctx)
+	if err != nil {
+		t.Fatalf("bounds: %v", err)
+	}
+	first, err := reader.Read(ctx, bounds.Oldest, DefaultChangeReadOptions())
+	if err != nil {
+		t.Fatalf("read first manifest range: %v", err)
+	}
+	if len(first.Changes) != 0 {
+		t.Fatalf("first manifest range returned %d changes, want none", len(first.Changes))
+	}
+	if first.CaughtUp() {
+		t.Fatal("first manifest range reported caught up before the change beyond the boundary")
+	}
+	if got, want := first.Next.entry, bounds.Oldest.entry+maxChangeManifestEntries; got != want {
+		t.Fatalf("first next manifest entry=%d want=%d", got, want)
+	}
+
+	second, err := reader.Read(ctx, first.Next, DefaultChangeReadOptions())
+	if err != nil {
+		t.Fatalf("read second manifest range: %v", err)
+	}
+	if len(second.Changes) != 1 || string(second.Changes[0].Key) != "beyond-boundary" ||
+		string(second.Changes[0].Value) != "value" {
+		t.Fatalf("second manifest range changes=%+v", second.Changes)
+	}
+	if !second.CaughtUp() {
+		t.Fatalf("second manifest range stopped at %q before head %q", second.Next, second.Head)
+	}
+}
+
 func TestChangeReaderReusesObservedCurrentWithinBatch(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-observed-current")

@@ -25,6 +25,11 @@ var ErrChangeFeedDisabled = errors.New("change feed disabled")
 // change the payload policy of an already-enabled feed.
 var ErrChangeFeedPayloadMismatch = manifest.ErrChangeFeedPayloadMismatch
 
+// ErrCommitIndeterminate is returned when a writer retries an unacknowledged
+// conditional commit after manifest retention has removed the immutable entry
+// needed to prove whether that commit succeeded.
+var ErrCommitIndeterminate = manifest.ErrCommitIndeterminate
+
 // ChangeFeedPayload controls whether committed PUT records retain their value.
 // A zero value is invalid when ChangeFeedOptions is present.
 type ChangeFeedPayload uint8

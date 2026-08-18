@@ -628,14 +628,49 @@ of the returned `[]Change`. A single change larger than `MaxBytes` is returned
 alone so its cursor can make progress. Negative limits return
 `ErrInvalidChangeReadOptions`; zero fields select defaults.
 
-A cursor identifies the next change. Persist `page.Next`, and only persist it
-after the page has been processed successfully.
+A cursor identifies the next change. It is an opaque resume position containing
+a manifest-entry position and an index inside that entry's change batch. It is
+not the same value as `Change.Sequence`, and the API does not currently seek by
+`Change.Sequence`.
+
+### Choose the initial cursor
+
+`ChangeCursor.IsZero()` means that the application has no saved resume
+position. It does not mean "start at the latest change." A new consumer must
+choose its startup policy explicitly:
+
+```go
+bounds, err := reader.Bounds(ctx)
+if err != nil {
+    return err
+}
+
+// Replay every change that is still retained.
+replayCursor := bounds.Oldest
+
+// Ignore existing history and consume only changes published after Bounds.
+tailCursor := bounds.Head
+```
+
+`Oldest` points to the first retained feed position. `Head` points immediately
+after everything visible to `Bounds`; an initial read from `Head` normally
+returns an empty, caught-up page. A commit that becomes visible after that
+boundary is returned by a later `Read`. Passing a zero cursor directly to
+`Read` starts from `Oldest`, but resolving `Bounds` makes the startup policy
+explicit.
+
+Persist the selected initial cursor before polling. Otherwise, a process that
+crashes after choosing `Head` but before saving it may choose a newer head on
+restart and silently skip changes. After processing starts, persist
+`page.Next`, and only persist it after the complete page has been applied
+successfully.
 
 ```go
 func drainChanges(
     ctx context.Context,
     reader *isledb.ChangeReader,
     savedCursor string,
+    startAtHead bool,
     apply func(isledb.Change) error,
     saveCursor func(string) error,
 ) error {
@@ -649,7 +684,14 @@ func drainChanges(
         if err != nil {
             return err
         }
-        cursor = bounds.Oldest // use bounds.Head to consume only future changes
+        if startAtHead {
+            cursor = bounds.Head
+        } else {
+            cursor = bounds.Oldest
+        }
+        if err := saveCursor(cursor.String()); err != nil {
+            return err
+        }
     }
 
     options := isledb.DefaultChangeReadOptions()
@@ -679,8 +721,12 @@ the cursor over manifest entries without user mutations. Continue until
 `CaughtUp` is true, then let the application choose its polling interval.
 
 When retention passes a saved cursor, `Read` refreshes its view and returns
-`ErrChangeCursorExpired`. The caller must choose whether to restart from
-`Bounds().Oldest`, rebuild from a KV snapshot, or fail the consumer.
+`ErrChangeCursorExpired`. This means there is a gap between the saved position
+and the oldest retained position. Restarting from `Bounds().Oldest` accepts and
+skips that gap. A derived-state consumer can instead rebuild from a KV snapshot
+and then resume the feed. A consumer that requires every historical event must
+fail and require explicit recovery; a current-state snapshot cannot reconstruct
+intermediate updates or deletes.
 
 Change batches contain independently compressed and checksummed blocks. A read
 range-fetches only the blocks needed for the requested page and reuses decoded
@@ -1035,6 +1081,7 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrChangeFeedDisabled` | `OpenChangeReader` was called for a disabled feed |
 | `ErrChangeFeedPayloadMismatch` | Requested payload differs from persisted mode |
 | `ErrStorePolicyMismatch` | Writer policy differs from persisted store policy |
+| `ErrCommitIndeterminate` | An uncertain writer commit can no longer be proven because its manifest evidence was retired |
 
 ### Writer
 
