@@ -52,6 +52,8 @@ type Reader struct {
 	mu            sync.RWMutex
 	manifest      *manifestState
 	version       Version
+	changeFeed    bool
+	changeHead    ChangeCursor
 	viewPolicy    ReaderViewPolicy
 	viewRefreshAt time.Time
 	viewExpiresAt time.Time
@@ -106,12 +108,16 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	}()
 
 	viewRefreshAt := viewLoadedAt.Add(viewPolicy.RefreshAfter)
-	viewExpiresAt := viewLoadedAt.Add(ms.CurrentData().PinnedViewAge())
+	current := ms.CurrentData()
+	changeFeed, changeHead := readerChangeFeedState(current)
+	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
 		store:                    store,
 		manifestStore:            ms,
 		manifest:                 m,
-		version:                  versionFromCurrent(ms.CurrentData()),
+		version:                  versionFromCurrent(current),
+		changeFeed:               changeFeed,
+		changeHead:               changeHead,
 		viewPolicy:               viewPolicy,
 		viewRefreshAt:            viewRefreshAt,
 		viewExpiresAt:            viewExpiresAt,
@@ -196,6 +202,8 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	current := r.manifestStore.CurrentData()
+	changeFeed, changeHead := readerChangeFeedState(current)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -207,11 +215,20 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	// Publish a new manifest pointer. Existing readers/views may still retain
 	// the previous manifest as an immutable snapshot.
 	r.manifest = m
-	r.version = versionFromCurrent(r.manifestStore.CurrentData())
+	r.version = versionFromCurrent(current)
+	r.changeFeed = changeFeed
+	r.changeHead = changeHead
 	r.viewRefreshAt = viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
-	r.viewExpiresAt = viewLoadedAt.Add(r.manifestStore.CurrentData().PinnedViewAge())
+	r.viewExpiresAt = viewLoadedAt.Add(current.PinnedViewAge())
 	r.armManifestExpiry(r.viewRefreshAt, r.viewExpiresAt)
 	return nil
+}
+
+func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
+	if current == nil {
+		return false, changeCursorAt(0, 0)
+	}
+	return current.ChangeFeedEnabled, changeCursorAt(current.NextSeq, 0)
 }
 
 func (r *Reader) armManifestExpiry(refreshAt, expiresAt time.Time) {
@@ -382,6 +399,12 @@ func (r *Reader) currentManifestState() (*manifestState, Version, time.Time) {
 	return r.manifest, r.version, r.viewExpiresAt
 }
 
+func (r *Reader) currentBootstrapState() (*manifestState, Version, ChangeCursor, bool, time.Time) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.manifest, r.version, r.changeHead, r.changeFeed, r.viewExpiresAt
+}
+
 // Snapshot returns an immutable read handle over a fresh manifest state. The
 // returned snapshot does not refresh and inherits that view's store deadline.
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
@@ -402,6 +425,43 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, ErrReadViewExpired
 	}
 	return newSnapshot(r, m, version, expiresAt), nil
+}
+
+// BootstrapView returns an immutable KV snapshot and the first change-feed
+// cursor not represented by it. Snapshot, Cursor, and Version all come from
+// one loaded CURRENT, so an application can materialize the snapshot and then
+// resume the feed from Cursor without a gap.
+//
+// The returned snapshot inherits the loaded view's store deadline. The caller
+// must close view.Snapshot when it is no longer needed. Like Snapshot, this
+// method follows the reader's freshness policy; call Refresh first when the
+// application requires the latest published CURRENT immediately.
+func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error) {
+	done, err := r.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	if err := r.ensureFreshManifest(ctx); err != nil {
+		return nil, err
+	}
+	m, version, cursor, changeFeed, expiresAt := r.currentBootstrapState()
+	if m == nil {
+		return nil, errors.New("manifest not loaded")
+	}
+	if !changeFeed {
+		return nil, ErrChangeFeedDisabled
+	}
+	if !time.Now().Before(expiresAt) {
+		return nil, ErrReadViewExpired
+	}
+	snapshot := newSnapshot(r, m, version, expiresAt)
+	return &BootstrapView{
+		Snapshot: snapshot,
+		Cursor:   cursor,
+		Version:  version,
+	}, nil
 }
 
 // Get returns the value for key if present and not deleted/expired.

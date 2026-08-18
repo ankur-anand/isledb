@@ -372,6 +372,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error)
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
 func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
+func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) SSTCacheStats() CacheStats
 func (r *Reader) BloomCacheStats() CacheStats
@@ -460,6 +461,67 @@ returns `ErrSnapshotExpired`, `ErrIteratorExpired`, or `ErrReadViewExpired`.
 Refresh or create a new snapshot instead of retrying against the expired view.
 
 Closing the parent reader invalidates its snapshots and iterators.
+
+### Materialize state and resume the change feed
+
+`BootstrapView` binds a KV snapshot to the exact change-feed boundary from the
+same loaded `CURRENT`:
+
+```go
+type BootstrapView struct {
+    Snapshot *Snapshot
+    Cursor   ChangeCursor
+    Version  Version
+}
+
+func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
+```
+
+`Snapshot` contains every mutation committed before `Cursor`. `Cursor` is the
+first feed position not represented by the snapshot. `Version` is the same
+opaque value returned by `Snapshot.Version()` and can be recorded in
+checkpoint metadata for diagnostics.
+
+This lets an application scan the snapshot into a local materialized database,
+store `Cursor` with that database, and then consume only later changes. Do not
+construct this boundary by calling `Snapshot()` and `ChangeReader.Bounds()`
+separately: a writer may publish between those calls, producing a cursor newer
+than the snapshot and skipping a committed change.
+
+```go
+view, err := reader.BootstrapView(ctx)
+if err != nil {
+    return err
+}
+defer view.Snapshot.Close()
+
+iterator, err := view.Snapshot.NewIterator(ctx, isledb.IteratorOptions{})
+if err != nil {
+    return err
+}
+defer iterator.Close()
+
+for iterator.Next() {
+    if err := materialize(iterator.Key(), iterator.Value()); err != nil {
+        return err
+    }
+}
+if err := iterator.Err(); err != nil {
+    return err
+}
+
+if err := saveCheckpointCursor(view.Cursor.String()); err != nil {
+    return err
+}
+```
+
+The change feed must be enabled or `BootstrapView` returns
+`ErrChangeFeedDisabled`. The snapshot keeps the normal loaded-view deadline,
+so the materialization must finish before it expires. Change-feed retention
+must also keep `Cursor` available until the generated checkpoint is installed
+and caught up. Like `Snapshot`, this method follows the reader freshness
+policy; call `Refresh` first when the checkpoint must start from the latest
+published `CURRENT`. Close `view.Snapshot` when materialization finishes.
 
 ### Prefetch selected SSTs
 
