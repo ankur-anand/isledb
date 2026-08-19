@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,15 @@ type kvS3ReadCounts struct {
 	// sstDelay models a small amount of object-store latency in the
 	// synchronized cold-miss benchmark. It is configured before readers start.
 	sstDelay time.Duration
+
+	recordRanges atomic.Bool
+	rangesMu     sync.Mutex
+	ranges       []kvS3ByteRange
+}
+
+type kvS3ByteRange struct {
+	offset int64
+	length int64
 }
 
 func (c *kvS3ReadCounts) observe(request *http.Request) {
@@ -36,6 +46,13 @@ func (c *kvS3ReadCounts) observe(request *http.Request) {
 		c.current.Add(1)
 	case strings.Contains(path, "/sstable/"):
 		c.ssts.Add(1)
+		if c.recordRanges.Load() {
+			if byteRange, ok := parseKVReaderBenchmarkRange(request.Header.Get("Range")); ok {
+				c.rangesMu.Lock()
+				c.ranges = append(c.ranges, byteRange)
+				c.rangesMu.Unlock()
+			}
+		}
 		if c.sstDelay > 0 {
 			time.Sleep(c.sstDelay)
 		}
@@ -46,6 +63,32 @@ func (c *kvS3ReadCounts) reset() {
 	c.current.Store(0)
 	c.ssts.Store(0)
 	c.lists.Store(0)
+	c.rangesMu.Lock()
+	c.ranges = c.ranges[:0]
+	c.rangesMu.Unlock()
+}
+
+func (c *kvS3ReadCounts) rangeSnapshot() []kvS3ByteRange {
+	c.rangesMu.Lock()
+	defer c.rangesMu.Unlock()
+	return append([]kvS3ByteRange(nil), c.ranges...)
+}
+
+func parseKVReaderBenchmarkRange(value string) (kvS3ByteRange, bool) {
+	value = strings.TrimPrefix(value, "bytes=")
+	startValue, endValue, ok := strings.Cut(value, "-")
+	if !ok || startValue == "" || endValue == "" {
+		return kvS3ByteRange{}, false
+	}
+	start, err := strconv.ParseInt(startValue, 10, 64)
+	if err != nil || start < 0 {
+		return kvS3ByteRange{}, false
+	}
+	end, err := strconv.ParseInt(endValue, 10, 64)
+	if err != nil || end < start {
+		return kvS3ByteRange{}, false
+	}
+	return kvS3ByteRange{offset: start, length: end - start + 1}, true
 }
 
 func BenchmarkFakeS3_KVReaderGet_16384x256B(b *testing.B) {
@@ -208,7 +251,7 @@ func BenchmarkFakeS3_KVReaderGet_ConcurrentColdMiss(b *testing.B) {
 			defer func() { _ = reader.Close() }()
 
 			// Keep the bloom sidecar out of the synchronized miss wave. It has
-			// independent singleflight protection and is not the cache path this
+			// independent miss coalescing and is not the cache path this
 			// benchmark compares.
 			assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
 			waitKVReaderBenchmarkCache(reader)
@@ -250,6 +293,85 @@ func BenchmarkFakeS3_KVReaderGet_ConcurrentColdMiss(b *testing.B) {
 			waves := float64(b.N)
 			b.ReportMetric(float64(counts.ssts.Load())/waves, "sst_GETs/wave")
 			b.ReportMetric((kvReaderRemoteBytes(metrics)-bytesBefore)/waves, "remote_B/wave")
+		})
+	}
+}
+
+// BenchmarkFakeS3_KVReaderGet_RangeReadRequestShape reports the exact ordered
+// range requests used by one cold point lookup. The rN_gap_B metrics are the
+// distance between the end of request N and the logical end of the Pebble SST;
+// they make it visible which reads a tail-oriented read-before window covers.
+func BenchmarkFakeS3_KVReaderGet_RangeReadRequestShape(b *testing.B) {
+	const valueSize = 256
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cases := []struct {
+		records    int
+		blockBytes int
+	}{
+		{records: 16_384, blockBytes: 4 << 10},
+		{records: 50_000, blockBytes: 4 << 10},
+		{records: 16_384, blockBytes: 16 << 10},
+	}
+	for _, benchmarkCase := range cases {
+		name := fmt.Sprintf(
+			"records=%d/block=%dKiB", benchmarkCase.records, benchmarkCase.blockBytes>>10)
+		b.Run(name, func(b *testing.B) {
+			db, counts := prepareFakeS3KVBenchmarkDB(
+				b, ctx, benchmarkCase.records, valueSize,
+				kvReaderBenchmarkSSTOutput(benchmarkCase.blockBytes))
+			reader, _ := openFakeS3KVBenchmarkReader(b, ctx, db, "range-read")
+			defer func() { _ = reader.Close() }()
+			key := []byte(fmt.Sprintf("key-%08d", benchmarkCase.records/2))
+			manifestState := reader.currentManifest()
+			if manifestState == nil {
+				b.Fatal("benchmark manifest is not loaded")
+			}
+			if len(manifestState.L0SSTs) != 1 {
+				b.Fatalf("benchmark manifest has %d L0 SSTs, want 1", len(manifestState.L0SSTs))
+			}
+			logicalSSTSize := manifestState.L0SSTs[0].Size
+
+			// Keep the container Bloom warm so the trace contains only Pebble SST
+			// navigation. Each measured iteration starts with an empty range cache.
+			assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
+			waitKVReaderBenchmarkCache(reader)
+			clearKVReaderBenchmarkCache(b, reader)
+			counts.recordRanges.Store(true)
+
+			var ranges []kvS3ByteRange
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				clearKVReaderBenchmarkCache(b, reader)
+				counts.reset()
+				b.StartTimer()
+				assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
+				b.StopTimer()
+				ranges = counts.rangeSnapshot()
+			}
+
+			b.ReportMetric(float64(logicalSSTSize), "logical_sst_B")
+			b.ReportMetric(float64(len(ranges)), "range_GETs/op")
+			for i, byteRange := range ranges {
+				request := i + 1
+				b.ReportMetric(float64(byteRange.length), fmt.Sprintf("r%d_B", request))
+				gap := logicalSSTSize - (byteRange.offset + byteRange.length)
+				b.ReportMetric(float64(gap), fmt.Sprintf("r%d_gap_B", request))
+			}
+			for _, window := range []int64{32 << 10, 64 << 10, 512 << 10} {
+				covered := 0
+				windowStart := max(int64(0), logicalSSTSize-window)
+				for _, byteRange := range ranges {
+					if byteRange.offset >= windowStart &&
+						byteRange.offset+byteRange.length <= logicalSSTSize {
+						covered++
+					}
+				}
+				b.ReportMetric(float64(covered), fmt.Sprintf("tail_%dKiB_ranges", window>>10))
+			}
 		})
 	}
 }
@@ -313,9 +435,13 @@ func prepareFakeS3KVBenchmarkDB(
 }
 
 func kvReaderComparisonSSTOutput() SSTOutputOptions {
+	return kvReaderBenchmarkSSTOutput(16 << 10)
+}
+
+func kvReaderBenchmarkSSTOutput(blockBytes int) SSTOutputOptions {
 	encoding := SSTEncodingOptions{
 		Compression:     "none",
-		BlockBytes:      16 << 10,
+		BlockBytes:      blockBytes,
 		BloomBitsPerKey: 10,
 	}
 	return SSTOutputOptions{L0: encoding, Compacted: encoding}

@@ -49,7 +49,7 @@ func (c *bloomFilterCache) get(id string) (*z.Bloom, bool) {
 	return c.lookup(id, true)
 }
 
-// peek rechecks the cache after joining a singleflight load without counting
+// peek rechecks the cache after joining a coalesced load without counting
 // an additional application-level lookup.
 func (c *bloomFilterCache) peek(id string) (*z.Bloom, bool) {
 	return c.lookup(id, false)
