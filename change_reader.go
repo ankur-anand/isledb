@@ -15,7 +15,6 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -191,7 +190,7 @@ type ChangeReader struct {
 	release     func()
 	viewMu      sync.RWMutex
 	view        *manifest.ChangeFeedView
-	viewLoad    singleflight.Group
+	viewLoad    coalescedLoadGroup
 
 	batchMu    sync.Mutex
 	batchPath  string
@@ -199,12 +198,12 @@ type ChangeReader struct {
 	batch      *changeBatchIndex
 	batchEntry uint64
 	batchView  *manifest.ChangeFeedView
-	batchLoad  singleflight.Group
+	batchLoad  coalescedLoadGroup
 
 	blockCache      []cachedChangeBlock
 	blockCacheBytes uint64
 	blockCacheClock uint64
-	blockLoad       singleflight.Group
+	blockLoad       coalescedLoadGroup
 	work            changeReaderWork
 }
 
@@ -487,8 +486,8 @@ func (r *ChangeReader) rememberBatchView(
 }
 
 func (r *ChangeReader) refreshView(ctx context.Context) (*manifest.ChangeFeedView, error) {
-	result := r.viewLoad.DoChan("current", func() (any, error) {
-		view, err := r.manifestLog.LoadChangeFeedView(ctx)
+	value, err := r.viewLoad.Do(ctx, "current", func(loadCtx context.Context) (any, error) {
+		view, err := r.manifestLog.LoadChangeFeedView(loadCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -507,15 +506,10 @@ func (r *ChangeReader) refreshView(ctx context.Context) (*manifest.ChangeFeedVie
 		r.viewMu.Unlock()
 		return view, nil
 	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case loaded := <-result:
-		if loaded.Err != nil {
-			return nil, loaded.Err
-		}
-		return loaded.Val.(*manifest.ChangeFeedView), nil
+	if err != nil {
+		return nil, err
 	}
+	return value.(*manifest.ChangeFeedView), nil
 }
 
 func (r *ChangeReader) readBatch(ctx context.Context, meta *manifest.ChangeBatchMeta) (*changeBatchIndex, error) {
@@ -535,7 +529,7 @@ func (r *ChangeReader) readBatch(ctx context.Context, meta *manifest.ChangeBatch
 	r.batchMu.Unlock()
 
 	loadKey := fmt.Sprintf("%s#index#%d#%d", meta.Path, meta.Size, meta.BlockCount)
-	result := r.batchLoad.DoChan(loadKey, func() (any, error) {
+	value, err := r.batchLoad.Do(ctx, loadKey, func(loadCtx context.Context) (any, error) {
 		r.batchMu.Lock()
 		if r.batchPath == meta.Path && r.batch != nil {
 			if r.batchMeta != *meta {
@@ -548,7 +542,7 @@ func (r *ChangeReader) readBatch(ctx context.Context, meta *manifest.ChangeBatch
 		}
 		r.batchMu.Unlock()
 
-		batch, err := r.loadBatchIndex(ctx, meta)
+		batch, err := r.loadBatchIndex(loadCtx, meta)
 		if err != nil {
 			return nil, err
 		}
@@ -568,15 +562,10 @@ func (r *ChangeReader) readBatch(ctx context.Context, meta *manifest.ChangeBatch
 		r.batchMu.Unlock()
 		return batch, nil
 	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case loaded := <-result:
-		if loaded.Err != nil {
-			return nil, loaded.Err
-		}
-		return loaded.Val.(*changeBatchIndex), nil
+	if err != nil {
+		return nil, err
 	}
+	return value.(*changeBatchIndex), nil
 }
 
 func validateChangeBatchMeta(meta *manifest.ChangeBatchMeta) error {
@@ -801,7 +790,7 @@ func (r *ChangeReader) readBlock(
 	}
 
 	loadKey := fmt.Sprintf("%s#block#%d#%d", meta.Path, ordinal, meta.Size)
-	result := r.blockLoad.DoChan(loadKey, func() (any, error) {
+	value, err := r.blockLoad.Do(ctx, loadKey, func(loadCtx context.Context) (any, error) {
 		changes, err := r.cachedBlock(meta, ordinal)
 		if err != nil {
 			return nil, err
@@ -810,7 +799,7 @@ func (r *ChangeReader) readBlock(
 			return changes, nil
 		}
 
-		changes, err = r.loadBlock(ctx, meta, index, ordinal)
+		changes, err = r.loadBlock(loadCtx, meta, index, ordinal)
 		if err != nil {
 			return nil, err
 		}
@@ -820,15 +809,10 @@ func (r *ChangeReader) readBlock(
 		r.cacheBlock(meta, ordinal, uint64(index.Blocks[ordinal].RawSize), changes)
 		return changes, nil
 	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case loaded := <-result:
-		if loaded.Err != nil {
-			return nil, loaded.Err
-		}
-		return loaded.Val.([]changeRecord), nil
+	if err != nil {
+		return nil, err
 	}
+	return value.([]changeRecord), nil
 }
 
 func (r *ChangeReader) cachedBlock(meta *manifest.ChangeBatchMeta, ordinal int) ([]changeRecord, error) {
@@ -1011,6 +995,9 @@ func (r *ChangeReader) Close() error {
 	if r == nil || !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	r.viewLoad.Close(ErrChangeReaderClosed)
+	r.batchLoad.Close(ErrChangeReaderClosed)
+	r.blockLoad.Close(ErrChangeReaderClosed)
 	if r.release != nil {
 		r.releaseOnce.Do(r.release)
 	}

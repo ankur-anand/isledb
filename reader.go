@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/dgraph-io/ristretto/v2/z"
-	"golang.org/x/sync/singleflight"
 )
 
 type Reader struct {
@@ -34,10 +33,10 @@ type Reader struct {
 	sstCache      diskcache.RefCountedCache
 	blockCache    *ristretto.Cache[string, []byte]
 	bloomCache    *bloomFilterCache
-	bloomLoads    singleflight.Group
-	sstLoads      singleflight.Group
-	sstRangeLoads singleflight.Group
-	manifestLoads singleflight.Group
+	bloomLoads    coalescedLoadGroup
+	sstLoads      coalescedLoadGroup
+	sstRangeLoads coalescedLoadGroup
+	manifestLoads coalescedLoadGroup
 
 	verifySST                bool
 	allowUnverifiedRangeRead bool
@@ -182,11 +181,11 @@ func (r *Reader) ensureFreshManifest(ctx context.Context) error {
 }
 
 func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
-	_, err, _ := r.manifestLoads.Do("manifest", func() (any, error) {
+	_, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
 		if !force && !r.manifestViewExpired() {
 			return nil, nil
 		}
-		return nil, r.reloadManifest(ctx)
+		return nil, r.reloadManifest(loadCtx)
 	})
 	return err
 }
@@ -313,6 +312,10 @@ func (r *Reader) Close() error {
 	defer r.releaseReader()
 	r.stopManifestExpiry()
 	r.closeOpenIterators()
+	r.manifestLoads.Close(ErrReaderClosed)
+	r.bloomLoads.Close(ErrReaderClosed)
+	r.sstLoads.Close(ErrReaderClosed)
+	r.sstRangeLoads.Close(ErrReaderClosed)
 
 	var firstErr error
 
@@ -755,13 +758,13 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		return filter.Has(bloomHashKey(key)), nil
 	}
 
-	value, err, _ := r.bloomLoads.Do(sstMeta.ID, func() (interface{}, error) {
+	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
 		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
 			return filter, nil
 		}
 
 		path := r.store.SSTPath(sstMeta.ID)
-		data, err := r.store.ReadRange(ctx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
+		data, err := r.store.ReadRange(loadCtx, path, sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
 		if err != nil {
 			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
 		}
@@ -1035,12 +1038,12 @@ func (r *Reader) ensureSSTCached(ctx context.Context, meta *sstMetadata, path st
 		return nil
 	}
 
-	_, err, _ := r.sstLoads.Do(path, func() (interface{}, error) {
+	_, err := r.sstLoads.Do(ctx, path, func(loadCtx context.Context) (any, error) {
 		if _, ok := r.sstCache.Acquire(path); ok {
 			r.sstCache.Release(path)
 			return nil, nil
 		}
-		return nil, r.cacheSST(ctx, meta, path)
+		return nil, r.cacheSST(loadCtx, meta, path)
 	})
 	return err
 }
