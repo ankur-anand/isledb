@@ -9,14 +9,61 @@ import (
 )
 
 type kMergeIterator struct {
-	iters   []sstable.Iterator
+	iters   []mergeIteratorSource
 	states  []mergeState
 	tree    []int
 	size    int
 	current *mergeEntry
 	lastKey []byte
 	err     error
+
+	initialized bool
+	pending     int
 }
+
+// mergeIteratorSource is the small part of an SST iterator the merge needs.
+// Keeping this boundary local lets reader scans provide a lazy source for a
+// whole non-overlapping level, while compaction can continue to pass ordinary
+// Pebble SST iterators.
+type mergeIteratorSource interface {
+	first() (*sstable.InternalKey, []byte)
+	next() (*sstable.InternalKey, []byte)
+	seekGE([]byte) (*sstable.InternalKey, []byte)
+	err() error
+	close() error
+}
+
+type sstableMergeIteratorSource struct {
+	iter sstable.Iterator
+}
+
+func (s *sstableMergeIteratorSource) first() (*sstable.InternalKey, []byte) {
+	kv := s.iter.First()
+	if kv == nil {
+		return nil, nil
+	}
+	return &kv.K, kv.InPlaceValue()
+}
+
+func (s *sstableMergeIteratorSource) next() (*sstable.InternalKey, []byte) {
+	kv := s.iter.Next()
+	if kv == nil {
+		return nil, nil
+	}
+	return &kv.K, kv.InPlaceValue()
+}
+
+func (s *sstableMergeIteratorSource) seekGE(target []byte) (*sstable.InternalKey, []byte) {
+	// 0 is base.SeekGEFlagNone.
+	kv := s.iter.SeekGE(target, 0)
+	if kv == nil {
+		return nil, nil
+	}
+	return &kv.K, kv.InPlaceValue()
+}
+
+func (s *sstableMergeIteratorSource) err() error   { return s.iter.Error() }
+func (s *sstableMergeIteratorSource) close() error { return s.iter.Close() }
 
 type mergeEntry struct {
 	key     []byte
@@ -37,9 +84,18 @@ type mergeState struct {
 }
 
 func newMergeIterator(iters []sstable.Iterator) *kMergeIterator {
+	sources := make([]mergeIteratorSource, len(iters))
+	for i, iter := range iters {
+		sources[i] = &sstableMergeIteratorSource{iter: iter}
+	}
+	return newMergeIteratorSources(sources)
+}
+
+func newMergeIteratorSources(iters []mergeIteratorSource) *kMergeIterator {
 	mi := &kMergeIterator{
-		iters:  iters,
-		states: make([]mergeState, len(iters)),
+		iters:   iters,
+		states:  make([]mergeState, len(iters)),
+		pending: -1,
 	}
 
 	n := len(iters)
@@ -57,21 +113,31 @@ func newMergeIterator(iters []sstable.Iterator) *kMergeIterator {
 		mi.tree[i] = -1
 	}
 
-	for i, iter := range iters {
-		kv := iter.First()
-		if kv != nil {
-			mi.loadState(i, &kv.K, kv.InPlaceValue())
-			mi.tree[size+i] = i
-		} else if err := iter.Error(); err != nil && mi.err == nil {
+	return mi
+}
+
+func (mi *kMergeIterator) initializeFirst() {
+	if mi.initialized {
+		return
+	}
+	mi.initialized = true
+
+	for i, iter := range mi.iters {
+		key, value := iter.first()
+		if key != nil {
+			mi.loadState(i, key, value)
+			mi.tree[mi.size+i] = i
+		} else if err := iter.err(); err != nil && mi.err == nil {
 			mi.err = err
 		}
 	}
+	mi.rebuildTree()
+}
 
-	for i := size - 1; i >= 1; i-- {
+func (mi *kMergeIterator) rebuildTree() {
+	for i := mi.size - 1; i >= 1; i-- {
 		mi.tree[i] = mi.winner(mi.tree[i*2], mi.tree[i*2+1])
 	}
-
-	return mi
 }
 
 func (mi *kMergeIterator) loadState(i int, ikey *sstable.InternalKey, val []byte) {
@@ -116,12 +182,12 @@ func (mi *kMergeIterator) winner(a, b int) int {
 }
 
 func (mi *kMergeIterator) advance(i int) {
-	kv := mi.iters[i].Next()
-	if kv != nil {
-		mi.loadState(i, &kv.K, kv.InPlaceValue())
+	key, value := mi.iters[i].next()
+	if key != nil {
+		mi.loadState(i, key, value)
 		mi.tree[mi.size+i] = i
 	} else {
-		if err := mi.iters[i].Error(); err != nil && mi.err == nil {
+		if err := mi.iters[i].err(); err != nil && mi.err == nil {
 			mi.err = err
 		}
 		mi.states[i].valid = false
@@ -142,6 +208,20 @@ func (mi *kMergeIterator) Next() bool {
 	if mi.err != nil {
 		return false
 	}
+	if !mi.initialized {
+		mi.initializeFirst()
+		if mi.err != nil {
+			return false
+		}
+	} else if mi.pending >= 0 {
+		pending := mi.pending
+		mi.pending = -1
+		mi.advance(pending)
+		if mi.err != nil {
+			return false
+		}
+	}
+
 	for mi.tree != nil && mi.tree[1] != -1 {
 		index := mi.tree[1]
 		state := &mi.states[index]
@@ -156,16 +236,16 @@ func (mi *kMergeIterator) Next() bool {
 		mi.current.kind = state.kind
 		mi.current.source = index
 
-		mi.advance(index)
-		if mi.err != nil {
-			return false
-		}
-
 		if mi.lastKey != nil && bytes.Equal(mi.current.key, mi.lastKey) {
+			mi.advance(index)
+			if mi.err != nil {
+				return false
+			}
 			continue
 		}
 
 		mi.lastKey = append(mi.lastKey[:0], mi.current.key...)
+		mi.pending = index
 		return true
 	}
 
@@ -240,7 +320,7 @@ func (mi *kMergeIterator) Err() error {
 		return mi.err
 	}
 	for _, iter := range mi.iters {
-		if err := iter.Error(); err != nil {
+		if err := iter.err(); err != nil {
 			return err
 		}
 	}
@@ -250,7 +330,7 @@ func (mi *kMergeIterator) Err() error {
 func (mi *kMergeIterator) close() error {
 	var firstErr error
 	for _, iter := range mi.iters {
-		if err := iter.Close(); err != nil && firstErr == nil {
+		if err := iter.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -261,19 +341,20 @@ func (mi *kMergeIterator) seekGE(target []byte) {
 	mi.current = nil
 	mi.lastKey = nil
 	mi.err = nil
+	mi.pending = -1
+	mi.initialized = true
 
 	if mi.tree == nil {
 		return
 	}
 
 	for i, iter := range mi.iters {
-		// pebble 0 is base.SeekGEFlagNone
-		kv := iter.SeekGE(target, 0)
-		if kv != nil {
-			mi.loadState(i, &kv.K, kv.InPlaceValue())
+		key, value := iter.seekGE(target)
+		if key != nil {
+			mi.loadState(i, key, value)
 			mi.tree[mi.size+i] = i
 		} else {
-			if err := iter.Error(); err != nil && mi.err == nil {
+			if err := iter.err(); err != nil && mi.err == nil {
 				mi.err = err
 			}
 			mi.states[i].valid = false
@@ -283,7 +364,5 @@ func (mi *kMergeIterator) seekGE(target []byte) {
 		}
 	}
 
-	for i := mi.size - 1; i >= 1; i-- {
-		mi.tree[i] = mi.winner(mi.tree[i*2], mi.tree[i*2+1])
-	}
+	mi.rebuildTree()
 }

@@ -587,26 +587,22 @@ func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState,
 		return nil, errors.New("manifest not loaded")
 	}
 
-	allIters, err := r.openRangeIters(ctx, m, minKey, maxKey)
+	sources, err := r.openRangeSources(ctx, m, minKey, maxKey, false)
 	if err != nil {
 		return nil, err
 	}
-	defer closeSSTIters(allIters)
+	defer closeMergeSources(sources)
 
-	if len(allIters) == 0 {
+	if len(sources) == 0 {
 		return nil, nil
 	}
 
-	mergeIter := newMergeIterator(allIters)
+	mergeIter := newMergeIteratorSources(sources)
 
 	nowMs := time.Now().UnixMilli()
-	for mergeIter.Next() {
+	for (limit <= 0 || len(out) < limit) && mergeIter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
-		}
-
-		if limit > 0 && len(out) >= limit {
-			break
 		}
 
 		entry, err := mergeIter.entry()
@@ -647,14 +643,19 @@ func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState,
 	return out, nil
 }
 
-func closeSSTIters(iters []sstable.Iterator) {
-	for _, it := range iters {
-		_ = it.Close()
+func closeMergeSources(sources []mergeIteratorSource) {
+	for _, source := range sources {
+		_ = source.close()
 	}
 }
 
-func (r *Reader) openRangeIters(ctx context.Context, m *manifestState, minKey, maxKey []byte) ([]sstable.Iterator, error) {
-	var allIters []sstable.Iterator
+func (r *Reader) openRangeSources(
+	ctx context.Context,
+	m *manifestState,
+	minKey, maxKey []byte,
+	detachNarrowLevels bool,
+) ([]mergeIteratorSource, error) {
+	var sources []mergeIteratorSource
 	upper := maxKey
 	if len(maxKey) > 0 {
 		upper = incrementKey(maxKey)
@@ -664,27 +665,24 @@ func (r *Reader) openRangeIters(ctx context.Context, m *manifestState, minKey, m
 		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			closeSSTIters(allIters)
-			return nil, err
-		}
-		allIters = append(allIters, iter)
+		sources = append(sources, newLevelMergeIteratorSourceWithMetadata(
+			r, ctx, []sstMetadata{sst}, minKey, upper))
 	}
 
 	for i := range m.Levels {
 		overlapping := m.Levels[i].OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				closeSSTIters(allIters)
-				return nil, err
+		if len(overlapping) > 0 {
+			if detachNarrowLevels && len(overlapping) < len(m.Levels[i].SSTs) {
+				sources = append(sources,
+					newLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
+			} else {
+				sources = append(sources,
+					newBorrowedLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
 			}
-			allIters = append(allIters, iter)
 		}
 	}
 
-	return allIters, nil
+	return sources, nil
 }
 
 func keyInRange(key, minKey, maxKey []byte) bool {
@@ -1198,7 +1196,7 @@ type Iterator struct {
 	maxKey    []byte
 	nowMs     int64
 	mergeIter *kMergeIterator
-	sstIters  []sstable.Iterator
+	sources   []mergeIteratorSource
 	current   *iterEntry
 	started   bool
 	closed    bool
@@ -1237,13 +1235,13 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 	}
 	iterCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrIteratorExpired)
 
-	allIters, err := r.openRangeIters(iterCtx, m, opts.MinKey, opts.MaxKey)
+	sources, err := r.openRangeSources(iterCtx, m, opts.MinKey, opts.MaxKey, true)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	if len(allIters) == 0 {
+	if len(sources) == 0 {
 
 		it := &Iterator{
 			reader:    r,
@@ -1267,8 +1265,8 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 		minKey:    opts.MinKey,
 		maxKey:    opts.MaxKey,
 		nowMs:     time.Now().UnixMilli(),
-		mergeIter: newMergeIterator(allIters),
-		sstIters:  allIters,
+		mergeIter: newMergeIteratorSources(sources),
+		sources:   sources,
 		closed:    false,
 	}
 	r.registerIterator(it)
@@ -1420,10 +1418,8 @@ func (it *Iterator) close(cause error) error {
 	it.closed = true
 	it.current = nil
 
-	for _, iter := range it.sstIters {
-		_ = iter.Close()
-	}
-	it.sstIters = nil
+	closeMergeSources(it.sources)
+	it.sources = nil
 	it.mergeIter = nil
 	if it.cancel != nil {
 		it.cancel()
