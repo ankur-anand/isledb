@@ -3,6 +3,8 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"testing"
@@ -85,7 +87,9 @@ func TestWriteSST_Inline(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
-	res, err := writeSST(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+	res, err := writeSST(context.Background(), it, sstWriterOptions{
+		BlockSize: 4096, Compression: "none", BloomBitsPerKey: 10,
+	}, 1)
 	if err != nil {
 		t.Fatalf("writeSST error: %v", err)
 	}
@@ -98,6 +102,7 @@ func TestWriteSST_Inline(t *testing.T) {
 	if !bytes.Equal(res.Meta.MinKey, []byte("a")) || !bytes.Equal(res.Meta.MaxKey, []byte("b")) {
 		t.Errorf("key range mismatch: %s-%s", res.Meta.MinKey, res.Meta.MaxKey)
 	}
+	requireBloomChecksum(t, res.Meta, res.SSTData)
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, res.Meta, res.SSTData)), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("reader error: %v", err)
@@ -284,4 +289,23 @@ func sstPayload(tb testing.TB, meta sstMetadata, data []byte) []byte {
 		tb.Fatalf("sst payload too short: %d < %d", len(data), meta.Size)
 	}
 	return data[:meta.Size]
+}
+
+func requireBloomChecksum(tb testing.TB, meta sstMetadata, data []byte) {
+	tb.Helper()
+	if meta.Bloom.Length <= 0 {
+		tb.Fatalf("sst %s has no bloom sidecar", meta.ID)
+	}
+	if meta.Bloom.Checksum == "" {
+		tb.Fatalf("sst %s bloom checksum is empty", meta.ID)
+	}
+	end := meta.Bloom.Offset + meta.Bloom.Length
+	if meta.Bloom.Offset < 0 || end < meta.Bloom.Offset || end > int64(len(data)) {
+		tb.Fatalf("sst %s bloom range=[%d,%d) data=%d", meta.ID, meta.Bloom.Offset, end, len(data))
+	}
+	sum := sha256.Sum256(data[meta.Bloom.Offset:end])
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	if meta.Bloom.Checksum != want {
+		tb.Fatalf("sst %s bloom checksum=%q want=%q", meta.ID, meta.Bloom.Checksum, want)
+	}
 }

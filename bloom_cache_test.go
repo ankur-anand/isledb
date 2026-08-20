@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -68,6 +69,25 @@ func TestBuildBloomBytesRejectsOversizedFilter(t *testing.T) {
 	}
 }
 
+func TestBloomChecksumValidation(t *testing.T) {
+	data := []byte("encoded-bloom")
+	checksum := bloomChecksum(data)
+	if !strings.HasPrefix(checksum, "sha256:") {
+		t.Fatalf("bloom checksum=%q", checksum)
+	}
+	if err := validateBloomChecksum(checksum, data); err != nil {
+		t.Fatalf("validate bloom checksum: %v", err)
+	}
+	if err := validateBloomChecksum(checksum, []byte("corrupt")); err == nil ||
+		!strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("corrupt bloom checksum error=%v", err)
+	}
+	if err := validateBloomChecksum("md5:abcd", data); err == nil ||
+		!strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("unsupported bloom checksum error=%v", err)
+	}
+}
+
 func TestBloomFilterCacheEvictsLeastRecentlyUsedWithinByteLimit(t *testing.T) {
 	filter := z.NewBloomFilter(64, 2)
 	filter.Add(1)
@@ -122,15 +142,17 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	metaA := sstMetadata{
 		ID: "sst-a",
 		Bloom: bloomMetadata{
-			Offset: 0,
-			Length: int64(len(dataA)),
+			Offset:   0,
+			Length:   int64(len(dataA)),
+			Checksum: bloomChecksum(dataA),
 		},
 	}
 	metaB := sstMetadata{
 		ID: "sst-b",
 		Bloom: bloomMetadata{
-			Offset: 0,
-			Length: int64(len(dataB)),
+			Offset:   0,
+			Length:   int64(len(dataB)),
+			Checksum: bloomChecksum(dataB),
 		},
 	}
 	if _, err := store.Write(ctx, store.SSTPath(metaA.ID), dataA); err != nil {
@@ -177,6 +199,58 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	stats := reader.BloomCacheStats()
 	if stats.EntryCount != 1 || stats.Bytes > stats.MaxBytes {
 		t.Fatalf("bloom cache outside its bound: %+v", stats)
+	}
+}
+
+func TestReaderRejectsBloomChecksumMismatchBeforeCaching(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-bloom-checksum")
+	defer store.Close()
+
+	key := []byte("present")
+	data := bloomBytesForCacheTest(t, key)
+	meta := sstMetadata{
+		ID: "sst-corrupt-bloom",
+		Bloom: bloomMetadata{
+			Length:   int64(len(data)),
+			Checksum: bloomChecksum(data),
+		},
+	}
+	corrupt := append([]byte(nil), data...)
+	corrupt[len(corrupt)/2] ^= 0x01
+	if _, err := store.Write(ctx, store.SSTPath(meta.ID), corrupt); err != nil {
+		t.Fatalf("write corrupt bloom: %v", err)
+	}
+
+	reader := &Reader{store: store, bloomCache: newBloomFilterCache(1 << 20)}
+	if _, err := reader.bloomMayContain(ctx, meta, key); err == nil ||
+		!strings.Contains(err.Error(), "bloom checksum mismatch") {
+		t.Fatalf("bloom checksum error=%v", err)
+	}
+	if stats := reader.BloomCacheStats(); stats.EntryCount != 0 {
+		t.Fatalf("corrupt bloom entered cache: %+v", stats)
+	}
+}
+
+func TestReaderAllowsLegacyBloomWithoutChecksum(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-legacy-bloom")
+	defer store.Close()
+
+	key := []byte("present")
+	data := bloomBytesForCacheTest(t, key)
+	meta := sstMetadata{
+		ID:    "sst-legacy-bloom",
+		Bloom: bloomMetadata{Length: int64(len(data))},
+	}
+	if _, err := store.Write(ctx, store.SSTPath(meta.ID), data); err != nil {
+		t.Fatalf("write legacy bloom: %v", err)
+	}
+
+	reader := &Reader{store: store, bloomCache: newBloomFilterCache(1 << 20)}
+	contains, err := reader.bloomMayContain(ctx, meta, key)
+	if err != nil || !contains {
+		t.Fatalf("legacy bloom contains=%t err=%v", contains, err)
 	}
 }
 

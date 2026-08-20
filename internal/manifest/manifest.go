@@ -34,10 +34,11 @@ type Level struct {
 }
 
 type BloomMeta struct {
-	BitsPerKey int   `json:"bits_per_key"`
-	K          int   `json:"k"`
-	Offset     int64 `json:"offset"`
-	Length     int64 `json:"length"`
+	BitsPerKey int    `json:"bits_per_key"`
+	K          int    `json:"k"`
+	Offset     int64  `json:"offset"`
+	Length     int64  `json:"length"`
+	Checksum   string `json:"checksum,omitempty"`
 }
 
 type SSTMeta struct {
