@@ -15,6 +15,17 @@ import (
 const bloomTrailerMagic = "ISLEBLM1"
 const bloomTrailerLen = 16
 
+const (
+	// maxBloomSidecarBytes bounds both parsing work and the allocation performed
+	// by ristretto's bloom decoder. Real filters are much smaller than this; an
+	// object above the limit is corrupt rather than a useful SST sidecar.
+	maxBloomSidecarBytes = 64 << 20
+	// Ristretto rounds the requested bit count up to a power of two, and JSON
+	// base64-encodes the resulting byte slice. Keeping the raw bitset at or below
+	// half the encoded limit leaves room for that expansion and JSON framing.
+	maxBloomBitsetBits = uint64(maxBloomSidecarBytes/2) * 8
+)
+
 func bloomHashKey(key []byte) uint64 {
 	return xxhash.Sum64(key)
 }
@@ -36,21 +47,30 @@ func buildBloomBytes(hashes []uint64, bitsPerKey int) ([]byte, int, error) {
 	if bitsPerKey <= 0 || len(hashes) == 0 {
 		return nil, 0, nil
 	}
+	keyCount := uint64(len(hashes))
+	if uint64(bitsPerKey) > maxBloomBitsetBits/keyCount {
+		return nil, 0, fmt.Errorf(
+			"bloom filter keys=%d bits_per_key=%d exceeds maximum bitset",
+			len(hashes), bitsPerKey)
+	}
+	bitCount := keyCount * uint64(bitsPerKey)
 	k := bloomProbes(bitsPerKey)
 	if k <= 0 {
 		return nil, 0, errors.New("invalid bloom probes")
 	}
-	bloom := z.NewBloomFilter(float64(len(hashes)), float64(k))
+	// With an explicit probe count, ristretto interprets its first argument as
+	// the total number of bits, not the number of inserted keys.
+	bloom := z.NewBloomFilter(float64(bitCount), float64(k))
 	for _, h := range hashes {
 		bloom.Add(h)
 	}
-	return bloom.JSONMarshal(), k, nil
+	encoded := bloom.JSONMarshal()
+	if len(encoded) > maxBloomSidecarBytes {
+		return nil, 0, fmt.Errorf(
+			"bloom filter bytes=%d max=%d", len(encoded), maxBloomSidecarBytes)
+	}
+	return encoded, k, nil
 }
-
-// maxBloomSidecarBytes bounds both parsing work and the allocation performed
-// by ristretto's bloom decoder. Real filters are much smaller than this; an
-// object above the limit is corrupt rather than a useful SST sidecar.
-const maxBloomSidecarBytes = 64 << 20
 
 // bloomSidecar mirrors the stable JSON shape emitted by z.Bloom.JSONMarshal.
 // It is decoded once here so hostile fields can be rejected before reaching

@@ -1,9 +1,11 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,9 +20,13 @@ import (
 )
 
 type kvS3ReadCounts struct {
-	current atomic.Int64
-	ssts    atomic.Int64
-	lists   atomic.Int64
+	current    atomic.Int64
+	ssts       atomic.Int64
+	lists      atomic.Int64
+	rangeBytes atomic.Int64
+
+	sstInFlight    atomic.Int64
+	maxSSTInFlight atomic.Int64
 
 	// sstDelay models a small amount of object-store latency in the
 	// synchronized cold-miss benchmark. It is configured before readers start.
@@ -49,14 +55,22 @@ func (c *kvS3ReadCounts) observe(request *http.Request) {
 		c.current.Add(1)
 	case strings.Contains(path, "/sstable/"):
 		c.ssts.Add(1)
-		if c.recordRanges.Load() {
-			if byteRange, ok := parseKVReaderBenchmarkRange(request.Header.Get("Range")); ok {
+		if byteRange, ok := parseKVReaderBenchmarkRange(request.Header.Get("Range")); ok {
+			c.rangeBytes.Add(byteRange.length)
+			if c.recordRanges.Load() {
 				c.rangesMu.Lock()
 				c.ranges = append(c.ranges, byteRange)
 				c.rangesMu.Unlock()
 			}
 		}
 		if c.sstDelay > 0 {
+			inFlight := c.sstInFlight.Add(1)
+			for maximum := c.maxSSTInFlight.Load(); inFlight > maximum; maximum = c.maxSSTInFlight.Load() {
+				if c.maxSSTInFlight.CompareAndSwap(maximum, inFlight) {
+					break
+				}
+			}
+			defer c.sstInFlight.Add(-1)
 			time.Sleep(c.sstDelay)
 		}
 	}
@@ -66,6 +80,8 @@ func (c *kvS3ReadCounts) reset() {
 	c.current.Store(0)
 	c.ssts.Store(0)
 	c.lists.Store(0)
+	c.rangeBytes.Store(0)
+	c.maxSSTInFlight.Store(0)
 	c.rangesMu.Lock()
 	c.ranges = c.ranges[:0]
 	c.rangesMu.Unlock()
@@ -300,6 +316,223 @@ func BenchmarkFakeS3_KVReaderGet_ConcurrentColdMiss(b *testing.B) {
 	}
 }
 
+// BenchmarkFakeS3_KVReaderGet_SortedLevelDepth establishes the baseline for
+// point lookups through an increasingly deep LSM. Every level contains one
+// multi-block SST whose range covers each probe key. Bloom filters reject the
+// key in preceding levels; a deep hit therefore still pays one sequential
+// object-store request per level before reading the SST that owns the value.
+//
+// A fixed provider delay makes the latency shape visible without changing the
+// request count. The concurrent case also shows whether the existing load
+// coalescing bounds request amplification when many callers miss together.
+func BenchmarkFakeS3_KVReaderGet_SortedLevelDepth(b *testing.B) {
+	const (
+		maxLevels   = 16
+		valueSize   = 256
+		concurrency = 100
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	fixture := prepareFakeS3KVBenchmarkPointLevels(b, ctx, maxLevels, valueSize)
+	defer func() { _ = fixture.reader.Close() }()
+	fixture.counts.sstDelay = 2 * time.Millisecond
+
+	for _, depth := range []int{1, 4, 8, 16} {
+		state := &manifestState{Levels: fixture.state.Levels[:depth]}
+		cases := []struct {
+			name       string
+			key        []byte
+			wantFound  bool
+			candidates int
+		}{
+			{name: "l1-hit", key: fixture.hitKeys[1], wantFound: true, candidates: 1},
+			{name: "deepest-hit", key: fixture.hitKeys[depth], wantFound: true, candidates: depth},
+			{name: "missing", key: fixture.missingKey, candidates: depth},
+		}
+
+		for _, benchmarkCase := range cases {
+			for _, temperature := range []string{"cold", "warm"} {
+				name := fmt.Sprintf(
+					"levels=%d/%s/%s", depth, benchmarkCase.name, temperature)
+				b.Run(name, func(b *testing.B) {
+					clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+					if temperature == "warm" {
+						assertKVReaderBenchmarkManifestGet(
+							b, ctx, fixture.reader, state, benchmarkCase.key,
+							benchmarkCase.wantFound, valueSize)
+						waitKVReaderBenchmarkCache(fixture.reader)
+					}
+
+					fixture.counts.reset()
+					b.ReportAllocs()
+					b.SetBytes(valueSize)
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if temperature == "cold" {
+							b.StopTimer()
+							clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+							b.StartTimer()
+						}
+						assertKVReaderBenchmarkManifestGet(
+							b, ctx, fixture.reader, state, benchmarkCase.key,
+							benchmarkCase.wantFound, valueSize)
+					}
+					b.StopTimer()
+
+					iterations := float64(b.N)
+					b.ReportMetric(float64(depth), "sorted_levels")
+					b.ReportMetric(float64(benchmarkCase.candidates), "candidate_ssts")
+					b.ReportMetric(float64(fixture.counts.ssts.Load())/iterations, "sst_GETs/op")
+					b.ReportMetric(float64(fixture.counts.rangeBytes.Load())/iterations, "range_B/op")
+					b.ReportMetric(float64(fixture.counts.maxSSTInFlight.Load()), "max_sst_GET_concurrency")
+				})
+			}
+		}
+	}
+
+	for _, temperature := range []string{"cold", "warm"} {
+		b.Run("levels=16/l0-tombstone/"+temperature, func(b *testing.B) {
+			state := &manifestState{
+				L0SSTs: fixture.state.L0SSTs,
+				Levels: fixture.state.Levels[:maxLevels],
+			}
+			clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+			if temperature == "warm" {
+				assertKVReaderBenchmarkManifestGet(
+					b, ctx, fixture.reader, state, fixture.tombstoneKey, false, valueSize)
+				waitKVReaderBenchmarkCache(fixture.reader)
+			}
+
+			fixture.counts.reset()
+			b.ReportAllocs()
+			b.SetBytes(valueSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if temperature == "cold" {
+					b.StopTimer()
+					clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+					b.StartTimer()
+				}
+				assertKVReaderBenchmarkManifestGet(
+					b, ctx, fixture.reader, state, fixture.tombstoneKey, false, valueSize)
+			}
+			b.StopTimer()
+
+			iterations := float64(b.N)
+			b.ReportMetric(1, "candidate_ssts")
+			b.ReportMetric(float64(fixture.counts.ssts.Load())/iterations, "sst_GETs/op")
+			b.ReportMetric(float64(fixture.counts.rangeBytes.Load())/iterations, "range_B/op")
+			b.ReportMetric(float64(fixture.counts.maxSSTInFlight.Load()), "max_sst_GET_concurrency")
+		})
+	}
+
+	windowState := &manifestState{Levels: fixture.state.Levels[:maxLevels]}
+	windowCases := []struct {
+		name       string
+		key        []byte
+		wantFound  bool
+		candidates int
+	}{
+		{name: "l1-hit", key: fixture.hitKeys[1], wantFound: true, candidates: 1},
+		{name: "deepest-hit", key: fixture.hitKeys[maxLevels], wantFound: true, candidates: maxLevels},
+		{name: "missing", key: fixture.missingKey, candidates: maxLevels},
+	}
+	for _, window := range []int{1, 2, 4, 8} {
+		for _, benchmarkCase := range windowCases {
+			for _, temperature := range []string{"cold", "warm"} {
+				name := fmt.Sprintf(
+					"levels=16/window=%d/%s/%s",
+					window, benchmarkCase.name, temperature)
+				b.Run(name, func(b *testing.B) {
+					clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+					if temperature == "warm" {
+						assertKVReaderBenchmarkWindowedGet(
+							b, ctx, fixture.reader, windowState, benchmarkCase.key,
+							benchmarkCase.wantFound, valueSize, window)
+						waitKVReaderBenchmarkCache(fixture.reader)
+					}
+
+					fixture.counts.reset()
+					b.ReportAllocs()
+					b.SetBytes(valueSize)
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if temperature == "cold" {
+							b.StopTimer()
+							clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+							b.StartTimer()
+						}
+						assertKVReaderBenchmarkWindowedGet(
+							b, ctx, fixture.reader, windowState, benchmarkCase.key,
+							benchmarkCase.wantFound, valueSize, window)
+					}
+					b.StopTimer()
+
+					iterations := float64(b.N)
+					b.ReportMetric(float64(window), "level_window")
+					b.ReportMetric(float64(benchmarkCase.candidates), "candidate_ssts")
+					b.ReportMetric(float64(fixture.counts.ssts.Load())/iterations, "sst_GETs/op")
+					b.ReportMetric(float64(fixture.counts.rangeBytes.Load())/iterations, "range_B/op")
+					b.ReportMetric(float64(fixture.counts.maxSSTInFlight.Load()), "max_sst_GET_concurrency")
+				})
+			}
+		}
+	}
+
+	// Use the deepest hit for the synchronized wave: all callers traverse the
+	// same 16 candidates, so singleflight should keep the provider request count
+	// close to one ordinary deep lookup rather than multiplying it by 100.
+	state := &manifestState{Levels: fixture.state.Levels[:maxLevels]}
+	for _, temperature := range []string{"cold", "warm"} {
+		b.Run("levels=16/deepest-hit/concurrent-100/"+temperature, func(b *testing.B) {
+			clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+			if temperature == "warm" {
+				assertKVReaderBenchmarkManifestGet(
+					b, ctx, fixture.reader, state, fixture.hitKeys[maxLevels], true, valueSize)
+				waitKVReaderBenchmarkCache(fixture.reader)
+			}
+
+			fixture.counts.reset()
+			b.ReportAllocs()
+			b.SetBytes(concurrency * valueSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				if temperature == "cold" {
+					clearKVReaderPointBenchmarkCaches(b, fixture.reader)
+				}
+				start := make(chan struct{})
+				errs := make(chan error, concurrency)
+				var workers sync.WaitGroup
+				workers.Add(concurrency)
+				for range concurrency {
+					go func() {
+						defer workers.Done()
+						<-start
+						errs <- checkKVReaderBenchmarkManifestGet(
+							ctx, fixture.reader, state, fixture.hitKeys[maxLevels], true, valueSize)
+					}()
+				}
+				b.StartTimer()
+				close(start)
+				workers.Wait()
+				b.StopTimer()
+				for range concurrency {
+					if err := <-errs; err != nil {
+						b.Fatalf("concurrent Get: %v", err)
+					}
+				}
+			}
+
+			waves := float64(b.N)
+			b.ReportMetric(float64(fixture.counts.ssts.Load())/waves, "sst_GETs/wave")
+			b.ReportMetric(float64(fixture.counts.rangeBytes.Load())/waves, "range_B/wave")
+			b.ReportMetric(float64(fixture.counts.maxSSTInFlight.Load()), "max_sst_GET_concurrency")
+		})
+	}
+}
+
 // BenchmarkFakeS3_KVReaderGet_RangeReadRequestShape reports the exact ordered
 // range requests used by one cold point lookup. The rN_gap_B metrics are the
 // distance between the end of request N and the logical end of the Pebble SST;
@@ -514,6 +747,103 @@ type kvLeveledBenchmarkFixture struct {
 	totalKeys int
 	totalSSTs int
 	sstBytes  int64
+}
+
+type kvPointLevelBenchmarkFixture struct {
+	reader       *Reader
+	state        *manifestState
+	counts       *kvS3ReadCounts
+	hitKeys      map[int][]byte
+	missingKey   []byte
+	tombstoneKey []byte
+}
+
+func prepareFakeS3KVBenchmarkPointLevels(
+	b *testing.B,
+	ctx context.Context,
+	levelCount, valueSize int,
+) kvPointLevelBenchmarkFixture {
+	b.Helper()
+
+	const rowsPerLevel = 4096
+	counts := &kvS3ReadCounts{}
+	bucketURL := setupFakeS3BucketURLWithObserver(b, counts.observe)
+	store, err := blobstore.Open(
+		ctx, bucketURL, fmt.Sprintf("bench/kv-point-levels-%d", time.Now().UnixNano()))
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+
+	values := benchmarkChangeFeedValues(rowsPerLevel, valueSize, true)
+	hitKeys := make(map[int][]byte, levelCount)
+	for level := 1; level <= levelCount; level++ {
+		hitKeys[level] = []byte(fmt.Sprintf("key-00002048/probe-level-%02d", level))
+	}
+	missingKey := []byte("key-00002048/probe-missing")
+	tombstoneKey := []byte("key-00002048/probe-tombstone")
+
+	state := &manifestState{Levels: make([]manifest.Level, 0, levelCount)}
+	for level := 1; level <= levelCount; level++ {
+		entries := make([]internal.MemEntry, 0, rowsPerLevel+1)
+		seqBase := uint64((levelCount - level + 1) * (rowsPerLevel + 1))
+		for row := 0; row < rowsPerLevel; row++ {
+			entries = append(entries, internal.MemEntry{
+				Key:   kvLeveledBenchmarkKey(row),
+				Seq:   seqBase + uint64(row+1),
+				Kind:  internal.OpPut,
+				Value: values[row],
+			})
+		}
+		entries = append(entries, internal.MemEntry{
+			Key:   hitKeys[level],
+			Seq:   seqBase + uint64(rowsPerLevel+1),
+			Kind:  internal.OpPut,
+			Value: bytes.Repeat([]byte{byte(level)}, valueSize),
+		})
+		if level == 1 {
+			entries = append(entries, internal.MemEntry{
+				Key:   tombstoneKey,
+				Seq:   seqBase + uint64(rowsPerLevel+2),
+				Kind:  internal.OpPut,
+				Value: bytes.Repeat([]byte("v"), valueSize),
+			})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return bytes.Compare(entries[i].Key, entries[j].Key) < 0
+		})
+
+		meta, _ := writeFakeS3KVBenchmarkSST(
+			b, ctx, store, entries, uint32(level), uint64(level))
+		state.Levels = append(state.Levels, manifest.Level{
+			Number: uint32(level), SSTs: []manifest.SSTMeta{meta},
+		})
+	}
+	l0Meta, _ := writeFakeS3KVBenchmarkSST(b, ctx, store, []internal.MemEntry{{
+		Key: tombstoneKey, Seq: uint64((levelCount + 1) * (rowsPerLevel + 2)),
+		Kind: internal.OpDelete,
+	}}, 0, uint64(levelCount+1))
+	state.L0SSTs = []manifest.SSTMeta{l0Meta}
+	if err := state.ValidateLevels(); err != nil {
+		b.Fatalf("validate point-level benchmark manifest: %v", err)
+	}
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:                 b.TempDir(),
+		BlockCacheSize:           64 << 20,
+		AllowUnverifiedRangeRead: true,
+		RangeReadMinSSTSize:      1,
+		Metrics:                  metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
+
+	return kvPointLevelBenchmarkFixture{
+		reader: reader, state: state, counts: counts,
+		hitKeys: hitKeys, missingKey: missingKey, tombstoneKey: tombstoneKey,
+	}
 }
 
 func prepareFakeS3KVBenchmarkLeveled(
@@ -835,6 +1165,20 @@ func clearKVReaderBenchmarkCache(b *testing.B, reader *Reader) {
 	}
 }
 
+func clearKVReaderPointBenchmarkCaches(b *testing.B, reader *Reader) {
+	b.Helper()
+	waitKVReaderBenchmarkCache(reader)
+	if reader.blockCache != nil {
+		reader.blockCache.Clear()
+	}
+	if reader.bloomCache != nil {
+		reader.bloomCache.clear()
+	}
+	if err := reader.sstCache.Clear(); err != nil {
+		b.Fatalf("clear SST cache: %v", err)
+	}
+}
+
 func waitKVReaderBenchmarkCache(reader *Reader) {
 	if reader != nil && reader.blockCache != nil {
 		reader.blockCache.Wait()
@@ -857,6 +1201,145 @@ func assertKVReaderBenchmarkGet(b *testing.B, ctx context.Context, reader *Reade
 	}
 	if !found || len(value) != valueSize {
 		b.Fatalf("Get found=%v value_bytes=%d want=%d", found, len(value), valueSize)
+	}
+}
+
+func assertKVReaderBenchmarkManifestGet(
+	b *testing.B,
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	key []byte,
+	wantFound bool,
+	valueSize int,
+) {
+	b.Helper()
+	if err := checkKVReaderBenchmarkManifestGet(
+		ctx, reader, state, key, wantFound, valueSize); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func checkKVReaderBenchmarkManifestGet(
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	key []byte,
+	wantFound bool,
+	valueSize int,
+) error {
+	value, found, err := reader.getWithManifest(ctx, state, key)
+	if err != nil {
+		return fmt.Errorf("Get(%q): %w", key, err)
+	}
+	if found != wantFound {
+		return fmt.Errorf("Get(%q) found=%t want=%t", key, found, wantFound)
+	}
+	if found && len(value) != valueSize {
+		return fmt.Errorf("Get(%q) value_bytes=%d want=%d", key, len(value), valueSize)
+	}
+	return nil
+}
+
+type kvWindowedGetResult struct {
+	value   []byte
+	got     bool
+	deleted bool
+	err     error
+}
+
+// getKVReaderBenchmarkWindowed is an experimental point-lookup path used only
+// by the benchmark. It preserves the production ordering rules while allowing
+// a fixed number of sorted-level candidates to perform their object reads in
+// parallel. A window of one calls the production implementation directly.
+func getKVReaderBenchmarkWindowed(
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	key []byte,
+	window int,
+) ([]byte, bool, error) {
+	if window <= 1 {
+		return reader.getWithManifest(ctx, state, key)
+	}
+
+	for _, sst := range state.L0SSTs {
+		if !keyInRange(key, sst.MinKey, sst.MaxKey) {
+			continue
+		}
+		value, got, deleted, err := reader.getFromSST(ctx, sst, key)
+		if err != nil {
+			return nil, false, err
+		}
+		if got {
+			if deleted {
+				return nil, false, nil
+			}
+			return value, true, nil
+		}
+	}
+
+	candidates := make([]sstMetadata, 0, len(state.Levels))
+	for i := range state.Levels {
+		if sst := state.Levels[i].FindSST(key); sst != nil {
+			candidates = append(candidates, *sst)
+		}
+	}
+
+	for start := 0; start < len(candidates); start += window {
+		end := min(start+window, len(candidates))
+		results := make([]kvWindowedGetResult, end-start)
+		var workers sync.WaitGroup
+		workers.Add(len(results))
+		for i := range results {
+			go func(result *kvWindowedGetResult, sst sstMetadata) {
+				defer workers.Done()
+				result.value, result.got, result.deleted, result.err =
+					reader.getFromSST(ctx, sst, key)
+			}(&results[i], candidates[start+i])
+		}
+		workers.Wait()
+
+		// Examine results in level order. An error or tombstone in a shallower
+		// level has the same precedence it has in the sequential implementation;
+		// speculative failures after an earlier hit remain unobservable.
+		for i := range results {
+			result := &results[i]
+			if result.err != nil {
+				return nil, false, result.err
+			}
+			if result.got {
+				if result.deleted {
+					return nil, false, nil
+				}
+				return result.value, true, nil
+			}
+		}
+	}
+
+	return nil, false, nil
+}
+
+func assertKVReaderBenchmarkWindowedGet(
+	b *testing.B,
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	key []byte,
+	wantFound bool,
+	valueSize int,
+	window int,
+) {
+	b.Helper()
+	value, found, err := getKVReaderBenchmarkWindowed(ctx, reader, state, key, window)
+	if err != nil {
+		b.Fatalf("windowed Get(%q): %v", key, err)
+	}
+	if found != wantFound {
+		b.Fatalf("windowed Get(%q) found=%t want=%t", key, found, wantFound)
+	}
+	if found && len(value) != valueSize {
+		b.Fatalf("windowed Get(%q) value_bytes=%d want=%d", key, len(value), valueSize)
 	}
 }
 
