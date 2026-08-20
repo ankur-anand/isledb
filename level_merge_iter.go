@@ -15,10 +15,12 @@ import (
 // rather than concatenating the whole level.
 type levelMergeIteratorSource struct {
 	reader *Reader
-	ctx    context.Context
-	ssts   []sstMetadata
-	lower  []byte
-	upper  []byte
+	// ctx carries the parent read/iterator lifetime into SST opens that happen
+	// lazily, after this source is constructed.
+	ctx   context.Context
+	ssts  []sstMetadata
+	lower []byte
+	upper []byte
 
 	index    int
 	current  *sstableMergeIteratorSource
@@ -89,22 +91,48 @@ func (s *levelMergeIteratorSource) next() (*sstable.InternalKey, []byte) {
 }
 
 func (s *levelMergeIteratorSource) seekGE(target []byte) (*sstable.InternalKey, []byte) {
-	if !s.reset() || len(s.ssts) == 0 {
+	if s.closed || s.errValue != nil || len(s.ssts) == 0 {
 		return nil, nil
 	}
 	if len(s.lower) > 0 && bytes.Compare(target, s.lower) < 0 {
 		target = s.lower
 	}
 	if len(s.upper) > 0 && bytes.Compare(target, s.upper) >= 0 {
+		_ = s.reset()
 		return nil, nil
 	}
 
-	s.index = sort.Search(len(s.ssts), func(i int) bool {
+	index := sort.Search(len(s.ssts), func(i int) bool {
 		return bytes.Compare(s.ssts[i].MaxKey, target) >= 0
 	})
-	if s.index == len(s.ssts) {
+	if index == len(s.ssts) {
+		_ = s.reset()
 		return nil, nil
 	}
+
+	// Pebble iterators support repositioning in either direction. Keep the
+	// current SST open when the target remains inside it; rebuilding the reader
+	// and iterator on every seek is unnecessary cache and metadata work.
+	if s.current != nil && s.index == index {
+		key, value := s.current.seekGE(target)
+		if key != nil {
+			return key, value
+		}
+		if err := s.current.err(); err != nil {
+			s.errValue = err
+			return nil, nil
+		}
+		if !s.closeCurrent() {
+			return nil, nil
+		}
+		s.index++
+		return s.openAndFirst()
+	}
+
+	if !s.reset() {
+		return nil, nil
+	}
+	s.index = index
 	if !s.openCurrent() {
 		return nil, nil
 	}
@@ -159,13 +187,12 @@ func (s *levelMergeIteratorSource) openCurrent() bool {
 }
 
 func (s *levelMergeIteratorSource) reset() bool {
-	if s.closed {
+	if s.closed || s.errValue != nil {
 		return false
 	}
 	if !s.closeCurrent() {
 		return false
 	}
-	s.errValue = nil
 	s.index = -1
 	return true
 }
@@ -202,6 +229,9 @@ func (s *levelMergeIteratorSource) close() error {
 	if s.current != nil {
 		err = s.current.close()
 		s.current = nil
+	}
+	if err != nil && s.errValue == nil {
+		s.errValue = err
 	}
 	s.ssts = nil
 	return err

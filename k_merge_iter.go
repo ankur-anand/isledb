@@ -339,8 +339,13 @@ func (mi *kMergeIterator) close() error {
 
 func (mi *kMergeIterator) seekGE(target []byte) {
 	mi.current = nil
+	if err := mi.Err(); err != nil {
+		// Iterator failures are sticky. A seek may reposition a healthy
+		// iterator, but it must not turn an unobserved read failure into success.
+		mi.err = err
+		return
+	}
 	mi.lastKey = nil
-	mi.err = nil
 	mi.pending = -1
 	mi.initialized = true
 

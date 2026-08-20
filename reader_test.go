@@ -3,14 +3,30 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+type closeErrorMergeSource struct {
+	closeErr error
+}
+
+func (*closeErrorMergeSource) first() (*sstable.InternalKey, []byte) { return nil, nil }
+func (*closeErrorMergeSource) next() (*sstable.InternalKey, []byte)  { return nil, nil }
+func (*closeErrorMergeSource) seekGE([]byte) (*sstable.InternalKey, []byte) {
+	return nil, nil
+}
+func (*closeErrorMergeSource) err() error { return nil }
+func (s *closeErrorMergeSource) close() error {
+	return s.closeErr
+}
 
 func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) writeSSTResult {
 	t.Helper()
@@ -418,6 +434,11 @@ func TestReader_IteratorReturnsCurrentBeforeLaterSSTError(t *testing.T) {
 	if iter.Next() {
 		t.Fatal("second Next unexpectedly succeeded")
 	}
+	// The failed move must make the iterator terminal. Seeking before checking
+	// Err must not erase the failure and reopen an earlier healthy SST.
+	if iter.SeekGE([]byte("a")) {
+		t.Fatal("SeekGE succeeded after an unobserved iterator failure")
+	}
 	if err := iter.Err(); err == nil {
 		t.Fatal("later SST error was not reported through Iterator.Err")
 	}
@@ -536,6 +557,58 @@ func TestLevelMergeIteratorSourceCopiesSelectedMetadata(t *testing.T) {
 	all[500].ID = "mutated"
 	if source.ssts[0].ID != "selected" {
 		t.Fatalf("source metadata aliases manifest storage: got ID %q", source.ssts[0].ID)
+	}
+}
+
+func TestLevelMergeIteratorSource_SeekGEReusesCurrentSST(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-seek-reuses-current-sst")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	result := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+		{Key: []byte("m"), Seq: 2, Kind: internal.OpPut, Value: []byte("vm")},
+		{Key: []byte("z"), Seq: 3, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 1)
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	source := newLevelMergeIteratorSource(
+		reader, ctx, []sstMetadata{result.Meta}, nil, nil)
+	defer source.close()
+
+	key, _ := source.seekGE([]byte("a"))
+	if key == nil || !bytes.Equal(key.UserKey, []byte("a")) {
+		t.Fatalf("SeekGE(a): key=%v err=%v", key, source.err())
+	}
+	current := source.current
+	if current == nil {
+		t.Fatal("SeekGE(a) left no current SST iterator")
+	}
+
+	key, _ = source.seekGE([]byte("m"))
+	if key == nil || !bytes.Equal(key.UserKey, []byte("m")) {
+		t.Fatalf("SeekGE(m): key=%v err=%v", key, source.err())
+	}
+	if source.current != current {
+		t.Fatal("SeekGE within one SST rebuilt the SST iterator")
+	}
+}
+
+func TestReader_IteratorCloseReturnsSourceError(t *testing.T) {
+	want := errors.New("close source")
+	it := &Iterator{
+		ctx:     context.Background(),
+		sources: []mergeIteratorSource{&closeErrorMergeSource{closeErr: want}},
+	}
+
+	if err := it.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close error=%v want=%v", err, want)
 	}
 }
 
