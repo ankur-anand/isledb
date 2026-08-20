@@ -140,6 +140,7 @@ func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch 
 			K:          bloomK,
 			Offset:     sstSize,
 			Length:     int64(len(bloomBytes)),
+			Checksum:   bloomChecksum(bloomBytes),
 		},
 		CreatedAt: time.Now().UTC(),
 	}

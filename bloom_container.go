@@ -2,11 +2,13 @@ package isledb
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/dgraph-io/ristretto/v2/z"
@@ -28,6 +30,28 @@ const (
 
 func bloomHashKey(key []byte) uint64 {
 	return xxhash.Sum64(key)
+}
+
+func bloomChecksum(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", sum[:])
+}
+
+func validateBloomChecksum(expected string, data []byte) error {
+	if expected == "" {
+		return errors.New("missing bloom checksum")
+	}
+	algo, _, ok := strings.Cut(expected, ":")
+	if !ok || algo != "sha256" {
+		return fmt.Errorf("unsupported bloom checksum %q", expected)
+	}
+	if actual := bloomChecksum(data); actual != expected {
+		return errors.New("bloom checksum mismatch")
+	}
+	return nil
 }
 
 func bloomProbes(bitsPerKey int) int {

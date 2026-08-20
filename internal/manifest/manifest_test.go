@@ -23,6 +23,7 @@ func TestSSTMetaJSONSchema(t *testing.T) {
 			K:          7,
 			Offset:     2048,
 			Length:     256,
+			Checksum:   "sha256:bloom",
 		},
 		CreatedAt: time.Date(2026, time.August, 8, 10, 30, 0, 0, time.UTC),
 		Level:     1,
@@ -32,7 +33,7 @@ func TestSSTMetaJSONSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"id":"sst-001","epoch":2,"seq_lo":10,"seq_hi":20,"min_key":"YWxwaGE=","max_key":"b21lZ2E=","size":4096,"checksum":"sha256:abc","bloom":{"bits_per_key":10,"k":7,"offset":2048,"length":256},"created_at":"2026-08-08T10:30:00Z","level":1}`
+	const want = `{"id":"sst-001","epoch":2,"seq_lo":10,"seq_hi":20,"min_key":"YWxwaGE=","max_key":"b21lZ2E=","size":4096,"checksum":"sha256:abc","bloom":{"bits_per_key":10,"k":7,"offset":2048,"length":256,"checksum":"sha256:bloom"},"created_at":"2026-08-08T10:30:00Z","level":1}`
 	if string(body) != want {
 		t.Fatalf("SSTMeta JSON schema changed\n got: %s\nwant: %s", body, want)
 	}

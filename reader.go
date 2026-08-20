@@ -771,6 +771,15 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if err != nil {
 			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
 		}
+		// Historical manifests predate Bloom checksums. New manifests always
+		// carry one, and every present checksum is enforced before the filter can
+		// enter the in-memory cache where a corrupted false negative would be
+		// indistinguishable from an absent key.
+		if sstMeta.Bloom.Checksum != "" {
+			if err := validateBloomChecksum(sstMeta.Bloom.Checksum, data); err != nil {
+				return nil, fmt.Errorf("validate bloom %s: %w", sstMeta.ID, err)
+			}
+		}
 		filter, err := parseBloomFilter(data)
 		if err != nil {
 			return nil, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)

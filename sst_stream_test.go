@@ -36,7 +36,9 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 		return nil
 	}
 
-	result, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1, 2, uploadFn)
+	result, err := writeSSTStreaming(context.Background(), it, sstWriterOptions{
+		BlockSize: 4096, Compression: "none", BloomBitsPerKey: 10,
+	}, 1, 1, 2, uploadFn)
 	if err != nil {
 		t.Fatalf("writeSSTStreaming error: %v", err)
 	}
@@ -78,6 +80,7 @@ func TestWriteSSTStreaming_Basic(t *testing.T) {
 	if result.Meta.Checksum != expectedChecksum {
 		t.Errorf("checksum mismatch: got %s, want %s", result.Meta.Checksum, expectedChecksum)
 	}
+	requireBloomChecksum(t, result.Meta, uploadedData)
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(payload), sstable.ReaderOptions{})
 	if err != nil {
@@ -412,7 +415,9 @@ func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{
+		BlockSize: 4096, Compression: "none", BloomBitsPerKey: 10,
+	}, 1, 1<<20, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
@@ -428,6 +433,7 @@ func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 	if result.Meta.Checksum != expectedChecksum {
 		t.Errorf("checksum mismatch: got %s, want %s", result.Meta.Checksum, expectedChecksum)
 	}
+	requireBloomChecksum(t, result.Meta, uploadedData)
 
 	reader, err := sstable.NewReader(context.Background(), newMemReadable(sstPayload(t, result.Meta, uploadedData)), sstable.ReaderOptions{})
 	if err != nil {

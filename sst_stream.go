@@ -204,6 +204,7 @@ func writeSSTStreaming(
 				K:          bloomK,
 				Offset:     sstSize,
 				Length:     int64(len(bloomBytes)),
+				Checksum:   bloomChecksum(bloomBytes),
 			},
 		}
 		return nil
@@ -365,6 +366,7 @@ func writeMultipleSSTsStreaming(
 					K:          bloomK,
 					Offset:     sstSize,
 					Length:     int64(len(bloomBytes)),
+					Checksum:   bloomChecksum(bloomBytes),
 				},
 				CreatedAt: ts,
 			},
