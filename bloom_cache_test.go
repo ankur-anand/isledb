@@ -2,11 +2,71 @@ package isledb
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
+
+func TestBuildBloomBytesHonorsBitsPerKey(t *testing.T) {
+	const (
+		keyCount   = 4096
+		bitsPerKey = 10
+	)
+
+	hashes := make([]uint64, keyCount)
+	for i := range hashes {
+		hashes[i] = bloomHashKey([]byte(fmt.Sprintf("present-%08d", i)))
+	}
+	data, _, err := buildBloomBytes(hashes, bitsPerKey)
+	if err != nil {
+		t.Fatalf("build bloom: %v", err)
+	}
+
+	var sidecar bloomSidecar
+	if err := json.Unmarshal(data, &sidecar); err != nil {
+		t.Fatalf("decode bloom sidecar: %v", err)
+	}
+	minimumBytes := (keyCount*bitsPerKey + 7) / 8
+	if len(sidecar.FilterSet) < minimumBytes {
+		t.Fatalf("bloom bit vector bytes=%d want at least %d for %d keys at %d bits/key",
+			len(sidecar.FilterSet), minimumBytes, keyCount, bitsPerKey)
+	}
+
+	filter, err := parseBloomFilter(data)
+	if err != nil {
+		t.Fatalf("parse bloom: %v", err)
+	}
+	for i, hash := range hashes {
+		if !filter.Has(hash) {
+			t.Fatalf("inserted key %d is absent from bloom", i)
+		}
+	}
+
+	falsePositives := 0
+	for i := range keyCount {
+		hash := bloomHashKey([]byte(fmt.Sprintf("absent-%08d", i)))
+		if filter.Has(hash) {
+			falsePositives++
+		}
+	}
+	// Ten configured bits per key should remain comfortably below this
+	// deterministic five-percent ceiling. The old one-bit-per-key allocation
+	// returns true for nearly every absent key.
+	if falsePositives > keyCount/20 {
+		t.Fatalf("bloom false positives=%d/%d exceed 5%%", falsePositives, keyCount)
+	}
+}
+
+func TestBuildBloomBytesRejectsOversizedFilter(t *testing.T) {
+	_, _, err := buildBloomBytes(
+		[]uint64{bloomHashKey([]byte("key"))}, int(maxBloomBitsetBits)+1)
+	if err == nil {
+		t.Fatal("oversized bloom filter was accepted")
+	}
+}
 
 func TestBloomFilterCacheEvictsLeastRecentlyUsedWithinByteLimit(t *testing.T) {
 	filter := z.NewBloomFilter(64, 2)
