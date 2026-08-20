@@ -587,26 +587,21 @@ func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState,
 		return nil, errors.New("manifest not loaded")
 	}
 
-	allIters, err := r.openRangeIters(ctx, m, minKey, maxKey)
-	if err != nil {
-		return nil, err
-	}
-	defer closeSSTIters(allIters)
+	sources := r.openRangeSources(ctx, m, minKey, maxKey, false)
+	defer func() {
+		err = errors.Join(err, closeMergeSources(sources))
+	}()
 
-	if len(allIters) == 0 {
+	if len(sources) == 0 {
 		return nil, nil
 	}
 
-	mergeIter := newMergeIterator(allIters)
+	mergeIter := newMergeIteratorSources(sources)
 
 	nowMs := time.Now().UnixMilli()
-	for mergeIter.Next() {
+	for (limit <= 0 || len(out) < limit) && mergeIter.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
-		}
-
-		if limit > 0 && len(out) >= limit {
-			break
 		}
 
 		entry, err := mergeIter.entry()
@@ -647,14 +642,21 @@ func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState,
 	return out, nil
 }
 
-func closeSSTIters(iters []sstable.Iterator) {
-	for _, it := range iters {
-		_ = it.Close()
+func closeMergeSources(sources []mergeIteratorSource) error {
+	var closeErr error
+	for _, source := range sources {
+		closeErr = errors.Join(closeErr, source.close())
 	}
+	return closeErr
 }
 
-func (r *Reader) openRangeIters(ctx context.Context, m *manifestState, minKey, maxKey []byte) ([]sstable.Iterator, error) {
-	var allIters []sstable.Iterator
+func (r *Reader) openRangeSources(
+	ctx context.Context,
+	m *manifestState,
+	minKey, maxKey []byte,
+	detachNarrowLevels bool,
+) []mergeIteratorSource {
+	var sources []mergeIteratorSource
 	upper := maxKey
 	if len(maxKey) > 0 {
 		upper = incrementKey(maxKey)
@@ -664,27 +666,28 @@ func (r *Reader) openRangeIters(ctx context.Context, m *manifestState, minKey, m
 		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
 			continue
 		}
-		_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-		if err != nil {
-			closeSSTIters(allIters)
-			return nil, err
-		}
-		allIters = append(allIters, iter)
+		sources = append(sources, newLevelMergeIteratorSourceWithMetadata(
+			r, ctx, []sstMetadata{sst}, minKey, upper))
 	}
 
 	for i := range m.Levels {
 		overlapping := m.Levels[i].OverlappingSSTs(minKey, maxKey)
-		for _, sst := range overlapping {
-			_, iter, err := r.openSSTIterBounded(ctx, sst, minKey, upper)
-			if err != nil {
-				closeSSTIters(allIters)
-				return nil, err
+		if len(overlapping) > 0 {
+			// Reader manifests are immutable after publication. Borrowing their
+			// metadata is therefore safe. A narrow long-lived iterator copies its
+			// selection only to avoid retaining a much larger backing level; a full
+			// level already needs all of that metadata, so copying saves no memory.
+			if detachNarrowLevels && len(overlapping) < len(m.Levels[i].SSTs) {
+				sources = append(sources,
+					newLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
+			} else {
+				sources = append(sources,
+					newBorrowedLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
 			}
-			allIters = append(allIters, iter)
 		}
 	}
 
-	return allIters, nil
+	return sources
 }
 
 func keyInRange(key, minKey, maxKey []byte) bool {
@@ -1198,7 +1201,7 @@ type Iterator struct {
 	maxKey    []byte
 	nowMs     int64
 	mergeIter *kMergeIterator
-	sstIters  []sstable.Iterator
+	sources   []mergeIteratorSource
 	current   *iterEntry
 	started   bool
 	closed    bool
@@ -1237,13 +1240,9 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 	}
 	iterCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrIteratorExpired)
 
-	allIters, err := r.openRangeIters(iterCtx, m, opts.MinKey, opts.MaxKey)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
+	sources := r.openRangeSources(iterCtx, m, opts.MinKey, opts.MaxKey, true)
 
-	if len(allIters) == 0 {
+	if len(sources) == 0 {
 
 		it := &Iterator{
 			reader:    r,
@@ -1267,8 +1266,8 @@ func (r *Reader) newIteratorWithManifest(ctx context.Context, m *manifestState, 
 		minKey:    opts.MinKey,
 		maxKey:    opts.MaxKey,
 		nowMs:     time.Now().UnixMilli(),
-		mergeIter: newMergeIterator(allIters),
-		sstIters:  allIters,
+		mergeIter: newMergeIteratorSources(sources),
+		sources:   sources,
 		closed:    false,
 	}
 	r.registerIterator(it)
@@ -1314,6 +1313,9 @@ func (it *Iterator) next() bool {
 		}
 
 		if !it.mergeIter.Next() {
+			if err := it.mergeIter.Err(); err != nil {
+				it.err = err
+			}
 			return false
 		}
 
@@ -1420,10 +1422,8 @@ func (it *Iterator) close(cause error) error {
 	it.closed = true
 	it.current = nil
 
-	for _, iter := range it.sstIters {
-		_ = iter.Close()
-	}
-	it.sstIters = nil
+	closeErr := closeMergeSources(it.sources)
+	it.sources = nil
 	it.mergeIter = nil
 	if it.cancel != nil {
 		it.cancel()
@@ -1433,7 +1433,7 @@ func (it *Iterator) close(cause error) error {
 		it.reader.unregisterIterator(it)
 	}
 
-	return nil
+	return closeErr
 }
 
 func (it *Iterator) SeekGE(target []byte) bool {
@@ -1462,7 +1462,8 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	}
 
 	it.mergeIter.seekGE(target)
-	if it.mergeIter.err != nil {
+	if err := it.mergeIter.Err(); err != nil {
+		it.err = err
 		return false
 	}
 	return it.next()

@@ -3,14 +3,30 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+type closeErrorMergeSource struct {
+	closeErr error
+}
+
+func (*closeErrorMergeSource) first() (*sstable.InternalKey, []byte) { return nil, nil }
+func (*closeErrorMergeSource) next() (*sstable.InternalKey, []byte)  { return nil, nil }
+func (*closeErrorMergeSource) seekGE([]byte) (*sstable.InternalKey, []byte) {
+	return nil, nil
+}
+func (*closeErrorMergeSource) err() error { return nil }
+func (s *closeErrorMergeSource) close() error {
+	return s.closeErr
+}
 
 func writeTestSST(t *testing.T, ctx context.Context, store *blobstore.Store, ms *manifest.Store, entries []internal.MemEntry, level int, epoch uint64) writeSSTResult {
 	t.Helper()
@@ -308,6 +324,291 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	}
 	if !bytes.Equal(results[3].Key, []byte("e")) || !bytes.Equal(results[3].Value, []byte("ve")) {
 		t.Fatalf("scan[3]: %q=%q", results[3].Key, results[3].Value)
+	}
+}
+
+func TestReader_ScanLimit_LazilyOpensSortedLevel(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-scan-limit-lazy-level")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	first := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+	}, 1, 1)
+	second := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("m"), Seq: 2, Kind: internal.OpPut, Value: []byte("vm")},
+	}, 1, 2)
+	third := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("z"), Seq: 3, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 3)
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	results, err := reader.ScanLimit(ctx, nil, nil, 1)
+	if err != nil {
+		t.Fatalf("ScanLimit: %v", err)
+	}
+	if len(results) != 1 || !bytes.Equal(results[0].Key, []byte("a")) {
+		t.Fatalf("ScanLimit result: %+v", results)
+	}
+	if !reader.sstCached(first.Meta.ID) {
+		t.Fatal("first L1 SST was not opened")
+	}
+	if reader.sstCached(second.Meta.ID) {
+		t.Fatal("second L1 SST was opened after the scan reached its limit")
+	}
+	if reader.sstCached(third.Meta.ID) {
+		t.Fatal("third L1 SST was opened before the scan reached it")
+	}
+}
+
+func TestReader_ScanLimit_DoesNotReadPastLimit(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-scan-limit-no-read-ahead")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+	}, 1, 1)
+	second := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("z"), Seq: 2, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 2)
+	if err := store.Delete(ctx, store.SSTPath(second.Meta.ID)); err != nil {
+		t.Fatalf("delete second SST: %v", err)
+	}
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	results, err := reader.ScanLimit(ctx, nil, nil, 1)
+	if err != nil {
+		t.Fatalf("ScanLimit read beyond its limit: %v", err)
+	}
+	if len(results) != 1 || !bytes.Equal(results[0].Key, []byte("a")) {
+		t.Fatalf("ScanLimit result: %+v", results)
+	}
+}
+
+func TestReader_IteratorReturnsCurrentBeforeLaterSSTError(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-iterator-later-sst-error")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+	}, 1, 1)
+	second := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("z"), Seq: 2, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 2)
+	if err := store.Delete(ctx, store.SSTPath(second.Meta.ID)); err != nil {
+		t.Fatalf("delete second SST: %v", err)
+	}
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	iter, err := reader.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewIterator: %v", err)
+	}
+	defer iter.Close()
+
+	if !iter.Next() {
+		t.Fatalf("first Next was suppressed by a later SST error: %v", iter.Err())
+	}
+	if got := iter.Key(); !bytes.Equal(got, []byte("a")) {
+		t.Fatalf("first key: got %q want a", got)
+	}
+	if iter.Next() {
+		t.Fatal("second Next unexpectedly succeeded")
+	}
+	// The failed move must make the iterator terminal. Seeking before checking
+	// Err must not erase the failure and reopen an earlier healthy SST.
+	if iter.SeekGE([]byte("a")) {
+		t.Fatal("SeekGE succeeded after an unobserved iterator failure")
+	}
+	if err := iter.Err(); err == nil {
+		t.Fatal("later SST error was not reported through Iterator.Err")
+	}
+}
+
+func TestReader_Iterator_SeekGESkipsEarlierSortedLevelSSTs(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-seek-lazy-level")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	first := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+	}, 1, 1)
+	second := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("m"), Seq: 2, Kind: internal.OpPut, Value: []byte("vm")},
+	}, 1, 2)
+	third := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("z"), Seq: 3, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 3)
+	l0 := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("b"), Seq: 4, Kind: internal.OpPut, Value: []byte("vb")},
+	}, 0, 4)
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	iter, err := reader.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewIterator: %v", err)
+	}
+	defer iter.Close()
+
+	// Construction alone must not perform object I/O. Otherwise a subsequent
+	// seek pays for the first SST before jumping to the target SST.
+	if reader.sstCached(first.Meta.ID) {
+		t.Fatal("first L1 SST was opened before the iterator was positioned")
+	}
+	if reader.sstCached(second.Meta.ID) {
+		t.Fatal("middle L1 SST was opened before the iterator was positioned")
+	}
+	if reader.sstCached(third.Meta.ID) {
+		t.Fatal("target L1 SST was opened before the iterator was positioned")
+	}
+	if reader.sstCached(l0.Meta.ID) {
+		t.Fatal("L0 SST was opened before the iterator was positioned")
+	}
+	if !iter.SeekGE([]byte("z")) {
+		t.Fatalf("SeekGE(z): %v", iter.Err())
+	}
+	if got := iter.Key(); !bytes.Equal(got, []byte("z")) {
+		t.Fatalf("SeekGE key: got %q want z", got)
+	}
+	if reader.sstCached(second.Meta.ID) {
+		t.Fatal("middle L1 SST was opened by a seek that skipped over it")
+	}
+	if reader.sstCached(first.Meta.ID) {
+		t.Fatal("first L1 SST was opened by a seek that skipped over it")
+	}
+	if !reader.sstCached(third.Meta.ID) {
+		t.Fatal("target L1 SST was not opened")
+	}
+	if reader.sstCached(l0.Meta.ID) {
+		t.Fatal("L0 SST below the seek target was opened")
+	}
+}
+
+func TestReader_IteratorReportsInitialLazyOpenError(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-iterator-initial-open-error")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	first := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+	}, 1, 1)
+	if err := store.Delete(ctx, store.SSTPath(first.Meta.ID)); err != nil {
+		t.Fatalf("delete first SST: %v", err)
+	}
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	iter, err := reader.NewIterator(ctx, IteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewIterator should remain lazy: %v", err)
+	}
+	defer iter.Close()
+	if iter.Next() {
+		t.Fatal("Next unexpectedly succeeded for a missing first SST")
+	}
+	if err := iter.Err(); err == nil {
+		t.Fatal("initial lazy-open error was not reported through Iterator.Err")
+	}
+}
+
+func TestLevelMergeIteratorSourceCopiesSelectedMetadata(t *testing.T) {
+	all := make([]sstMetadata, 1024)
+	all[500].ID = "selected"
+	selected := all[500:501]
+
+	source := newLevelMergeIteratorSource(nil, context.Background(), selected, nil, nil)
+	if len(source.ssts) != 1 {
+		t.Fatalf("source metadata length=%d want=1", len(source.ssts))
+	}
+	if cap(source.ssts) != len(source.ssts) {
+		t.Fatalf("source retains level backing array: len=%d cap=%d", len(source.ssts), cap(source.ssts))
+	}
+
+	all[500].ID = "mutated"
+	if source.ssts[0].ID != "selected" {
+		t.Fatalf("source metadata aliases manifest storage: got ID %q", source.ssts[0].ID)
+	}
+}
+
+func TestLevelMergeIteratorSource_SeekGEReusesCurrentSST(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-seek-reuses-current-sst")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	result := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+		{Key: []byte("m"), Seq: 2, Kind: internal.OpPut, Value: []byte("vm")},
+		{Key: []byte("z"), Seq: 3, Kind: internal.OpPut, Value: []byte("vz")},
+	}, 1, 1)
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+
+	source := newLevelMergeIteratorSource(
+		reader, ctx, []sstMetadata{result.Meta}, nil, nil)
+	defer source.close()
+
+	key, _ := source.seekGE([]byte("a"))
+	if key == nil || !bytes.Equal(key.UserKey, []byte("a")) {
+		t.Fatalf("SeekGE(a): key=%v err=%v", key, source.err())
+	}
+	current := source.current
+	if current == nil {
+		t.Fatal("SeekGE(a) left no current SST iterator")
+	}
+
+	key, _ = source.seekGE([]byte("m"))
+	if key == nil || !bytes.Equal(key.UserKey, []byte("m")) {
+		t.Fatalf("SeekGE(m): key=%v err=%v", key, source.err())
+	}
+	if source.current != current {
+		t.Fatal("SeekGE within one SST rebuilt the SST iterator")
+	}
+}
+
+func TestReader_IteratorCloseReturnsSourceError(t *testing.T) {
+	want := errors.New("close source")
+	it := &Iterator{
+		ctx:     context.Background(),
+		sources: []mergeIteratorSource{&closeErrorMergeSource{closeErr: want}},
+	}
+
+	if err := it.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close error=%v want=%v", err, want)
 	}
 }
 

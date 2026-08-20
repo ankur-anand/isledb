@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -376,6 +379,354 @@ func BenchmarkFakeS3_KVReaderGet_RangeReadRequestShape(b *testing.B) {
 	}
 }
 
+// BenchmarkFakeS3_KVReaderScanLimit_ManyL1SSTs guards the lazy per-level scan
+// path. L1 SSTs are sorted and non-overlapping, so the cost of returning one
+// row should remain roughly constant as the number of SSTs in the level grows.
+//
+// The cold case exposes the resulting object-store request amplification. The
+// warm case keeps all range bytes in memory and isolates the CPU/allocation
+// cost of rebuilding every SST reader and iterator.
+func BenchmarkFakeS3_KVReaderScanLimit_ManyL1SSTs(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	for _, sstCount := range []int{16, 128, 512} {
+		b.Run(fmt.Sprintf("ssts=%d", sstCount), func(b *testing.B) {
+			reader, state, counts, metrics := prepareFakeS3KVBenchmarkL1(b, ctx, sstCount)
+			defer func() { _ = reader.Close() }()
+
+			for _, temperature := range []string{"cold", "warm"} {
+				b.Run(temperature, func(b *testing.B) {
+					if temperature == "warm" {
+						assertKVReaderBenchmarkScanLimit(b, ctx, reader, state, 1)
+						waitKVReaderBenchmarkCache(reader)
+					} else {
+						waitKVReaderBenchmarkCache(reader)
+						reader.blockCache.Clear()
+					}
+
+					counts.reset()
+					bytesBefore := kvReaderRemoteBytes(metrics)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if temperature == "cold" {
+							b.StopTimer()
+							waitKVReaderBenchmarkCache(reader)
+							reader.blockCache.Clear()
+							b.StartTimer()
+						}
+						assertKVReaderBenchmarkScanLimit(b, ctx, reader, state, 1)
+					}
+					b.StopTimer()
+
+					iterations := float64(b.N)
+					b.ReportMetric(float64(sstCount), "l1_ssts")
+					b.ReportMetric(float64(counts.ssts.Load())/iterations, "sst_GETs/op")
+					b.ReportMetric((kvReaderRemoteBytes(metrics)-bytesBefore)/iterations, "remote_B/op")
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkFakeS3_KVReaderScanLimit_LeveledDataset exercises lazy sorted-level
+// scanning through a more production-shaped manifest: multi-block SSTs,
+// overlapping L0 updates and tombstones, and two sorted levels containing
+// newer and older versions of the same keyspace.
+func BenchmarkFakeS3_KVReaderScanLimit_LeveledDataset(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	fixture := prepareFakeS3KVBenchmarkLeveled(b, ctx)
+	defer func() { _ = fixture.reader.Close() }()
+
+	cases := []struct {
+		name   string
+		minKey []byte
+		maxKey []byte
+		limit  int
+	}{
+		{name: "first-page-100", limit: 100},
+		{name: "first-page-1000", limit: 1000},
+		{name: "middle-page-100", minKey: kvLeveledBenchmarkKey(fixture.totalKeys / 2), limit: 100},
+		{
+			name:   "bounded-middle-window-100",
+			minKey: kvLeveledBenchmarkKey(fixture.totalKeys / 4),
+			maxKey: kvLeveledBenchmarkKey(3 * fixture.totalKeys / 4),
+			limit:  100,
+		},
+	}
+
+	for _, benchmarkCase := range cases {
+		b.Run(benchmarkCase.name, func(b *testing.B) {
+			candidateSSTs := kvBenchmarkOverlappingSSTCount(
+				fixture.state, benchmarkCase.minKey, benchmarkCase.maxKey)
+
+			for _, temperature := range []string{"cold", "warm"} {
+				b.Run(temperature, func(b *testing.B) {
+					if temperature == "warm" {
+						assertKVReaderBenchmarkScanLimitRange(
+							b, ctx, fixture.reader, fixture.state,
+							benchmarkCase.minKey, benchmarkCase.maxKey, benchmarkCase.limit)
+						waitKVReaderBenchmarkCache(fixture.reader)
+					} else {
+						waitKVReaderBenchmarkCache(fixture.reader)
+						fixture.reader.blockCache.Clear()
+					}
+
+					fixture.counts.reset()
+					bytesBefore := kvReaderRemoteBytes(fixture.metrics)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if temperature == "cold" {
+							b.StopTimer()
+							waitKVReaderBenchmarkCache(fixture.reader)
+							fixture.reader.blockCache.Clear()
+							b.StartTimer()
+						}
+						assertKVReaderBenchmarkScanLimitRange(
+							b, ctx, fixture.reader, fixture.state,
+							benchmarkCase.minKey, benchmarkCase.maxKey, benchmarkCase.limit)
+					}
+					b.StopTimer()
+
+					iterations := float64(b.N)
+					b.ReportMetric(float64(candidateSSTs), "candidate_ssts")
+					b.ReportMetric(float64(fixture.totalSSTs), "dataset_ssts")
+					b.ReportMetric(float64(fixture.totalKeys), "keyspace_keys")
+					b.ReportMetric(float64(fixture.sstBytes)/(1<<20), "sst_MiB")
+					b.ReportMetric(float64(fixture.counts.ssts.Load())/iterations, "sst_GETs/op")
+					b.ReportMetric(
+						(kvReaderRemoteBytes(fixture.metrics)-bytesBefore)/iterations, "remote_B/op")
+				})
+			}
+		})
+	}
+}
+
+type kvLeveledBenchmarkFixture struct {
+	reader    *Reader
+	state     *manifestState
+	counts    *kvS3ReadCounts
+	metrics   *ReaderMetrics
+	totalKeys int
+	totalSSTs int
+	sstBytes  int64
+}
+
+func prepareFakeS3KVBenchmarkLeveled(
+	b *testing.B,
+	ctx context.Context,
+) kvLeveledBenchmarkFixture {
+	b.Helper()
+
+	const (
+		totalKeys      = 65_536
+		valueBytes     = 256
+		l0SSTs         = 8
+		l0RowsPerSST   = 256
+		l1SSTs         = 256
+		l1RowsPerSST   = 256
+		l2SSTs         = 128
+		l2RowsPerSST   = 512
+		readerCacheMax = 128 << 20
+	)
+
+	counts := &kvS3ReadCounts{}
+	bucketURL := setupFakeS3BucketURLWithObserver(b, counts.observe)
+	store, err := blobstore.Open(ctx, bucketURL, fmt.Sprintf("bench/kv-leveled-%d", time.Now().UnixNano()))
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+
+	values := benchmarkChangeFeedValues(totalKeys, valueBytes, true)
+	state := &manifestState{}
+	var sstBytes int64
+
+	l1, bytesWritten := writeFakeS3KVBenchmarkLevel(
+		b, ctx, store, 1, l1SSTs, l1RowsPerSST, uint64(totalKeys), 2, values)
+	state.Levels = append(state.Levels, l1)
+	sstBytes += bytesWritten
+
+	l2, bytesWritten := writeFakeS3KVBenchmarkLevel(
+		b, ctx, store, 2, l2SSTs, l2RowsPerSST, 0, 1, values)
+	state.Levels = append(state.Levels, l2)
+	sstBytes += bytesWritten
+
+	for i := 0; i < l0SSTs; i++ {
+		entries := make([]internal.MemEntry, 0, l0RowsPerSST)
+		for j := 0; j < l0RowsPerSST; j++ {
+			keyIndex := j*(totalKeys/l0RowsPerSST) + i
+			entry := internal.MemEntry{
+				Key:   kvLeveledBenchmarkKey(keyIndex),
+				Seq:   uint64(2*totalKeys + (l0SSTs-i)*l0RowsPerSST + j),
+				Kind:  internal.OpPut,
+				Value: values[keyIndex],
+			}
+			if (i+j)%11 == 0 {
+				entry.Kind = internal.OpDelete
+				entry.Value = nil
+			}
+			entries = append(entries, entry)
+		}
+
+		meta, written := writeFakeS3KVBenchmarkSST(
+			b, ctx, store, entries, 0, uint64(10-i))
+		state.L0SSTs = append(state.L0SSTs, meta)
+		sstBytes += written
+	}
+
+	if err := state.ValidateLevels(); err != nil {
+		b.Fatalf("validate benchmark manifest: %v", err)
+	}
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:                 b.TempDir(),
+		BlockCacheSize:           readerCacheMax,
+		AllowUnverifiedRangeRead: true,
+		RangeReadMinSSTSize:      1,
+		Metrics:                  metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
+
+	return kvLeveledBenchmarkFixture{
+		reader: reader, state: state, counts: counts, metrics: metrics,
+		totalKeys: totalKeys, totalSSTs: l0SSTs + l1SSTs + l2SSTs, sstBytes: sstBytes,
+	}
+}
+
+func writeFakeS3KVBenchmarkLevel(
+	b *testing.B,
+	ctx context.Context,
+	store *blobstore.Store,
+	levelNumber, sstCount, rowsPerSST int,
+	seqBase, epoch uint64,
+	values [][]byte,
+) (manifest.Level, int64) {
+	b.Helper()
+
+	level := manifest.Level{
+		Number: uint32(levelNumber),
+		SSTs:   make([]manifest.SSTMeta, 0, sstCount),
+	}
+	var bytesWritten int64
+	for sstIndex := 0; sstIndex < sstCount; sstIndex++ {
+		entries := make([]internal.MemEntry, rowsPerSST)
+		for row := 0; row < rowsPerSST; row++ {
+			keyIndex := sstIndex*rowsPerSST + row
+			entries[row] = internal.MemEntry{
+				Key: kvLeveledBenchmarkKey(keyIndex), Seq: seqBase + uint64(keyIndex+1),
+				Kind: internal.OpPut, Value: values[keyIndex],
+			}
+		}
+		meta, written := writeFakeS3KVBenchmarkSST(
+			b, ctx, store, entries, uint32(levelNumber), epoch)
+		level.SSTs = append(level.SSTs, meta)
+		bytesWritten += written
+	}
+	return level, bytesWritten
+}
+
+func writeFakeS3KVBenchmarkSST(
+	b *testing.B,
+	ctx context.Context,
+	store *blobstore.Store,
+	entries []internal.MemEntry,
+	level uint32,
+	epoch uint64,
+) (manifest.SSTMeta, int64) {
+	b.Helper()
+
+	result, err := writeSST(ctx, &sliceSSTIter{entries: entries}, sstWriterOptions{
+		BlockSize: 4096, BloomBitsPerKey: 10, Compression: "snappy",
+	}, epoch)
+	if err != nil {
+		b.Fatalf("write L%d SST: %v", level, err)
+	}
+	result.Meta.Level = level
+	if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), result.SSTData); err != nil {
+		b.Fatalf("store L%d SST: %v", level, err)
+	}
+	return result.Meta, int64(len(result.SSTData))
+}
+
+func kvLeveledBenchmarkKey(index int) []byte {
+	return []byte(fmt.Sprintf("key-%08d", index))
+}
+
+func kvBenchmarkOverlappingSSTCount(state *manifestState, minKey, maxKey []byte) int {
+	if state == nil {
+		return 0
+	}
+	count := 0
+	for _, sst := range state.L0SSTs {
+		if internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+			count++
+		}
+	}
+	for i := range state.Levels {
+		count += len(state.Levels[i].OverlappingSSTs(minKey, maxKey))
+	}
+	return count
+}
+
+func prepareFakeS3KVBenchmarkL1(
+	b *testing.B,
+	ctx context.Context,
+	sstCount int,
+) (*Reader, *manifestState, *kvS3ReadCounts, *ReaderMetrics) {
+	b.Helper()
+
+	counts := &kvS3ReadCounts{}
+	bucketURL := setupFakeS3BucketURLWithObserver(b, counts.observe)
+	store, err := blobstore.Open(ctx, bucketURL, fmt.Sprintf("bench/kv-l1-%d", time.Now().UnixNano()))
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+
+	level := manifest.Level{Number: 1, SSTs: make([]manifest.SSTMeta, 0, sstCount)}
+	value := []byte("value")
+	for i := 0; i < sstCount; i++ {
+		key := []byte(fmt.Sprintf("key-%08d", i))
+		result, err := writeSST(ctx, &sliceSSTIter{entries: []internal.MemEntry{{
+			Key: key, Seq: uint64(i + 1), Kind: internal.OpPut, Value: value,
+		}}}, sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1)
+		if err != nil {
+			b.Fatalf("write SST %d: %v", i, err)
+		}
+		result.Meta.Level = 1
+		if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), result.SSTData); err != nil {
+			b.Fatalf("store SST %d: %v", i, err)
+		}
+		level.SSTs = append(level.SSTs, result.Meta)
+	}
+
+	state := &manifestState{Levels: []manifest.Level{level}}
+	if err := state.ValidateLevels(); err != nil {
+		b.Fatalf("validate benchmark manifest: %v", err)
+	}
+
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:                 b.TempDir(),
+		BlockCacheSize:           64 << 20,
+		AllowUnverifiedRangeRead: true,
+		RangeReadMinSSTSize:      1,
+		Metrics:                  metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
+	return reader, state, counts, metrics
+}
+
 func prepareFakeS3KVReaderBenchmark(
 	b *testing.B,
 	ctx context.Context,
@@ -517,5 +868,34 @@ func assertKVReaderBenchmarkScan(b *testing.B, ctx context.Context, reader *Read
 	}
 	if len(values) != records {
 		b.Fatalf("Scan records=%d want=%d", len(values), records)
+	}
+}
+
+func assertKVReaderBenchmarkScanLimit(
+	b *testing.B,
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	limit int,
+) {
+	b.Helper()
+	assertKVReaderBenchmarkScanLimitRange(b, ctx, reader, state, nil, nil, limit)
+}
+
+func assertKVReaderBenchmarkScanLimitRange(
+	b *testing.B,
+	ctx context.Context,
+	reader *Reader,
+	state *manifestState,
+	minKey, maxKey []byte,
+	limit int,
+) {
+	b.Helper()
+	values, err := reader.scanInternalWithManifest(ctx, state, minKey, maxKey, limit)
+	if err != nil {
+		b.Fatalf("ScanLimit: %v", err)
+	}
+	if len(values) != limit {
+		b.Fatalf("ScanLimit records=%d want=%d", len(values), limit)
 	}
 }
