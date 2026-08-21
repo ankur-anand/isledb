@@ -25,6 +25,7 @@ type artifactContentTier struct {
 	publishMu         sync.Mutex
 	indexMu           sync.Mutex
 	index             *artifactContentIndex
+	openPersistent    func(artifactContentAddress, int64, string) ([]byte, bool, error)
 	capacityEvictions atomic.Int64
 }
 
@@ -33,7 +34,7 @@ func newArtifactContentTier(kind ArtifactKind, maxBytes int64) (*artifactContent
 	if err != nil {
 		return nil, err
 	}
-	return &artifactContentTier{index: index}, nil
+	return &artifactContentTier{index: index, openPersistent: openPersistentArtifact}, nil
 }
 
 // probe checks residency without pinning or changing recency.
@@ -112,6 +113,9 @@ func (tier *artifactContentTier) publishPinned(
 
 	tier.indexMu.Lock()
 	entry, inserted, err := tier.index.insertPinned(address, size)
+	if err == nil && !inserted && entry != nil {
+		_, err = tier.index.release(entry)
+	}
 	tier.indexMu.Unlock()
 	if err != nil || !inserted {
 		if err == nil {

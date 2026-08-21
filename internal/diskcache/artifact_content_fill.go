@@ -24,6 +24,7 @@ type artifactContentFill struct {
 	hash         hash.Hash
 	written      int64
 	done         bool
+	syncFile     func(*os.File) error
 }
 
 func newArtifactContentFill(
@@ -52,6 +53,9 @@ func newArtifactContentFill(
 		file:         file,
 		path:         file.Name(),
 		hash:         sha256.New(),
+		syncFile: func(file *os.File) error {
+			return file.Sync()
+		},
 	}, nil
 }
 
@@ -80,8 +84,11 @@ func (fill *artifactContentFill) Write(data []byte) (int, error) {
 	return written, err
 }
 
-// finish verifies the completed download and transfers ownership of its temp
-// file to a staged artifact. Verification failures close and remove the temp.
+// finish verifies and syncs the completed download, then transfers ownership
+// of its temp file to a staged artifact. The sync deliberately happens before
+// publication locking. Verification failures close and remove the temp; a
+// sync failure leaves verified bytes staged so the initiating read can use a
+// transient handle.
 func (fill *artifactContentFill) finish() (*artifactStagedContent, error) {
 	if fill == nil {
 		return nil, os.ErrInvalid
@@ -110,15 +117,16 @@ func (fill *artifactContentFill) finish() (*artifactStagedContent, error) {
 	if subtle.ConstantTimeCompare(actualChecksum, fill.address.checksum[:]) != 1 {
 		return cleanupFailure(ErrArtifactChecksumMismatch)
 	}
-	return &artifactStagedContent{
+	staged := &artifactStagedContent{
 		address: fill.address,
 		size:    written,
 		file:    file,
 		path:    path,
-		syncFile: func(file *os.File) error {
-			return file.Sync()
-		},
-	}, nil
+	}
+	if err := fill.syncFile(file); err != nil {
+		return staged, fmt.Errorf("diskcache: sync incoming artifact: %w", err)
+	}
+	return staged, nil
 }
 
 // abort removes an incomplete download. It is safe to call after finish.
@@ -157,13 +165,12 @@ type artifactStagedContent struct {
 	file     *os.File
 	path     string
 	consumed bool
-	syncFile func(*os.File) error
 }
 
-// publish syncs the completed file and renames it to its derived final path.
-// Directory entries are intentionally not synced because cache persistence is
-// best-effort. On failure the incoming path remains available for transient
-// serving whenever the rename did not succeed.
+// publish closes the already-synced file and renames it to its derived final
+// path. Directory entries are intentionally not synced because cache
+// persistence is best-effort. On failure the incoming path remains available
+// for transient serving whenever the rename did not succeed.
 func (staged *artifactStagedContent) publish(finalPath string) error {
 	if staged == nil {
 		return os.ErrInvalid
@@ -174,9 +181,6 @@ func (staged *artifactStagedContent) publish(finalPath string) error {
 		return os.ErrClosed
 	}
 	if staged.file != nil {
-		if err := staged.syncFile(staged.file); err != nil {
-			return fmt.Errorf("diskcache: sync incoming artifact: %w", err)
-		}
 		if err := staged.file.Close(); err != nil {
 			staged.file = nil
 			return fmt.Errorf("diskcache: close incoming artifact: %w", err)
@@ -194,10 +198,11 @@ func (staged *artifactStagedContent) publish(finalPath string) error {
 	return nil
 }
 
-// openTransient transfers the incoming file to a handle that unconditionally
-// removes that unique temp path when closed. It never owns a final derived
-// cache path.
-func (staged *artifactStagedContent) openTransient() (*artifactTransientHandle, error) {
+// prepareHandle establishes the view used by the initiating read before the
+// staged inode is renamed. An SST mapping remains valid across rename; Bloom
+// bytes are copied to heap once. Publication can therefore never strand a
+// verified download between rename and a later open or mmap.
+func (staged *artifactStagedContent) prepareHandle() (*artifactPreparedContent, error) {
 	if staged == nil {
 		return nil, os.ErrInvalid
 	}
@@ -206,29 +211,113 @@ func (staged *artifactStagedContent) openTransient() (*artifactTransientHandle, 
 	if staged.consumed || staged.path == "" {
 		return nil, os.ErrClosed
 	}
-	if staged.file != nil {
-		if err := staged.file.Close(); err != nil {
-			staged.file = nil
-			cleanupErr := removeArtifactContentFile(staged.path)
-			staged.path = ""
-			staged.consumed = true
-			return nil, errors.Join(
-				fmt.Errorf("diskcache: close transient artifact: %w", err), cleanupErr)
+
+	if staged.address.kind == ArtifactBloom {
+		data := make([]byte, staged.size)
+		var err error
+		if staged.file != nil {
+			_, err = staged.file.ReadAt(data, 0)
+		} else {
+			data, err = os.ReadFile(staged.path)
 		}
+		if err != nil {
+			return nil, fmt.Errorf("diskcache: read staged Bloom: %w", err)
+		}
+		if int64(len(data)) != staged.size {
+			return nil, fmt.Errorf(
+				"%w: got=%d want=%d", ErrArtifactSizeMismatch, len(data), staged.size)
+		}
+		return &artifactPreparedContent{data: data}, nil
+	}
+
+	if staged.address.kind != ArtifactSST {
+		return nil, fmt.Errorf(
+			"diskcache: invalid staged artifact kind %d", staged.address.kind)
+	}
+	var (
+		data []byte
+		err  error
+	)
+	if staged.file != nil {
+		data, err = MmapFile(staged.file)
+	} else {
+		data, _, err = readTransientArtifact(ArtifactSST, staged.path)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("diskcache: map staged SST: %w", err)
+	}
+	return &artifactPreparedContent{data: data, mapped: true}, nil
+}
+
+type artifactPreparedContent struct {
+	data   []byte
+	mapped bool
+}
+
+func (prepared *artifactPreparedContent) take() ([]byte, bool) {
+	if prepared == nil {
+		return nil, false
+	}
+	data, mapped := prepared.data, prepared.mapped
+	prepared.data = nil
+	prepared.mapped = false
+	return data, mapped
+}
+
+func (prepared *artifactPreparedContent) close() error {
+	if prepared == nil {
+		return nil
+	}
+	data, mapped := prepared.take()
+	if mapped {
+		return Munmap(data)
+	}
+	return nil
+}
+
+// openTransient transfers the incoming file to a handle that unconditionally
+// removes that unique temp path when closed. It never owns a final derived
+// cache path.
+func (staged *artifactStagedContent) openTransient() (*artifactTransientHandle, error) {
+	prepared, err := staged.prepareHandle()
+	if err != nil {
+		return nil, err
+	}
+	handle, err := staged.takeTransient(prepared)
+	if err != nil {
+		_ = prepared.close()
+	}
+	return handle, err
+}
+
+// takeTransient transfers a prepared view and the unique incoming path to a
+// transient handle. A successfully published staged artifact has no incoming
+// path; that defensive case still serves the prepared bytes without claiming
+// ownership of the final derived path.
+func (staged *artifactStagedContent) takeTransient(
+	prepared *artifactPreparedContent,
+) (*artifactTransientHandle, error) {
+	if staged == nil {
+		return nil, os.ErrInvalid
+	}
+	staged.mu.Lock()
+	defer staged.mu.Unlock()
+	data, mapped := prepared.take()
+	if data == nil {
+		return nil, os.ErrInvalid
+	}
+	var closeErr error
+	if staged.file != nil {
+		closeErr = staged.file.Close()
 		staged.file = nil
 	}
 
 	path := staged.path
-	data, mapped, err := readTransientArtifact(staged.address.kind, path)
-	if err != nil {
-		cleanupErr := removeArtifactContentFile(path)
-		staged.path = ""
-		staged.consumed = true
-		return nil, errors.Join(err, cleanupErr)
-	}
 	staged.path = ""
 	staged.consumed = true
-	return &artifactTransientHandle{data: data, path: path, mapped: mapped}, nil
+	return &artifactTransientHandle{
+		data: data, path: path, mapped: mapped, err: closeErr,
+	}, nil
 }
 
 func (staged *artifactStagedContent) discard() error {

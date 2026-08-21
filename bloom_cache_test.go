@@ -9,6 +9,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestBuildBloomBytesHonorsBitsPerKey(t *testing.T) {
@@ -166,9 +167,11 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse bloom A: %v", err)
 	}
+	metrics := DefaultReaderMetrics(nil)
 	reader := &Reader{
 		store:      store,
 		bloomCache: newBloomFilterCache(bloomFilterCacheCost(metaA.ID, filterA)),
+		metrics:    metrics,
 	}
 
 	if contains, err := reader.bloomMayContain(ctx, metaA, keyA); err != nil || !contains {
@@ -192,8 +195,11 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	if err := store.Delete(ctx, store.SSTPath(metaA.ID)); err != nil {
 		t.Fatalf("delete evicted bloom A: %v", err)
 	}
-	if _, err := reader.bloomMayContain(ctx, metaA, keyA); err == nil {
-		t.Fatal("evicted bloom A was returned without reloading its deleted origin")
+	if contains, err := reader.bloomMayContain(ctx, metaA, keyA); err != nil || !contains {
+		t.Fatalf("unavailable bloom must fail open: contains=%t err=%v", contains, err)
+	}
+	if got := testutil.ToFloat64(metrics.BloomFilterErrors); got != 1 {
+		t.Fatalf("Bloom errors=%v, want 1", got)
 	}
 
 	stats := reader.BloomCacheStats()
@@ -222,17 +228,22 @@ func TestReaderRejectsBloomChecksumMismatchBeforeCaching(t *testing.T) {
 		t.Fatalf("write corrupt bloom: %v", err)
 	}
 
-	reader := &Reader{store: store, bloomCache: newBloomFilterCache(1 << 20)}
-	if _, err := reader.bloomMayContain(ctx, meta, key); err == nil ||
-		!strings.Contains(err.Error(), "bloom checksum mismatch") {
-		t.Fatalf("bloom checksum error=%v", err)
+	metrics := DefaultReaderMetrics(nil)
+	reader := &Reader{
+		store: store, bloomCache: newBloomFilterCache(1 << 20), metrics: metrics,
+	}
+	if contains, err := reader.bloomMayContain(ctx, meta, key); err != nil || !contains {
+		t.Fatalf("corrupt bloom must fail open: contains=%t err=%v", contains, err)
 	}
 	if stats := reader.BloomCacheStats(); stats.EntryCount != 0 {
 		t.Fatalf("corrupt bloom entered cache: %+v", stats)
 	}
+	if got := testutil.ToFloat64(metrics.BloomFilterErrors); got != 1 {
+		t.Fatalf("Bloom errors=%v, want 1", got)
+	}
 }
 
-func TestReaderAllowsLegacyBloomWithoutChecksum(t *testing.T) {
+func TestReaderBloomWithoutChecksumFailsOpen(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-legacy-bloom")
 	defer store.Close()
@@ -248,9 +259,9 @@ func TestReaderAllowsLegacyBloomWithoutChecksum(t *testing.T) {
 	}
 
 	reader := &Reader{store: store, bloomCache: newBloomFilterCache(1 << 20)}
-	contains, err := reader.bloomMayContain(ctx, meta, key)
+	contains, err := reader.bloomMayContain(ctx, meta, []byte("definitely-absent"))
 	if err != nil || !contains {
-		t.Fatalf("legacy bloom contains=%t err=%v", contains, err)
+		t.Fatalf("checksum-less bloom must fail open: contains=%t err=%v", contains, err)
 	}
 }
 

@@ -174,7 +174,7 @@ func initReaderDiskCache(opts readerOptions) (
 	return cache, true, nil
 }
 
-// Refresh reloads the manifest and invalidates caches for removed SSTs.
+// Refresh reloads and publishes the current manifest view.
 func (r *Reader) Refresh(ctx context.Context) (err error) {
 	done, err := r.beginRead()
 	if err != nil {
@@ -707,12 +707,14 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 			if !filter.Has(bloomHashKey(key)) {
 				return nil, false, false, nil
 			}
-		} else if resident, err := r.sstResident(sstMeta); err != nil {
-			return nil, false, false, fmt.Errorf("probe sst %s: %w", sstMeta.ID, err)
-		} else if !resident {
+		} else if resident, _ := r.sstResident(sstMeta); !resident {
 			mayContain, err := r.bloomMayContain(ctx, sstMeta, key)
 			if err != nil {
-				return nil, false, false, err
+				// bloomMayContain is fail-open, so reaching this branch is a
+				// defensive invariant. Never let a Bloom diagnostic suppress
+				// the authoritative SST lookup.
+				r.observeBloomFilterError(sstMeta.ID, err)
+				mayContain = true
 			}
 			if !mayContain {
 				return nil, false, false, nil
@@ -772,12 +774,15 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 			filter, parseErr := parseBloomFilter(handle.Bytes())
 			closeErr := handle.Close()
 			if parseErr != nil {
-				_ = r.artifactCache.Remove(
+				removeErr := r.artifactCache.Remove(
 					bloomArtifactDescriptor(sstMeta), diskcache.ArtifactRemovalCorrupt)
+				r.observeBloomFilterError(
+					sstMeta.ID, errors.Join(parseErr, closeErr, removeErr))
 			} else {
 				// Cleanup errors are cache diagnostics. The decoded heap copy is
 				// independent of the persistent handle and remains safe to use.
-				_ = closeErr
+				r.observeArtifactCacheDiagnostic(
+					"release", diskcache.ArtifactBloom, sstMeta.ID, closeErr)
 				r.bloomCache.put(sstMeta.ID, filter)
 				return filter, nil
 			}
@@ -791,7 +796,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		// Reader manifest activation requires a checksum for every present Bloom.
 		// A cache-less internal Reader must still verify the origin response before
 		// a corrupted false negative can enter the decoded in-memory cache.
-		if r.artifactCache == nil && sstMeta.Bloom.Checksum != "" {
+		if r.artifactCache == nil {
 			if err := validateBloomChecksum(sstMeta.Bloom.Checksum, data); err != nil {
 				return nil, fmt.Errorf("validate bloom %s: %w", sstMeta.ID, err)
 			}
@@ -819,16 +824,24 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		}
 		if handle != nil {
 			if err := handle.Close(); err != nil {
-				return nil, fmt.Errorf("release bloom %s: %w", sstMeta.ID, err)
+				r.observeArtifactCacheDiagnostic(
+					"release", diskcache.ArtifactBloom, sstMeta.ID, err)
 			}
 		}
 		r.bloomCache.put(sstMeta.ID, filter)
 		return filter, nil
 	})
 	if err != nil {
-		return false, err
+		r.observeBloomFilterError(sstMeta.ID, err)
+		return true, nil
 	}
-	return value.(*z.Bloom).Has(bloomHashKey(key)), nil
+	filter, ok := value.(*z.Bloom)
+	if !ok || filter == nil {
+		err := fmt.Errorf("bloom load %s returned %T", sstMeta.ID, value)
+		r.observeBloomFilterError(sstMeta.ID, err)
+		return true, nil
+	}
+	return filter.Has(bloomHashKey(key)), nil
 }
 
 func (r *Reader) entryValue(_ context.Context, entry internal.CompactionEntry) ([]byte, error) {
@@ -1073,10 +1086,14 @@ func (r *Reader) downloadSSTArtifact(
 	// verified download are handled by Commit's transient-file path.
 	fill, err := r.artifactCache.BeginFill(sstArtifactDescriptor(*meta))
 	if err != nil {
+		r.observeArtifactCacheDiagnostic("begin-fill", diskcache.ArtifactSST, meta.ID, err)
 		return nil, 0, fmt.Errorf("begin cache fill for sst %s: %w", meta.ID, err)
 	}
 	defer fill.Abort()
 
+	// The enclosing object may append Bloom and trailer bytes after the Pebble
+	// payload. ArtifactFill intentionally rejects overflow, so keep this stream
+	// bounded to exactly the manifest's [0, Size) SST extent.
 	stream, err := r.store.ReadRangeStream(ctx, path, 0, meta.Size)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read sst %s: %w", path, err)

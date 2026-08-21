@@ -171,27 +171,20 @@ func TestArtifactContentSyncFailureCanStillServeTransient(t *testing.T) {
 	}
 	data := []byte("verified but not durable")
 	desc := contentFillDescriptor(ArtifactBloom, "sst-a", data)
-	staged := finishArtifactContentFill(t, incomingDir, desc, data)
-	tempPath := staged.path
-	wantErr := errors.New("sync failed")
-	staged.syncFile = func(*os.File) error { return wantErr }
-	tier, err := newArtifactContentTier(ArtifactBloom, int64(len(data)))
+	fill, err := newArtifactContentFill(incomingDir, desc)
 	if err != nil {
-		t.Fatalf("new tier: %v", err)
+		t.Fatalf("new fill: %v", err)
 	}
-	finalPath := filepath.Join(root, staged.address.relativePath())
-
-	entry, admission, err := tier.publishPinned(
-		staged.address,
-		staged.size,
-		func() error { return staged.publish(finalPath) },
-		func(address artifactContentAddress) error {
-			return removeArtifactContentFile(filepath.Join(root, address.relativePath()))
-		},
-	)
-	if entry != nil || admission != artifactContentBypassedPublicationFailure || !errors.Is(err, wantErr) {
-		t.Fatalf("entry=%p admission=%d err=%v, want sync-failure bypass", entry, admission, err)
+	if _, err := fill.Write(data); err != nil {
+		t.Fatalf("write fill: %v", err)
 	}
+	wantErr := errors.New("sync failed")
+	fill.syncFile = func(*os.File) error { return wantErr }
+	staged, err := fill.finish()
+	if staged == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("finish: staged=%p err=%v, want staged sync failure", staged, err)
+	}
+	tempPath := staged.path
 	handle, openErr := staged.openTransient()
 	if openErr != nil {
 		t.Fatalf("open transient after sync failure: %v", openErr)
@@ -204,6 +197,52 @@ func TestArtifactContentSyncFailureCanStillServeTransient(t *testing.T) {
 	}
 	if _, statErr := os.Stat(tempPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("transient temp file remains after close: %v", statErr)
+	}
+}
+
+func TestArtifactContentFillSyncRunsBeforePublicationLock(t *testing.T) {
+	root := t.TempDir()
+	incomingDir := filepath.Join(root, "incoming")
+	if err := os.MkdirAll(incomingDir, 0o700); err != nil {
+		t.Fatalf("create incoming: %v", err)
+	}
+	data := []byte("sync outside publication lock")
+	fill, err := newArtifactContentFill(
+		incomingDir, contentFillDescriptor(ArtifactSST, "sst-a", data))
+	if err != nil {
+		t.Fatalf("new fill: %v", err)
+	}
+	if _, err := fill.Write(data); err != nil {
+		t.Fatalf("write fill: %v", err)
+	}
+	tier, err := newArtifactContentTier(ArtifactSST, int64(len(data)))
+	if err != nil {
+		t.Fatalf("new tier: %v", err)
+	}
+	fill.syncFile = func(*os.File) error {
+		if !tier.publishMu.TryLock() {
+			t.Fatal("file sync ran while publication mutex was held")
+		}
+		tier.publishMu.Unlock()
+		return nil
+	}
+	staged, err := fill.finish()
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	defer staged.discard()
+
+	finalPath := filepath.Join(root, staged.address.relativePath())
+	entry, admission, err := tier.publishPinned(
+		staged.address,
+		staged.size,
+		func() error { return staged.publish(finalPath) },
+		func(address artifactContentAddress) error {
+			return removeArtifactContentFile(filepath.Join(root, address.relativePath()))
+		},
+	)
+	if err != nil || admission != artifactContentAdmitted || entry == nil {
+		t.Fatalf("publish: entry=%p admission=%d err=%v", entry, admission, err)
 	}
 }
 

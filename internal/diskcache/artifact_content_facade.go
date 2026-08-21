@@ -237,10 +237,21 @@ func (fill *artifactContentCacheFill) commit() (
 	fill.done = true
 	fill.mu.Unlock()
 
-	staged, err := fill.fill.finish()
-	if err != nil {
+	staged, finishErr := fill.fill.finish()
+	if staged == nil {
 		fill.completeWithoutHandle()
-		return nil, 0, err
+		return nil, 0, finishErr
+	}
+	prepared, prepareErr := staged.prepareHandle()
+	if prepareErr != nil {
+		_ = staged.discard()
+		fill.completeWithoutHandle()
+		return nil, 0, errors.Join(finishErr, prepareErr)
+	}
+	if finishErr != nil {
+		fill.recordAdmission(artifactContentBypassedPublicationFailure)
+		return fill.transientOrError(
+			staged, prepared, artifactContentBypassedPublicationFailure, finishErr)
 	}
 	tier := fill.cache.tiers[fill.kind]
 	entry, admission, publishErr := tier.publishPinned(
@@ -254,15 +265,11 @@ func (fill *artifactContentCacheFill) commit() (
 	switch admission {
 	case artifactContentAdmitted:
 		if publishErr != nil {
-			return fill.transientOrError(staged, admission, publishErr)
+			return fill.transientOrError(staged, prepared, admission, publishErr)
 		}
-		persistent, hit, openErr := tier.openPinned(
-			entry, fill.cache.path(staged.address), fill.cache.remove)
-		if openErr != nil || !hit {
-			_ = staged.discard()
-			fill.completeWithoutHandle()
-			return nil, admission, openErr
-		}
+		data, mapped := prepared.take()
+		persistent := newArtifactPersistentHandle(
+			tier, entry, fill.cache.remove, data, mapped)
 		_ = staged.discard()
 		fill.completeIncomingAccounting()
 		return fill.cache.transitionFillToHandleForTier(
@@ -273,6 +280,7 @@ func (fill *artifactContentCacheFill) commit() (
 			persistent, hit, openErr := tier.openPinned(
 				entry, fill.cache.path(staged.address), fill.cache.remove)
 			if openErr == nil && hit {
+				_ = prepared.close()
 				_ = staged.discard()
 				fill.completeIncomingAccounting()
 				return fill.cache.transitionFillToHandleForTier(
@@ -281,14 +289,16 @@ func (fill *artifactContentCacheFill) commit() (
 			publishErr = openErr
 		}
 		fill.cache.counters[fill.kind].bypassedPublicationFailure.Add(1)
-		return fill.transientOrError(staged, artifactContentBypassedPublicationFailure, publishErr)
+		return fill.transientOrError(
+			staged, prepared, artifactContentBypassedPublicationFailure, publishErr)
 
 	case artifactContentBypassedOversized,
 		artifactContentBypassedPinnedCapacity,
 		artifactContentBypassedPublicationFailure:
-		return fill.transientOrError(staged, admission, publishErr)
+		return fill.transientOrError(staged, prepared, admission, publishErr)
 
 	default:
+		_ = prepared.close()
 		_ = staged.discard()
 		fill.completeWithoutHandle()
 		return nil, admission, errors.New("diskcache: invalid content admission outcome")
@@ -297,11 +307,13 @@ func (fill *artifactContentCacheFill) commit() (
 
 func (fill *artifactContentCacheFill) transientOrError(
 	staged *artifactStagedContent,
+	prepared *artifactPreparedContent,
 	admission artifactContentAdmission,
 	diagnostic error,
 ) (*artifactContentCacheHandle, artifactContentAdmission, error) {
-	transient, err := staged.openTransient()
+	transient, err := staged.takeTransient(prepared)
 	if err != nil {
+		_ = prepared.close()
 		_ = staged.discard()
 		fill.completeWithoutHandle()
 		return nil, admission, errors.Join(diagnostic, err)

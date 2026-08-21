@@ -87,20 +87,40 @@ func (tier *artifactContentTier) openPinned(
 	if entry == nil || removeFile == nil {
 		return nil, false, errors.New("diskcache: invalid pinned artifact open")
 	}
-	data, mapped, err := openPersistentArtifact(entry.address, entry.size, path)
+	data, mapped, err := tier.openPersistent(entry.address, entry.size, path)
 	if err == nil {
-		return &artifactPersistentHandle{
-			data:       data,
-			mapped:     mapped,
-			tier:       tier,
-			entry:      entry,
-			removeFile: removeFile,
-		}, true, nil
+		return newArtifactPersistentHandle(
+			tier, entry, removeFile, data, mapped), true, nil
 	}
 
-	_, detachErr := tier.detach(entry, removeFile)
+	var detachErr error
+	if artifactOpenFailureRequiresRemoval(err) {
+		_, detachErr = tier.detach(entry, removeFile)
+	}
 	releaseErr := tier.release(entry, removeFile)
 	return nil, false, errors.Join(err, detachErr, releaseErr)
+}
+
+func newArtifactPersistentHandle(
+	tier *artifactContentTier,
+	entry *artifactContentIndexEntry,
+	removeFile func(artifactContentAddress) error,
+	data []byte,
+	mapped bool,
+) *artifactPersistentHandle {
+	return &artifactPersistentHandle{
+		data:       data,
+		mapped:     mapped,
+		tier:       tier,
+		entry:      entry,
+		removeFile: removeFile,
+	}
+}
+
+func artifactOpenFailureRequiresRemoval(err error) bool {
+	return errors.Is(err, ErrArtifactSizeMismatch) ||
+		errors.Is(err, ErrArtifactChecksumMismatch) ||
+		errors.Is(err, os.ErrNotExist)
 }
 
 func openPersistentArtifact(
@@ -151,6 +171,14 @@ func readPersistentBloom(
 	expectedSize int64,
 	expectedChecksum [sha256.Size]byte,
 ) ([]byte, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("diskcache: stat persistent Bloom: %w", err)
+	}
+	if info.Size() != expectedSize {
+		return nil, false, fmt.Errorf(
+			"%w: got=%d want=%d", ErrArtifactSizeMismatch, info.Size(), expectedSize)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false, fmt.Errorf("diskcache: read persistent Bloom: %w", err)

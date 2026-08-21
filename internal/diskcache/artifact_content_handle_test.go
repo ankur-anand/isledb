@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -161,5 +162,34 @@ func TestArtifactContentPersistentSSTAcquireUsesPerHandleMappings(t *testing.T) 
 	}
 	if got := publishedEntry.refs; got != 0 {
 		t.Fatalf("references after closes=%d, want 0", got)
+	}
+}
+
+func TestArtifactContentTransientOpenFailurePreservesResidentArtifact(t *testing.T) {
+	data := []byte("healthy persistent SST bytes")
+	tier, publishedEntry, address, path := publishArtifactContentForHandleTest(t, ArtifactSST, data)
+	removeFile := func(artifactContentAddress) error { return removeArtifactContentFile(path) }
+	if err := tier.release(publishedEntry, removeFile); err != nil {
+		t.Fatalf("release publication reference: %v", err)
+	}
+
+	wantErr := syscall.EMFILE
+	tier.openPersistent = func(
+		artifactContentAddress, int64, string,
+	) ([]byte, bool, error) {
+		return nil, false, wantErr
+	}
+	handle, ok, err := tier.acquire(address, int64(len(data)), path, removeFile)
+	if handle != nil || ok || !errors.Is(err, wantErr) {
+		t.Fatalf("acquire: handle=%p ok=%t err=%v, want transient miss", handle, ok, err)
+	}
+	if _, resident := tier.probe(address); !resident {
+		t.Fatal("transient open failure detached healthy artifact")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("transient open failure removed healthy artifact: %v", err)
+	}
+	if got := publishedEntry.refs; got != 0 {
+		t.Fatalf("references after failed open=%d, want 0", got)
 	}
 }

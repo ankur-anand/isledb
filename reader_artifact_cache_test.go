@@ -12,6 +12,7 @@ import (
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
@@ -108,6 +109,41 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 	}
 	if stats := reopened.BloomDiskCacheStats(); stats.Corruptions != 1 {
 		t.Fatalf("Bloom corruption stats=%+v", stats)
+	}
+}
+
+func TestReaderCorruptOriginBloomFallsThroughToValidSST(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-origin-bloom-fail-open")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	result := writeReaderArtifactCacheTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
+		{Key: []byte("key"), Seq: 1, Kind: internal.OpPut, Value: []byte("value")},
+	}, 1)
+
+	corrupt := append([]byte(nil), result.SSTData...)
+	corrupt[result.Meta.Bloom.Offset] ^= 0xff
+	if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), corrupt); err != nil {
+		t.Fatal(err)
+	}
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir: t.TempDir(), Metrics: metrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	value, found, err := reader.Get(ctx, []byte("key"))
+	if err != nil || !found || string(value) != "value" {
+		t.Fatalf("Get through corrupt Bloom value=%q found=%t err=%v", value, found, err)
+	}
+	if got := testutil.ToFloat64(metrics.BloomFilterErrors); got != 1 {
+		t.Fatalf("Bloom errors=%v, want 1", got)
+	}
+	if stats := reader.BloomCacheStats(); stats.EntryCount != 0 {
+		t.Fatalf("corrupt Bloom entered decoded cache: %+v", stats)
 	}
 }
 

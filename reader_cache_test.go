@@ -6,7 +6,9 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,6 +68,25 @@ func TestReader_cacheSSTArtifact_ChecksumMismatch(t *testing.T) {
 	require.NoError(t, acquireErr)
 	require.False(t, ok)
 	require.Equal(t, 0, reader.SSTCacheStats().EntryCount)
+}
+
+func TestReaderArtifactCacheDescriptorRejectionIsObservableMiss(t *testing.T) {
+	cache, err := diskcache.OpenArtifactCache(diskcache.ArtifactCacheOptions{
+		Dir: t.TempDir(), SSTMaxBytes: 1 << 20, BloomMaxBytes: 1 << 20,
+	})
+	require.NoError(t, err)
+	defer cache.Close()
+	metrics := DefaultReaderMetrics(nil)
+	reader := &Reader{artifactCache: cache, metrics: metrics}
+
+	_, _, ok, err := reader.acquireSST(sstMetadata{
+		ID: "accepted-by-reader", Size: 1, Checksum: "invalid",
+	})
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.EqualValues(t, 1, testutil.ToFloat64(metrics.ArtifactCacheErrors))
+	require.EqualValues(t, 1,
+		testutil.ToFloat64(metrics.ArtifactCacheInvariantViolations))
 }
 
 func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T) {

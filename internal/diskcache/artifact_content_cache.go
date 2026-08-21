@@ -22,8 +22,7 @@ type artifactContentCacheOptions struct {
 }
 
 // artifactContentCache owns the persistent cache directory and its two
-// independently budgeted tiers. It is intentionally private until Reader
-// integration replaces the current ArtifactCache in one reviewable change.
+// independently budgeted tiers. ArtifactCache exposes its Reader-facing API.
 type artifactContentCache struct {
 	mu sync.Mutex
 

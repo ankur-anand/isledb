@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -151,6 +152,63 @@ func TestArtifactContentCacheFacadePublicationFailureStillReturnsTransient(t *te
 	stats := cache.stats(ArtifactSST)
 	if stats.BypassedPublicationFailure != 1 || stats.TransientFiles != 1 {
 		t.Fatalf("publication-failure stats=%+v", stats)
+	}
+}
+
+func TestArtifactContentCacheFacadeAdmissionUsesPrepublicationMapping(t *testing.T) {
+	data := []byte("verified SST survives final-path open failure")
+	cache := openArtifactContentCacheForTest(
+		t, t.TempDir(), int64(len(data)), 1)
+	cache.tiers[ArtifactSST].openPersistent = func(
+		artifactContentAddress, int64, string,
+	) ([]byte, bool, error) {
+		return nil, false, syscall.EMFILE
+	}
+
+	handle, admission := commitThroughArtifactContentCache(
+		t, cache, contentFillDescriptor(ArtifactSST, "sst-a", data), data)
+	if admission != artifactContentAdmitted {
+		t.Fatalf("admission=%d, want admitted", admission)
+	}
+	if !bytes.Equal(handle.bytes(), data) {
+		t.Fatalf("admitted bytes=%q, want %q", handle.bytes(), data)
+	}
+	if stats := cache.stats(ArtifactSST); stats.ResidentEntries != 1 {
+		t.Fatalf("resident entries=%d, want 1", stats.ResidentEntries)
+	}
+}
+
+func TestArtifactContentCacheFacadeSyncFailureReturnsTransient(t *testing.T) {
+	data := []byte("verified but unsynced SST")
+	cache := openArtifactContentCacheForTest(
+		t, t.TempDir(), int64(len(data)), 1)
+	desc := contentFillDescriptor(ArtifactSST, "sst-a", data)
+	fill, err := cache.beginFill(desc)
+	if err != nil {
+		t.Fatalf("begin fill: %v", err)
+	}
+	if _, err := fill.Write(data); err != nil {
+		t.Fatalf("write fill: %v", err)
+	}
+	wantErr := errors.New("sync failed")
+	fill.fill.syncFile = func(*os.File) error { return wantErr }
+
+	handle, admission, err := fill.commit()
+	if err != nil {
+		t.Fatalf("commit after sync failure: %v", err)
+	}
+	if admission != artifactContentBypassedPublicationFailure {
+		t.Fatalf("admission=%d, want publication-failure bypass", admission)
+	}
+	if !bytes.Equal(handle.bytes(), data) {
+		t.Fatalf("transient bytes=%q, want %q", handle.bytes(), data)
+	}
+	if err := handle.close(); err != nil && !errors.Is(err, wantErr) {
+		t.Fatalf("close transient: %v", err)
+	}
+	stats := cache.stats(ArtifactSST)
+	if stats.ResidentEntries != 0 || stats.BypassedPublicationFailure != 1 {
+		t.Fatalf("sync-failure stats=%+v", stats)
 	}
 }
 

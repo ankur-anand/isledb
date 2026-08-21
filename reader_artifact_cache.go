@@ -3,6 +3,7 @@ package isledb
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/ankur-anand/isledb/internal/diskcache"
@@ -32,7 +33,7 @@ func (a *sharedSSTArtifact) retainCoalescedLoad() any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.handle == nil {
-		return &sstArtifactLease{}
+		return nil
 	}
 	a.refs++
 	return &sstArtifactLease{shared: a, data: a.handle.Bytes()}
@@ -105,7 +106,11 @@ func bloomArtifactDescriptor(meta sstMetadata) diskcache.ArtifactDescriptor {
 
 func (r *Reader) acquireSST(meta sstMetadata) ([]byte, func(), bool, error) {
 	handle, ok, err := r.artifactCache.Acquire(sstArtifactDescriptor(meta))
-	if err != nil || !ok {
+	if err != nil {
+		r.observeArtifactCacheDiagnostic("acquire", diskcache.ArtifactSST, meta.ID, err)
+		return nil, nil, false, nil
+	}
+	if !ok {
 		// The cache is advisory. A lookup diagnostic becomes an origin miss.
 		return nil, nil, false, nil
 	}
@@ -116,6 +121,7 @@ func (r *Reader) acquireSST(meta sstMetadata) ([]byte, func(), bool, error) {
 func (r *Reader) sstResident(meta sstMetadata) (bool, error) {
 	presence, err := r.artifactCache.Probe(sstArtifactDescriptor(meta))
 	if err != nil {
+		r.observeArtifactCacheDiagnostic("probe", diskcache.ArtifactSST, meta.ID, err)
 		return false, nil
 	}
 	return presence != diskcache.ArtifactAbsent, nil
@@ -166,9 +172,45 @@ func (r *Reader) acquireRawBloom(meta sstMetadata) (*diskcache.ArtifactHandle, b
 	}
 	handle, ok, err := r.artifactCache.Acquire(bloomArtifactDescriptor(meta))
 	if err != nil {
+		r.observeArtifactCacheDiagnostic("acquire", diskcache.ArtifactBloom, meta.ID, err)
 		return nil, false, nil
 	}
 	return handle, ok, nil
+}
+
+func (r *Reader) observeArtifactCacheDiagnostic(
+	operation string,
+	kind diskcache.ArtifactKind,
+	sstID string,
+	err error,
+) {
+	if err == nil {
+		return
+	}
+	invariantViolation := errors.Is(err, diskcache.ErrInvalidArtifactDescriptor) ||
+		errors.Is(err, diskcache.ErrArtifactCacheClosed)
+	r.metrics.ObserveArtifactCacheDiagnostic(invariantViolation)
+	if invariantViolation {
+		slog.Error(
+			"isledb: artifact cache invariant violation",
+			"operation", operation,
+			"kind", kind,
+			"sst_id", sstID,
+			"error", err,
+		)
+	}
+}
+
+func (r *Reader) observeBloomFilterError(sstID string, err error) {
+	if err == nil {
+		return
+	}
+	r.metrics.ObserveBloomFilterError()
+	slog.Warn(
+		"isledb: Bloom filter unavailable; continuing with SST lookup",
+		"sst_id", sstID,
+		"error", err,
+	)
 }
 
 func (r *Reader) admitRawBloom(

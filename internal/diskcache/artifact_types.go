@@ -177,6 +177,9 @@ func (o ArtifactCacheOptions) normalize() (ArtifactCacheOptions, error) {
 }
 
 // ArtifactStats reports one persistent tier's current occupancy and activity.
+// ResidentBytes includes detached generations still pinned by handles, so it
+// may temporarily exceed MaxBytes. MaxBytes bounds searchable residency, not
+// incoming, transient, or pending-deletion files.
 type ArtifactStats struct {
 	Hits              int64
 	Misses            int64
