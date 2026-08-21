@@ -39,8 +39,13 @@ type CacheStats struct {
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
-	// CacheDir is the directory for disk caches. It must be non-empty and may
-	// be owned by only one live Reader process at a time.
+	// CacheDir is the directory for disk caches. It must be non-empty, may be
+	// owned by only one live Reader process at a time, and must remain writable
+	// with enough free space to stage SST downloads for the Reader's lifetime.
+	// A read that needs a full SST fails if local staging cannot be created;
+	// IsleDB does not fall back to buffering an unbounded SST in memory. Once a
+	// download has completed and passed checksum verification, later cache
+	// publication failures are served from the staged file transiently.
 	CacheDir string
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).

@@ -20,11 +20,15 @@ type artifactContentIndexEntry struct {
 // artifact kind. It provides no synchronization; the cache tier that owns the
 // index must serialize access.
 type artifactContentIndex struct {
-	kind          ArtifactKind
-	maxBytes      int64
-	entries       map[artifactContentAddress]*artifactContentIndexEntry
-	lru           list.List
-	residentBytes int64
+	kind           ArtifactKind
+	maxBytes       int64
+	entries        map[artifactContentAddress]*artifactContentIndexEntry
+	lru            list.List
+	residentBytes  int64
+	pinnedEntries  int
+	pinnedBytes    int64
+	pendingEntries int
+	pendingBytes   int64
 }
 
 func newArtifactContentIndex(kind ArtifactKind, maxBytes int64) (*artifactContentIndex, error) {
@@ -48,6 +52,21 @@ func (index *artifactContentIndex) insertPinned(
 	address artifactContentAddress,
 	size int64,
 ) (*artifactContentIndexEntry, bool, error) {
+	return index.insert(address, size, true)
+}
+
+func (index *artifactContentIndex) insertUnpinned(
+	address artifactContentAddress,
+	size int64,
+) (*artifactContentIndexEntry, bool, error) {
+	return index.insert(address, size, false)
+}
+
+func (index *artifactContentIndex) insert(
+	address artifactContentAddress,
+	size int64,
+	pin bool,
+) (*artifactContentIndexEntry, bool, error) {
 	if address.kind != index.kind {
 		return nil, false, fmt.Errorf(
 			"diskcache: artifact kind %d does not belong in tier %d",
@@ -62,12 +81,23 @@ func (index *artifactContentIndex) insertPinned(
 				"diskcache: content size changed for one checksum: got=%d want=%d",
 				size, existing.size)
 		}
-		existing.refs++
+		if pin {
+			if existing.refs == 0 {
+				index.pinnedEntries++
+				index.pinnedBytes += existing.size
+			}
+			existing.refs++
+		}
 		index.lru.MoveToBack(existing.element)
 		return existing, false, nil
 	}
 
-	entry := &artifactContentIndexEntry{address: address, size: size, refs: 1}
+	entry := &artifactContentIndexEntry{address: address, size: size}
+	if pin {
+		entry.refs = 1
+		index.pinnedEntries++
+		index.pinnedBytes += entry.size
+	}
 	entry.element = index.lru.PushBack(entry)
 	index.entries[address] = entry
 	index.residentBytes += size
@@ -99,6 +129,10 @@ func (index *artifactContentIndex) pin(
 			"diskcache: content size changed for one checksum: got=%d want=%d",
 			size, entry.size)
 	}
+	if entry.refs == 0 {
+		index.pinnedEntries++
+		index.pinnedBytes += entry.size
+	}
 	entry.refs++
 	index.lru.MoveToBack(entry.element)
 	return entry, true, nil
@@ -119,6 +153,8 @@ func (index *artifactContentIndex) detach(
 	entry.element = nil
 	if entry.refs > 0 {
 		entry.deleteOnRelease = true
+		index.pendingEntries++
+		index.pendingBytes += entry.size
 		return false, true
 	}
 	return true, true
@@ -134,6 +170,14 @@ func (index *artifactContentIndex) release(
 		return false, fmt.Errorf("diskcache: release of unpinned artifact entry")
 	}
 	entry.refs--
+	if entry.refs == 0 {
+		index.pinnedEntries--
+		index.pinnedBytes -= entry.size
+		if entry.deleteOnRelease {
+			index.pendingEntries--
+			index.pendingBytes -= entry.size
+		}
+	}
 	return entry.refs == 0 && entry.deleteOnRelease, nil
 }
 

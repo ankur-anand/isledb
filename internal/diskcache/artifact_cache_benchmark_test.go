@@ -2,13 +2,13 @@ package diskcache
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func BenchmarkArtifactCacheAcquireWarm(b *testing.B) {
@@ -22,9 +22,9 @@ func BenchmarkArtifactCacheAcquireWarm(b *testing.B) {
 	} {
 		b.Run(benchmarkCase.name, func(b *testing.B) {
 			data := benchmarkArtifactData(benchmarkCase.size, 1)
-			desc := testArtifactDescriptor(benchmarkCase.kind, "warm", data)
+			desc := contentFillDescriptor(benchmarkCase.kind, "warm", data)
 			cache := openBenchmarkArtifactCache(
-				b, b.TempDir(), int64(benchmarkCase.size*2), int64(benchmarkCase.size*2), 8)
+				b, b.TempDir(), int64(benchmarkCase.size*2), int64(benchmarkCase.size*2))
 			defer cache.Close()
 
 			handle, admission, err := cache.AdmitBytes(desc, data)
@@ -80,10 +80,10 @@ func BenchmarkArtifactCacheAcquireRecovered(b *testing.B) {
 	} {
 		b.Run(benchmarkCase.name, func(b *testing.B) {
 			data := benchmarkArtifactData(benchmarkCase.size, 2)
-			desc := testArtifactDescriptor(benchmarkCase.kind, "recovered", data)
+			desc := contentFillDescriptor(benchmarkCase.kind, "recovered", data)
 			dir := b.TempDir()
 			cache := openBenchmarkArtifactCache(
-				b, dir, int64(benchmarkCase.size*2), int64(benchmarkCase.size*2), 8)
+				b, dir, int64(benchmarkCase.size*2), int64(benchmarkCase.size*2))
 			handle, _, err := cache.AdmitBytes(desc, data)
 			if err != nil {
 				b.Fatalf("prime recovered artifact: %v", err)
@@ -101,7 +101,7 @@ func BenchmarkArtifactCacheAcquireRecovered(b *testing.B) {
 			for range b.N {
 				b.StopTimer()
 				cache = openBenchmarkArtifactCache(
-					b, dir, int64(benchmarkCase.size*2), int64(benchmarkCase.size*2), 8)
+					b, dir, int64(benchmarkCase.size*2), int64(benchmarkCase.size*2))
 				b.StartTimer()
 				handle, ok, err := cache.Acquire(desc)
 				if err != nil || !ok {
@@ -131,9 +131,9 @@ func BenchmarkArtifactCacheAdmission(b *testing.B) {
 	} {
 		b.Run(benchmarkCase.name, func(b *testing.B) {
 			data := benchmarkArtifactData(benchmarkCase.size, 3)
-			desc := testArtifactDescriptor(benchmarkCase.kind, "admission", data)
+			desc := contentFillDescriptor(benchmarkCase.kind, "admission", data)
 			cache := openBenchmarkArtifactCache(
-				b, b.TempDir(), int64(benchmarkCase.size*2), int64(benchmarkCase.size*2), 8)
+				b, b.TempDir(), int64(benchmarkCase.size*2), int64(benchmarkCase.size*2))
 			defer cache.Close()
 
 			b.ReportAllocs()
@@ -141,7 +141,7 @@ func BenchmarkArtifactCacheAdmission(b *testing.B) {
 			b.ResetTimer()
 			for range b.N {
 				b.StopTimer()
-				if err := cache.Remove(desc.Key, ArtifactRemovalPurge); err != nil {
+				if err := cache.Remove(desc, ArtifactRemovalPurge); err != nil {
 					b.Fatal(err)
 				}
 				b.StartTimer()
@@ -170,7 +170,6 @@ func BenchmarkArtifactCacheOpenRecovery(b *testing.B) {
 			for range b.N {
 				cache, err := OpenArtifactCache(ArtifactCacheOptions{
 					Dir: dir, SSTMaxBytes: int64(entryCount * 2), BloomMaxBytes: 1,
-					MaxOpenEntries: 8, TouchInterval: time.Hour,
 				})
 				if err != nil {
 					b.Fatal(err)
@@ -203,7 +202,7 @@ func BenchmarkArtifactCacheLoad(b *testing.B) {
 			)
 			payloads, descriptors := benchmarkArtifactDataset(entryCount, entryBytes)
 			accessCache := &benchmarkArtifactAccessCache{
-				cache:    openBenchmarkArtifactCache(b, b.TempDir(), capacity, 1, 64),
+				cache:    openBenchmarkArtifactCache(b, b.TempDir(), capacity, 1),
 				payloads: payloads, descriptors: descriptors,
 			}
 			defer accessCache.close()
@@ -282,7 +281,7 @@ func benchmarkArtifactDataset(count, size int) ([][]byte, []ArtifactDescriptor) 
 	descriptors := make([]ArtifactDescriptor, count)
 	for index := range count {
 		payloads[index] = benchmarkArtifactData(size, byte(index+1))
-		descriptors[index] = testArtifactDescriptor(
+		descriptors[index] = contentFillDescriptor(
 			ArtifactSST, fmt.Sprintf("load-%04d", index), payloads[index])
 	}
 	return payloads, descriptors
@@ -292,12 +291,10 @@ func openBenchmarkArtifactCache(
 	b testing.TB,
 	dir string,
 	sstBytes, bloomBytes int64,
-	maxOpenEntries int,
 ) *ArtifactCache {
 	b.Helper()
 	cache, err := OpenArtifactCache(ArtifactCacheOptions{
 		Dir: dir, SSTMaxBytes: sstBytes, BloomMaxBytes: bloomBytes,
-		MaxOpenEntries: maxOpenEntries, TouchInterval: time.Hour,
 	})
 	if err != nil {
 		b.Fatalf("open artifact cache: %v", err)
@@ -307,15 +304,15 @@ func openBenchmarkArtifactCache(
 
 func seedRecoveredArtifactDirectory(b *testing.B, dir string, entryCount int) {
 	b.Helper()
-	cache := openBenchmarkArtifactCache(b, dir, int64(entryCount*2), 1, 8)
+	cache := openBenchmarkArtifactCache(b, dir, int64(entryCount*2), 1)
 	if err := cache.Close(); err != nil {
 		b.Fatal(err)
 	}
 
 	createdShards := make(map[string]struct{})
 	for index := range entryCount {
-		id := artifactIDFor(ArtifactKey{Kind: ArtifactSST, SSTID: fmt.Sprintf("recovery-%08d", index)})
-		path := cache.artifactPath(id)
+		checksum := sha256.Sum256([]byte(fmt.Sprintf("recovery-%08d", index)))
+		path := cache.inner.path(artifactContentAddress{kind: ArtifactSST, checksum: checksum})
 		shard := filepath.Dir(path)
 		if _, ok := createdShards[shard]; !ok {
 			if err := os.MkdirAll(shard, 0o700); err != nil {

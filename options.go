@@ -104,7 +104,9 @@ func defaultWriterValueOptions() ValueOptions {
 }
 
 type readerOptions struct {
-	// CacheDir is the directory for disk caches.
+	// CacheDir is required local working storage for SST downloads as well as
+	// the root of the persistent disk caches. It must remain writable while the
+	// Reader is open.
 	CacheDir string
 
 	// ArtifactCache is an optional pre-created persistent SST/Bloom cache.

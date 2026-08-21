@@ -80,6 +80,9 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	if err != nil {
 		return nil, err
 	}
+	if err := m.ValidateArtifacts(); err != nil {
+		return nil, fmt.Errorf("validate reader manifest artifacts: %w", err)
+	}
 
 	artifactCache, ownsArtifactCache, err := initReaderDiskCache(opts)
 	if err != nil {
@@ -209,6 +212,9 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	m, err = r.manifestStore.Replay(ctx)
 	if err != nil {
 		return err
+	}
+	if err = m.ValidateArtifacts(); err != nil {
+		return fmt.Errorf("validate reader manifest artifacts: %w", err)
 	}
 	current := r.manifestStore.CurrentData()
 	r.publishManifestView(m, current, viewLoadedAt)
@@ -762,25 +768,19 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
 			return filter, nil
 		}
-		if handle, ok, err := r.acquireRawBloom(sstMeta); err != nil {
-			return nil, fmt.Errorf("acquire cached bloom %s: %w", sstMeta.ID, err)
-		} else if ok {
+		if handle, ok, _ := r.acquireRawBloom(sstMeta); ok {
 			filter, parseErr := parseBloomFilter(handle.Bytes())
 			closeErr := handle.Close()
 			if parseErr != nil {
-				removeErr := r.artifactCache.Remove(
-					bloomArtifactDescriptor(sstMeta).Key, diskcache.ArtifactRemovalCorrupt)
-				return nil, errors.Join(
-					fmt.Errorf("decode cached bloom %s: %w", sstMeta.ID, parseErr),
-					closeErr,
-					removeErr,
-				)
+				_ = r.artifactCache.Remove(
+					bloomArtifactDescriptor(sstMeta), diskcache.ArtifactRemovalCorrupt)
+			} else {
+				// Cleanup errors are cache diagnostics. The decoded heap copy is
+				// independent of the persistent handle and remains safe to use.
+				_ = closeErr
+				r.bloomCache.put(sstMeta.ID, filter)
+				return filter, nil
 			}
-			if closeErr != nil {
-				return nil, fmt.Errorf("release cached bloom %s: %w", sstMeta.ID, closeErr)
-			}
-			r.bloomCache.put(sstMeta.ID, filter)
-			return filter, nil
 		}
 
 		path := r.store.SSTPath(sstMeta.ID)
@@ -788,10 +788,9 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if err != nil {
 			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
 		}
-		// Historical manifests predate Bloom checksums. New manifests always
-		// carry one, and every present checksum is enforced before the filter can
-		// enter the in-memory cache where a corrupted false negative would be
-		// indistinguishable from an absent key.
+		// Reader manifest activation requires a checksum for every present Bloom.
+		// A cache-less internal Reader must still verify the origin response before
+		// a corrupted false negative can enter the decoded in-memory cache.
 		if r.artifactCache == nil && sstMeta.Bloom.Checksum != "" {
 			if err := validateBloomChecksum(sstMeta.Bloom.Checksum, data); err != nil {
 				return nil, fmt.Errorf("validate bloom %s: %w", sstMeta.ID, err)
@@ -813,7 +812,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 			if handle != nil {
 				closeErr = handle.Close()
 				removeErr = r.artifactCache.Remove(
-					bloomArtifactDescriptor(sstMeta).Key, diskcache.ArtifactRemovalCorrupt)
+					bloomArtifactDescriptor(sstMeta), diskcache.ArtifactRemovalCorrupt)
 			}
 			return nil, errors.Join(
 				fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err), closeErr, removeErr)
@@ -847,9 +846,7 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 	path := r.store.SSTPath(sstMeta.ID)
 	var cachedOpenErr error
 
-	if cached, releaseCache, ok, err := r.acquireSST(sstMeta); err != nil {
-		return nil, nil, fmt.Errorf("acquire cached sst %s: %w", sstMeta.ID, err)
-	} else if ok {
+	if cached, releaseCache, ok, _ := r.acquireSST(sstMeta); ok {
 		r.metrics.ObserveSSTCacheLookup(true)
 		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, releaseCache)
 		if err == nil {
@@ -858,9 +855,8 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		cachedOpenErr = err
 		// Cached bytes are not authoritative. If they cannot be opened, release
 		// and evict them, then make one attempt against object storage below.
-		if removeErr := r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt); removeErr != nil {
-			return nil, nil, errors.Join(err, removeErr)
-		}
+		cachedOpenErr = errors.Join(cachedOpenErr,
+			r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt))
 	} else {
 		r.metrics.ObserveSSTCacheLookup(false)
 	}
@@ -1034,14 +1030,9 @@ func (r *Reader) loadSSTArtifact(
 	}
 
 	value, err := r.sstLoads.Do(ctx, path, func(loadCtx context.Context) (any, error) {
-		if resident, err := r.sstResident(*meta); err != nil {
-			return nil, err
-		} else if resident {
+		if resident, _ := r.sstResident(*meta); resident {
 			handle, ok, err := r.artifactCache.Acquire(sstArtifactDescriptor(*meta))
-			if err != nil {
-				return nil, err
-			}
-			if ok {
+			if err == nil && ok {
 				return newSharedSSTArtifact(handle), nil
 			}
 		}
@@ -1076,6 +1067,10 @@ func (r *Reader) downloadSSTArtifact(
 	if meta == nil {
 		return nil, 0, fmt.Errorf("cache sst %s: missing metadata", path)
 	}
+	// Local staging is a Reader availability requirement. Fail before paying
+	// object-store egress when it cannot be created; buffering an arbitrarily
+	// large SST in memory is deliberately not a fallback. Failures after the
+	// verified download are handled by Commit's transient-file path.
 	fill, err := r.artifactCache.BeginFill(sstArtifactDescriptor(*meta))
 	if err != nil {
 		return nil, 0, fmt.Errorf("begin cache fill for sst %s: %w", meta.ID, err)

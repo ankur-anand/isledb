@@ -6,15 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 )
 
 const (
-	artifactCacheFormat       = "isledb-artifact-cache-v1\n"
 	defaultArtifactSSTBytes   = int64(1 << 30)
 	defaultArtifactBloomBytes = int64(64 << 20)
-	defaultMaxOpenEntries     = 256
-	defaultTouchInterval      = time.Minute
 )
 
 var (
@@ -59,9 +55,9 @@ func (k ArtifactKind) extension() string {
 	}
 }
 
-// ArtifactKey is the logical identity of an SST payload or its Bloom sidecar.
-// Checksum is deliberately not part of identity: it validates the immutable
-// bytes associated with this key.
+// ArtifactKey identifies the database object associated with an artifact.
+// Persistent cache identity is kind plus the descriptor's full checksum;
+// SSTID remains useful for diagnostics and Reader-level download coalescing.
 type ArtifactKey struct {
 	Kind  ArtifactKind
 	SSTID string
@@ -89,17 +85,6 @@ func (d ArtifactDescriptor) validate() error {
 		return fmt.Errorf("%w: %v", ErrInvalidArtifactDescriptor, err)
 	}
 	return nil
-}
-
-type artifactDigest [sha256.Size]byte
-
-type artifactID struct {
-	kind   ArtifactKind
-	digest artifactDigest
-}
-
-func artifactIDFor(key ArtifactKey) artifactID {
-	return artifactID{kind: key.Kind, digest: sha256.Sum256([]byte(key.SSTID))}
 }
 
 func validateSHA256Checksum(checksum string) error {
@@ -151,6 +136,7 @@ const (
 	ArtifactAlreadyResident
 	ArtifactBypassedOversized
 	ArtifactBypassedPinnedCapacity
+	ArtifactBypassedPublicationFailure
 )
 
 // ArtifactRemovalReason explains why a resident entry left the cache.
@@ -164,22 +150,21 @@ const (
 )
 
 // ArtifactCacheOptions configures the persistent SST and raw-Bloom tiers.
-// One live process may own Dir at a time.
+// One live process may own Dir at a time. Dir is also required working space
+// for incoming and transient artifacts, whose bytes are additional to the
+// searchable resident-byte budgets.
 type ArtifactCacheOptions struct {
 	Dir string
 
 	SSTMaxBytes   int64
 	BloomMaxBytes int64
-
-	MaxOpenEntries int
-	TouchInterval  time.Duration
 }
 
 func (o ArtifactCacheOptions) normalize() (ArtifactCacheOptions, error) {
 	if o.Dir == "" {
 		return ArtifactCacheOptions{}, errors.New("diskcache: artifact cache directory is required")
 	}
-	if o.SSTMaxBytes < 0 || o.BloomMaxBytes < 0 || o.MaxOpenEntries < 0 || o.TouchInterval < 0 {
+	if o.SSTMaxBytes < 0 || o.BloomMaxBytes < 0 {
 		return ArtifactCacheOptions{}, errors.New("diskcache: artifact cache limits cannot be negative")
 	}
 	if o.SSTMaxBytes == 0 {
@@ -187,12 +172,6 @@ func (o ArtifactCacheOptions) normalize() (ArtifactCacheOptions, error) {
 	}
 	if o.BloomMaxBytes == 0 {
 		o.BloomMaxBytes = defaultArtifactBloomBytes
-	}
-	if o.MaxOpenEntries == 0 {
-		o.MaxOpenEntries = defaultMaxOpenEntries
-	}
-	if o.TouchInterval == 0 {
-		o.TouchInterval = defaultTouchInterval
 	}
 	return o, nil
 }

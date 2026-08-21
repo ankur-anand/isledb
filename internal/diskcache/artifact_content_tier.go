@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 type artifactContentAdmission uint8
@@ -21,9 +22,10 @@ const (
 // Lock order is always publishMu followed by indexMu. Operations that begin
 // with indexMu must release it before attempting to acquire publishMu.
 type artifactContentTier struct {
-	publishMu sync.Mutex
-	indexMu   sync.Mutex
-	index     *artifactContentIndex
+	publishMu         sync.Mutex
+	indexMu           sync.Mutex
+	index             *artifactContentIndex
+	capacityEvictions atomic.Int64
 }
 
 func newArtifactContentTier(kind ArtifactKind, maxBytes int64) (*artifactContentTier, error) {
@@ -93,6 +95,7 @@ func (tier *artifactContentTier) publishPinned(
 	if admission != artifactContentAdmitted {
 		return nil, admission, nil
 	}
+	tier.capacityEvictions.Add(int64(len(victims)))
 
 	var cleanupErr error
 	for _, victim := range victims {
@@ -136,6 +139,38 @@ func (tier *artifactContentTier) detach(
 		return detached, nil
 	}
 	return true, removeFile(entry.address)
+}
+
+// purge detaches every searchable entry. Pinned generations remain usable by
+// their existing handles and remove their file after the final release.
+func (tier *artifactContentTier) purge(
+	removeFile func(artifactContentAddress) error,
+) (int, error) {
+	if removeFile == nil {
+		return 0, errors.New("diskcache: artifact removal callback is required")
+	}
+	tier.publishMu.Lock()
+	defer tier.publishMu.Unlock()
+
+	tier.indexMu.Lock()
+	entries := make([]*artifactContentIndexEntry, 0, len(tier.index.entries))
+	for _, entry := range tier.index.entries {
+		entries = append(entries, entry)
+	}
+	deleteNow := make([]artifactContentAddress, 0, len(entries))
+	for _, entry := range entries {
+		removeNow, detached := tier.index.detach(entry)
+		if detached && removeNow {
+			deleteNow = append(deleteNow, entry.address)
+		}
+	}
+	tier.indexMu.Unlock()
+
+	var cleanupErr error
+	for _, address := range deleteNow {
+		cleanupErr = errors.Join(cleanupErr, removeFile(address))
+	}
+	return len(entries), cleanupErr
 }
 
 // release drops a handle reference. It uses two disjoint lock phases so it

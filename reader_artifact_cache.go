@@ -106,7 +106,8 @@ func bloomArtifactDescriptor(meta sstMetadata) diskcache.ArtifactDescriptor {
 func (r *Reader) acquireSST(meta sstMetadata) ([]byte, func(), bool, error) {
 	handle, ok, err := r.artifactCache.Acquire(sstArtifactDescriptor(meta))
 	if err != nil || !ok {
-		return nil, nil, ok, err
+		// The cache is advisory. A lookup diagnostic becomes an origin miss.
+		return nil, nil, false, nil
 	}
 	return handle.Bytes(), func() { _ = handle.Close() }, true, nil
 }
@@ -114,7 +115,10 @@ func (r *Reader) acquireSST(meta sstMetadata) ([]byte, func(), bool, error) {
 // sstResident is a side-effect-free presence check.
 func (r *Reader) sstResident(meta sstMetadata) (bool, error) {
 	presence, err := r.artifactCache.Probe(sstArtifactDescriptor(meta))
-	return presence != diskcache.ArtifactAbsent, err
+	if err != nil {
+		return false, nil
+	}
+	return presence != diskcache.ArtifactAbsent, nil
 }
 
 // sstArtifactResidentByID is the ID-only probe used by lazy-reader tests.
@@ -142,7 +146,7 @@ func (r *Reader) sstArtifactResidentByID(id string) bool {
 }
 
 func (r *Reader) removeSST(meta sstMetadata, reason diskcache.ArtifactRemovalReason) error {
-	return r.artifactCache.Remove(sstArtifactDescriptor(meta).Key, reason)
+	return r.artifactCache.Remove(sstArtifactDescriptor(meta), reason)
 }
 
 func (r *Reader) clearSSTCache() error {
@@ -157,17 +161,21 @@ func (r *Reader) clearBloomDiskCache() error {
 }
 
 func (r *Reader) acquireRawBloom(meta sstMetadata) (*diskcache.ArtifactHandle, bool, error) {
-	if r.artifactCache == nil || meta.Bloom.Checksum == "" {
+	if r.artifactCache == nil {
 		return nil, false, nil
 	}
-	return r.artifactCache.Acquire(bloomArtifactDescriptor(meta))
+	handle, ok, err := r.artifactCache.Acquire(bloomArtifactDescriptor(meta))
+	if err != nil {
+		return nil, false, nil
+	}
+	return handle, ok, nil
 }
 
 func (r *Reader) admitRawBloom(
 	meta sstMetadata,
 	data []byte,
 ) (*diskcache.ArtifactHandle, error) {
-	if r.artifactCache == nil || meta.Bloom.Checksum == "" {
+	if r.artifactCache == nil {
 		return nil, nil
 	}
 	handle, _, err := r.artifactCache.AdmitBytes(bloomArtifactDescriptor(meta), data)
@@ -175,7 +183,12 @@ func (r *Reader) admitRawBloom(
 		if errors.Is(err, diskcache.ErrArtifactChecksumMismatch) {
 			return nil, fmt.Errorf("bloom checksum mismatch: %w", err)
 		}
-		return nil, err
+		// Admission is advisory. Preserve Bloom integrity when bypassing the
+		// cache because a corrupted false negative would be silent.
+		if validateErr := validateBloomChecksum(meta.Bloom.Checksum, data); validateErr != nil {
+			return nil, validateErr
+		}
+		return nil, nil
 	}
 	return handle, nil
 }

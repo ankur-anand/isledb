@@ -18,8 +18,8 @@ func TestArtifactCacheConcurrentMixedLoadMaintainsInvariants(t *testing.T) {
 		operations      = 200
 	)
 	payloads, descriptors := benchmarkArtifactDataset(entryCount, entryBytes)
-	cache := openTestArtifactCache(
-		t, t.TempDir(), residentEntries*entryBytes, residentEntries*entryBytes)
+	cache := openChecksumArtifactCacheForTest(
+		t, residentEntries*entryBytes, residentEntries*entryBytes)
 	defer cache.Close()
 
 	for index := range hotEntries {
@@ -105,22 +105,17 @@ func TestArtifactCacheConcurrentMixedLoadMaintainsInvariants(t *testing.T) {
 		t.Fatalf("load did not exercise hit/miss/eviction paths: %+v", stats)
 	}
 
-	cache.mu.Lock()
-	activeOps := cache.activeOps
-	activeFills := cache.activeFills
-	activeHandles := cache.activeHandles
-	openEntries := cache.openEntries
-	maxOpenEntries := cache.maxOpenEntries
-	cache.mu.Unlock()
+	cache.inner.mu.Lock()
+	activeOps := cache.inner.activeOps
+	activeFills := cache.inner.activeFills
+	activeHandles := cache.inner.activeHandles
+	cache.inner.mu.Unlock()
 	if activeOps != 0 || activeFills != 0 || activeHandles != 0 {
 		t.Fatalf(
 			"activity leaked: operations=%d fills=%d handles=%d",
 			activeOps, activeFills, activeHandles)
 	}
-	if openEntries > maxOpenEntries {
-		t.Fatalf("open mappings=%d exceed max=%d", openEntries, maxOpenEntries)
-	}
-	incoming, err := os.ReadDir(cache.incomingDir)
+	incoming, err := os.ReadDir(cache.inner.incomingDir)
 	if err != nil {
 		t.Fatal(err)
 	}
