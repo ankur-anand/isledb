@@ -8,7 +8,10 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
-const defaultSSTCacheSize = 1 << 30
+const (
+	defaultSSTCacheSize       = 1 << 30
+	defaultBloomDiskCacheSize = 64 << 20
+)
 
 const (
 	defaultMaxKeyBytes   = 64 * 1024
@@ -104,11 +107,14 @@ type readerOptions struct {
 	// CacheDir is the directory for disk caches.
 	CacheDir string
 
-	// SSTCache is an optional pre-created SST cache.
-	SSTCache diskcache.RefCountedCache
+	// ArtifactCache is an optional pre-created persistent SST/Bloom cache.
+	ArtifactCache *diskcache.ArtifactCache
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
 	SSTCacheSize int64
+
+	// BloomDiskCacheSize is the maximum bytes for verified raw Bloom sidecars.
+	BloomDiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes for the in-memory block cache used
 	// when range-reading SSTs. Default 0 disables the block cache.
@@ -132,8 +138,8 @@ type readerOptions struct {
 	ManifestPageCacheSize    int
 	DisableManifestPageCache bool
 
-	// ValidateSSTChecksum verifies SST checksums on first download.
-	// If enabled and checksum is missing or mismatched, reads fail.
+	// ValidateSSTChecksum verifies SST checksums on read paths that can
+	// otherwise skip it. Persistent ArtifactCache admissions always verify.
 	ValidateSSTChecksum bool
 
 	ViewPolicy ReaderViewPolicy
@@ -143,8 +149,9 @@ type readerOptions struct {
 
 func defaultReaderOptions() readerOptions {
 	return readerOptions{
-		SSTCacheSize:   defaultSSTCacheSize,
-		BloomCacheSize: defaultBloomCacheSize,
+		SSTCacheSize:       defaultSSTCacheSize,
+		BloomDiskCacheSize: defaultBloomDiskCacheSize,
+		BloomCacheSize:     defaultBloomCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},

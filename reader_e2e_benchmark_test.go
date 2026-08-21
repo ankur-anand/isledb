@@ -123,7 +123,7 @@ func BenchmarkFakeS3_KVReaderGet_16384x256B(b *testing.B) {
 
 	for _, cache := range []string{"cold", "warm"} {
 		b.Run(cache, func(b *testing.B) {
-			if err := reader.sstCache.Clear(); err != nil {
+			if err := reader.clearSSTCache(); err != nil {
 				b.Fatalf("clear SST cache: %v", err)
 			}
 			if cache == "warm" {
@@ -136,7 +136,7 @@ func BenchmarkFakeS3_KVReaderGet_16384x256B(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				if cache == "cold" {
 					b.StopTimer()
-					if err := reader.sstCache.Clear(); err != nil {
+					if err := reader.clearSSTCache(); err != nil {
 						b.Fatalf("clear SST cache: %v", err)
 					}
 					b.StartTimer()
@@ -163,7 +163,7 @@ func BenchmarkFakeS3_KVReaderScan_16384x256B(b *testing.B) {
 	reader, counts := prepareFakeS3KVReaderBenchmark(b, ctx, records, valueSize)
 	for _, cache := range []string{"cold", "warm"} {
 		b.Run(cache, func(b *testing.B) {
-			if err := reader.sstCache.Clear(); err != nil {
+			if err := reader.clearSSTCache(); err != nil {
 				b.Fatalf("clear SST cache: %v", err)
 			}
 			if cache == "warm" {
@@ -176,7 +176,7 @@ func BenchmarkFakeS3_KVReaderScan_16384x256B(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				if cache == "cold" {
 					b.StopTimer()
-					if err := reader.sstCache.Clear(); err != nil {
+					if err := reader.clearSSTCache(); err != nil {
 						b.Fatalf("clear SST cache: %v", err)
 					}
 					b.StartTimer()
@@ -1160,7 +1160,7 @@ func clearKVReaderBenchmarkCache(b *testing.B, reader *Reader) {
 		reader.blockCache.Clear()
 		return
 	}
-	if err := reader.sstCache.Clear(); err != nil {
+	if err := reader.clearSSTCache(); err != nil {
 		b.Fatalf("clear SST cache: %v", err)
 	}
 }
@@ -1174,8 +1174,11 @@ func clearKVReaderPointBenchmarkCaches(b *testing.B, reader *Reader) {
 	if reader.bloomCache != nil {
 		reader.bloomCache.clear()
 	}
-	if err := reader.sstCache.Clear(); err != nil {
+	if err := reader.clearSSTCache(); err != nil {
 		b.Fatalf("clear SST cache: %v", err)
+	}
+	if err := reader.clearBloomDiskCache(); err != nil {
+		b.Fatalf("clear Bloom disk cache: %v", err)
 	}
 }
 

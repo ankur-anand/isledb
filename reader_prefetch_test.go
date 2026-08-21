@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -153,6 +154,40 @@ func TestReader_PrefetchAllAndSkipCached(t *testing.T) {
 	}
 }
 
+func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("prefetch-oversized-bypass")
+	manifestStore := newManifestStore(store, nil)
+	writer := newPrefetchTestWriter(t, ctx, store, manifestStore)
+	defer writer.close(ctx)
+	writePrefetchBatch(t, ctx, writer, "oversized", 0, 3)
+
+	manifest, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.L0SSTs) != 1 || manifest.L0SSTs[0].Size <= 1 {
+		t.Fatalf("unexpected test manifest: %+v", manifest.L0SSTs)
+	}
+	sstSize := manifest.L0SSTs[0].Size
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{
+		SSTCacheSize: sstSize - 1,
+	})
+	defer reader.Close()
+
+	stats, err := reader.Prefetch(ctx, PrefetchOptions{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 || stats.BytesRead != sstSize {
+		t.Fatalf("oversized prefetch stats=%+v", stats)
+	}
+	cacheStats := reader.SSTCacheStats()
+	if cacheStats.EntryCount != 0 || cacheStats.Bytes != 0 || cacheStats.AdmissionBypasses != 1 {
+		t.Fatalf("oversized cache stats=%+v", cacheStats)
+	}
+}
+
 func TestReader_PrefetchRespectsMaxSSTs(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
@@ -245,8 +280,9 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 {
 		t.Fatalf("stats after error = %+v, want matched=1 cached=0", stats)
 	}
-	if _, ok := reader.sstCache.Acquire(path); ok {
-		reader.sstCache.Release(path)
+	if resident, probeErr := reader.sstResident(m.L0SSTs[0]); probeErr != nil {
+		t.Fatal(probeErr)
+	} else if resident {
 		t.Fatal("corrupted SST was cached")
 	}
 }
@@ -348,7 +384,19 @@ func TestReader_EvictsInvalidCachedSSTAndRedownloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if err := reader.sstCache.Set(path, valid[:len(valid)/2]); err != nil {
+	truncated := valid[:len(valid)/2]
+	handle, _, err := reader.artifactCache.AdmitBytes(diskcache.ArtifactDescriptor{
+		Key: diskcache.ArtifactKey{
+			Kind:  diskcache.ArtifactSST,
+			SSTID: m.L0SSTs[0].ID,
+		},
+		Size:     int64(len(truncated)),
+		Checksum: bloomChecksum(truncated),
+	}, truncated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
 		t.Fatal(err)
 	}
 

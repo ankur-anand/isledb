@@ -26,6 +26,14 @@ type coalescedLoadCall struct {
 	err      error
 }
 
+// coalescedLoadValue lets a completed load lend independently releasable
+// values to every waiter while retaining one owner until all waiters have
+// collected their result. Ordinary immutable values need not implement it.
+type coalescedLoadValue interface {
+	retainCoalescedLoad() any
+	releaseCoalescedLoad()
+}
+
 func (g *coalescedLoadGroup) Do(
 	ctx context.Context,
 	key string,
@@ -71,6 +79,7 @@ func (g *coalescedLoadGroup) run(
 ) {
 	value, err := load(call.ctx)
 	if cause := context.Cause(call.ctx); cause != nil {
+		releaseCoalescedLoadValue(value)
 		value = nil
 		err = cause
 	}
@@ -82,8 +91,15 @@ func (g *coalescedLoadGroup) run(
 	if g.calls[key] == call {
 		delete(g.calls, key)
 	}
+	releaseValue := call.waiters == 0
+	if releaseValue {
+		call.value = nil
+	}
 	close(call.done)
 	g.mu.Unlock()
+	if releaseValue {
+		releaseCoalescedLoadValue(value)
+	}
 
 	call.cancel(context.Canceled)
 	g.active.Done()
@@ -96,23 +112,50 @@ func (g *coalescedLoadGroup) wait(
 ) (any, error) {
 	select {
 	case <-ctx.Done():
-		g.releaseWaiter(key, call)
+		g.releaseWaiter(key, call, false)
 		return nil, ctx.Err()
 	case <-call.done:
-		g.releaseWaiter(key, call)
-		return call.value, call.err
+		return g.releaseWaiter(key, call, true)
 	}
 }
 
-func (g *coalescedLoadGroup) releaseWaiter(key string, call *coalescedLoadCall) {
+func (g *coalescedLoadGroup) releaseWaiter(
+	key string,
+	call *coalescedLoadCall,
+	completed bool,
+) (any, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	var value any
+	var err error
+	if completed {
+		value = call.value
+		err = call.err
+		if err == nil {
+			if shared, ok := value.(coalescedLoadValue); ok {
+				value = shared.retainCoalescedLoad()
+			}
+		}
+	}
 	call.waiters--
 	if call.waiters == 0 && !call.finished {
 		if g.calls[key] == call {
 			delete(g.calls, key)
 		}
 		call.cancel(context.Canceled)
+	}
+	var releaseValue any
+	if call.waiters == 0 && call.finished {
+		releaseValue = call.value
+		call.value = nil
+	}
+	g.mu.Unlock()
+	releaseCoalescedLoadValue(releaseValue)
+	return value, err
+}
+
+func releaseCoalescedLoadValue(value any) {
+	if shared, ok := value.(coalescedLoadValue); ok {
+		shared.releaseCoalescedLoad()
 	}
 }
 

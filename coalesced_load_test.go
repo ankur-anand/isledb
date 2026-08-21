@@ -9,6 +9,47 @@ import (
 	"time"
 )
 
+type testCoalescedSharedValue struct {
+	mu       sync.Mutex
+	refs     int
+	retains  int
+	releases int
+}
+
+type testCoalescedLease struct {
+	shared *testCoalescedSharedValue
+	once   sync.Once
+}
+
+func newTestCoalescedSharedValue() *testCoalescedSharedValue {
+	return &testCoalescedSharedValue{refs: 1}
+}
+
+func (v *testCoalescedSharedValue) retainCoalescedLoad() any {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.refs++
+	v.retains++
+	return &testCoalescedLease{shared: v}
+}
+
+func (v *testCoalescedSharedValue) releaseCoalescedLoad() {
+	v.release()
+}
+
+func (v *testCoalescedSharedValue) release() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.refs--
+	if v.refs == 0 {
+		v.releases++
+	}
+}
+
+func (l *testCoalescedLease) Close() {
+	l.once.Do(func() { l.shared.release() })
+}
+
 func TestCoalescedLoadGroup_CanceledLeaderDoesNotCancelWaiter(t *testing.T) {
 	var group coalescedLoadGroup
 	started := make(chan struct{})
@@ -349,6 +390,64 @@ func TestCoalescedLoadGroup_ManyWaitersShareOneLoad(t *testing.T) {
 	}
 	if got := loads.Load(); got != 1 {
 		t.Fatalf("loads=%d want=1", got)
+	}
+	group.Close(ErrReaderClosed)
+}
+
+func TestCoalescedLoadGroup_SharedValueLivesUntilEveryLeaseCloses(t *testing.T) {
+	const waiters = 16
+
+	var group coalescedLoadGroup
+	shared := newTestCoalescedSharedValue()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	results := make(chan *testCoalescedLease, waiters)
+	start := make(chan struct{})
+
+	for range waiters {
+		go func() {
+			<-start
+			value, err := group.Do(context.Background(), "shared", func(context.Context) (any, error) {
+				close(started)
+				<-release
+				return shared, nil
+			})
+			if err != nil {
+				results <- nil
+				return
+			}
+			results <- value.(*testCoalescedLease)
+		}()
+	}
+	close(start)
+	<-started
+	waitForCoalescedLoadWaiters(t, &group, "shared", waiters)
+	close(release)
+
+	leases := make([]*testCoalescedLease, 0, waiters)
+	for range waiters {
+		lease := <-results
+		if lease == nil {
+			t.Fatal("coalesced waiter failed")
+		}
+		leases = append(leases, lease)
+	}
+
+	shared.mu.Lock()
+	refs, retains, releases := shared.refs, shared.retains, shared.releases
+	shared.mu.Unlock()
+	if refs != waiters || retains != waiters || releases != 0 {
+		t.Fatalf("shared value before lease close: refs=%d retains=%d releases=%d", refs, retains, releases)
+	}
+
+	for _, lease := range leases {
+		lease.Close()
+	}
+	shared.mu.Lock()
+	refs, releases = shared.refs, shared.releases
+	shared.mu.Unlock()
+	if refs != 0 || releases != 1 {
+		t.Fatalf("shared value after lease close: refs=%d releases=%d", refs, releases)
 	}
 	group.Close(ErrReaderClosed)
 }
