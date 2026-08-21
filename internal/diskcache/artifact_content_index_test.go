@@ -75,7 +75,7 @@ func TestArtifactContentIndexMaintainsLRUOrder(t *testing.T) {
 	if got := index.oldest(); got != first {
 		t.Fatal("probe changed LRU order")
 	}
-	if _, ok := index.pin(firstAddress, 64); !ok {
+	if _, ok, err := index.pin(firstAddress, 64); err != nil || !ok {
 		t.Fatal("pin did not find first entry")
 	}
 	if got := index.oldest(); got != second {

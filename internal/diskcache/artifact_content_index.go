@@ -84,14 +84,19 @@ func (index *artifactContentIndex) probe(
 func (index *artifactContentIndex) pin(
 	address artifactContentAddress,
 	size int64,
-) (*artifactContentIndexEntry, bool) {
+) (*artifactContentIndexEntry, bool, error) {
 	entry := index.entries[address]
-	if entry == nil || entry.size != size {
-		return nil, false
+	if entry == nil {
+		return nil, false, nil
+	}
+	if entry.size != size {
+		return nil, false, fmt.Errorf(
+			"diskcache: content size changed for one checksum: got=%d want=%d",
+			size, entry.size)
 	}
 	entry.refs++
 	index.lru.MoveToBack(entry.element)
-	return entry, true
+	return entry, true, nil
 }
 
 // detach removes entry from searchable residency only if it still owns its
