@@ -48,6 +48,7 @@ type artifactTier struct {
 
 	residentBytes int64
 	pinnedBytes   int64
+	pinnedEntries int
 	entries       map[artifactDigest]*artifactEntry
 	lru           list.List
 
@@ -77,6 +78,14 @@ func (c artifactCleanup) run() error {
 	return err
 }
 
+func runArtifactCleanups(cleanups []artifactCleanup) error {
+	var err error
+	for _, cleanup := range cleanups {
+		err = errors.Join(err, cleanup.run())
+	}
+	return err
+}
+
 // ArtifactCache is a process-exclusive, persistent cache for immutable SST
 // payloads and raw Bloom sidecars.
 type ArtifactCache struct {
@@ -88,6 +97,8 @@ type ArtifactCache struct {
 	touchInterval  time.Duration
 	maxOpenEntries int
 	openEntries    int
+	syncDirectory  func(string) error
+	verifyFile     func(string, ArtifactDescriptor) (bool, error)
 	tiers          map[ArtifactKind]*artifactTier
 	directoryLock  *artifactDirectoryLock
 	closed         bool
@@ -117,6 +128,8 @@ func OpenArtifactCache(opts ArtifactCacheOptions) (*ArtifactCache, error) {
 		incomingDir:    filepath.Join(normalized.Dir, "incoming"),
 		touchInterval:  normalized.TouchInterval,
 		maxOpenEntries: normalized.MaxOpenEntries,
+		syncDirectory:  syncArtifactDirectory,
+		verifyFile:     verifyArtifactFile,
 		directoryLock:  directoryLock,
 		tiers: map[ArtifactKind]*artifactTier{
 			ArtifactSST: {
@@ -223,12 +236,8 @@ func (c *ArtifactCache) Stats(kind ArtifactKind) ArtifactStats {
 	stats.ResidentEntries = len(tier.entries)
 	stats.ResidentBytes = tier.residentBytes
 	stats.PinnedBytes = tier.pinnedBytes
+	stats.PinnedEntries = tier.pinnedEntries
 	stats.MaxBytes = tier.maxBytes
-	for _, entry := range tier.entries {
-		if entry.refs > 0 {
-			stats.PinnedEntries++
-		}
-	}
 	return stats
 }
 
@@ -282,22 +291,31 @@ func (c *ArtifactCache) reserveLocked(
 		tier.stats.AdmissionBypasses++
 		return nil, ArtifactBypassedOversized
 	}
-	var cleanups []artifactCleanup
-	for tier.residentBytes+required > tier.maxBytes {
-		var victim *artifactEntry
-		for element := tier.lru.Front(); element != nil; element = element.Next() {
-			candidate := element.Value.(*artifactEntry)
-			if candidate.id.digest == exclude || candidate.refs != 0 || candidate.pendingRemoval ||
-				candidate.state != artifactEntryReady {
-				continue
-			}
-			victim = candidate
+	requiredReclaim := tier.residentBytes + required - tier.maxBytes
+	if requiredReclaim <= 0 {
+		return nil, ArtifactAdmitted
+	}
+	var victims []*artifactEntry
+	var reclaimable int64
+	for element := tier.lru.Front(); element != nil; element = element.Next() {
+		candidate := element.Value.(*artifactEntry)
+		if candidate.id.digest == exclude || candidate.refs != 0 || candidate.pendingRemoval ||
+			candidate.state != artifactEntryReady {
+			continue
+		}
+		victims = append(victims, candidate)
+		reclaimable += candidate.size
+		if reclaimable >= requiredReclaim {
 			break
 		}
-		if victim == nil {
-			tier.stats.AdmissionBypasses++
-			return cleanups, ArtifactBypassedPinnedCapacity
-		}
+	}
+	if reclaimable < requiredReclaim {
+		tier.stats.AdmissionBypasses++
+		return nil, ArtifactBypassedPinnedCapacity
+	}
+
+	cleanups := make([]artifactCleanup, 0, len(victims))
+	for _, victim := range victims {
 		cleanups = append(cleanups, c.detachEntryLocked(tier, victim, ArtifactRemovalCapacity))
 	}
 	return cleanups, ArtifactAdmitted

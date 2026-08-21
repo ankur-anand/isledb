@@ -262,13 +262,24 @@ func TestArtifactCacheCrashReleasesLockAndCleansIncoming(t *testing.T) {
 			fmt.Fprintf(os.Stdout, "error:%v\n", err)
 			os.Exit(2)
 		}
-		data := []byte("unfinished-download")
-		fill, err := cache.BeginFill(testArtifactDescriptor(ArtifactSST, "sst-crash", data))
+		completedData := []byte("completed-before-crash")
+		completedDesc := testArtifactDescriptor(ArtifactSST, "sst-completed-before-crash", completedData)
+		handle, _, err := cache.AdmitBytes(completedDesc, completedData)
 		if err != nil {
 			fmt.Fprintf(os.Stdout, "error:%v\n", err)
 			os.Exit(2)
 		}
-		_, _ = fill.Write(data[:5])
+		if err := handle.Close(); err != nil {
+			fmt.Fprintf(os.Stdout, "error:%v\n", err)
+			os.Exit(2)
+		}
+		partialData := []byte("unfinished-download")
+		fill, err := cache.BeginFill(testArtifactDescriptor(ArtifactSST, "sst-crash", partialData))
+		if err != nil {
+			fmt.Fprintf(os.Stdout, "error:%v\n", err)
+			os.Exit(2)
+		}
+		_, _ = fill.Write(partialData[:5])
 		fmt.Fprintln(os.Stdout, "ready")
 		time.Sleep(time.Hour)
 		return
@@ -312,6 +323,18 @@ func TestArtifactCacheCrashReleasesLockAndCleansIncoming(t *testing.T) {
 	if len(incoming) != 0 {
 		t.Fatalf("incoming artifacts survived crash recovery: %v", incoming)
 	}
+	completedData := []byte("completed-before-crash")
+	completedDesc := testArtifactDescriptor(ArtifactSST, "sst-completed-before-crash", completedData)
+	handle, ok, err := cache.Acquire(completedDesc)
+	if err != nil || !ok {
+		t.Fatalf("acquire completed crash artifact ok=%t err=%v", ok, err)
+	}
+	if !bytes.Equal(handle.Bytes(), completedData) {
+		t.Fatalf("completed crash artifact bytes=%q", handle.Bytes())
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestArtifactCacheAdmissionValidation(t *testing.T) {
@@ -337,6 +360,174 @@ func TestArtifactCacheAdmissionValidation(t *testing.T) {
 	}
 	if len(incoming) != 0 {
 		t.Fatalf("rejected fills remain in incoming: %v", incoming)
+	}
+
+	retryDesc := testArtifactDescriptor(ArtifactBloom, "wrong-checksum", data)
+	handle, admission, err := cache.AdmitBytes(retryDesc, data)
+	if err != nil || admission != ArtifactAdmitted {
+		t.Fatalf("retry admission=%d err=%v", admission, err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArtifactFillRejectsOverlongWriteBeforeSpendingDisk(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 1<<20, 1<<20)
+	defer cache.Close()
+	data := []byte("bounded")
+	desc := testArtifactDescriptor(ArtifactSST, "overlong-write", data)
+	fill, err := cache.BeginFill(desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fill.Abort()
+
+	written, err := fill.Write(append(append([]byte(nil), data...), '!'))
+	if !errors.Is(err, ErrArtifactSizeMismatch) {
+		t.Fatalf("overlong Write bytes=%d error=%v want=%v", written, err, ErrArtifactSizeMismatch)
+	}
+	if written != 0 {
+		t.Fatalf("overlong Write spent %d bytes before rejection", written)
+	}
+}
+
+func TestArtifactCachePinnedCapacityBypassDoesNotEvictUsefulEntries(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 10, 10)
+	defer cache.Close()
+	unpinnedData := []byte("aaa")
+	pinnedData := []byte("bbbbbbb")
+	bypassData := []byte("cccccccc")
+	unpinnedDesc := testArtifactDescriptor(ArtifactSST, "unpinned", unpinnedData)
+	pinnedDesc := testArtifactDescriptor(ArtifactSST, "pinned", pinnedData)
+	bypassDesc := testArtifactDescriptor(ArtifactSST, "bypass", bypassData)
+
+	unpinned, _, err := cache.AdmitBytes(unpinnedDesc, unpinnedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unpinned.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pinned, _, err := cache.AdmitBytes(pinnedDesc, pinnedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+
+	bypassed, admission, err := cache.AdmitBytes(bypassDesc, bypassData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admission != ArtifactBypassedPinnedCapacity {
+		t.Fatalf("admission=%d want=%d", admission, ArtifactBypassedPinnedCapacity)
+	}
+	if err := bypassed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if presence, err := cache.Probe(unpinnedDesc); err != nil || presence == ArtifactAbsent {
+		t.Fatalf("useful unpinned entry was evicted before bypass: presence=%d err=%v", presence, err)
+	}
+}
+
+func TestArtifactCachePublishRunsEveryDetachedCleanup(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 8, 8)
+	defer cache.Close()
+	dataA := []byte("aaaa")
+	dataB := []byte("bbbb")
+	dataC := []byte("cccccccc")
+	descA := testArtifactDescriptor(ArtifactSST, "cleanup-a", dataA)
+	descB := testArtifactDescriptor(ArtifactSST, "cleanup-b", dataB)
+	descC := testArtifactDescriptor(ArtifactSST, "cleanup-c", dataC)
+
+	for _, item := range []struct {
+		desc ArtifactDescriptor
+		data []byte
+	}{{descA, dataA}, {descB, dataB}} {
+		handle, _, err := cache.AdmitBytes(item.desc, item.data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := handle.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pathB := cache.artifactPath(artifactIDFor(descB.Key))
+
+	// Make the first victim's unlink fail after its mmap and descriptor have
+	// been released. Publication must still run the second victim's cleanup.
+	cache.mu.Lock()
+	cache.tiers[ArtifactSST].entries[artifactIDFor(descA.Key).digest].path = cache.dir
+	cache.mu.Unlock()
+
+	if _, _, err := cache.AdmitBytes(descC, dataC); err == nil {
+		t.Fatal("publication unexpectedly succeeded after injected cleanup failure")
+	}
+	if _, err := os.Stat(pathB); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("later detached cleanup was abandoned: stat error=%v", err)
+	}
+}
+
+func TestArtifactCachePublishDoesNotHoldGlobalMutexDuringDirectorySync(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 1<<20, 1<<20)
+	defer cache.Close()
+	data := []byte("sync-without-global-lock")
+	desc := testArtifactDescriptor(ArtifactSST, "sync-lock-scope", data)
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	cache.syncDirectory = func(path string) error {
+		if path == filepath.Dir(cache.artifactPath(artifactIDFor(desc.Key))) {
+			close(started)
+			<-unblock
+		}
+		return syncArtifactDirectory(path)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		handle, _, err := cache.AdmitBytes(desc, data)
+		if handle != nil {
+			err = errors.Join(err, handle.Close())
+		}
+		result <- err
+	}()
+	<-started
+	lockAvailable := cache.mu.TryLock()
+	if lockAvailable {
+		cache.mu.Unlock()
+	}
+	close(unblock)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if !lockAvailable {
+		t.Fatal("global cache mutex was held during directory sync")
+	}
+}
+
+func TestArtifactCacheFirstShardCreationSyncsTierDirectory(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 1<<20, 1<<20)
+	defer cache.Close()
+	data := []byte("durable-first-shard")
+	desc := testArtifactDescriptor(ArtifactSST, "first-shard", data)
+	finalPath := cache.artifactPath(artifactIDFor(desc.Key))
+	shardDir := filepath.Dir(finalPath)
+	tierDir := filepath.Dir(shardDir)
+	var synced []string
+	cache.syncDirectory = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return syncArtifactDirectory(path)
+	}
+
+	handle, _, err := cache.AdmitBytes(desc, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) < 2 || synced[0] != filepath.Clean(tierDir) || synced[1] != filepath.Clean(shardDir) {
+		t.Fatalf("directory sync order=%v want tier then shard", synced)
 	}
 }
 
@@ -477,6 +668,88 @@ func TestArtifactCacheRecoveredCorruptionBecomesMiss(t *testing.T) {
 	}
 }
 
+func TestArtifactCacheSuccessfulVerificationPreservesPendingRemovalReason(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("verified-while-purged")
+	desc := testArtifactDescriptor(ArtifactSST, "purged-during-verification", data)
+	cache := openTestArtifactCache(t, dir, 1<<20, 1<<20)
+	handle, _, err := cache.AdmitBytes(desc, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cache = openTestArtifactCache(t, dir, 1<<20, 1<<20)
+	defer cache.Close()
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	cache.verifyFile = func(path string, got ArtifactDescriptor) (bool, error) {
+		close(started)
+		<-unblock
+		return verifyArtifactFile(path, got)
+	}
+	result := make(chan error, 1)
+	go func() {
+		acquired, ok, err := cache.Acquire(desc)
+		if acquired != nil {
+			err = errors.Join(err, acquired.Close())
+		}
+		if ok {
+			err = errors.Join(err, errors.New("purged verification returned a hit"))
+		}
+		result <- err
+	}()
+	<-started
+	if err := cache.Purge(ArtifactSST); err != nil {
+		close(unblock)
+		t.Fatal(err)
+	}
+	close(unblock)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+
+	stats := cache.Stats(ArtifactSST)
+	if stats.Corruptions != 0 || stats.PurgeRemovals != 1 {
+		t.Fatalf("pending purge was misclassified: %+v", stats)
+	}
+}
+
+func TestArtifactCacheRefillOfUnverifiedRecoveryIsNotCorruption(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("recovered-and-refilled")
+	desc := testArtifactDescriptor(ArtifactBloom, "refilled-recovery", data)
+	cache := openTestArtifactCache(t, dir, 1<<20, 1<<20)
+	handle, _, err := cache.AdmitBytes(desc, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cache = openTestArtifactCache(t, dir, 1<<20, 1<<20)
+	defer cache.Close()
+	handle, admission, err := cache.AdmitBytes(desc, data)
+	if err != nil || admission != ArtifactAdmitted {
+		t.Fatalf("refill admission=%d err=%v", admission, err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := cache.Stats(ArtifactBloom); stats.Corruptions != 0 {
+		t.Fatalf("unverified recovery refill was classified as corruption: %+v", stats)
+	}
+}
+
 func TestArtifactCacheConcurrentRecoveredAcquire(t *testing.T) {
 	dir := t.TempDir()
 	data := bytes.Repeat([]byte("concurrent-recovery"), 1024)
@@ -532,12 +805,19 @@ func TestArtifactCacheRecoveryEnforcesReducedCapacityAndCleansMalformedFiles(t *
 		t.Fatal(err)
 	}
 	_ = handleA.Close()
-	time.Sleep(time.Millisecond)
 	handleB, _, err := cache.AdmitBytes(descB, dataB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = handleB.Close()
+	oldTime := time.Unix(1_700_000_000, 0)
+	newTime := oldTime.Add(time.Second)
+	if err := os.Chtimes(cache.artifactPath(artifactIDFor(descA.Key)), oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(cache.artifactPath(artifactIDFor(descB.Key)), newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
 	malformed := filepath.Join(cache.versionDir, ArtifactSST.dirName(), "not-a-shard", "junk.sst")
 	if err := os.MkdirAll(filepath.Dir(malformed), 0o700); err != nil {
 		t.Fatal(err)
@@ -644,5 +924,25 @@ func TestArtifactCacheBoundsUnpinnedOpenMappings(t *testing.T) {
 	cache.mu.Unlock()
 	if openEntries != 1 {
 		t.Fatalf("open entries=%d want=1", openEntries)
+	}
+}
+
+func TestArtifactCacheMappedEntryDoesNotRetainFileDescriptor(t *testing.T) {
+	cache := openTestArtifactCache(t, t.TempDir(), 1<<20, 1<<20)
+	defer cache.Close()
+	data := []byte("mapped-without-open-fd")
+	desc := testArtifactDescriptor(ArtifactSST, "no-retained-fd", data)
+	handle, _, err := cache.AdmitBytes(desc, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+
+	cache.mu.Lock()
+	entry := cache.tiers[ArtifactSST].entries[artifactIDFor(desc.Key).digest]
+	retainedFile := entry.file
+	cache.mu.Unlock()
+	if retainedFile != nil {
+		t.Fatal("mmap entry retained its source file descriptor")
 	}
 }

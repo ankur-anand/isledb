@@ -29,11 +29,11 @@ type ArtifactFill struct {
 
 // BeginFill creates a temporary artifact in the cache's incoming directory.
 func (c *ArtifactCache) BeginFill(desc ArtifactDescriptor) (*ArtifactFill, error) {
-	if err := desc.validate(); err != nil {
-		return nil, err
-	}
 	if c == nil {
 		return nil, ErrArtifactCacheClosed
+	}
+	if err := desc.validate(); err != nil {
+		return nil, err
 	}
 	c.mu.Lock()
 	if c.closed {
@@ -67,6 +67,11 @@ func (f *ArtifactFill) Write(data []byte) (int, error) {
 	defer f.mu.Unlock()
 	if f.done || f.file == nil {
 		return 0, os.ErrClosed
+	}
+	remaining := f.desc.Size - f.size
+	if int64(len(data)) > remaining {
+		return 0, fmt.Errorf(
+			"%w: write=%d remaining=%d", ErrArtifactSizeMismatch, len(data), remaining)
 	}
 	written, err := f.file.Write(data)
 	if written > 0 {
@@ -190,10 +195,27 @@ func (c *ArtifactCache) publishFill(
 ) (*ArtifactHandle, ArtifactAdmission, error) {
 	id := artifactIDFor(desc.Key)
 	finalPath := c.artifactPath(id)
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0o700); err != nil {
+	shardDir := filepath.Dir(finalPath)
+	shardMissing := false
+	if _, err := os.Stat(shardDir); errors.Is(err, os.ErrNotExist) {
+		shardMissing = true
+	} else if err != nil {
+		_ = os.Remove(tempPath)
+		c.finishFill()
+		return nil, 0, fmt.Errorf("diskcache: inspect artifact shard: %w", err)
+	}
+	if err := os.MkdirAll(shardDir, 0o700); err != nil {
 		_ = os.Remove(tempPath)
 		c.finishFill()
 		return nil, 0, fmt.Errorf("diskcache: create artifact shard: %w", err)
+	}
+	if shardMissing {
+		if err := c.syncDirectory(filepath.Dir(shardDir)); err != nil {
+			_ = os.Remove(tempPath)
+			_ = os.Remove(shardDir)
+			c.finishFill()
+			return nil, 0, err
+		}
 	}
 
 	c.mu.Lock()
@@ -216,12 +238,21 @@ func (c *ArtifactCache) publishFill(
 			return c.pinExistingFillLocked(tier, existing, tempPath)
 		}
 		if existing.refs == 0 && existing.state == artifactEntryReady {
-			cleanups = append(cleanups, c.detachEntryLocked(tier, existing, ArtifactRemovalCorrupt))
+			removalReason := ArtifactRemovalCorrupt
+			if existing.pendingReason != 0 {
+				removalReason = existing.pendingReason
+			} else if existing.verifiedChecksum == "" {
+				// Recovery deliberately leaves the checksum unverified. A verified
+				// refill may replace it without implying that the recovered bytes
+				// were corrupt.
+				removalReason = 0
+			}
+			cleanups = append(cleanups, c.detachEntryLocked(tier, existing, removalReason))
 		} else {
 			// A conflicting or transitional resident cannot be replaced safely.
 			// The verified fill remains usable through a transient handle.
 			tier.stats.AdmissionBypasses++
-			return c.publishTransientLocked(tempPath, ArtifactBypassedPinnedCapacity)
+			return c.publishTransientLocked(tempPath, ArtifactBypassedPinnedCapacity, nil)
 		}
 	}
 
@@ -229,41 +260,8 @@ func (c *ArtifactCache) publishFill(
 	var reserveCleanups []artifactCleanup
 	reserveCleanups, admission = c.reserveLocked(tier, desc.Size, id.digest)
 	cleanups = append(cleanups, reserveCleanups...)
-	for _, cleanup := range cleanups {
-		if err := cleanup.run(); err != nil {
-			c.activeFills--
-			directoryLock := c.takeDirectoryLockIfIdleLocked()
-			c.mu.Unlock()
-			_ = os.Remove(tempPath)
-			if directoryLock != nil {
-				_ = directoryLock.close()
-			}
-			return nil, 0, fmt.Errorf("diskcache: remove evicted artifact: %w", err)
-		}
-	}
 	if admission != ArtifactAdmitted {
-		return c.publishTransientLocked(tempPath, admission)
-	}
-
-	if err := os.Rename(tempPath, finalPath); err != nil {
-		c.activeFills--
-		directoryLock := c.takeDirectoryLockIfIdleLocked()
-		c.mu.Unlock()
-		_ = os.Remove(tempPath)
-		if directoryLock != nil {
-			_ = directoryLock.close()
-		}
-		return nil, 0, fmt.Errorf("diskcache: publish artifact: %w", err)
-	}
-	if err := syncArtifactDirectory(filepath.Dir(finalPath)); err != nil {
-		_ = os.Remove(finalPath)
-		c.activeFills--
-		directoryLock := c.takeDirectoryLockIfIdleLocked()
-		c.mu.Unlock()
-		if directoryLock != nil {
-			_ = directoryLock.close()
-		}
-		return nil, 0, err
+		return c.publishTransientLocked(tempPath, admission, cleanups)
 	}
 
 	now := time.Now()
@@ -277,11 +275,56 @@ func (c *ArtifactCache) publishFill(
 	tier.entries[id.digest] = entry
 	tier.residentBytes += entry.size
 	tier.pinnedBytes += entry.size
+	tier.pinnedEntries++
 	c.activeFills--
 	c.activeHandles++
 	c.mu.Unlock()
 
+	if err := runArtifactCleanups(cleanups); err != nil {
+		return c.failPublishingFill(
+			tier, entry, tempPath, fmt.Errorf("diskcache: remove evicted artifact: %w", err))
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return c.failPublishingFill(
+			tier, entry, tempPath, fmt.Errorf("diskcache: publish artifact: %w", err))
+	}
+	if err := c.syncDirectory(shardDir); err != nil {
+		return c.failPublishingFill(tier, entry, tempPath, err)
+	}
+
 	return c.finishOpeningFill(tier, entry, ArtifactAdmitted)
+}
+
+func (c *ArtifactCache) failPublishingFill(
+	tier *artifactTier,
+	entry *artifactEntry,
+	tempPath string,
+	cause error,
+) (*ArtifactHandle, ArtifactAdmission, error) {
+	c.mu.Lock()
+	wait := entry.wait
+	entry.wait = nil
+	if wait != nil {
+		close(wait)
+	}
+	entry.refs--
+	c.activeHandles--
+	if entry.refs == 0 {
+		tier.pinnedBytes -= entry.size
+		tier.pinnedEntries--
+	}
+	cleanup := c.detachEntryLocked(tier, entry, 0)
+	directoryLock := c.takeDirectoryLockIfIdleLocked()
+	c.mu.Unlock()
+
+	cleanupErr := errors.Join(
+		artifactCleanup{path: tempPath, remove: true}.run(),
+		cleanup.run(),
+	)
+	if directoryLock != nil {
+		cleanupErr = errors.Join(cleanupErr, directoryLock.close())
+	}
+	return nil, 0, errors.Join(cause, cleanupErr)
 }
 
 func (c *ArtifactCache) pinExistingFillLocked(
@@ -292,6 +335,7 @@ func (c *ArtifactCache) pinExistingFillLocked(
 	entry.refs++
 	if entry.refs == 1 {
 		tier.pinnedBytes += entry.size
+		tier.pinnedEntries++
 	}
 	entry.lastAccess = time.Now()
 	if entry.elem != nil {
@@ -337,6 +381,7 @@ func (c *ArtifactCache) finishOpeningFill(
 	c.activeHandles--
 	if entry.refs == 0 {
 		tier.pinnedBytes -= entry.size
+		tier.pinnedEntries--
 	}
 	cleanup := c.detachEntryLocked(tier, entry, ArtifactRemovalCorrupt)
 	directoryLock := c.takeDirectoryLockIfIdleLocked()
@@ -358,10 +403,20 @@ func (c *ArtifactCache) newPersistentHandle(tier *artifactTier, entry *artifactE
 func (c *ArtifactCache) publishTransientLocked(
 	path string,
 	admission ArtifactAdmission,
+	cleanups []artifactCleanup,
 ) (*ArtifactHandle, ArtifactAdmission, error) {
 	c.activeFills--
 	c.activeHandles++
 	c.mu.Unlock()
+	if err := runArtifactCleanups(cleanups); err != nil {
+		removeErr := os.Remove(path)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		c.finishTransientHandle()
+		return nil, 0, errors.Join(
+			fmt.Errorf("diskcache: remove conflicting artifact: %w", err), removeErr)
+	}
 
 	file, data, err := openMappedArtifact(path)
 	if err != nil {

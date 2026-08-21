@@ -182,6 +182,9 @@ func (c *ArtifactCache) recoverArtifacts() error {
 	}
 
 	sort.Slice(recovered, func(i, j int) bool {
+		if recovered[i].modTime.Equal(recovered[j].modTime) {
+			return recovered[i].path < recovered[j].path
+		}
 		return recovered[i].modTime.Before(recovered[j].modTime)
 	})
 	for _, item := range recovered {

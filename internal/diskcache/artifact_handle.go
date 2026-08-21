@@ -100,7 +100,7 @@ func (c *ArtifactCache) Acquire(desc ArtifactDescriptor) (*ArtifactHandle, bool,
 			path := entry.path
 			c.mu.Unlock()
 
-			matches, verifyErr := verifyArtifactFile(path, desc)
+			matches, verifyErr := c.verifyFile(path, desc)
 
 			c.mu.Lock()
 			if current := tier.entries[id.digest]; current != entry {
@@ -120,12 +120,16 @@ func (c *ArtifactCache) Acquire(desc ArtifactDescriptor) (*ArtifactHandle, bool,
 				continue
 			}
 			close(wait)
+			removalReason := ArtifactRemovalCorrupt
+			if matches && verifyErr == nil && entry.pendingReason != 0 {
+				removalReason = entry.pendingReason
+			}
 			var cleanup artifactCleanup
 			if entry.refs == 0 {
-				cleanup = c.detachEntryLocked(tier, entry, ArtifactRemovalCorrupt)
+				cleanup = c.detachEntryLocked(tier, entry, removalReason)
 			} else {
 				entry.pendingRemoval = true
-				entry.pendingReason = ArtifactRemovalCorrupt
+				entry.pendingReason = removalReason
 			}
 			tier.stats.Misses++
 			c.mu.Unlock()
@@ -201,6 +205,7 @@ func (c *ArtifactCache) Acquire(desc ArtifactDescriptor) (*ArtifactHandle, bool,
 		c.activeHandles++
 		if wasUnpinned {
 			tier.pinnedBytes += entry.size
+			tier.pinnedEntries++
 		}
 		now := time.Now()
 		entry.lastAccess = now
@@ -255,7 +260,14 @@ func openMappedArtifact(path string) (*os.File, []byte, error) {
 		_ = file.Close()
 		return nil, nil, err
 	}
-	return file, data, nil
+	// The mapping owns its kernel reference to the file. Keeping the source
+	// descriptor open would make concurrent pinned entries an avoidable EMFILE
+	// risk without extending the mapping's lifetime.
+	if err := file.Close(); err != nil {
+		return nil, nil, errors.Join(
+			fmt.Errorf("diskcache: close mapped artifact: %w", err), Munmap(data))
+	}
+	return nil, data, nil
 }
 
 func (c *ArtifactCache) releasePersistentHandle(tier *artifactTier, entry *artifactEntry) error {
@@ -269,6 +281,7 @@ func (c *ArtifactCache) releasePersistentHandle(tier *artifactTier, entry *artif
 	var cleanups []artifactCleanup
 	if entry.refs == 0 {
 		tier.pinnedBytes -= entry.size
+		tier.pinnedEntries--
 		if entry.pendingRemoval {
 			cleanups = append(cleanups, c.detachEntryLocked(tier, entry, entry.pendingReason))
 		} else if c.closed && (entry.mmap != nil || entry.file != nil) {
