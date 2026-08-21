@@ -102,15 +102,15 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	for _, sst := range selected {
 		sst := sst
 		g.Go(func() error {
-			resident, err := r.prefetchSST(gctx, sst)
+			resident, downloaded, err := r.prefetchSST(gctx, sst)
 			if err != nil {
 				return err
 			}
 			if resident {
 				cached.Add(1)
 			}
-			if sst.Size > 0 {
-				bytesRead.Add(sst.Size)
+			if downloaded > 0 {
+				bytesRead.Add(downloaded)
 			}
 			return nil
 		})
@@ -232,20 +232,20 @@ func sstOverlapsPrefetchRange(sst sstMetadata, r KeyRange) bool {
 	return true
 }
 
-func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (bool, error) {
+func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (bool, int64, error) {
 	path := r.store.SSTPath(sst.ID)
 	if resident, err := r.sstResident(sst); err != nil {
-		return false, fmt.Errorf("probe sst %s: %w", sst.ID, err)
+		return false, 0, fmt.Errorf("probe sst %s: %w", sst.ID, err)
 	} else if resident {
-		return true, nil
+		return true, 0, nil
 	}
 
 	if err := r.cacheSST(ctx, &sst, path); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	resident, err := r.sstResident(sst)
 	if err != nil {
-		return false, fmt.Errorf("probe prefetched sst %s: %w", sst.ID, err)
+		return false, sst.Size, fmt.Errorf("probe prefetched sst %s: %w", sst.ID, err)
 	}
-	return resident, nil
+	return resident, sst.Size, nil
 }

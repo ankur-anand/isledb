@@ -38,3 +38,23 @@ func TestReaderOpenOptionsRejectsNegativeBloomCacheSize(t *testing.T) {
 		t.Fatalf("readerOptionsFromPublic error=%v want=%v", err, ErrInvalidReaderOptions)
 	}
 }
+
+func TestReaderOpenOptionsRejectsOtherNegativeCacheLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ReaderOpenOptions)
+	}{
+		{name: "sst_cache", mutate: func(opts *ReaderOpenOptions) { opts.SSTCacheSize = -1 }},
+		{name: "block_cache", mutate: func(opts *ReaderOpenOptions) { opts.BlockCacheSize = -1 }},
+		{name: "range_read_min_sst", mutate: func(opts *ReaderOpenOptions) { opts.RangeReadMinSSTSize = -1 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := DefaultReaderOpenOptions(t.TempDir())
+			test.mutate(&opts)
+			if _, err := readerOptionsFromPublic(opts); !errors.Is(err, ErrInvalidReaderOptions) {
+				t.Fatalf("readerOptionsFromPublic error=%v want=%v", err, ErrInvalidReaderOptions)
+			}
+		})
+	}
+}

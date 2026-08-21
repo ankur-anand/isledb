@@ -1,14 +1,14 @@
 package isledb
 
 import (
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/dgraph-io/ristretto/v2/z"
 )
 
-func TestPublishManifestViewDoesNotHoldReaderLockDuringInvalidation(t *testing.T) {
+func TestPublishManifestViewDoesNotConsultBloomCache(t *testing.T) {
 	oldManifest := &manifestState{L0SSTs: []manifest.SSTMeta{{ID: "retired-sst"}}}
 	newManifest := &manifestState{}
 	reader := &Reader{
@@ -18,15 +18,10 @@ func TestPublishManifestViewDoesNotHoldReaderLockDuringInvalidation(t *testing.T
 	}
 	defer reader.stopManifestExpiry()
 
-	// Force invalidation to stop at the decoded-Bloom cache. Publication must
-	// still release Reader.mu before it reaches this independently locked cache.
+	// Manifest publication must not scan or invalidate the independently bounded
+	// decoded-Bloom cache.
 	reader.bloomCache.mu.Lock()
-	bloomLocked := true
-	defer func() {
-		if bloomLocked {
-			reader.bloomCache.mu.Unlock()
-		}
-	}()
+	defer reader.bloomCache.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -36,32 +31,36 @@ func TestPublishManifestViewDoesNotHoldReaderLockDuringInvalidation(t *testing.T
 		close(done)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	published := false
-	for time.Now().Before(deadline) {
-		if reader.mu.TryRLock() {
-			published = reader.manifest == newManifest
-			reader.mu.RUnlock()
-			if published {
-				break
-			}
-		}
-		runtime.Gosched()
-	}
-	if !published {
-		t.Fatal("new manifest was not readable while Bloom invalidation was blocked")
-	}
-	select {
-	case <-done:
-		t.Fatal("manifest publication completed without reaching blocked invalidation")
-	default:
-	}
-
-	reader.bloomCache.mu.Unlock()
-	bloomLocked = false
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("manifest invalidation did not finish after Bloom cache was released")
+		t.Fatal("manifest publication consulted the locked Bloom cache")
+	}
+	reader.mu.RLock()
+	published := reader.manifest == newManifest
+	reader.mu.RUnlock()
+	if !published {
+		t.Fatal("new manifest was not published")
+	}
+}
+
+func TestPublishManifestViewRetainsRetiredDecodedBloom(t *testing.T) {
+	const retiredID = "retired-sst"
+	filter := z.NewBloomFilter(64, 2)
+	filter.Add(1)
+	cache := newBloomFilterCache(bloomFilterCacheCost(retiredID, filter))
+	cache.put(retiredID, filter)
+	reader := &Reader{
+		manifest:   &manifestState{L0SSTs: []manifest.SSTMeta{{ID: retiredID}}},
+		bloomCache: cache,
+		viewPolicy: ReaderViewPolicy{RefreshAfter: time.Hour},
+	}
+	defer reader.stopManifestExpiry()
+
+	reader.publishManifestView(&manifestState{}, &manifest.Current{
+		MaxPinnedViewAge: time.Hour,
+	}, time.Now())
+	if _, ok := cache.peek(retiredID); !ok {
+		t.Fatal("retired decoded Bloom was removed instead of remaining LRU-managed")
 	}
 }

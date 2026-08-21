@@ -120,18 +120,17 @@ func (r *Reader) sstResident(meta sstMetadata) (bool, error) {
 // sstArtifactResidentByID is the ID-only probe used by lazy-reader tests.
 // Runtime read paths pass metadata directly and avoid this manifest scan.
 func (r *Reader) sstArtifactResidentByID(id string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.manifest == nil {
+	current := r.currentManifest()
+	if current == nil {
 		return false
 	}
-	for _, meta := range r.manifest.L0SSTs {
+	for _, meta := range current.L0SSTs {
 		if meta.ID == id {
 			resident, _ := r.sstResident(meta)
 			return resident
 		}
 	}
-	for _, level := range r.manifest.Levels {
+	for _, level := range current.Levels {
 		for _, meta := range level.SSTs {
 			if meta.ID == id {
 				resident, _ := r.sstResident(meta)

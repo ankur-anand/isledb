@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,13 @@ func initReaderDiskCache(opts readerOptions) (
 	if err != nil {
 		return nil, false, fmt.Errorf("create artifact cache: %w", err)
 	}
+	// The previous process-lifetime cache used CacheDir/sst. It cannot be
+	// adopted by the digest-addressed artifact cache and otherwise survives an
+	// upgrade forever outside the new cache's accounting.
+	if err := os.RemoveAll(filepath.Join(opts.CacheDir, "sst")); err != nil {
+		_ = cache.Close()
+		return nil, false, fmt.Errorf("remove legacy SST cache: %w", err)
+	}
 
 	return cache, true, nil
 }
@@ -216,11 +224,10 @@ func (r *Reader) publishManifestView(
 	refreshAt := viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
-	// Manifest states are immutable after publication. Swap the view and its
-	// metadata under a short critical section, then do the O(SST count) cache
-	// cleanup without blocking readers that only need the current view pointer.
+	// Manifest states and SST IDs are immutable after publication. Swap the view
+	// and its metadata under one short critical section. Artifact and decoded
+	// Bloom caches remain byte-bounded and age retired entries through their LRUs.
 	r.mu.Lock()
-	oldManifest := r.manifest
 	r.manifest = m
 	r.version = versionFromCurrent(current)
 	r.changeFeed = changeFeed
@@ -230,9 +237,6 @@ func (r *Reader) publishManifestView(
 	r.mu.Unlock()
 
 	r.armManifestExpiry(refreshAt, expiresAt)
-	if oldManifest != nil {
-		r.invalidateRemovedSSTs(oldManifest, m)
-	}
 }
 
 func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
@@ -287,26 +291,6 @@ func (r *Reader) stopManifestExpiry() {
 	r.viewTimerMu.Unlock()
 	if timer != nil {
 		timer.Stop()
-	}
-}
-
-func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *manifestState) {
-	oldIDs := make(map[string]struct{})
-	for _, id := range oldManifest.AllSSTIDs() {
-		oldIDs[id] = struct{}{}
-	}
-
-	newIDs := make(map[string]struct{})
-	for _, id := range newManifest.AllSSTIDs() {
-		newIDs[id] = struct{}{}
-	}
-
-	for id := range oldIDs {
-		if _, exists := newIDs[id]; !exists {
-			// Persistent artifacts are immutable and byte-bounded. Retain retired
-			// SST and raw-Bloom bytes until capacity pressure reclaims them.
-			r.bloomCache.delete(id)
-		}
 	}
 }
 
@@ -861,6 +845,7 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	path := r.store.SSTPath(sstMeta.ID)
+	var cachedOpenErr error
 
 	if cached, releaseCache, ok, err := r.acquireSST(sstMeta); err != nil {
 		return nil, nil, fmt.Errorf("acquire cached sst %s: %w", sstMeta.ID, err)
@@ -870,6 +855,7 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		if err == nil {
 			return reader, iter, nil
 		}
+		cachedOpenErr = err
 		// Cached bytes are not authoritative. If they cannot be opened, release
 		// and evict them, then make one attempt against object storage below.
 		if removeErr := r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt); removeErr != nil {
@@ -880,14 +866,18 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 	}
 
 	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(cachedOpenErr, err)
 	} else if ok {
-		return r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
+		reader, iter, err := r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
+		if err != nil {
+			err = errors.Join(cachedOpenErr, err)
+		}
+		return reader, iter, err
 	}
 
 	loaded, err := r.loadSSTArtifact(ctx, &sstMeta, path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(cachedOpenErr, err)
 	}
 	releaseLoaded := func() { _ = loaded.Close() }
 	reader, iter, err := r.openSSTIterFromData(
@@ -898,6 +888,7 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		if removeErr := r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt); removeErr != nil {
 			err = errors.Join(err, removeErr)
 		}
+		err = errors.Join(cachedOpenErr, err)
 	}
 	return reader, iter, err
 }

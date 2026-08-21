@@ -154,6 +154,22 @@ func TestReader_PrefetchAllAndSkipCached(t *testing.T) {
 	}
 }
 
+func TestReader_PrefetchResidentRaceReportsNoDownloadedBytes(t *testing.T) {
+	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, true)
+	defer cleanup()
+	if err := reader.cacheSST(ctx, &meta, path); err != nil {
+		t.Fatal(err)
+	}
+
+	resident, downloaded, err := reader.prefetchSST(ctx, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resident || downloaded != 0 {
+		t.Fatalf("resident=%t downloaded=%d want=true,0", resident, downloaded)
+	}
+}
+
 func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("prefetch-oversized-bypass")

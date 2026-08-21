@@ -68,6 +68,31 @@ func TestReader_cacheSSTArtifact_ChecksumMismatch(t *testing.T) {
 	require.Equal(t, 0, reader.SSTCacheStats().EntryCount)
 }
 
+func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("cached-open-error")
+	defer store.Close()
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	require.NoError(t, err)
+	defer reader.Close()
+
+	data := []byte("verified but not an SST")
+	meta := sstMetadata{
+		ID:       "invalid-cached-sst",
+		Size:     int64(len(data)),
+		Checksum: bloomChecksum(data),
+	}
+	handle, _, err := reader.artifactCache.AdmitBytes(sstArtifactDescriptor(meta), data)
+	require.NoError(t, err)
+	require.NoError(t, handle.Close())
+
+	_, _, parseErr := reader.openSSTIterFromData(ctx, meta, data, nil, nil, nil)
+	require.Error(t, parseErr)
+	_, _, err = reader.openSSTIterBounded(ctx, meta, nil, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, parseErr.Error())
+}
+
 func TestReader_OversizedSSTBypassesCacheAndServesRead(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("oversized-sst-cache-bypass")

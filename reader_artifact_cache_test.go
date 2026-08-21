@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
@@ -110,6 +111,45 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 	}
 }
 
+func TestPinnedSnapshotReadsRetiredArtifactsWithoutOrigin(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-retired-artifact-snapshot")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	result := writeReaderArtifactCacheTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
+		{Key: []byte("key"), Seq: 1, Kind: internal.OpPut, Value: []byte("value")},
+	}, 1)
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if value, found, err := reader.Get(ctx, []byte("key")); err != nil || !found || string(value) != "value" {
+		t.Fatalf("prime Get value=%q found=%t err=%v", value, found, err)
+	}
+	snapshot, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	reader.publishManifestView(&manifestState{}, &manifest.Current{
+		MaxPinnedViewAge: time.Hour,
+	}, time.Now())
+	if err := reader.clearBloomDiskCache(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(ctx, store.SSTPath(result.Meta.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	value, found, err := snapshot.Get(ctx, []byte("key"))
+	if err != nil || !found || string(value) != "value" {
+		t.Fatalf("retired snapshot Get value=%q found=%t err=%v", value, found, err)
+	}
+}
+
 func TestReaderArtifactCacheExclusivelyLocksCacheDirectory(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-artifact-lock")
@@ -132,6 +172,29 @@ func TestReaderArtifactCacheExclusivelyLocksCacheDirectory(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReaderArtifactCacheRemovesLegacySSTCacheOnUpgrade(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-artifact-legacy-cleanup")
+	defer store.Close()
+	cacheDir := t.TempDir()
+	legacyDir := filepath.Join(cacheDir, "sst")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "sst-orphan"), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := os.Stat(legacyDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy SST cache survived upgrade: %v", err)
 	}
 }
 

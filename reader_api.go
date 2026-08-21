@@ -39,7 +39,8 @@ type CacheStats struct {
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
-	// CacheDir is the directory for disk caches. It must be non-empty.
+	// CacheDir is the directory for disk caches. It must be non-empty and may
+	// be owned by only one live Reader process at a time.
 	CacheDir string
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
@@ -90,6 +91,14 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 }
 
 func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
+	if opts.SSTCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: sst_cache_size=%d", ErrInvalidReaderOptions, opts.SSTCacheSize)
+	}
+	if opts.BlockCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: block_cache_size=%d", ErrInvalidReaderOptions, opts.BlockCacheSize)
+	}
 	if opts.BloomCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_cache_size=%d", ErrInvalidReaderOptions, opts.BloomCacheSize)
@@ -97,6 +106,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	if opts.BloomDiskCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_disk_cache_size=%d", ErrInvalidReaderOptions, opts.BloomDiskCacheSize)
+	}
+	if opts.RangeReadMinSSTSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {

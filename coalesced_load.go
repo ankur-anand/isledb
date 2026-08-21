@@ -130,7 +130,9 @@ func (g *coalescedLoadGroup) releaseWaiter(
 	if completed {
 		value = call.value
 		err = call.err
-		if err == nil {
+		if err != nil {
+			value = nil
+		} else {
 			if shared, ok := value.(coalescedLoadValue); ok {
 				value = shared.retainCoalescedLoad()
 			}
