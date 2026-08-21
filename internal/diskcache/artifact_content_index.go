@@ -5,13 +5,15 @@ import (
 	"fmt"
 )
 
-// artifactContentIndexEntry is one searchable resident artifact. Filesystem
-// lifetime and handle references are deliberately outside this first index
-// primitive.
+// artifactContentIndexEntry is one generation of a cached artifact. An entry
+// may outlive its searchable index membership while an existing handle keeps
+// it pinned.
 type artifactContentIndexEntry struct {
-	address artifactContentAddress
-	size    int64
-	element *list.Element
+	address         artifactContentAddress
+	size            int64
+	refs            int
+	deleteOnRelease bool
+	element         *list.Element
 }
 
 // artifactContentIndex maintains byte accounting and LRU order for one
@@ -34,9 +36,10 @@ func newArtifactContentIndex(kind ArtifactKind) (*artifactContentIndex, error) {
 	}, nil
 }
 
-// insert adds an artifact as the most recently used entry. Existing content
-// is left in place and touched instead of being accounted twice.
-func (index *artifactContentIndex) insert(
+// insertPinned adds an artifact as the most recently used entry with the
+// reference owned by its publishing handle. Existing content is pinned and
+// touched instead of being accounted twice.
+func (index *artifactContentIndex) insertPinned(
 	address artifactContentAddress,
 	size int64,
 ) (*artifactContentIndexEntry, bool, error) {
@@ -54,44 +57,74 @@ func (index *artifactContentIndex) insert(
 				"diskcache: content size changed for one checksum: got=%d want=%d",
 				size, existing.size)
 		}
+		existing.refs++
 		index.lru.MoveToBack(existing.element)
 		return existing, false, nil
 	}
 
-	entry := &artifactContentIndexEntry{address: address, size: size}
+	entry := &artifactContentIndexEntry{address: address, size: size, refs: 1}
 	entry.element = index.lru.PushBack(entry)
 	index.entries[address] = entry
 	index.residentBytes += size
 	return entry, true, nil
 }
 
-// find returns an entry and optionally records its use. Probe-like callers can
-// pass touch=false to avoid changing eviction order.
-func (index *artifactContentIndex) find(
+// probe checks searchable residency without changing references or LRU order.
+func (index *artifactContentIndex) probe(
 	address artifactContentAddress,
-	touch bool,
 ) (*artifactContentIndexEntry, bool) {
 	entry := index.entries[address]
 	if entry == nil {
 		return nil, false
 	}
-	if touch {
-		index.lru.MoveToBack(entry.element)
-	}
 	return entry, true
 }
 
-// remove deletes entry only if it is still the indexed owner of its content
-// address. This prevents stale entry pointers from removing a replacement.
-func (index *artifactContentIndex) remove(entry *artifactContentIndexEntry) bool {
+// pin acquires a reference and records real use in the LRU.
+func (index *artifactContentIndex) pin(
+	address artifactContentAddress,
+	size int64,
+) (*artifactContentIndexEntry, bool) {
+	entry := index.entries[address]
+	if entry == nil || entry.size != size {
+		return nil, false
+	}
+	entry.refs++
+	index.lru.MoveToBack(entry.element)
+	return entry, true
+}
+
+// detach removes entry from searchable residency only if it still owns its
+// content address. The first result reports whether its path may be deleted
+// immediately; pinned entries defer that work until their last release.
+func (index *artifactContentIndex) detach(
+	entry *artifactContentIndexEntry,
+) (deleteNow bool, detached bool) {
 	if entry == nil || index.entries[entry.address] != entry {
-		return false
+		return false, false
 	}
 	delete(index.entries, entry.address)
 	index.lru.Remove(entry.element)
 	index.residentBytes -= entry.size
 	entry.element = nil
-	return true
+	if entry.refs > 0 {
+		entry.deleteOnRelease = true
+		return false, true
+	}
+	return true, true
+}
+
+// release drops one handle reference. A true result means a detached entry's
+// final handle closed and its derived path may now be considered for deletion.
+// The caller must still verify that a replacement does not own that path.
+func (index *artifactContentIndex) release(
+	entry *artifactContentIndexEntry,
+) (deletionOwed bool, err error) {
+	if entry == nil || entry.refs == 0 {
+		return false, fmt.Errorf("diskcache: release of unpinned artifact entry")
+	}
+	entry.refs--
+	return entry.refs == 0 && entry.deleteOnRelease, nil
 }
 
 func (index *artifactContentIndex) oldest() *artifactContentIndexEntry {
