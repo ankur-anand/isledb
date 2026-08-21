@@ -19,7 +19,7 @@ func mustArtifactContentAddress(
 }
 
 func TestArtifactContentIndexAccountsUniqueContentOnce(t *testing.T) {
-	index, err := newArtifactContentIndex(ArtifactSST)
+	index, err := newArtifactContentIndex(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestArtifactContentIndexAccountsUniqueContentOnce(t *testing.T) {
 }
 
 func TestArtifactContentIndexMaintainsLRUOrder(t *testing.T) {
-	index, err := newArtifactContentIndex(ArtifactSST)
+	index, err := newArtifactContentIndex(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestArtifactContentIndexMaintainsLRUOrder(t *testing.T) {
 }
 
 func TestArtifactContentIndexRemoveRequiresCurrentOwner(t *testing.T) {
-	index, err := newArtifactContentIndex(ArtifactBloom)
+	index, err := newArtifactContentIndex(ArtifactBloom, 1<<20)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestArtifactContentIndexRemoveRequiresCurrentOwner(t *testing.T) {
 }
 
 func TestArtifactContentIndexRejectsBrokenInvariants(t *testing.T) {
-	index, err := newArtifactContentIndex(ArtifactSST)
+	index, err := newArtifactContentIndex(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestArtifactContentIndexRejectsBrokenInvariants(t *testing.T) {
 }
 
 func TestArtifactContentIndexDetachedGenerationCannotHideReplacement(t *testing.T) {
-	index, err := newArtifactContentIndex(ArtifactSST)
+	index, err := newArtifactContentIndex(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}

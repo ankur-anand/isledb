@@ -1,6 +1,20 @@
 package diskcache
 
-import "sync"
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+type artifactContentAdmission uint8
+
+const (
+	artifactContentAdmitted artifactContentAdmission = iota + 1
+	artifactContentAlreadyResident
+	artifactContentBypassedOversized
+	artifactContentBypassedPinnedCapacity
+	artifactContentBypassedPublicationFailure
+)
 
 // artifactContentTier serializes one independently budgeted artifact index.
 //
@@ -12,8 +26,8 @@ type artifactContentTier struct {
 	index     *artifactContentIndex
 }
 
-func newArtifactContentTier(kind ArtifactKind) (*artifactContentTier, error) {
-	index, err := newArtifactContentIndex(kind)
+func newArtifactContentTier(kind ArtifactKind, maxBytes int64) (*artifactContentTier, error) {
+	index, err := newArtifactContentIndex(kind, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -46,25 +60,63 @@ func (tier *artifactContentTier) publishPinned(
 	address artifactContentAddress,
 	size int64,
 	publishFile func() error,
-) (*artifactContentIndexEntry, bool, error) {
+	removeFile func(artifactContentAddress) error,
+) (*artifactContentIndexEntry, artifactContentAdmission, error) {
+	if address.kind != tier.index.kind {
+		return nil, artifactContentBypassedPublicationFailure, fmt.Errorf(
+			"diskcache: artifact kind %d does not belong in tier %d",
+			address.kind, tier.index.kind)
+	}
+	if size <= 0 {
+		return nil, artifactContentBypassedPublicationFailure,
+			fmt.Errorf("diskcache: invalid artifact size %d", size)
+	}
+	if publishFile == nil || removeFile == nil {
+		return nil, artifactContentBypassedPublicationFailure,
+			errors.New("diskcache: artifact publication callbacks are required")
+	}
 	tier.publishMu.Lock()
 	defer tier.publishMu.Unlock()
 
 	tier.indexMu.Lock()
 	existing, ok, err := tier.index.pin(address, size)
+	if err != nil {
+		tier.indexMu.Unlock()
+		return nil, artifactContentBypassedPublicationFailure, err
+	}
+	if ok {
+		tier.indexMu.Unlock()
+		return existing, artifactContentAlreadyResident, nil
+	}
+	victims, admission := tier.index.reserveCapacity(size)
 	tier.indexMu.Unlock()
-	if err != nil || ok {
-		return existing, false, err
+	if admission != artifactContentAdmitted {
+		return nil, admission, nil
+	}
+
+	var cleanupErr error
+	for _, victim := range victims {
+		cleanupErr = errors.Join(cleanupErr, removeFile(victim.address))
+	}
+	if cleanupErr != nil {
+		return nil, artifactContentBypassedPublicationFailure,
+			fmt.Errorf("diskcache: remove capacity victims: %w", cleanupErr)
 	}
 
 	if err := publishFile(); err != nil {
-		return nil, false, err
+		return nil, artifactContentBypassedPublicationFailure, err
 	}
 
 	tier.indexMu.Lock()
 	entry, inserted, err := tier.index.insertPinned(address, size)
 	tier.indexMu.Unlock()
-	return entry, inserted, err
+	if err != nil || !inserted {
+		if err == nil {
+			err = errors.New("diskcache: published content was already indexed")
+		}
+		return nil, artifactContentBypassedPublicationFailure, err
+	}
+	return entry, artifactContentAdmitted, nil
 }
 
 // detach removes an entry from searchable residency. removeFile runs while

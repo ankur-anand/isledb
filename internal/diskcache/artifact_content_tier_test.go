@@ -8,7 +8,7 @@ import (
 )
 
 func TestArtifactContentTierCoalescesSameContentPublication(t *testing.T) {
-	tier, err := newArtifactContentTier(ArtifactSST)
+	tier, err := newArtifactContentTier(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new tier: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestArtifactContentTierCoalescesSameContentPublication(t *testing.T) {
 			close(firstPublishing)
 			<-allowFirstPublish
 			return nil
-		})
+		}, func(artifactContentAddress) error { return nil })
 		if publishErr != nil {
 			t.Errorf("first publication: %v", publishErr)
 		}
@@ -35,13 +35,13 @@ func TestArtifactContentTierCoalescesSameContentPublication(t *testing.T) {
 
 	secondDone := make(chan struct{})
 	var secondEntry *artifactContentIndexEntry
-	var secondInserted bool
+	var secondAdmission artifactContentAdmission
 	go func() {
 		defer close(secondDone)
-		secondEntry, secondInserted, err = tier.publishPinned(address, 128, func() error {
+		secondEntry, secondAdmission, err = tier.publishPinned(address, 128, func() error {
 			publications.Add(1)
 			return nil
-		})
+		}, func(artifactContentAddress) error { return nil })
 	}()
 
 	select {
@@ -55,8 +55,8 @@ func TestArtifactContentTierCoalescesSameContentPublication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second publication: %v", err)
 	}
-	if secondInserted {
-		t.Fatal("same content was inserted twice")
+	if secondAdmission != artifactContentAlreadyResident {
+		t.Fatalf("second admission=%d, want already resident", secondAdmission)
 	}
 	if got := publications.Load(); got != 1 {
 		t.Fatalf("publication callbacks=%d, want 1", got)
@@ -70,7 +70,7 @@ func TestArtifactContentTierCoalescesSameContentPublication(t *testing.T) {
 }
 
 func TestArtifactContentTierPublicationFailureLeavesNoEntry(t *testing.T) {
-	tier, err := newArtifactContentTier(ArtifactSST)
+	tier, err := newArtifactContentTier(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new tier: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestArtifactContentTierPublicationFailureLeavesNoEntry(t *testing.T) {
 
 	if _, _, err := tier.publishPinned(address, 128, func() error {
 		return wantErr
-	}); !errors.Is(err, wantErr) {
+	}, func(artifactContentAddress) error { return nil }); !errors.Is(err, wantErr) {
 		t.Fatalf("publication error=%v, want %v", err, wantErr)
 	}
 	if _, ok := tier.probe(address); ok {
@@ -89,15 +89,16 @@ func TestArtifactContentTierPublicationFailureLeavesNoEntry(t *testing.T) {
 }
 
 func TestArtifactContentTierReleaseDoesNotDeleteReplacement(t *testing.T) {
-	tier, err := newArtifactContentTier(ArtifactSST)
+	tier, err := newArtifactContentTier(ArtifactSST, 1<<20)
 	if err != nil {
 		t.Fatalf("new tier: %v", err)
 	}
 	address := mustArtifactContentAddress(t, ArtifactSST,
 		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-	oldEntry, inserted, err := tier.publishPinned(address, 128, func() error { return nil })
-	if err != nil || !inserted {
-		t.Fatalf("publish old entry: inserted=%t err=%v", inserted, err)
+	oldEntry, admission, err := tier.publishPinned(
+		address, 128, func() error { return nil }, func(artifactContentAddress) error { return nil })
+	if err != nil || admission != artifactContentAdmitted {
+		t.Fatalf("publish old entry: admission=%d err=%v", admission, err)
 	}
 	if detached, err := tier.detach(oldEntry, func(artifactContentAddress) error {
 		t.Fatal("pinned old entry was removed immediately")
@@ -106,9 +107,10 @@ func TestArtifactContentTierReleaseDoesNotDeleteReplacement(t *testing.T) {
 		t.Fatalf("detach old entry: detached=%t err=%v", detached, err)
 	}
 
-	newEntry, inserted, err := tier.publishPinned(address, 128, func() error { return nil })
-	if err != nil || !inserted {
-		t.Fatalf("publish replacement: inserted=%t err=%v", inserted, err)
+	newEntry, admission, err := tier.publishPinned(
+		address, 128, func() error { return nil }, func(artifactContentAddress) error { return nil })
+	if err != nil || admission != artifactContentAdmitted {
+		t.Fatalf("publish replacement: admission=%d err=%v", admission, err)
 	}
 	var removals atomic.Int64
 	if err := tier.release(oldEntry, func(artifactContentAddress) error {
@@ -126,13 +128,14 @@ func TestArtifactContentTierReleaseDoesNotDeleteReplacement(t *testing.T) {
 }
 
 func TestArtifactContentTierReleaseDeletesDetachedFinalGeneration(t *testing.T) {
-	tier, err := newArtifactContentTier(ArtifactBloom)
+	tier, err := newArtifactContentTier(ArtifactBloom, 1<<20)
 	if err != nil {
 		t.Fatalf("new tier: %v", err)
 	}
 	address := mustArtifactContentAddress(t, ArtifactBloom,
 		"sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
-	entry, _, err := tier.publishPinned(address, 32, func() error { return nil })
+	entry, _, err := tier.publishPinned(
+		address, 32, func() error { return nil }, func(artifactContentAddress) error { return nil })
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -155,5 +158,202 @@ func TestArtifactContentTierReleaseDeletesDetachedFinalGeneration(t *testing.T) 
 	}
 	if got := removals.Load(); got != 1 {
 		t.Fatalf("removals=%d, want 1", got)
+	}
+}
+
+func TestArtifactContentTierOversizedAdmissionBypassesWithoutPublishing(t *testing.T) {
+	tier, err := newArtifactContentTier(ArtifactSST, 4)
+	if err != nil {
+		t.Fatalf("new tier: %v", err)
+	}
+	address := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	var callbacks atomic.Int64
+	entry, admission, err := tier.publishPinned(address, 5, func() error {
+		callbacks.Add(1)
+		return nil
+	}, func(artifactContentAddress) error {
+		callbacks.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("publish oversized content: %v", err)
+	}
+	if entry != nil || admission != artifactContentBypassedOversized {
+		t.Fatalf("entry=%p admission=%d, want nil oversized bypass", entry, admission)
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("callbacks=%d, want 0", got)
+	}
+}
+
+func TestArtifactContentTierPinnedCapacityBypassPreservesAllEntries(t *testing.T) {
+	tier, err := newArtifactContentTier(ArtifactSST, 10)
+	if err != nil {
+		t.Fatalf("new tier: %v", err)
+	}
+	firstAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	pinnedAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	incomingAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	noRemove := func(artifactContentAddress) error { return nil }
+
+	first, _, err := tier.publishPinned(firstAddress, 4, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish first: %v", err)
+	}
+	if err := tier.release(first, noRemove); err != nil {
+		t.Fatalf("release first: %v", err)
+	}
+	pinned, _, err := tier.publishPinned(pinnedAddress, 6, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish pinned: %v", err)
+	}
+
+	var callbacks atomic.Int64
+	entry, admission, err := tier.publishPinned(incomingAddress, 8, func() error {
+		callbacks.Add(1)
+		return nil
+	}, func(artifactContentAddress) error {
+		callbacks.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("publish under pinned pressure: %v", err)
+	}
+	if entry != nil || admission != artifactContentBypassedPinnedCapacity {
+		t.Fatalf("entry=%p admission=%d, want nil pinned-capacity bypass", entry, admission)
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("callbacks=%d, want 0", got)
+	}
+	if _, ok := tier.probe(firstAddress); !ok {
+		t.Fatal("failed admission detached a partially useful victim set")
+	}
+	if resident, ok := tier.probe(pinnedAddress); !ok || resident != pinned {
+		t.Fatal("failed admission removed the pinned entry")
+	}
+}
+
+func TestArtifactContentTierCapacityEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
+	tier, err := newArtifactContentTier(ArtifactSST, 8)
+	if err != nil {
+		t.Fatalf("new tier: %v", err)
+	}
+	firstAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	secondAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	incomingAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	noRemove := func(artifactContentAddress) error { return nil }
+
+	first, _, err := tier.publishPinned(firstAddress, 4, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish first: %v", err)
+	}
+	second, _, err := tier.publishPinned(secondAddress, 4, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish second: %v", err)
+	}
+	if err := tier.release(first, noRemove); err != nil {
+		t.Fatalf("release first: %v", err)
+	}
+	if err := tier.release(second, noRemove); err != nil {
+		t.Fatalf("release second: %v", err)
+	}
+	first, ok, err := tier.pin(firstAddress, 4)
+	if err != nil || !ok {
+		t.Fatalf("touch first: ok=%t err=%v", ok, err)
+	}
+	if err := tier.release(first, noRemove); err != nil {
+		t.Fatalf("release touched first: %v", err)
+	}
+
+	var removed artifactContentAddress
+	_, admission, err := tier.publishPinned(incomingAddress, 4, func() error { return nil },
+		func(address artifactContentAddress) error {
+			removed = address
+			return nil
+		})
+	if err != nil || admission != artifactContentAdmitted {
+		t.Fatalf("publish incoming: admission=%d err=%v", admission, err)
+	}
+	if removed != secondAddress {
+		t.Fatalf("removed address=%v, want LRU second=%v", removed, secondAddress)
+	}
+	if _, ok := tier.probe(firstAddress); !ok {
+		t.Fatal("recently used first entry was evicted")
+	}
+	if _, ok := tier.probe(secondAddress); ok {
+		t.Fatal("least recently used second entry remains searchable")
+	}
+
+	tier.indexMu.Lock()
+	residentBytes := tier.index.residentBytes
+	tier.indexMu.Unlock()
+	if residentBytes != 8 {
+		t.Fatalf("resident bytes=%d, want 8", residentBytes)
+	}
+}
+
+func TestArtifactContentTierCapacityCleanupRunsAllVictimsBeforeBypass(t *testing.T) {
+	tier, err := newArtifactContentTier(ArtifactSST, 8)
+	if err != nil {
+		t.Fatalf("new tier: %v", err)
+	}
+	firstAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	secondAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	incomingAddress := mustArtifactContentAddress(t, ArtifactSST,
+		"sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	noRemove := func(artifactContentAddress) error { return nil }
+
+	first, _, err := tier.publishPinned(firstAddress, 4, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish first: %v", err)
+	}
+	second, _, err := tier.publishPinned(secondAddress, 4, func() error { return nil }, noRemove)
+	if err != nil {
+		t.Fatalf("publish second: %v", err)
+	}
+	if err := tier.release(first, noRemove); err != nil {
+		t.Fatalf("release first: %v", err)
+	}
+	if err := tier.release(second, noRemove); err != nil {
+		t.Fatalf("release second: %v", err)
+	}
+
+	wantErr := errors.New("remove failed")
+	var removals atomic.Int64
+	var publications atomic.Int64
+	_, admission, err := tier.publishPinned(incomingAddress, 8, func() error {
+		publications.Add(1)
+		return nil
+	}, func(address artifactContentAddress) error {
+		removals.Add(1)
+		if address == firstAddress {
+			return wantErr
+		}
+		return nil
+	})
+	if admission != artifactContentBypassedPublicationFailure || !errors.Is(err, wantErr) {
+		t.Fatalf("admission=%d error=%v, want publication-failure bypass wrapping %v",
+			admission, err, wantErr)
+	}
+	if got := removals.Load(); got != 2 {
+		t.Fatalf("removal callbacks=%d, want 2", got)
+	}
+	if got := publications.Load(); got != 0 {
+		t.Fatalf("publication callbacks=%d, want 0", got)
+	}
+	if _, ok := tier.probe(firstAddress); ok {
+		t.Fatal("first detached victim remains searchable")
+	}
+	if _, ok := tier.probe(secondAddress); ok {
+		t.Fatal("second detached victim remains searchable")
 	}
 }

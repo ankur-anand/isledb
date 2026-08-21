@@ -21,18 +21,23 @@ type artifactContentIndexEntry struct {
 // index must serialize access.
 type artifactContentIndex struct {
 	kind          ArtifactKind
+	maxBytes      int64
 	entries       map[artifactContentAddress]*artifactContentIndexEntry
 	lru           list.List
 	residentBytes int64
 }
 
-func newArtifactContentIndex(kind ArtifactKind) (*artifactContentIndex, error) {
+func newArtifactContentIndex(kind ArtifactKind, maxBytes int64) (*artifactContentIndex, error) {
 	if !kind.valid() {
 		return nil, fmt.Errorf("diskcache: invalid artifact index kind %d", kind)
 	}
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("diskcache: invalid artifact index capacity %d", maxBytes)
+	}
 	return &artifactContentIndex{
-		kind:    kind,
-		entries: make(map[artifactContentAddress]*artifactContentIndexEntry),
+		kind:     kind,
+		maxBytes: maxBytes,
+		entries:  make(map[artifactContentAddress]*artifactContentIndexEntry),
 	}, nil
 }
 
@@ -138,4 +143,41 @@ func (index *artifactContentIndex) oldest() *artifactContentIndexEntry {
 		return nil
 	}
 	return element.Value.(*artifactContentIndexEntry)
+}
+
+// reserveCapacity atomically plans and detaches enough unpinned LRU entries
+// for incomingSize. If insufficient reclaimable capacity exists, it leaves
+// every entry searchable and returns a bypass decision.
+func (index *artifactContentIndex) reserveCapacity(
+	incomingSize int64,
+) ([]*artifactContentIndexEntry, artifactContentAdmission) {
+	if incomingSize > index.maxBytes {
+		return nil, artifactContentBypassedOversized
+	}
+	required := index.residentBytes + incomingSize - index.maxBytes
+	if required <= 0 {
+		return nil, artifactContentAdmitted
+	}
+
+	var reclaimable int64
+	var victims []*artifactContentIndexEntry
+	for element := index.lru.Front(); element != nil && reclaimable < required; element = element.Next() {
+		entry := element.Value.(*artifactContentIndexEntry)
+		if entry.refs != 0 {
+			continue
+		}
+		victims = append(victims, entry)
+		reclaimable += entry.size
+	}
+	if reclaimable < required {
+		return nil, artifactContentBypassedPinnedCapacity
+	}
+
+	for _, victim := range victims {
+		delete(index.entries, victim.address)
+		index.lru.Remove(victim.element)
+		index.residentBytes -= victim.size
+		victim.element = nil
+	}
+	return victims, artifactContentAdmitted
 }
