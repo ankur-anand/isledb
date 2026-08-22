@@ -50,6 +50,9 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("initial scan rows=%v err=%v", rows, err)
 		}
 		assertArtifactCacheHealthyStats(t, reader, 1, 1)
+		if stats := reader.BloomCacheStats(); stats.EntryCount != 1 || stats.Bytes > stats.MaxBytes {
+			t.Fatalf("primed decoded Bloom L1 stats=%+v", stats)
+		}
 
 		// A second DB using the same local cache directory must fail while the
 		// first Reader owns it, then the directory must be reusable after Close.
@@ -71,8 +74,15 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		corruptSingleArtifactFile(
 			t, filepath.Join(cacheDir, "artifacts", "v1", "bloom", "*", "*.bloom"))
 		healingReader := openArtifactCacheTestReader(t, ctx, db, cacheDir, 0)
+		assertArtifactCacheRecoveredTiers(t, healingReader, 1, 1)
+		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
+			t.Fatalf("decoded Bloom L1 survived Reader restart: %+v", stats)
+		}
 		if !healingReader.bloomMayContain(ctx, meta, []byte("accounts/001")) {
 			t.Fatal("recovered Bloom returned definitely absent")
+		}
+		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 1 || stats.Misses == 0 {
+			t.Fatalf("decoded Bloom L1 did not repopulate: %+v", stats)
 		}
 		assertArtifactCacheTestValue(t, ctx, healingReader, "accounts/001", "Ada")
 		if stats := healingReader.SSTCacheStats(); stats.Corruptions != 1 {
@@ -93,8 +103,15 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		}
 		cacheOnlyReader := openArtifactCacheTestReader(t, ctx, db, cacheDir, 0)
 		defer cacheOnlyReader.Close()
+		assertArtifactCacheRecoveredTiers(t, cacheOnlyReader, 1, 1)
+		if stats := cacheOnlyReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
+			t.Fatalf("cache-only decoded Bloom L1 survived Reader restart: %+v", stats)
+		}
 		if !cacheOnlyReader.bloomMayContain(ctx, meta, []byte("accounts/001")) {
 			t.Fatal("persisted Bloom returned definitely absent")
+		}
+		if stats := cacheOnlyReader.BloomCacheStats(); stats.EntryCount != 1 || stats.Misses == 0 {
+			t.Fatalf("cache-only decoded Bloom L1 did not reload from L2: %+v", stats)
 		}
 		assertArtifactCacheTestValue(t, ctx, cacheOnlyReader, "accounts/001", "Ada")
 		if stats := cacheOnlyReader.SSTCacheStats(); stats.Hits == 0 {
