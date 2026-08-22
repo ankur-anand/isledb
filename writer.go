@@ -114,9 +114,21 @@ func newWriterWithMaintenanceWake(
 		return nil, err
 	}
 
+	ownerID := opts.OwnerID
+	if ownerID == "" {
+		ownerID = fmt.Sprintf("writer-%d-%s", time.Now().UnixNano(), ksuid.New().String())
+	}
+	token, err := manifestLog.ClaimWriterWithPolicy(ctx, ownerID, storePolicy.MaxPinnedViewAge)
+	if err != nil {
+		return nil, fmt.Errorf("claim writer fence: %w", err)
+	}
+
+	// The replay must happen after the fence claim. Once the claim succeeds,
+	// the previous writer can no longer publish, so these sequence and epoch
+	// counters include every commit that won the race before takeover.
 	m, err := manifestLog.Replay(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("replay manifest: %w", err)
+		return nil, fmt.Errorf("replay manifest after writer fence claim: %w", err)
 	}
 
 	writerCtx, cancel := context.WithCancel(context.Background())
@@ -134,18 +146,9 @@ func newWriterWithMaintenanceWake(
 		maintenanceWake: maintenanceWake,
 		stopCh:          make(chan struct{}),
 		workerDone:      make(chan struct{}),
+		fenceToken:      token,
 		metrics:         opts.Metrics,
 	}
-
-	ownerID := opts.OwnerID
-	if ownerID == "" {
-		ownerID = fmt.Sprintf("writer-%d-%d", time.Now().UnixNano(), m.NextEpoch)
-	}
-	token, err := manifestLog.ClaimWriterWithPolicy(ctx, ownerID, storePolicy.MaxPinnedViewAge)
-	if err != nil {
-		return nil, fmt.Errorf("claim writer fence: %w", err)
-	}
-	w.fenceToken = token
 
 	if opts.Flush.Interval > 0 {
 		w.flushTicker = time.NewTicker(opts.Flush.Interval)

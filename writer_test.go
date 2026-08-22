@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -310,6 +311,100 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	}
 	if len(logs) < 2 {
 		t.Fatalf("expected at least 2 committed manifest entries, got %d", len(logs))
+	}
+}
+
+type firstCurrentReadHookStorage struct {
+	manifest.Storage
+	once    sync.Once
+	hook    func() error
+	hookErr error
+}
+
+func (s *firstCurrentReadHookStorage) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	data, etag, err := s.Storage.ReadCurrent(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	data = bytes.Clone(data)
+	s.once.Do(func() {
+		if s.hook != nil {
+			s.hookErr = s.hook()
+		}
+	})
+	if s.hookErr != nil {
+		return nil, "", s.hookErr
+	}
+	return data, etag, nil
+}
+
+func TestWriter_TakeoverReplaysCountersAfterClaimingFence(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-takeover-counter-replay")
+	defer store.Close()
+
+	storage := manifest.NewBlobStoreBackend(store)
+	incumbentManifest := manifest.NewStoreWithStorage(storage)
+	opts := testWriterOptions(1<<20, 0)
+	incumbent, err := newWriter(ctx, store, incumbentManifest, opts)
+	if err != nil {
+		t.Fatalf("new incumbent writer: %v", err)
+	}
+	defer func() { _ = incumbent.close(ctx) }()
+
+	if err := incumbent.put(ctx, []byte("before-takeover"), []byte("v1")); err != nil {
+		t.Fatalf("incumbent put before takeover: %v", err)
+	}
+	if err := incumbent.flush(ctx); err != nil {
+		t.Fatalf("incumbent flush before takeover: %v", err)
+	}
+	if err := incumbent.put(ctx, []byte("during-takeover"), []byte("v2")); err != nil {
+		t.Fatalf("incumbent put during takeover: %v", err)
+	}
+
+	// Return a stale CURRENT to the successor's first read, but only after the
+	// incumbent commits its pending mutation. Correct startup ordering uses
+	// this read to claim the fence, retries the failed CAS, and then replays the
+	// incumbent's commit. Replaying before the claim leaves stale counters.
+	hookedStorage := &firstCurrentReadHookStorage{
+		Storage: storage,
+		hook: func() error {
+			return incumbent.flush(ctx)
+		},
+	}
+	successorManifest := manifest.NewStoreWithStorage(hookedStorage)
+	successor, err := newWriter(ctx, store, successorManifest, opts)
+	if err != nil {
+		t.Fatalf("new successor writer: %v", err)
+	}
+	defer func() { _ = successor.close(ctx) }()
+
+	if err := successor.put(ctx, []byte("after-takeover"), []byte("v3")); err != nil {
+		t.Fatalf("successor put: %v", err)
+	}
+	if err := successor.flush(ctx); err != nil {
+		t.Fatalf("successor flush: %v", err)
+	}
+
+	replayed, err := manifest.NewStoreWithStorage(storage).Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay manifest: %v", err)
+	}
+	if got, want := len(replayed.L0SSTs), 3; got != want {
+		t.Fatalf("L0 SST count=%d, want %d", got, want)
+	}
+
+	latest := replayed.L0SSTs[0]
+	if got, want := latest.SeqLo, uint64(3); got != want {
+		t.Errorf("successor SST SeqLo=%d, want %d", got, want)
+	}
+	if got, want := latest.SeqHi, uint64(3); got != want {
+		t.Errorf("successor SST SeqHi=%d, want %d", got, want)
+	}
+	incumbentLatest := replayed.L0SSTs[1]
+	if latest.Epoch <= incumbentLatest.Epoch {
+		t.Errorf("successor SST epoch=%d, want greater than incumbent epoch=%d",
+			latest.Epoch, incumbentLatest.Epoch)
 	}
 }
 
