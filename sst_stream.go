@@ -270,6 +270,7 @@ func writeMultipleSSTsStreaming(
 	var ts time.Time
 	var uploadErr atomic.Value
 	var uploadDone chan struct{}
+	var uploadCancel context.CancelFunc
 	var started bool
 	var sstIndex int
 
@@ -292,11 +293,13 @@ func writeMultipleSSTsStreaming(
 		hashes = nil
 		uploadErr = atomic.Value{}
 		uploadDone = make(chan struct{})
+		uploadCtx, cancelUpload := context.WithCancel(ctx)
+		uploadCancel = cancelUpload
 		started = true
 
 		go func(id string, reader *io.PipeReader, done chan struct{}, errVal *atomic.Value) {
 			defer close(done)
-			err := uploadFn(ctx, id, reader)
+			err := uploadFn(uploadCtx, id, reader)
 			if err != nil {
 				errVal.Store(err)
 			}
@@ -312,6 +315,7 @@ func writeMultipleSSTsStreaming(
 
 		if err := sst.Close(); err != nil {
 			pw.CloseWithError(err)
+			uploadCancel()
 			<-uploadDone
 			return err
 		}
@@ -324,17 +328,20 @@ func writeMultipleSSTsStreaming(
 			bloomBytes, bloomK, err = buildBloomBytes(hashes, opts.BloomBitsPerKey)
 			if err != nil {
 				pw.CloseWithError(err)
+				uploadCancel()
 				<-uploadDone
 				return err
 			}
 			if len(bloomBytes) > 0 {
 				if _, err := pw.Write(bloomBytes); err != nil {
 					pw.CloseWithError(err)
+					uploadCancel()
 					<-uploadDone
 					return err
 				}
 				if err := appendBloomTrailer(pw, int64(len(bloomBytes))); err != nil {
 					pw.CloseWithError(err)
+					uploadCancel()
 					<-uploadDone
 					return err
 				}
@@ -344,6 +351,7 @@ func writeMultipleSSTsStreaming(
 		pw.Close()
 
 		<-uploadDone
+		uploadCancel()
 		if ue := getUploadErr(); ue != nil {
 			return fmt.Errorf("sst upload: %w", ue)
 		}
@@ -374,7 +382,7 @@ func writeMultipleSSTsStreaming(
 
 		results = append(results, result)
 		started = false
-		pr, pw, writable, sst, state, uploadDone = nil, nil, nil, nil, nil, nil
+		pr, pw, writable, sst, state, uploadDone, uploadCancel = nil, nil, nil, nil, nil, nil, nil
 		return nil
 	}
 
@@ -398,12 +406,15 @@ func writeMultipleSSTsStreaming(
 		if pr != nil {
 			pr.CloseWithError(abortErr)
 		}
+		if uploadCancel != nil {
+			uploadCancel()
+		}
 
 		if uploadDone != nil {
 			<-uploadDone
 		}
 		started = false
-		pr, pw, writable, sst, state, uploadDone = nil, nil, nil, nil, nil, nil
+		pr, pw, writable, sst, state, uploadDone, uploadCancel = nil, nil, nil, nil, nil, nil, nil
 	}
 
 	for it.Next() {
