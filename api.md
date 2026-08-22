@@ -570,17 +570,26 @@ immediate visibility check is required.
 
 ```go
 type CacheStats struct {
-    Hits       int64
-    Misses     int64
-    Bytes      int64
-    MaxBytes   int64
-    EntryCount int
-    MaxEntries int
+	Hits                int64
+	Misses              int64
+	Bytes               int64
+	MaxBytes            int64
+	EntryCount          int
+	MaxEntries          int
+	PinnedBytes         int64
+	PinnedEntries       int
+	Evictions           int64
+	Corruptions         int64
+	AdmissionBypasses   int64
+	SyncFailures        int64
+	PublicationFailures int64
 }
 ```
 
 Byte-bounded caches report `MaxEntries == 0`. Entry-bounded caches report
-`MaxBytes == 0`.
+`MaxBytes == 0`. `SyncFailures` counts verified fills served transiently after
+their file sync failed. `PublicationFailures` counts failures while cleaning
+capacity victims or publishing an artifact at its final cache path.
 
 ## Enable and consume the change feed
 

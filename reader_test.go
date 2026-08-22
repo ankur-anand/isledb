@@ -9,6 +9,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -355,13 +356,13 @@ func TestReader_ScanLimit_LazilyOpensSortedLevel(t *testing.T) {
 	if len(results) != 1 || !bytes.Equal(results[0].Key, []byte("a")) {
 		t.Fatalf("ScanLimit result: %+v", results)
 	}
-	if !reader.sstCached(first.Meta.ID) {
+	if !reader.sstArtifactResidentByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was not opened")
 	}
-	if reader.sstCached(second.Meta.ID) {
+	if reader.sstArtifactResidentByID(second.Meta.ID) {
 		t.Fatal("second L1 SST was opened after the scan reached its limit")
 	}
-	if reader.sstCached(third.Meta.ID) {
+	if reader.sstArtifactResidentByID(third.Meta.ID) {
 		t.Fatal("third L1 SST was opened before the scan reached it")
 	}
 }
@@ -477,16 +478,16 @@ func TestReader_Iterator_SeekGESkipsEarlierSortedLevelSSTs(t *testing.T) {
 
 	// Construction alone must not perform object I/O. Otherwise a subsequent
 	// seek pays for the first SST before jumping to the target SST.
-	if reader.sstCached(first.Meta.ID) {
+	if reader.sstArtifactResidentByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstCached(second.Meta.ID) {
+	if reader.sstArtifactResidentByID(second.Meta.ID) {
 		t.Fatal("middle L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstCached(third.Meta.ID) {
+	if reader.sstArtifactResidentByID(third.Meta.ID) {
 		t.Fatal("target L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstCached(l0.Meta.ID) {
+	if reader.sstArtifactResidentByID(l0.Meta.ID) {
 		t.Fatal("L0 SST was opened before the iterator was positioned")
 	}
 	if !iter.SeekGE([]byte("z")) {
@@ -495,16 +496,16 @@ func TestReader_Iterator_SeekGESkipsEarlierSortedLevelSSTs(t *testing.T) {
 	if got := iter.Key(); !bytes.Equal(got, []byte("z")) {
 		t.Fatalf("SeekGE key: got %q want z", got)
 	}
-	if reader.sstCached(second.Meta.ID) {
+	if reader.sstArtifactResidentByID(second.Meta.ID) {
 		t.Fatal("middle L1 SST was opened by a seek that skipped over it")
 	}
-	if reader.sstCached(first.Meta.ID) {
+	if reader.sstArtifactResidentByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was opened by a seek that skipped over it")
 	}
-	if !reader.sstCached(third.Meta.ID) {
+	if !reader.sstArtifactResidentByID(third.Meta.ID) {
 		t.Fatal("target L1 SST was not opened")
 	}
-	if reader.sstCached(l0.Meta.ID) {
+	if reader.sstArtifactResidentByID(l0.Meta.ID) {
 		t.Fatal("L0 SST below the seek target was opened")
 	}
 }
@@ -755,34 +756,46 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 	defer reader.Close()
 	defer store.Close()
 
-	path := store.SSTPath(res.Meta.ID)
-
 	_, iter, err := reader.openSSTIterBounded(ctx, res.Meta, nil, nil)
 	if err != nil {
 		t.Fatalf("openSSTIterBounded: %v", err)
 	}
 
-	if _, ok := reader.sstCache.Acquire(path); !ok {
+	if _, release, ok, acquireErr := reader.acquireSST(res.Meta); acquireErr != nil || !ok {
 		iter.Close()
-		t.Fatalf("expected sst cache entry after iterator open")
+		t.Fatalf("expected sst cache entry after iterator open: %v", acquireErr)
 	} else {
-		reader.sstCache.Release(path)
+		release()
 	}
 
-	reader.sstCache.Remove(path)
-	if _, ok := reader.sstCache.Acquire(path); !ok {
+	if err := reader.removeSST(res.Meta, diskcache.ArtifactRemovalPurge); err != nil {
+		t.Fatal(err)
+	}
+	if _, release, ok, acquireErr := reader.acquireSST(res.Meta); acquireErr != nil {
 		iter.Close()
-		t.Fatalf("expected sst cache entry to remain while iterator open")
-	} else {
-		reader.sstCache.Release(path)
+		t.Fatal(acquireErr)
+	} else if ok {
+		release()
+		iter.Close()
+		t.Fatal("pending removal accepted a new acquisition")
+	}
+	if kv := iter.First(); kv == nil {
+		iter.Close()
+		t.Fatalf("pinned iterator stopped working after removal: %v", iter.Error())
+	}
+	if got := reader.SSTCacheStats().EntryCount; got != 1 {
+		iter.Close()
+		t.Fatalf("pinned entry count=%d want=1", got)
 	}
 
 	if err := iter.Close(); err != nil {
 		t.Fatalf("iter close: %v", err)
 	}
 
-	if _, ok := reader.sstCache.Acquire(path); ok {
-		reader.sstCache.Release(path)
+	if _, release, ok, acquireErr := reader.acquireSST(res.Meta); acquireErr != nil {
+		t.Fatal(acquireErr)
+	} else if ok {
+		release()
 		t.Fatalf("expected sst cache entry removed after iterator close")
 	}
 }

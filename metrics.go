@@ -164,12 +164,15 @@ type ReaderMetrics struct {
 	ScanLimitLatency prometheus.Histogram
 	ScanLimitResults prometheus.Counter
 
-	SSTCacheHits       prometheus.Counter
-	SSTCacheMisses     prometheus.Counter
-	SSTDownloadTotal   prometheus.Counter
-	SSTDownloadErrors  prometheus.Counter
-	SSTDownloadLatency prometheus.Histogram
-	SSTDownloadBytes   prometheus.Counter
+	SSTCacheHits                     prometheus.Counter
+	SSTCacheMisses                   prometheus.Counter
+	ArtifactCacheErrors              prometheus.Counter
+	ArtifactCacheInvariantViolations prometheus.Counter
+	BloomFilterErrors                prometheus.Counter
+	SSTDownloadTotal                 prometheus.Counter
+	SSTDownloadErrors                prometheus.Counter
+	SSTDownloadLatency               prometheus.Histogram
+	SSTDownloadBytes                 prometheus.Counter
 
 	SSTRangeBlockCacheHits   prometheus.Counter
 	SSTRangeBlockCacheMisses prometheus.Counter
@@ -267,6 +270,23 @@ func (m *ReaderMetrics) ObserveSSTCacheLookup(hit bool) {
 		return
 	}
 	m.incCounter(m.SSTCacheMisses)
+}
+
+func (m *ReaderMetrics) ObserveArtifactCacheDiagnostic(invariantViolation bool) {
+	if m == nil {
+		return
+	}
+	m.incCounter(m.ArtifactCacheErrors)
+	if invariantViolation {
+		m.incCounter(m.ArtifactCacheInvariantViolations)
+	}
+}
+
+func (m *ReaderMetrics) ObserveBloomFilterError() {
+	if m == nil {
+		return
+	}
+	m.incCounter(m.BloomFilterErrors)
 }
 
 func (m *ReaderMetrics) ObserveSSTDownload(d time.Duration, sizeBytes int64, err error) {
@@ -436,6 +456,27 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "sst_cache_misses_total",
 			Help:        "Total number of SST cache misses.",
+			ConstLabels: constLabels,
+		}),
+		ArtifactCacheErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "artifact_cache_errors_total",
+			Help:        "Total advisory artifact-cache operation errors.",
+			ConstLabels: constLabels,
+		}),
+		ArtifactCacheInvariantViolations: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "artifact_cache_invariant_violations_total",
+			Help:        "Total artifact-cache errors that violate Reader/cache lifecycle or descriptor invariants.",
+			ConstLabels: constLabels,
+		}),
+		BloomFilterErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "bloom_filter_errors_total",
+			Help:        "Total Bloom-filter loading, verification, or decoding errors; operations either recover from origin or continue to the SST.",
 			ConstLabels: constLabels,
 		}),
 		SSTDownloadTotal: prometheus.NewCounter(prometheus.CounterOpts{

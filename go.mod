@@ -14,6 +14,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.4
 	github.com/dgraph-io/badger/v4 v4.9.0
 	github.com/fsouza/fake-gcs-server v1.53.1
+	github.com/gofrs/flock v0.13.0
 	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3
 	github.com/klauspost/compress v1.18.3
 	github.com/prometheus/client_golang v1.23.2

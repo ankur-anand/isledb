@@ -1,0 +1,288 @@
+package isledb
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/ankur-anand/isledb/internal/diskcache"
+)
+
+// sharedSSTArtifact owns the handle returned by one coalesced SST load. Each
+// waiter receives a lease, so resident pins and transient files remain valid
+// until the final iterator releases them.
+type sharedSSTArtifact struct {
+	mu     sync.Mutex
+	handle *diskcache.ArtifactHandle
+	refs   int
+}
+
+type sstArtifactLease struct {
+	shared *sharedSSTArtifact
+	data   []byte
+	once   sync.Once
+	err    error
+}
+
+const readerDiagnosticLogInterval = time.Minute
+
+// readerDiagnosticLimiter bounds diagnostic logs while leaving metrics exact.
+// It intentionally has no per-SST map, so a stream of unique corrupt objects
+// cannot turn observability into an unbounded memory consumer.
+type readerDiagnosticLimiter struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed uint64
+}
+
+func (limiter *readerDiagnosticLimiter) allow(now time.Time) (bool, uint64) {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if !limiter.last.IsZero() && now.Sub(limiter.last) < readerDiagnosticLogInterval {
+		limiter.suppressed++
+		return false, 0
+	}
+	suppressed := limiter.suppressed
+	limiter.last = now
+	limiter.suppressed = 0
+	return true, suppressed
+}
+
+func newSharedSSTArtifact(handle *diskcache.ArtifactHandle) *sharedSSTArtifact {
+	return &sharedSSTArtifact{handle: handle, refs: 1}
+}
+
+func (a *sharedSSTArtifact) retainCoalescedLoad() any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.handle == nil {
+		return nil
+	}
+	a.refs++
+	return &sstArtifactLease{shared: a, data: a.handle.Bytes()}
+}
+
+func (a *sharedSSTArtifact) releaseCoalescedLoad() {
+	_ = a.release()
+}
+
+func (a *sharedSSTArtifact) release() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	if a.refs == 0 {
+		a.mu.Unlock()
+		return nil
+	}
+	a.refs--
+	if a.refs != 0 {
+		a.mu.Unlock()
+		return nil
+	}
+	handle := a.handle
+	a.handle = nil
+	a.mu.Unlock()
+	return handle.Close()
+}
+
+func (l *sstArtifactLease) Bytes() []byte {
+	if l == nil {
+		return nil
+	}
+	return l.data
+}
+
+func (l *sstArtifactLease) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.once.Do(func() {
+		l.err = l.shared.release()
+		l.shared = nil
+		l.data = nil
+	})
+	return l.err
+}
+
+func sstArtifactDescriptor(meta sstMetadata) diskcache.ArtifactDescriptor {
+	return diskcache.ArtifactDescriptor{
+		Key: diskcache.ArtifactKey{
+			Kind:  diskcache.ArtifactSST,
+			SSTID: meta.ID,
+		},
+		Size:     meta.Size,
+		Checksum: meta.Checksum,
+	}
+}
+
+func bloomArtifactDescriptor(meta sstMetadata) diskcache.ArtifactDescriptor {
+	return diskcache.ArtifactDescriptor{
+		Key: diskcache.ArtifactKey{
+			Kind:  diskcache.ArtifactBloom,
+			SSTID: meta.ID,
+		},
+		Size:     meta.Bloom.Length,
+		Checksum: meta.Bloom.Checksum,
+	}
+}
+
+func (r *Reader) acquireSST(meta sstMetadata) ([]byte, func(), bool, error) {
+	handle, ok, err := r.artifactCache.Acquire(sstArtifactDescriptor(meta))
+	if err != nil {
+		r.observeArtifactCacheDiagnostic("acquire", diskcache.ArtifactSST, meta.ID, err)
+		return nil, nil, false, nil
+	}
+	if !ok {
+		// The cache is advisory. A lookup diagnostic becomes an origin miss.
+		return nil, nil, false, nil
+	}
+	return handle.Bytes(), func() { _ = handle.Close() }, true, nil
+}
+
+// sstResident is a side-effect-free presence check.
+func (r *Reader) sstResident(meta sstMetadata) (bool, error) {
+	presence, err := r.artifactCache.Probe(sstArtifactDescriptor(meta))
+	if err != nil {
+		r.observeArtifactCacheDiagnostic("probe", diskcache.ArtifactSST, meta.ID, err)
+		return false, nil
+	}
+	return presence != diskcache.ArtifactAbsent, nil
+}
+
+// sstArtifactResidentByID is the ID-only probe used by lazy-reader tests.
+// Runtime read paths pass metadata directly and avoid this manifest scan.
+func (r *Reader) sstArtifactResidentByID(id string) bool {
+	current := r.currentManifest()
+	if current == nil {
+		return false
+	}
+	for _, meta := range current.L0SSTs {
+		if meta.ID == id {
+			resident, _ := r.sstResident(meta)
+			return resident
+		}
+	}
+	for _, level := range current.Levels {
+		for _, meta := range level.SSTs {
+			if meta.ID == id {
+				resident, _ := r.sstResident(meta)
+				return resident
+			}
+		}
+	}
+	return false
+}
+
+func (r *Reader) removeSST(meta sstMetadata, reason diskcache.ArtifactRemovalReason) error {
+	return r.artifactCache.Remove(sstArtifactDescriptor(meta), reason)
+}
+
+func (r *Reader) clearSSTCache() error {
+	return r.artifactCache.Purge(diskcache.ArtifactSST)
+}
+
+func (r *Reader) clearBloomDiskCache() error {
+	if r.artifactCache == nil {
+		return nil
+	}
+	return r.artifactCache.Purge(diskcache.ArtifactBloom)
+}
+
+func (r *Reader) acquireRawBloom(meta sstMetadata) (*diskcache.ArtifactHandle, bool, error) {
+	if r.artifactCache == nil {
+		return nil, false, nil
+	}
+	handle, ok, err := r.artifactCache.Acquire(bloomArtifactDescriptor(meta))
+	if err != nil {
+		r.observeArtifactCacheDiagnostic("acquire", diskcache.ArtifactBloom, meta.ID, err)
+		return nil, false, nil
+	}
+	return handle, ok, nil
+}
+
+func (r *Reader) observeArtifactCacheDiagnostic(
+	operation string,
+	kind diskcache.ArtifactKind,
+	sstID string,
+	err error,
+) {
+	if err == nil {
+		return
+	}
+	invariantViolation := errors.Is(err, diskcache.ErrInvalidArtifactDescriptor) ||
+		errors.Is(err, diskcache.ErrArtifactCacheClosed)
+	r.metrics.ObserveArtifactCacheDiagnostic(invariantViolation)
+	if invariantViolation {
+		allowed, suppressed := r.artifactInvariantDiagnosticLimiter.allow(time.Now())
+		if !allowed {
+			return
+		}
+		slog.Error(
+			"isledb: artifact cache invariant violation",
+			"operation", operation,
+			"kind", kind,
+			"sst_id", sstID,
+			"error", err,
+			"suppressed_since_last_log", suppressed,
+		)
+	}
+}
+
+func (r *Reader) observeBloomFilterError(sstID string, err error) {
+	if err == nil {
+		return
+	}
+	r.metrics.ObserveBloomFilterError()
+	allowed, suppressed := r.bloomDiagnosticLimiter.allow(time.Now())
+	if !allowed {
+		return
+	}
+	slog.Warn(
+		"isledb: Bloom filter unavailable; continuing with SST lookup",
+		"sst_id", sstID,
+		"error", err,
+		"suppressed_since_last_log", suppressed,
+	)
+}
+
+func (r *Reader) admitRawBloom(
+	meta sstMetadata,
+	data []byte,
+) (*diskcache.ArtifactHandle, error) {
+	if r.artifactCache == nil {
+		return nil, nil
+	}
+	handle, _, err := r.artifactCache.AdmitBytes(bloomArtifactDescriptor(meta), data)
+	if err != nil {
+		if errors.Is(err, diskcache.ErrArtifactChecksumMismatch) {
+			return nil, fmt.Errorf("bloom checksum mismatch: %w", err)
+		}
+		// Admission is advisory. Preserve Bloom integrity when bypassing the
+		// cache because a corrupted false negative would be silent.
+		if validateErr := validateBloomChecksum(meta.Bloom.Checksum, data); validateErr != nil {
+			return nil, validateErr
+		}
+		return nil, nil
+	}
+	return handle, nil
+}
+
+func cacheStatsFromArtifact(stats diskcache.ArtifactStats) CacheStats {
+	return CacheStats{
+		Hits:                stats.Hits,
+		Misses:              stats.Misses,
+		Bytes:               stats.ResidentBytes,
+		MaxBytes:            stats.MaxBytes,
+		EntryCount:          stats.ResidentEntries,
+		PinnedBytes:         stats.PinnedBytes,
+		PinnedEntries:       stats.PinnedEntries,
+		Evictions:           stats.CapacityEvictions,
+		Corruptions:         stats.Corruptions,
+		AdmissionBypasses:   stats.AdmissionBypasses,
+		SyncFailures:        stats.SyncFailures,
+		PublicationFailures: stats.PublicationFailures,
+	}
+}

@@ -3,15 +3,11 @@ package isledb
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +26,7 @@ import (
 type Reader struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
-	sstCache      diskcache.RefCountedCache
+	artifactCache *diskcache.ArtifactCache
 	blockCache    *ristretto.Cache[string, []byte]
 	bloomCache    *bloomFilterCache
 	bloomLoads    coalescedLoadGroup
@@ -42,29 +38,31 @@ type Reader struct {
 	allowUnverifiedRangeRead bool
 	rangeReadMinSSTSize      int64
 
-	ownsSSTCache   bool
-	ownsBlockCache bool
-	cacheDir       string
+	ownsArtifactCache bool
+	ownsBlockCache    bool
+	cacheDir          string
 
-	lifecycleMu   sync.RWMutex
-	iteratorsMu   sync.Mutex
-	iterators     map[*Iterator]struct{}
-	mu            sync.RWMutex
-	manifest      *manifestState
-	version       Version
-	changeFeed    bool
-	changeHead    ChangeCursor
-	viewPolicy    ReaderViewPolicy
-	viewRefreshAt time.Time
-	viewExpiresAt time.Time
-	viewExpired   atomic.Bool
-	viewTimerMu   sync.Mutex
-	viewTimer     *time.Timer
-	viewTimerID   atomic.Uint64
-	metrics       *ReaderMetrics
-	closed        atomic.Bool
-	releaseOnce   sync.Once
-	release       func()
+	lifecycleMu                        sync.RWMutex
+	iteratorsMu                        sync.Mutex
+	iterators                          map[*Iterator]struct{}
+	mu                                 sync.RWMutex
+	manifest                           *manifestState
+	version                            Version
+	changeFeed                         bool
+	changeHead                         ChangeCursor
+	viewPolicy                         ReaderViewPolicy
+	viewRefreshAt                      time.Time
+	viewExpiresAt                      time.Time
+	viewExpired                        atomic.Bool
+	viewTimerMu                        sync.Mutex
+	viewTimer                          *time.Timer
+	viewTimerID                        atomic.Uint64
+	metrics                            *ReaderMetrics
+	artifactInvariantDiagnosticLimiter readerDiagnosticLimiter
+	bloomDiagnosticLimiter             readerDiagnosticLimiter
+	closed                             atomic.Bool
+	releaseOnce                        sync.Once
+	release                            func()
 }
 
 type KV struct {
@@ -80,19 +78,19 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 
 	ms := newManifestStoreWithCache(store, &opts)
 	viewLoadedAt := time.Now()
-	m, err := ms.Replay(ctx)
+	m, err := ms.ReplayWithArtifactValidation(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	sstCache, ownsSSTCache, err := initSSTCache(opts)
+	artifactCache, ownsArtifactCache, err := initReaderDiskCache(opts)
 	if err != nil {
 		return nil, err
 	}
-	cleanupSSTCache := ownsSSTCache
+	cleanupDiskCache := true
 	defer func() {
-		if cleanupSSTCache {
-			_ = sstCache.Close()
+		if cleanupDiskCache && ownsArtifactCache {
+			_ = artifactCache.Close()
 		}
 	}()
 
@@ -121,26 +119,30 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		viewPolicy:               viewPolicy,
 		viewRefreshAt:            viewRefreshAt,
 		viewExpiresAt:            viewExpiresAt,
-		sstCache:                 sstCache,
+		artifactCache:            artifactCache,
 		blockCache:               blockCache,
 		bloomCache:               newBloomFilterCache(opts.BloomCacheSize),
 		verifySST:                opts.ValidateSSTChecksum,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
-		ownsSSTCache:             ownsSSTCache,
+		ownsArtifactCache:        ownsArtifactCache,
 		ownsBlockCache:           ownsBlockCache,
 		cacheDir:                 opts.CacheDir,
 		metrics:                  opts.Metrics,
 	}
 	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
-	cleanupSSTCache = false
+	cleanupDiskCache = false
 	cleanupBlockCache = false
 	return reader, nil
 }
 
-func initSSTCache(opts readerOptions) (diskcache.RefCountedCache, bool, error) {
-	if opts.SSTCache != nil {
-		return opts.SSTCache, false, nil
+func initReaderDiskCache(opts readerOptions) (
+	*diskcache.ArtifactCache,
+	bool,
+	error,
+) {
+	if opts.ArtifactCache != nil {
+		return opts.ArtifactCache, false, nil
 	}
 
 	if opts.CacheDir == "" {
@@ -152,18 +154,26 @@ func initSSTCache(opts readerOptions) (diskcache.RefCountedCache, bool, error) {
 		maxSize = defaultSSTCacheSize
 	}
 
-	cache, err := diskcache.NewSSTCache(diskcache.SSTCacheOptions{
-		Dir:     filepath.Join(opts.CacheDir, "sst"),
-		MaxSize: maxSize,
+	cache, err := diskcache.OpenArtifactCache(diskcache.ArtifactCacheOptions{
+		Dir:           filepath.Join(opts.CacheDir, "artifacts"),
+		SSTMaxBytes:   maxSize,
+		BloomMaxBytes: opts.BloomDiskCacheSize,
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("create sst cache: %w", err)
+		return nil, false, fmt.Errorf("create artifact cache: %w", err)
+	}
+	// The previous process-lifetime cache used CacheDir/sst. It cannot be
+	// adopted by the digest-addressed artifact cache and otherwise survives an
+	// upgrade forever outside the new cache's accounting.
+	if err := os.RemoveAll(filepath.Join(opts.CacheDir, "sst")); err != nil {
+		_ = cache.Close()
+		return nil, false, fmt.Errorf("remove legacy SST cache: %w", err)
 	}
 
 	return cache, true, nil
 }
 
-// Refresh reloads the manifest and invalidates caches for removed SSTs.
+// Refresh reloads and publishes the current manifest view.
 func (r *Reader) Refresh(ctx context.Context) (err error) {
 	done, err := r.beginRead()
 	if err != nil {
@@ -198,30 +208,37 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	}()
 
 	var m *manifestState
-	m, err = r.manifestStore.Replay(ctx)
+	m, err = r.manifestStore.ReplayWithArtifactValidation(ctx)
 	if err != nil {
 		return err
 	}
 	current := r.manifestStore.CurrentData()
+	r.publishManifestView(m, current, viewLoadedAt)
+	return nil
+}
+
+func (r *Reader) publishManifestView(
+	m *manifestState,
+	current *manifest.Current,
+	viewLoadedAt time.Time,
+) {
 	changeFeed, changeHead := readerChangeFeedState(current)
+	refreshAt := viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
+	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
+	// Manifest states and SST IDs are immutable after publication. Swap the view
+	// and its metadata under one short critical section. Artifact and decoded
+	// Bloom caches remain byte-bounded and age retired entries through their LRUs.
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.manifest != nil {
-		r.invalidateRemovedSSTs(r.manifest, m)
-	}
-
-	// Publish a new manifest pointer. Existing readers/views may still retain
-	// the previous manifest as an immutable snapshot.
 	r.manifest = m
 	r.version = versionFromCurrent(current)
 	r.changeFeed = changeFeed
 	r.changeHead = changeHead
-	r.viewRefreshAt = viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
-	r.viewExpiresAt = viewLoadedAt.Add(current.PinnedViewAge())
-	r.armManifestExpiry(r.viewRefreshAt, r.viewExpiresAt)
-	return nil
+	r.viewRefreshAt = refreshAt
+	r.viewExpiresAt = expiresAt
+	r.mu.Unlock()
+
+	r.armManifestExpiry(refreshAt, expiresAt)
 }
 
 func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
@@ -279,26 +296,6 @@ func (r *Reader) stopManifestExpiry() {
 	}
 }
 
-func (r *Reader) invalidateRemovedSSTs(oldManifest, newManifest *manifestState) {
-	oldIDs := make(map[string]struct{})
-	for _, id := range oldManifest.AllSSTIDs() {
-		oldIDs[id] = struct{}{}
-	}
-
-	newIDs := make(map[string]struct{})
-	for _, id := range newManifest.AllSSTIDs() {
-		newIDs[id] = struct{}{}
-	}
-
-	for id := range oldIDs {
-		if _, exists := newIDs[id]; !exists {
-			path := r.store.SSTPath(id)
-			r.sstCache.Remove(path)
-			r.bloomCache.delete(id)
-		}
-	}
-}
-
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
@@ -319,8 +316,8 @@ func (r *Reader) Close() error {
 
 	var firstErr error
 
-	if r.sstCache != nil && r.ownsSSTCache {
-		if err := r.sstCache.Close(); err != nil {
+	if r.artifactCache != nil && r.ownsArtifactCache {
+		if err := r.artifactCache.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -706,12 +703,8 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 			if !filter.Has(bloomHashKey(key)) {
 				return nil, false, false, nil
 			}
-		} else if !r.sstCached(sstMeta.ID) {
-			mayContain, err := r.bloomMayContain(ctx, sstMeta, key)
-			if err != nil {
-				return nil, false, false, err
-			}
-			if !mayContain {
+		} else if resident, _ := r.sstResident(sstMeta); !resident {
+			if !r.bloomMayContain(ctx, sstMeta, key) {
 				return nil, false, false, nil
 			}
 		}
@@ -756,14 +749,34 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 	return append([]byte(nil), decoded.Value...), true, false, nil
 }
 
-func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) (bool, error) {
+// bloomMayContain returns false only when a verified, decoded Bloom filter
+// proves the key absent. Every loading, integrity, decoding, or cleanup
+// failure returns true so Bloom availability can never suppress an SST read.
+func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
 	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
-		return filter.Has(bloomHashKey(key)), nil
+		return filter.Has(bloomHashKey(key))
 	}
 
 	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
 		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
 			return filter, nil
+		}
+		if handle, ok, _ := r.acquireRawBloom(sstMeta); ok {
+			filter, parseErr := parseBloomFilter(handle.Bytes())
+			closeErr := handle.Close()
+			if parseErr != nil {
+				removeErr := r.artifactCache.Remove(
+					bloomArtifactDescriptor(sstMeta), diskcache.ArtifactRemovalCorrupt)
+				r.observeBloomFilterError(
+					sstMeta.ID, errors.Join(parseErr, closeErr, removeErr))
+			} else {
+				// Cleanup errors are cache diagnostics. The decoded heap copy is
+				// independent of the persistent handle and remains safe to use.
+				r.observeArtifactCacheDiagnostic(
+					"release", diskcache.ArtifactBloom, sstMeta.ID, closeErr)
+				r.bloomCache.put(sstMeta.ID, filter)
+				return filter, nil
+			}
 		}
 
 		path := r.store.SSTPath(sstMeta.ID)
@@ -771,35 +784,55 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if err != nil {
 			return nil, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
 		}
-		// Historical manifests predate Bloom checksums. New manifests always
-		// carry one, and every present checksum is enforced before the filter can
-		// enter the in-memory cache where a corrupted false negative would be
-		// indistinguishable from an absent key.
-		if sstMeta.Bloom.Checksum != "" {
+		// Reader manifest activation requires a checksum for every present Bloom.
+		// A cache-less internal Reader must still verify the origin response before
+		// a corrupted false negative can enter the decoded in-memory cache.
+		if r.artifactCache == nil {
 			if err := validateBloomChecksum(sstMeta.Bloom.Checksum, data); err != nil {
 				return nil, fmt.Errorf("validate bloom %s: %w", sstMeta.ID, err)
 			}
 		}
-		filter, err := parseBloomFilter(data)
+
+		bloomData := data
+		handle, err := r.admitRawBloom(sstMeta, data)
 		if err != nil {
-			return nil, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
+			return nil, fmt.Errorf("cache bloom %s: %w", sstMeta.ID, err)
+		}
+		if handle != nil {
+			bloomData = handle.Bytes()
+		}
+		filter, err := parseBloomFilter(bloomData)
+		if err != nil {
+			var closeErr error
+			var removeErr error
+			if handle != nil {
+				closeErr = handle.Close()
+				removeErr = r.artifactCache.Remove(
+					bloomArtifactDescriptor(sstMeta), diskcache.ArtifactRemovalCorrupt)
+			}
+			return nil, errors.Join(
+				fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err), closeErr, removeErr)
+		}
+		if handle != nil {
+			if err := handle.Close(); err != nil {
+				r.observeArtifactCacheDiagnostic(
+					"release", diskcache.ArtifactBloom, sstMeta.ID, err)
+			}
 		}
 		r.bloomCache.put(sstMeta.ID, filter)
 		return filter, nil
 	})
 	if err != nil {
-		return false, err
-	}
-	return value.(*z.Bloom).Has(bloomHashKey(key)), nil
-}
-
-func (r *Reader) sstCached(id string) bool {
-	path := r.store.SSTPath(id)
-	if _, ok := r.sstCache.Acquire(path); ok {
-		r.sstCache.Release(path)
+		r.observeBloomFilterError(sstMeta.ID, err)
 		return true
 	}
-	return false
+	filter, ok := value.(*z.Bloom)
+	if !ok || filter == nil {
+		err := fmt.Errorf("bloom load %s returned %T", sstMeta.ID, value)
+		r.observeBloomFilterError(sstMeta.ID, err)
+		return true
+	}
+	return filter.Has(bloomHashKey(key))
 }
 
 func (r *Reader) entryValue(_ context.Context, entry internal.CompactionEntry) ([]byte, error) {
@@ -815,45 +848,49 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	path := r.store.SSTPath(sstMeta.ID)
+	var cachedOpenErr error
 
-	if cached, ok := r.sstCache.Acquire(path); ok {
+	if cached, releaseCache, ok, _ := r.acquireSST(sstMeta); ok {
 		r.metrics.ObserveSSTCacheLookup(true)
-		release := func() {
-			r.sstCache.Release(path)
-		}
-		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, releaseCache)
 		if err == nil {
 			return reader, iter, nil
 		}
+		cachedOpenErr = err
 		// Cached bytes are not authoritative. If they cannot be opened, release
 		// and evict them, then make one attempt against object storage below.
-		r.sstCache.Remove(path)
+		cachedOpenErr = errors.Join(cachedOpenErr,
+			r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt))
 	} else {
 		r.metrics.ObserveSSTCacheLookup(false)
 	}
 
 	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(cachedOpenErr, err)
 	} else if ok {
-		return r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
-	}
-
-	if err := r.ensureSSTCached(ctx, &sstMeta, path); err != nil {
-		return nil, nil, err
-	}
-	if cached, ok := r.sstCache.Acquire(path); ok {
-		release := func() {
-			r.sstCache.Release(path)
-		}
-		reader, iter, err := r.openSSTIterFromData(ctx, sstMeta, cached, lower, upper, release)
+		reader, iter, err := r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
 		if err != nil {
-			// Do not let a failed download poison later reads. This is the only
-			// object-store attempt in this call, so return the error after eviction.
-			r.sstCache.Remove(path)
+			err = errors.Join(cachedOpenErr, err)
 		}
 		return reader, iter, err
 	}
-	return nil, nil, fmt.Errorf("cache sst %s: missing after download", sstMeta.ID)
+
+	loaded, err := r.loadSSTArtifact(ctx, &sstMeta, path)
+	if err != nil {
+		return nil, nil, errors.Join(cachedOpenErr, err)
+	}
+	releaseLoaded := func() { _ = loaded.Close() }
+	reader, iter, err := r.openSSTIterFromData(
+		ctx, sstMeta, loaded.Bytes(), lower, upper, releaseLoaded)
+	if err != nil {
+		// A resident artifact can be removed for the next read. Transient bypass
+		// bytes disappear when releaseLoaded closes their lease.
+		if removeErr := r.removeSST(sstMeta, diskcache.ArtifactRemovalCorrupt); removeErr != nil {
+			err = errors.Join(err, removeErr)
+		}
+		err = errors.Join(cachedOpenErr, err)
+	}
+	return reader, iter, err
 }
 
 func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, int64, error) {
@@ -966,40 +1003,6 @@ func (it *sstIterWithClose) Close() error {
 	return err
 }
 
-func (r *Reader) validateSSTData(meta sstMetadata, data []byte) error {
-	var err error
-	data, err = trimSSTData(meta, data)
-	if err != nil {
-		return err
-	}
-	if !r.verifySST {
-		return nil
-	}
-
-	sum := sha256.Sum256(data)
-	return r.validateSSTChecksum(meta, sum)
-}
-
-func (r *Reader) validateSSTChecksum(meta sstMetadata, sum [32]byte) error {
-	if !r.verifySST {
-		return nil
-	}
-
-	hashHex := hex.EncodeToString(sum[:])
-	if meta.Checksum == "" {
-		return fmt.Errorf("sst %s: missing checksum", meta.ID)
-	}
-	algo, expected, ok := strings.Cut(meta.Checksum, ":")
-	if !ok || algo != "sha256" {
-		return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
-	}
-	if expected != hashHex {
-		return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
-	}
-
-	return nil
-}
-
 func trimSSTData(meta sstMetadata, data []byte) ([]byte, error) {
 	if meta.Size <= 0 {
 		return nil, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
@@ -1011,132 +1014,116 @@ func trimSSTData(meta sstMetadata, data []byte) ([]byte, error) {
 }
 
 func (r *Reader) cacheSST(ctx context.Context, meta *sstMetadata, path string) (err error) {
-	if cache, ok := r.sstCache.(diskcache.FileBackedCache); ok {
-		return r.cacheSSTStream(ctx, cache, meta, path)
-	}
-
-	start := time.Now()
-	var downloadedBytes int64
-	defer func() {
-		r.metrics.ObserveSSTDownload(time.Since(start), downloadedBytes, err)
-	}()
-
-	var data []byte
-	if meta != nil && meta.Size > 0 {
-		data, err = r.store.ReadRange(ctx, path, 0, meta.Size)
-	} else {
-		data, _, err = r.store.Read(ctx, path)
-	}
+	handle, _, err := r.downloadSSTArtifact(ctx, meta, path)
 	if err != nil {
-		return fmt.Errorf("read sst %s: %w", path, err)
+		return err
 	}
-	downloadedBytes = int64(len(data))
-
-	if meta != nil {
-		if err := r.validateSSTData(*meta, data); err != nil {
-			return fmt.Errorf("validate sst %s: %w", path, err)
-		}
-	}
-
-	if err := r.sstCache.Set(path, data); err != nil {
-		return fmt.Errorf("cache sst %s: %w", path, err)
+	if err := handle.Close(); err != nil {
+		return fmt.Errorf("release downloaded sst %s: %w", meta.ID, err)
 	}
 	return nil
 }
 
-func (r *Reader) ensureSSTCached(ctx context.Context, meta *sstMetadata, path string) error {
-	if _, ok := r.sstCache.Acquire(path); ok {
-		r.sstCache.Release(path)
-		return nil
+func (r *Reader) loadSSTArtifact(
+	ctx context.Context,
+	meta *sstMetadata,
+	path string,
+) (*sstArtifactLease, error) {
+	if meta == nil {
+		return nil, errors.New("cache sst: missing metadata")
 	}
 
-	_, err := r.sstLoads.Do(ctx, path, func(loadCtx context.Context) (any, error) {
-		if _, ok := r.sstCache.Acquire(path); ok {
-			r.sstCache.Release(path)
-			return nil, nil
+	value, err := r.sstLoads.Do(ctx, path, func(loadCtx context.Context) (any, error) {
+		if resident, _ := r.sstResident(*meta); resident {
+			handle, ok, err := r.artifactCache.Acquire(sstArtifactDescriptor(*meta))
+			if err == nil && ok {
+				return newSharedSSTArtifact(handle), nil
+			}
 		}
-		return nil, r.cacheSST(loadCtx, meta, path)
+
+		handle, _, err := r.downloadSSTArtifact(loadCtx, meta, path)
+		if err != nil {
+			return nil, err
+		}
+		return newSharedSSTArtifact(handle), nil
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	lease, ok := value.(*sstArtifactLease)
+	if !ok || lease == nil {
+		return nil, fmt.Errorf("load sst %s: missing artifact lease", meta.ID)
+	}
+	return lease, nil
 }
 
-func (r *Reader) cacheSSTStream(ctx context.Context, cache diskcache.FileBackedCache, meta *sstMetadata, path string) (err error) {
+func (r *Reader) downloadSSTArtifact(
+	ctx context.Context,
+	meta *sstMetadata,
+	path string,
+) (handle *diskcache.ArtifactHandle, admission diskcache.ArtifactAdmission, err error) {
 	start := time.Now()
 	var downloadedBytes int64
 	defer func() {
 		r.metrics.ObserveSSTDownload(time.Since(start), downloadedBytes, err)
 	}()
 
-	tmpFile, err := os.CreateTemp(cache.CacheDir(), "sst-*")
+	if meta == nil {
+		return nil, 0, fmt.Errorf("cache sst %s: missing metadata", path)
+	}
+	// Local staging is a Reader availability requirement. Fail before paying
+	// object-store egress when it cannot be created; buffering an arbitrarily
+	// large SST in memory is deliberately not a fallback. Failures after the
+	// verified download are handled by Commit's transient-file path.
+	fill, err := r.artifactCache.BeginFill(sstArtifactDescriptor(*meta))
 	if err != nil {
-		return fmt.Errorf("create temp sst %s: %w", path, err)
+		r.observeArtifactCacheDiagnostic("begin-fill", diskcache.ArtifactSST, meta.ID, err)
+		return nil, 0, fmt.Errorf("begin cache fill for sst %s: %w", meta.ID, err)
 	}
-	tmpPath := tmpFile.Name()
-	cleanup := func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-	}
+	defer fill.Abort()
 
-	var stream io.ReadCloser
-	if meta != nil && meta.Size > 0 {
-		stream, err = r.store.ReadRangeStream(ctx, path, 0, meta.Size)
-	} else {
-		stream, err = r.store.ReadStream(ctx, path)
-	}
+	// The enclosing object may append Bloom and trailer bytes after the Pebble
+	// payload. ArtifactFill intentionally rejects overflow, so keep this stream
+	// bounded to exactly the manifest's [0, Size) SST extent.
+	stream, err := r.store.ReadRangeStream(ctx, path, 0, meta.Size)
 	if err != nil {
-		cleanup()
-		return fmt.Errorf("read sst %s: %w", path, err)
+		return nil, 0, fmt.Errorf("read sst %s: %w", path, err)
 	}
 	defer stream.Close()
 
-	needHash := meta != nil && r.verifySST
-	var hasher hash.Hash
-	writer := io.Writer(tmpFile)
-	if needHash {
-		hasher = sha256.New()
-		writer = io.MultiWriter(tmpFile, hasher)
-	}
-
-	written, err := io.Copy(writer, stream)
+	downloadedBytes, err = io.Copy(fill, stream)
 	if err != nil {
-		cleanup()
-		return fmt.Errorf("download sst %s: %w", path, err)
+		return nil, 0, fmt.Errorf("download sst %s: %w", path, err)
 	}
-	downloadedBytes = written
-	if meta != nil && meta.Size > 0 && written < meta.Size {
-		cleanup()
-		return fmt.Errorf("validate sst %s: short read: %d < %d", path, written, meta.Size)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close sst %s: %w", path, err)
-	}
-
-	if needHash {
-		var sum [32]byte
-		copy(sum[:], hasher.Sum(nil))
-		if err := r.validateSSTChecksum(*meta, sum); err != nil {
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("validate sst %s: %w", path, err)
+	handle, admission, err = fill.Commit()
+	if err != nil {
+		switch {
+		case errors.Is(err, diskcache.ErrArtifactChecksumMismatch):
+			return nil, 0, fmt.Errorf("validate sst %s: checksum mismatch: %w", meta.ID, err)
+		case errors.Is(err, diskcache.ErrArtifactSizeMismatch):
+			return nil, 0, fmt.Errorf("validate sst %s: size mismatch: %w", meta.ID, err)
+		default:
+			return nil, 0, fmt.Errorf("cache sst %s: %w", meta.ID, err)
 		}
 	}
-
-	if err := cache.SetFromFile(path, tmpPath, written); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("cache sst %s: %w", path, err)
-	}
-
-	return nil
+	return handle, admission, nil
 }
 
 func (r *Reader) SSTCacheStats() CacheStats {
-	return cacheStatsFromDisk(r.sstCache.Stats())
+	return cacheStatsFromArtifact(r.artifactCache.Stats(diskcache.ArtifactSST))
 }
 
-// BloomCacheStats reports the decoded bloom-filter cache occupancy.
+// BloomCacheStats reports decoded Bloom-filter L1 occupancy.
 func (r *Reader) BloomCacheStats() CacheStats {
 	return r.bloomCache.stats()
+}
+
+// BloomDiskCacheStats reports verified raw Bloom sidecar occupancy.
+func (r *Reader) BloomDiskCacheStats() CacheStats {
+	if r.artifactCache == nil {
+		return CacheStats{}
+	}
+	return cacheStatsFromArtifact(r.artifactCache.Stats(diskcache.ArtifactBloom))
 }
 
 func (r *Reader) ManifestPageCacheStats() CacheStats {
@@ -1150,16 +1137,6 @@ func (r *Reader) ManifestPageCacheStats() CacheStats {
 		}
 	}
 	return CacheStats{}
-}
-
-func cacheStatsFromDisk(stats diskcache.Stats) CacheStats {
-	return CacheStats{
-		Hits:       stats.Hits,
-		Misses:     stats.Misses,
-		Bytes:      stats.Size,
-		MaxBytes:   stats.MaxSize,
-		EntryCount: stats.EntryCount,
-	}
 }
 
 type sstReadable struct {

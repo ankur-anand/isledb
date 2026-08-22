@@ -102,12 +102,15 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	for _, sst := range selected {
 		sst := sst
 		g.Go(func() error {
-			if err := r.prefetchSST(gctx, sst); err != nil {
+			resident, downloaded, err := r.prefetchSST(gctx, sst)
+			if err != nil {
 				return err
 			}
-			cached.Add(1)
-			if sst.Size > 0 {
-				bytesRead.Add(sst.Size)
+			if resident {
+				cached.Add(1)
+			}
+			if downloaded > 0 {
+				bytesRead.Add(downloaded)
 			}
 			return nil
 		})
@@ -179,9 +182,13 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		}
 		stats.MatchedSSTs++
 
-		path := r.store.SSTPath(sst.ID)
-		if _, ok := r.sstCache.Acquire(path); ok {
-			r.sstCache.Release(path)
+		resident, err := r.sstResident(sst)
+		if err != nil {
+			// Descriptor errors will be returned by prefetchSST for selected
+			// entries; presence probing itself must not inflate hit/miss metrics.
+			resident = false
+		}
+		if resident {
 			stats.SkippedSSTs++
 			return
 		}
@@ -225,15 +232,20 @@ func sstOverlapsPrefetchRange(sst sstMetadata, r KeyRange) bool {
 	return true
 }
 
-func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) error {
+func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (bool, int64, error) {
 	path := r.store.SSTPath(sst.ID)
-	if _, ok := r.sstCache.Acquire(path); ok {
-		r.sstCache.Release(path)
-		return nil
+	if resident, err := r.sstResident(sst); err != nil {
+		return false, 0, fmt.Errorf("probe sst %s: %w", sst.ID, err)
+	} else if resident {
+		return true, 0, nil
 	}
 
 	if err := r.cacheSST(ctx, &sst, path); err != nil {
-		return err
+		return false, 0, err
 	}
-	return nil
+	resident, err := r.sstResident(sst)
+	if err != nil {
+		return false, sst.Size, fmt.Errorf("probe prefetched sst %s: %w", sst.ID, err)
+	}
+	return resident, sst.Size, nil
 }

@@ -2,13 +2,13 @@ package isledb
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,27 +39,22 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 	return reader, ctx, res.Meta, res.SSTData, store.SSTPath(res.Meta.ID), cleanup
 }
 
-func TestReader_cacheSST_StreamedToFileBackedCache(t *testing.T) {
+func TestReader_cacheSST_StreamedToArtifactCache(t *testing.T) {
 	reader, ctx, meta, data, path, cleanup := setupReaderCacheFixture(t, true)
 	defer cleanup()
 
 	err := reader.cacheSST(ctx, &meta, path)
 	require.NoError(t, err)
 
-	got, ok := reader.sstCache.Acquire(path)
+	got, release, ok, err := reader.acquireSST(meta)
+	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, data, got)
-	reader.sstCache.Release(path)
-
-	fb, ok := reader.sstCache.(diskcache.FileBackedCache)
-	require.True(t, ok)
-
-	entries, err := os.ReadDir(fb.CacheDir())
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
+	release()
+	require.Equal(t, 1, reader.SSTCacheStats().EntryCount)
 }
 
-func TestReader_cacheSSTStream_ChecksumMismatch(t *testing.T) {
+func TestReader_cacheSSTArtifact_ChecksumMismatch(t *testing.T) {
 	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, true)
 	defer cleanup()
 
@@ -69,13 +64,119 @@ func TestReader_cacheSSTStream_ChecksumMismatch(t *testing.T) {
 	err = reader.cacheSST(ctx, &meta, path)
 	require.Error(t, err)
 
-	_, ok := reader.sstCache.Acquire(path)
+	_, _, ok, acquireErr := reader.acquireSST(meta)
+	require.NoError(t, acquireErr)
 	require.False(t, ok)
+	require.Equal(t, 0, reader.SSTCacheStats().EntryCount)
+}
 
-	fb, ok := reader.sstCache.(diskcache.FileBackedCache)
-	require.True(t, ok)
-
-	entries, err := os.ReadDir(fb.CacheDir())
+func TestReaderArtifactCacheDescriptorRejectionIsObservableMiss(t *testing.T) {
+	cache, err := diskcache.OpenArtifactCache(diskcache.ArtifactCacheOptions{
+		Dir: t.TempDir(), SSTMaxBytes: 1 << 20, BloomMaxBytes: 1 << 20,
+	})
 	require.NoError(t, err)
-	require.Len(t, entries, 0)
+	defer cache.Close()
+	metrics := DefaultReaderMetrics(nil)
+	reader := &Reader{artifactCache: cache, metrics: metrics}
+
+	_, _, ok, err := reader.acquireSST(sstMetadata{
+		ID: "accepted-by-reader", Size: 1, Checksum: "invalid",
+	})
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.EqualValues(t, 1, testutil.ToFloat64(metrics.ArtifactCacheErrors))
+	require.EqualValues(t, 1,
+		testutil.ToFloat64(metrics.ArtifactCacheInvariantViolations))
+}
+
+func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("cached-open-error")
+	defer store.Close()
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	require.NoError(t, err)
+	defer reader.Close()
+
+	data := []byte("verified but not an SST")
+	meta := sstMetadata{
+		ID:       "invalid-cached-sst",
+		Size:     int64(len(data)),
+		Checksum: bloomChecksum(data),
+	}
+	handle, _, err := reader.artifactCache.AdmitBytes(sstArtifactDescriptor(meta), data)
+	require.NoError(t, err)
+	require.NoError(t, handle.Close())
+
+	_, _, parseErr := reader.openSSTIterFromData(ctx, meta, data, nil, nil, nil)
+	require.Error(t, parseErr)
+	_, _, err = reader.openSSTIterBounded(ctx, meta, nil, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, parseErr.Error())
+}
+
+func TestReader_OversizedSSTBypassesCacheAndServesRead(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("oversized-sst-cache-bypass")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	result := writeTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
+		{Key: []byte("key"), Seq: 1, Kind: internal.OpPut, Value: []byte("value")},
+	}, 0, 1)
+	if result.Meta.Size <= 1 {
+		t.Fatalf("test SST size=%d, want >1", result.Meta.Size)
+	}
+
+	opts := defaultReaderOptions()
+	opts.CacheDir = t.TempDir()
+	opts.SSTCacheSize = result.Meta.Size - 1
+	reader, err := newReader(ctx, store, opts)
+	require.NoError(t, err)
+	defer reader.Close()
+
+	value, found, err := reader.Get(ctx, []byte("key"))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, []byte("value"), value)
+
+	stats := reader.SSTCacheStats()
+	require.Zero(t, stats.EntryCount)
+	require.Zero(t, stats.Bytes)
+	require.EqualValues(t, 1, stats.AdmissionBypasses)
+}
+
+func TestReader_PinnedCapacityBypassServesRead(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("pinned-sst-cache-bypass")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	first := writeTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("first")},
+	}, 0, 1)
+	second := writeTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
+		{Key: []byte("b"), Seq: 2, Kind: internal.OpPut, Value: []byte("second")},
+	}, 0, 2)
+
+	opts := defaultReaderOptions()
+	opts.CacheDir = t.TempDir()
+	opts.SSTCacheSize = max(first.Meta.Size, second.Meta.Size)
+	reader, err := newReader(ctx, store, opts)
+	require.NoError(t, err)
+	defer reader.Close()
+
+	require.NoError(t, reader.cacheSST(ctx, &first.Meta, store.SSTPath(first.Meta.ID)))
+	_, releaseFirst, ok, err := reader.acquireSST(first.Meta)
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer releaseFirst()
+
+	value, found, err := reader.Get(ctx, []byte("b"))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, []byte("second"), value)
+
+	stats := reader.SSTCacheStats()
+	require.Equal(t, 1, stats.EntryCount)
+	require.Equal(t, first.Meta.Size, stats.Bytes)
+	require.Equal(t, first.Meta.Size, stats.PinnedBytes)
+	require.EqualValues(t, 1, stats.AdmissionBypasses)
 }

@@ -24,21 +24,42 @@ type ReaderViewPolicy struct {
 // limits are zero for entry-count-bounded caches; MaxEntries is zero for
 // byte-bounded caches.
 type CacheStats struct {
-	Hits       int64
-	Misses     int64
-	Bytes      int64
-	MaxBytes   int64
-	EntryCount int
-	MaxEntries int
+	Hits              int64
+	Misses            int64
+	Bytes             int64
+	MaxBytes          int64
+	EntryCount        int
+	MaxEntries        int
+	PinnedBytes       int64
+	PinnedEntries     int
+	Evictions         int64
+	Corruptions       int64
+	AdmissionBypasses int64
+	// SyncFailures counts verified fills that could not be made durable and
+	// were therefore served transiently instead of entering the cache.
+	SyncFailures int64
+	// PublicationFailures counts failures while cleaning capacity victims or
+	// publishing an artifact at its final cache path.
+	PublicationFailures int64
 }
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
-	// CacheDir is the directory for disk caches. It must be non-empty.
+	// CacheDir is the directory for disk caches. It must be non-empty, may be
+	// owned by only one live Reader process at a time, and must remain writable
+	// with enough free space to stage SST downloads for the Reader's lifetime.
+	// A read that needs a full SST fails if local staging cannot be created;
+	// IsleDB does not fall back to buffering an unbounded SST in memory. Once a
+	// download has completed and passed checksum verification, later cache
+	// publication failures are served from the staged file transiently.
 	CacheDir string
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
 	SSTCacheSize int64
+
+	// BloomDiskCacheSize is the maximum bytes for persistent, verified raw
+	// Bloom sidecars. Zero selects the default (64 MiB).
+	BloomDiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes for the in-memory block cache used
 	// when range-reading SSTs. Default 0 disables the block cache.
@@ -56,8 +77,8 @@ type ReaderOpenOptions struct {
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
 
-	// ValidateSSTChecksum verifies SST checksums on first download.
-	// If enabled and checksum is missing or mismatched, reads fail.
+	// ValidateSSTChecksum verifies SST checksums on read paths that can
+	// otherwise skip it. Persistent disk-cache admissions always verify.
 	ValidateSSTChecksum bool
 
 	// Views controls manifest freshness. Read-view lifetime is a store policy
@@ -72,17 +93,37 @@ type ReaderOpenOptions struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 	defaults := defaultReaderOptions()
 	return ReaderOpenOptions{
-		CacheDir:       cacheDir,
-		SSTCacheSize:   defaults.SSTCacheSize,
-		BloomCacheSize: defaults.BloomCacheSize,
-		Views:          defaults.ViewPolicy,
+		CacheDir:           cacheDir,
+		SSTCacheSize:       defaults.SSTCacheSize,
+		BloomDiskCacheSize: defaults.BloomDiskCacheSize,
+		BloomCacheSize:     defaults.BloomCacheSize,
+		Views:              defaults.ViewPolicy,
 	}
 }
 
 func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
+	if opts.CacheDir == "" {
+		return readerOptions{}, fmt.Errorf("%w: cache_dir is required", ErrInvalidReaderOptions)
+	}
+	if opts.SSTCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: sst_cache_size=%d", ErrInvalidReaderOptions, opts.SSTCacheSize)
+	}
+	if opts.BlockCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: block_cache_size=%d", ErrInvalidReaderOptions, opts.BlockCacheSize)
+	}
 	if opts.BloomCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_cache_size=%d", ErrInvalidReaderOptions, opts.BloomCacheSize)
+	}
+	if opts.BloomDiskCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: bloom_disk_cache_size=%d", ErrInvalidReaderOptions, opts.BloomDiskCacheSize)
+	}
+	if opts.RangeReadMinSSTSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
@@ -92,6 +133,7 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	return readerOptions{
 		CacheDir:                 opts.CacheDir,
 		SSTCacheSize:             opts.SSTCacheSize,
+		BloomDiskCacheSize:       opts.BloomDiskCacheSize,
 		BlockCacheSize:           opts.BlockCacheSize,
 		BloomCacheSize:           opts.BloomCacheSize,
 		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
