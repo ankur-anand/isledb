@@ -1,0 +1,80 @@
+name: Storage Engine Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: storage-engine-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  minio-storage-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.25.0'
+
+      - name: Start MinIO
+        run: |
+          docker run --detach --name isledb-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=minioadmin \
+            --env MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+
+      - name: Run MinIO storage-engine integration
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          ISLEDB_MINIO_ENDPOINT: http://127.0.0.1:9000
+        run: >-
+          go test -race -count=1 -v -timeout=5m
+          -tags="integration,minio" ./integration/storageengine
+
+      - name: Print MinIO logs on failure
+        if: failure()
+        run: docker logs isledb-minio
+
+  azurite-storage-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:latest
+        ports:
+          - 10000:10000
+          - 10001:10001
+          - 10002:10002
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.25.0'
+
+      - name: Run Azurite storage-engine integration
+        env:
+          AZURE_STORAGE_ACCOUNT: devstoreaccount1
+          AZURE_STORAGE_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+          ISLEDB_AZURITE_ENDPOINT: http://127.0.0.1:10000
+        run: >-
+          go test -race -count=1 -v -timeout=5m
+          -tags="integration,azure" ./integration/storageengine
+
+      - name: Print Azurite logs on failure
+        if: failure()
+        run: docker logs ${{ job.services.azurite.id }}
+
