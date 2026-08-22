@@ -42,27 +42,27 @@ type Reader struct {
 	ownsBlockCache    bool
 	cacheDir          string
 
-	lifecycleMu              sync.RWMutex
-	iteratorsMu              sync.Mutex
-	iterators                map[*Iterator]struct{}
-	mu                       sync.RWMutex
-	manifest                 *manifestState
-	version                  Version
-	changeFeed               bool
-	changeHead               ChangeCursor
-	viewPolicy               ReaderViewPolicy
-	viewRefreshAt            time.Time
-	viewExpiresAt            time.Time
-	viewExpired              atomic.Bool
-	viewTimerMu              sync.Mutex
-	viewTimer                *time.Timer
-	viewTimerID              atomic.Uint64
-	metrics                  *ReaderMetrics
-	artifactInvariantLogOnce sync.Once
-	bloomDiagnosticLimiter   readerDiagnosticLimiter
-	closed                   atomic.Bool
-	releaseOnce              sync.Once
-	release                  func()
+	lifecycleMu                        sync.RWMutex
+	iteratorsMu                        sync.Mutex
+	iterators                          map[*Iterator]struct{}
+	mu                                 sync.RWMutex
+	manifest                           *manifestState
+	version                            Version
+	changeFeed                         bool
+	changeHead                         ChangeCursor
+	viewPolicy                         ReaderViewPolicy
+	viewRefreshAt                      time.Time
+	viewExpiresAt                      time.Time
+	viewExpired                        atomic.Bool
+	viewTimerMu                        sync.Mutex
+	viewTimer                          *time.Timer
+	viewTimerID                        atomic.Uint64
+	metrics                            *ReaderMetrics
+	artifactInvariantDiagnosticLimiter readerDiagnosticLimiter
+	bloomDiagnosticLimiter             readerDiagnosticLimiter
+	closed                             atomic.Bool
+	releaseOnce                        sync.Once
+	release                            func()
 }
 
 type KV struct {
@@ -774,7 +774,6 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 				// independent of the persistent handle and remains safe to use.
 				r.observeArtifactCacheDiagnostic(
 					"release", diskcache.ArtifactBloom, sstMeta.ID, closeErr)
-				r.observeBloomFilterError(sstMeta.ID, closeErr)
 				r.bloomCache.put(sstMeta.ID, filter)
 				return filter, nil
 			}
@@ -818,7 +817,6 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 			if err := handle.Close(); err != nil {
 				r.observeArtifactCacheDiagnostic(
 					"release", diskcache.ArtifactBloom, sstMeta.ID, err)
-				r.observeBloomFilterError(sstMeta.ID, err)
 			}
 		}
 		r.bloomCache.put(sstMeta.ID, filter)

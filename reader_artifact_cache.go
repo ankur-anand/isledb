@@ -216,15 +216,18 @@ func (r *Reader) observeArtifactCacheDiagnostic(
 		errors.Is(err, diskcache.ErrArtifactCacheClosed)
 	r.metrics.ObserveArtifactCacheDiagnostic(invariantViolation)
 	if invariantViolation {
-		r.artifactInvariantLogOnce.Do(func() {
-			slog.Error(
-				"isledb: artifact cache invariant violation; further messages are suppressed",
-				"operation", operation,
-				"kind", kind,
-				"sst_id", sstID,
-				"error", err,
-			)
-		})
+		allowed, suppressed := r.artifactInvariantDiagnosticLimiter.allow(time.Now())
+		if !allowed {
+			return
+		}
+		slog.Error(
+			"isledb: artifact cache invariant violation",
+			"operation", operation,
+			"kind", kind,
+			"sst_id", sstID,
+			"error", err,
+			"suppressed_since_last_log", suppressed,
+		)
 	}
 }
 

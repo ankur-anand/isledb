@@ -31,6 +31,13 @@ func TestReaderOpenOptionsRejectsNegativeBloomDiskCacheSize(t *testing.T) {
 	}
 }
 
+func TestReaderOpenOptionsRejectsEmptyCacheDir(t *testing.T) {
+	opts := DefaultReaderOpenOptions("")
+	if _, err := readerOptionsFromPublic(opts); !errors.Is(err, ErrInvalidReaderOptions) {
+		t.Fatalf("readerOptionsFromPublic error=%v want=%v", err, ErrInvalidReaderOptions)
+	}
+}
+
 func TestReaderOpenOptionsRejectsNegativeBloomCacheSize(t *testing.T) {
 	opts := DefaultReaderOpenOptions(t.TempDir())
 	opts.BloomCacheSize = -1

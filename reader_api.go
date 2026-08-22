@@ -102,6 +102,9 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 }
 
 func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
+	if opts.CacheDir == "" {
+		return readerOptions{}, fmt.Errorf("%w: cache_dir is required", ErrInvalidReaderOptions)
+	}
 	if opts.SSTCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: sst_cache_size=%d", ErrInvalidReaderOptions, opts.SSTCacheSize)

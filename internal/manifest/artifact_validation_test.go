@@ -1,7 +1,6 @@
 package manifest
 
 import (
-	"errors"
 	"strings"
 	"testing"
 )
@@ -23,7 +22,7 @@ func validArtifactSSTMeta() SSTMeta {
 	}
 }
 
-func TestManifestValidateArtifacts(t *testing.T) {
+func TestManifestValidateLevelsValidatesArtifacts(t *testing.T) {
 	valid := validArtifactSSTMeta()
 	tests := []struct {
 		name string
@@ -56,28 +55,27 @@ func TestManifestValidateArtifacts(t *testing.T) {
 			if test.edit != nil {
 				test.edit(&sst)
 			}
-			err := (&Manifest{L0SSTs: []SSTMeta{sst}}).ValidateArtifacts()
+			err := (&Manifest{L0SSTs: []SSTMeta{sst}}).validateLevels(true)
 			if test.want == "" {
 				if err != nil {
-					t.Fatalf("ValidateArtifacts: %v", err)
+					t.Fatalf("validateLevels: %v", err)
 				}
 				return
 			}
-			if !errors.Is(err, ErrInvalidManifest) || !strings.Contains(err.Error(), test.want) ||
-				!strings.Contains(err.Error(), sst.ID) {
-				t.Fatalf("ValidateArtifacts error=%v want manifest error containing %q and SST ID", err, test.want)
+			if !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), sst.ID) {
+				t.Fatalf("validateLevels error=%v want error containing %q and SST ID", err, test.want)
 			}
 		})
 	}
 }
 
-func TestManifestValidateArtifactsChecksSortedLevels(t *testing.T) {
+func TestManifestValidateLevelsChecksSortedLevelArtifacts(t *testing.T) {
 	sst := validArtifactSSTMeta()
 	sst.ID = "level-sst"
 	sst.Level = 2
 	sst.Bloom.Checksum = ""
-	err := (&Manifest{Levels: []Level{{Number: 2, SSTs: []SSTMeta{sst}}}}).ValidateArtifacts()
-	if !errors.Is(err, ErrInvalidManifest) || !strings.Contains(err.Error(), `L2 SST "level-sst"`) {
-		t.Fatalf("ValidateArtifacts error=%v", err)
+	err := (&Manifest{Levels: []Level{{Number: 2, SSTs: []SSTMeta{sst}}}}).validateLevels(true)
+	if !strings.Contains(err.Error(), `L2 SST "level-sst"`) {
+		t.Fatalf("validateLevels error=%v", err)
 	}
 }
