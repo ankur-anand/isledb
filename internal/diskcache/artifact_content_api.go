@@ -114,13 +114,15 @@ func (cache *ArtifactCache) Stats(kind ArtifactKind) ArtifactStats {
 	}
 	stats := cache.inner.stats(kind)
 	return ArtifactStats{
-		Hits:              stats.Hits,
-		Misses:            stats.Misses,
-		Corruptions:       stats.Corruptions,
-		Evictions:         stats.CapacityEvictions,
-		CapacityEvictions: stats.CapacityEvictions,
-		PurgeRemovals:     stats.PurgeRemovals,
-		RecoveryRemovals:  stats.RecoveryRemovals,
+		Hits:                stats.Hits,
+		Misses:              stats.Misses,
+		Corruptions:         stats.Corruptions,
+		Evictions:           stats.CapacityEvictions,
+		CapacityEvictions:   stats.CapacityEvictions,
+		PurgeRemovals:       stats.PurgeRemovals,
+		RecoveryRemovals:    stats.RecoveryRemovals,
+		SyncFailures:        stats.SyncFailures,
+		PublicationFailures: stats.PublicationFailures,
 		AdmissionBypasses: stats.BypassedOversized +
 			stats.BypassedPinnedCapacity + stats.BypassedPublicationFailure,
 		RecoveredEntries: stats.RecoveredEntries,
@@ -136,6 +138,10 @@ func (cache *ArtifactCache) Stats(kind ArtifactKind) ArtifactStats {
 	}
 }
 
+// Close releases the cache's local resources and directory lock. A
+// caller-supplied ArtifactCache must remain open until all Readers using it
+// have closed; closing it early makes local SST staging unavailable and may
+// cause subsequent reads to fail.
 func (cache *ArtifactCache) Close() error {
 	if cache == nil || cache.inner == nil {
 		return nil

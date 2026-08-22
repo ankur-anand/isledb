@@ -35,6 +35,12 @@ type CacheStats struct {
 	Evictions         int64
 	Corruptions       int64
 	AdmissionBypasses int64
+	// SyncFailures counts verified fills that could not be made durable and
+	// were therefore served transiently instead of entering the cache.
+	SyncFailures int64
+	// PublicationFailures counts failures while cleaning capacity victims or
+	// publishing an artifact at its final cache path.
+	PublicationFailures int64
 }
 
 // ReaderOpenOptions configures a read-only handle.

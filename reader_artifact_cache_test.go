@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +16,54 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+func TestReaderDiagnosticLimiterBoundsLogsAndReportsSuppression(t *testing.T) {
+	var limiter readerDiagnosticLimiter
+	now := time.Unix(1_700_000_000, 0)
+	if allowed, suppressed := limiter.allow(now); !allowed || suppressed != 0 {
+		t.Fatalf("first allow=(%t,%d), want (true,0)", allowed, suppressed)
+	}
+	if allowed, _ := limiter.allow(now.Add(time.Second)); allowed {
+		t.Fatal("diagnostic inside interval was allowed")
+	}
+	if allowed, _ := limiter.allow(now.Add(2 * time.Second)); allowed {
+		t.Fatal("second diagnostic inside interval was allowed")
+	}
+	if allowed, suppressed := limiter.allow(now.Add(readerDiagnosticLogInterval)); !allowed || suppressed != 2 {
+		t.Fatalf("next allow=(%t,%d), want (true,2)", allowed, suppressed)
+	}
+
+	var concurrent readerDiagnosticLimiter
+	var allowed atomic.Int64
+	const callers = 32
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for range callers {
+		go func() {
+			defer wait.Done()
+			if ok, _ := concurrent.allow(now); ok {
+				allowed.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+	if got := allowed.Load(); got != 1 {
+		t.Fatalf("concurrent allowed=%d, want 1", got)
+	}
+	if ok, suppressed := concurrent.allow(now.Add(readerDiagnosticLogInterval)); !ok || suppressed != callers-1 {
+		t.Fatalf("concurrent suppression=(%t,%d), want (true,%d)",
+			ok, suppressed, callers-1)
+	}
+}
+
+func TestReaderCacheStatsExposeArtifactFailureCounters(t *testing.T) {
+	stats := cacheStatsFromArtifact(diskcache.ArtifactStats{
+		SyncFailures: 2, PublicationFailures: 3,
+	})
+	if stats.SyncFailures != 2 || stats.PublicationFailures != 3 {
+		t.Fatalf("reader cache stats=%+v", stats)
+	}
+}
 
 func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	ctx := context.Background()
@@ -52,9 +102,9 @@ func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	contains, err := reopened.bloomMayContain(ctx, result.Meta, []byte("key"))
-	if err != nil || !contains {
-		t.Fatalf("recovered Bloom contains=%t err=%v", contains, err)
+	contains := reopened.bloomMayContain(ctx, result.Meta, []byte("key"))
+	if !contains {
+		t.Fatal("recovered Bloom returned definitely absent")
 	}
 	value, found, err = reopened.Get(ctx, []byte("key"))
 	if err != nil || !found || string(value) != "value" {
@@ -97,8 +147,8 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if contains, err := reopened.bloomMayContain(ctx, result.Meta, []byte("key")); err != nil || !contains {
-		t.Fatalf("self-healed Bloom contains=%t err=%v", contains, err)
+	if contains := reopened.bloomMayContain(ctx, result.Meta, []byte("key")); !contains {
+		t.Fatal("self-healed Bloom returned definitely absent")
 	}
 	value, found, err := reopened.Get(ctx, []byte("key"))
 	if err != nil || !found || string(value) != "value" {

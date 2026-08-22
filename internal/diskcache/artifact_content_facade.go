@@ -17,6 +17,8 @@ type artifactContentCacheStats struct {
 	BypassedOversized          int64
 	BypassedPinnedCapacity     int64
 	BypassedPublicationFailure int64
+	SyncFailures               int64
+	PublicationFailures        int64
 	CapacityEvictions          int64
 	Removals                   int64
 	PurgeRemovals              int64
@@ -186,6 +188,8 @@ func (cache *artifactContentCache) stats(kind ArtifactKind) artifactContentCache
 	stats.BypassedOversized = counters.bypassedOversized.Load()
 	stats.BypassedPinnedCapacity = counters.bypassedPinnedCapacity.Load()
 	stats.BypassedPublicationFailure = counters.bypassedPublicationFailure.Load()
+	stats.SyncFailures = counters.syncFailures.Load()
+	stats.PublicationFailures = counters.publicationFailures.Load()
 	stats.CapacityEvictions = tier.capacityEvictions.Load()
 	stats.Removals = counters.removals.Load()
 	stats.PurgeRemovals = counters.purgeRemovals.Load()
@@ -242,6 +246,12 @@ func (fill *artifactContentCacheFill) commit() (
 		fill.completeWithoutHandle()
 		return nil, 0, finishErr
 	}
+	// A non-nil staged value with an error is finish's documented signal that
+	// verification succeeded but file.Sync failed. Count it even if preparing
+	// the transient view subsequently fails.
+	if finishErr != nil {
+		fill.cache.counters[fill.kind].syncFailures.Add(1)
+	}
 	prepared, prepareErr := staged.prepareHandle()
 	if prepareErr != nil {
 		_ = staged.discard()
@@ -260,13 +270,18 @@ func (fill *artifactContentCacheFill) commit() (
 		func() error { return staged.publish(fill.cache.path(staged.address)) },
 		fill.cache.remove,
 	)
-	fill.recordAdmission(admission)
-
 	switch admission {
 	case artifactContentAdmitted:
-		if publishErr != nil {
-			return fill.transientOrError(staged, prepared, admission, publishErr)
+		if entry == nil {
+			fill.recordPublicationFailure()
+			return fill.transientOrError(
+				staged,
+				prepared,
+				artifactContentBypassedPublicationFailure,
+				errors.New("diskcache: admitted content has no index entry"),
+			)
 		}
+		fill.recordAdmission(artifactContentAdmitted)
 		data, mapped := prepared.take()
 		persistent := newArtifactPersistentHandle(
 			tier, entry, fill.cache.remove, data, mapped)
@@ -280,6 +295,7 @@ func (fill *artifactContentCacheFill) commit() (
 			persistent, hit, openErr := tier.openPinned(
 				entry, fill.cache.path(staged.address), fill.cache.remove)
 			if openErr == nil && hit {
+				fill.recordAdmission(artifactContentAlreadyResident)
 				_ = prepared.close()
 				_ = staged.discard()
 				fill.completeIncomingAccounting()
@@ -287,14 +303,21 @@ func (fill *artifactContentCacheFill) commit() (
 					fill.kind, staged.size, false, persistent), admission, nil
 			}
 			publishErr = openErr
+			if publishErr == nil {
+				publishErr = errors.New("diskcache: resident content could not be opened")
+			}
 		}
-		fill.cache.counters[fill.kind].bypassedPublicationFailure.Add(1)
+		fill.recordPublicationFailure()
 		return fill.transientOrError(
 			staged, prepared, artifactContentBypassedPublicationFailure, publishErr)
 
 	case artifactContentBypassedOversized,
-		artifactContentBypassedPinnedCapacity,
-		artifactContentBypassedPublicationFailure:
+		artifactContentBypassedPinnedCapacity:
+		fill.recordAdmission(admission)
+		return fill.transientOrError(staged, prepared, admission, publishErr)
+
+	case artifactContentBypassedPublicationFailure:
+		fill.recordPublicationFailure()
 		return fill.transientOrError(staged, prepared, admission, publishErr)
 
 	default:
@@ -303,6 +326,11 @@ func (fill *artifactContentCacheFill) commit() (
 		fill.completeWithoutHandle()
 		return nil, admission, errors.New("diskcache: invalid content admission outcome")
 	}
+}
+
+func (fill *artifactContentCacheFill) recordPublicationFailure() {
+	fill.cache.counters[fill.kind].publicationFailures.Add(1)
+	fill.recordAdmission(artifactContentBypassedPublicationFailure)
 }
 
 func (fill *artifactContentCacheFill) transientOrError(

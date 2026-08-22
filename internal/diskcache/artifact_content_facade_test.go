@@ -150,7 +150,9 @@ func TestArtifactContentCacheFacadePublicationFailureStillReturnsTransient(t *te
 		t.Fatalf("transient bytes=%q, want %q", secondHandle.bytes(), secondData)
 	}
 	stats := cache.stats(ArtifactSST)
-	if stats.BypassedPublicationFailure != 1 || stats.TransientFiles != 1 {
+	if stats.Admitted != 1 || stats.AlreadyResident != 0 ||
+		stats.BypassedPublicationFailure != 1 || stats.PublicationFailures != 1 ||
+		stats.SyncFailures != 0 || stats.TransientFiles != 1 {
 		t.Fatalf("publication-failure stats=%+v", stats)
 	}
 }
@@ -207,8 +209,41 @@ func TestArtifactContentCacheFacadeSyncFailureReturnsTransient(t *testing.T) {
 		t.Fatalf("close transient: %v", err)
 	}
 	stats := cache.stats(ArtifactSST)
-	if stats.ResidentEntries != 0 || stats.BypassedPublicationFailure != 1 {
+	if stats.ResidentEntries != 0 || stats.Admitted != 0 || stats.AlreadyResident != 0 ||
+		stats.BypassedPublicationFailure != 1 ||
+		stats.SyncFailures != 1 || stats.PublicationFailures != 0 {
 		t.Fatalf("sync-failure stats=%+v", stats)
+	}
+}
+
+func TestArtifactContentAlreadyResidentOpenFailureHasOneAdmissionOutcome(t *testing.T) {
+	data := []byte("already resident content")
+	cache := openArtifactContentCacheForTest(t, t.TempDir(), 1<<20, 1)
+	desc := contentFillDescriptor(ArtifactSST, "sst-a", data)
+	first, admission := commitThroughArtifactContentCache(t, cache, desc, data)
+	if admission != artifactContentAdmitted {
+		t.Fatalf("first admission=%d, want admitted", admission)
+	}
+	if err := first.close(); err != nil {
+		t.Fatalf("close first handle: %v", err)
+	}
+
+	cache.tiers[ArtifactSST].openPersistent = func(
+		artifactContentAddress, int64, string,
+	) ([]byte, bool, error) {
+		return nil, false, syscall.EMFILE
+	}
+	second, secondAdmission := commitThroughArtifactContentCache(t, cache, desc, data)
+	if secondAdmission != artifactContentBypassedPublicationFailure {
+		t.Fatalf("second admission=%d, want publication-failure bypass", secondAdmission)
+	}
+	if !bytes.Equal(second.bytes(), data) {
+		t.Fatalf("transient bytes=%q, want %q", second.bytes(), data)
+	}
+	stats := cache.stats(ArtifactSST)
+	if stats.Admitted != 1 || stats.AlreadyResident != 0 ||
+		stats.BypassedPublicationFailure != 1 || stats.PublicationFailures != 1 {
+		t.Fatalf("mutually exclusive admission stats=%+v", stats)
 	}
 }
 

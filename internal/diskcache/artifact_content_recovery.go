@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -50,7 +51,27 @@ func (cache *artifactContentCache) prepareMetadata() error {
 	if err := cache.resetOwnedPaths(); err != nil {
 		return err
 	}
+	// Make removal of the old owned layout durable before publishing the new
+	// format marker. Steady-state artifact publication remains best-effort and
+	// deliberately does not sync directories.
+	if err := cache.syncDirectory(cache.dir); err != nil {
+		return fmt.Errorf("diskcache: sync reset content cache root: %w", err)
+	}
 	return writeArtifactContentMetadata(cache.dir, metadataPath)
+}
+
+func syncArtifactContentDirectory(path string) error {
+	// Windows does not provide a portable directory-fsync equivalent through
+	// os.File.Sync. A missing cache entry after a crash remains a safe miss, so
+	// format-reset durability is best-effort there.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func (cache *artifactContentCache) resetOwnedPaths() error {
@@ -166,8 +187,16 @@ func (cache *artifactContentCache) scanRecoveredTier(
 			}
 			return nil
 		}
-		if path == tierDir || entry.IsDir() {
+		if path == tierDir {
 			return nil
+		}
+		if entry.IsDir() {
+			relative, relativeErr := filepath.Rel(tierDir, path)
+			if relativeErr == nil && isCanonicalArtifactShard(relative) {
+				return nil
+			}
+			_ = os.RemoveAll(path)
+			return fs.SkipDir
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			_ = removeArtifactContentFile(path)
@@ -198,6 +227,19 @@ func (cache *artifactContentCache) scanRecoveredTier(
 		return nil, fmt.Errorf("diskcache: scan recovered %s content: %w", kind.dirName(), err)
 	}
 	return recovered, nil
+}
+
+func isCanonicalArtifactShard(relative string) bool {
+	if filepath.Base(relative) != relative || len(relative) != 2 {
+		return false
+	}
+	for index := range len(relative) {
+		char := relative[index]
+		if !('0' <= char && char <= '9') && !('a' <= char && char <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func recoveredArtifactContentAddress(

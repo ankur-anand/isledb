@@ -275,21 +275,6 @@ func (prepared *artifactPreparedContent) close() error {
 	return nil
 }
 
-// openTransient transfers the incoming file to a handle that unconditionally
-// removes that unique temp path when closed. It never owns a final derived
-// cache path.
-func (staged *artifactStagedContent) openTransient() (*artifactTransientHandle, error) {
-	prepared, err := staged.prepareHandle()
-	if err != nil {
-		return nil, err
-	}
-	handle, err := staged.takeTransient(prepared)
-	if err != nil {
-		_ = prepared.close()
-	}
-	return handle, err
-}
-
 // takeTransient transfers a prepared view and the unique incoming path to a
 // transient handle. A successfully published staged artifact has no incoming
 // path; that defensive case still serves the prepared bytes without claiming

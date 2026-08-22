@@ -21,6 +21,16 @@ func openChecksumArtifactCacheForTest(t *testing.T, sstMaxBytes, bloomMaxBytes i
 	return cache
 }
 
+func TestArtifactCacheStatsExposeSyncAndPublicationFailures(t *testing.T) {
+	cache := openChecksumArtifactCacheForTest(t, 1<<20, 1<<20)
+	cache.inner.counters[ArtifactSST].syncFailures.Add(2)
+	cache.inner.counters[ArtifactSST].publicationFailures.Add(3)
+	stats := cache.Stats(ArtifactSST)
+	if stats.SyncFailures != 2 || stats.PublicationFailures != 3 {
+		t.Fatalf("failure stats=%+v", stats)
+	}
+}
+
 func TestContentCacheUsesChecksumAsPersistentIdentity(t *testing.T) {
 	cache := openChecksumArtifactCacheForTest(t, 1<<20, 1<<20)
 	data := []byte("shared immutable content")

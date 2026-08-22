@@ -476,7 +476,7 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Namespace:   "isledb",
 			Subsystem:   "reader",
 			Name:        "bloom_filter_errors_total",
-			Help:        "Total Bloom-filter errors degraded to may-contain decisions.",
+			Help:        "Total Bloom-filter loading, verification, decoding, or cleanup errors; operations either recover from origin or continue to the SST.",
 			ConstLabels: constLabels,
 		}),
 		SSTDownloadTotal: prometheus.NewCounter(prometheus.CounterOpts{

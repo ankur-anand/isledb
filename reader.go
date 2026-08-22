@@ -42,25 +42,27 @@ type Reader struct {
 	ownsBlockCache    bool
 	cacheDir          string
 
-	lifecycleMu   sync.RWMutex
-	iteratorsMu   sync.Mutex
-	iterators     map[*Iterator]struct{}
-	mu            sync.RWMutex
-	manifest      *manifestState
-	version       Version
-	changeFeed    bool
-	changeHead    ChangeCursor
-	viewPolicy    ReaderViewPolicy
-	viewRefreshAt time.Time
-	viewExpiresAt time.Time
-	viewExpired   atomic.Bool
-	viewTimerMu   sync.Mutex
-	viewTimer     *time.Timer
-	viewTimerID   atomic.Uint64
-	metrics       *ReaderMetrics
-	closed        atomic.Bool
-	releaseOnce   sync.Once
-	release       func()
+	lifecycleMu              sync.RWMutex
+	iteratorsMu              sync.Mutex
+	iterators                map[*Iterator]struct{}
+	mu                       sync.RWMutex
+	manifest                 *manifestState
+	version                  Version
+	changeFeed               bool
+	changeHead               ChangeCursor
+	viewPolicy               ReaderViewPolicy
+	viewRefreshAt            time.Time
+	viewExpiresAt            time.Time
+	viewExpired              atomic.Bool
+	viewTimerMu              sync.Mutex
+	viewTimer                *time.Timer
+	viewTimerID              atomic.Uint64
+	metrics                  *ReaderMetrics
+	artifactInvariantLogOnce sync.Once
+	bloomDiagnosticLimiter   readerDiagnosticLimiter
+	closed                   atomic.Bool
+	releaseOnce              sync.Once
+	release                  func()
 }
 
 type KV struct {
@@ -76,12 +78,9 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 
 	ms := newManifestStoreWithCache(store, &opts)
 	viewLoadedAt := time.Now()
-	m, err := ms.Replay(ctx)
+	m, err := ms.ReplayWithArtifactValidation(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if err := m.ValidateArtifacts(); err != nil {
-		return nil, fmt.Errorf("validate reader manifest artifacts: %w", err)
 	}
 
 	artifactCache, ownsArtifactCache, err := initReaderDiskCache(opts)
@@ -209,12 +208,9 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	}()
 
 	var m *manifestState
-	m, err = r.manifestStore.Replay(ctx)
+	m, err = r.manifestStore.ReplayWithArtifactValidation(ctx)
 	if err != nil {
 		return err
-	}
-	if err = m.ValidateArtifacts(); err != nil {
-		return fmt.Errorf("validate reader manifest artifacts: %w", err)
 	}
 	current := r.manifestStore.CurrentData()
 	r.publishManifestView(m, current, viewLoadedAt)
@@ -708,15 +704,7 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 				return nil, false, false, nil
 			}
 		} else if resident, _ := r.sstResident(sstMeta); !resident {
-			mayContain, err := r.bloomMayContain(ctx, sstMeta, key)
-			if err != nil {
-				// bloomMayContain is fail-open, so reaching this branch is a
-				// defensive invariant. Never let a Bloom diagnostic suppress
-				// the authoritative SST lookup.
-				r.observeBloomFilterError(sstMeta.ID, err)
-				mayContain = true
-			}
-			if !mayContain {
+			if !r.bloomMayContain(ctx, sstMeta, key) {
 				return nil, false, false, nil
 			}
 		}
@@ -761,9 +749,12 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 	return append([]byte(nil), decoded.Value...), true, false, nil
 }
 
-func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) (bool, error) {
+// bloomMayContain returns false only when a verified, decoded Bloom filter
+// proves the key absent. Every loading, integrity, decoding, or cleanup
+// failure returns true so Bloom availability can never suppress an SST read.
+func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
 	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
-		return filter.Has(bloomHashKey(key)), nil
+		return filter.Has(bloomHashKey(key))
 	}
 
 	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
@@ -783,6 +774,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 				// independent of the persistent handle and remains safe to use.
 				r.observeArtifactCacheDiagnostic(
 					"release", diskcache.ArtifactBloom, sstMeta.ID, closeErr)
+				r.observeBloomFilterError(sstMeta.ID, closeErr)
 				r.bloomCache.put(sstMeta.ID, filter)
 				return filter, nil
 			}
@@ -826,6 +818,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 			if err := handle.Close(); err != nil {
 				r.observeArtifactCacheDiagnostic(
 					"release", diskcache.ArtifactBloom, sstMeta.ID, err)
+				r.observeBloomFilterError(sstMeta.ID, err)
 			}
 		}
 		r.bloomCache.put(sstMeta.ID, filter)
@@ -833,15 +826,15 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 	})
 	if err != nil {
 		r.observeBloomFilterError(sstMeta.ID, err)
-		return true, nil
+		return true
 	}
 	filter, ok := value.(*z.Bloom)
 	if !ok || filter == nil {
 		err := fmt.Errorf("bloom load %s returned %T", sstMeta.ID, value)
 		r.observeBloomFilterError(sstMeta.ID, err)
-		return true, nil
+		return true
 	}
-	return filter.Has(bloomHashKey(key)), nil
+	return filter.Has(bloomHashKey(key))
 }
 
 func (r *Reader) entryValue(_ context.Context, entry internal.CompactionEntry) ([]byte, error) {

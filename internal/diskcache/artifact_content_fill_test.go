@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -142,9 +143,14 @@ func TestArtifactContentOversizedBypassUsesTransientIncomingFile(t *testing.T) {
 		t.Fatalf("bypassed content unexpectedly published: %v", err)
 	}
 
-	handle, err := staged.openTransient()
+	prepared, err := staged.prepareHandle()
 	if err != nil {
-		t.Fatalf("open transient: %v", err)
+		t.Fatalf("prepare transient: %v", err)
+	}
+	handle, err := staged.takeTransient(prepared)
+	if err != nil {
+		_ = prepared.close()
+		t.Fatalf("take transient: %v", err)
 	}
 	if !bytes.Equal(handle.bytes(), data) {
 		t.Fatalf("transient bytes=%q, want %q", handle.bytes(), data)
@@ -185,9 +191,14 @@ func TestArtifactContentSyncFailureCanStillServeTransient(t *testing.T) {
 		t.Fatalf("finish: staged=%p err=%v, want staged sync failure", staged, err)
 	}
 	tempPath := staged.path
-	handle, openErr := staged.openTransient()
+	prepared, prepareErr := staged.prepareHandle()
+	if prepareErr != nil {
+		t.Fatalf("prepare transient after sync failure: %v", prepareErr)
+	}
+	handle, openErr := staged.takeTransient(prepared)
 	if openErr != nil {
-		t.Fatalf("open transient after sync failure: %v", openErr)
+		_ = prepared.close()
+		t.Fatalf("take transient after sync failure: %v", openErr)
 	}
 	if !bytes.Equal(handle.bytes(), data) {
 		t.Fatalf("transient bytes=%q, want %q", handle.bytes(), data)
@@ -219,7 +230,9 @@ func TestArtifactContentFillSyncRunsBeforePublicationLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new tier: %v", err)
 	}
+	var syncCalls atomic.Int64
 	fill.syncFile = func(*os.File) error {
+		syncCalls.Add(1)
 		if !tier.publishMu.TryLock() {
 			t.Fatal("file sync ran while publication mutex was held")
 		}
@@ -236,13 +249,21 @@ func TestArtifactContentFillSyncRunsBeforePublicationLock(t *testing.T) {
 	entry, admission, err := tier.publishPinned(
 		staged.address,
 		staged.size,
-		func() error { return staged.publish(finalPath) },
+		func() error {
+			if got := syncCalls.Load(); got != 1 {
+				t.Fatalf("sync calls before publication=%d, want 1", got)
+			}
+			return staged.publish(finalPath)
+		},
 		func(address artifactContentAddress) error {
 			return removeArtifactContentFile(filepath.Join(root, address.relativePath()))
 		},
 	)
 	if err != nil || admission != artifactContentAdmitted || entry == nil {
 		t.Fatalf("publish: entry=%p admission=%d err=%v", entry, admission, err)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("sync calls=%d, want 1", got)
 	}
 }
 

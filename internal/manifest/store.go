@@ -1100,7 +1100,18 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.replayCurrent(ctx, current)
+	return s.replayCurrent(ctx, current, false)
+}
+
+// ReplayWithArtifactValidation replays the manifest while validating the SST
+// and Bloom metadata required by Reader cache and origin paths. Artifact
+// validation is folded into the existing level-validation traversal.
+func (s *Store) ReplayWithArtifactValidation(ctx context.Context) (*Manifest, error) {
+	current, err := s.readCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.replayCurrent(ctx, current, true)
 }
 
 // ReplayWithCurrent returns a manifest and the exact CURRENT value used to
@@ -1111,19 +1122,23 @@ func (s *Store) ReplayWithCurrent(ctx context.Context) (*Manifest, *Current, err
 	if err != nil {
 		return nil, nil, err
 	}
-	m, err := s.replayCurrent(ctx, current)
+	m, err := s.replayCurrent(ctx, current, false)
 	if err != nil {
 		return nil, nil, err
 	}
 	return m, current, nil
 }
 
-func (s *Store) replayCurrent(ctx context.Context, current *Current) (*Manifest, error) {
+func (s *Store) replayCurrent(
+	ctx context.Context,
+	current *Current,
+	validateArtifacts bool,
+) (*Manifest, error) {
 
 	// Attempt incremental replay: if the snapshot and log window base haven't
 	// changed, we only need to read the new delta entries.
 	if m, ok := s.tryIncrementalReplay(ctx, current); ok {
-		if err := m.ValidateLevels(); err != nil {
+		if err := m.validateLevels(validateArtifacts); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
 		}
 		return m, nil
@@ -1132,7 +1147,7 @@ func (s *Store) replayCurrent(ctx context.Context, current *Current) (*Manifest,
 	if err != nil {
 		return nil, err
 	}
-	if err := m.ValidateLevels(); err != nil {
+	if err := m.validateLevels(validateArtifacts); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
 	}
 	return m, nil

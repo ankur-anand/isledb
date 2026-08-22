@@ -239,6 +239,14 @@ func (m *Manifest) LookupSST(id string) *SSTMeta {
 }
 
 func (m *Manifest) ValidateLevels() error {
+	return m.validateLevels(false)
+}
+
+// validateLevels performs the traversal required for topology validation and,
+// when requested by a Reader, validates immutable artifact metadata in that
+// same pass. Keeping the checks together avoids a second O(SST count) walk on
+// every manifest refresh.
+func (m *Manifest) validateLevels(validateArtifacts bool) error {
 	var previous uint32
 	totalSSTs := len(m.L0SSTs)
 	for i := range m.Levels {
@@ -255,6 +263,11 @@ func (m *Manifest) ValidateLevels() error {
 		seen[sst.ID] = struct{}{}
 		if sst.Level != 0 {
 			return fmt.Errorf("L0 SST %q has level %d", sst.ID, sst.Level)
+		}
+		if validateArtifacts {
+			if err := validateSSTArtifactMetadata(sst); err != nil {
+				return fmt.Errorf("L0 SST %q: %v", sst.ID, err)
+			}
 		}
 	}
 	for i := range m.Levels {
@@ -280,6 +293,11 @@ func (m *Manifest) ValidateLevels() error {
 			}
 			if j > 0 && bytes.Compare(level.SSTs[j-1].MaxKey, sst.MinKey) >= 0 {
 				return fmt.Errorf("overlapping SSTs %q and %q in L%d", level.SSTs[j-1].ID, sst.ID, level.Number)
+			}
+			if validateArtifacts {
+				if err := validateSSTArtifactMetadata(*sst); err != nil {
+					return fmt.Errorf("L%d SST %q: %v", level.Number, sst.ID, err)
+				}
 			}
 		}
 	}

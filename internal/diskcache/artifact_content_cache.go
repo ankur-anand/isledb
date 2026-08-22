@@ -19,6 +19,7 @@ type artifactContentCacheOptions struct {
 	dir           string
 	sstMaxBytes   int64
 	bloomMaxBytes int64
+	syncDirectory func(string) error
 }
 
 // artifactContentCache owns the persistent cache directory and its two
@@ -32,6 +33,7 @@ type artifactContentCache struct {
 	tiers         map[ArtifactKind]*artifactContentTier
 	counters      map[ArtifactKind]*artifactContentCounters
 	dirLock       *artifactDirectoryLock
+	syncDirectory func(string) error
 	closed        bool
 	activeOps     int
 	activeFills   int
@@ -47,6 +49,8 @@ type artifactContentCounters struct {
 	bypassedOversized          atomic.Int64
 	bypassedPinnedCapacity     atomic.Int64
 	bypassedPublicationFailure atomic.Int64
+	syncFailures               atomic.Int64
+	publicationFailures        atomic.Int64
 	removals                   atomic.Int64
 	purgeRemovals              atomic.Int64
 	recoveryRemovals           atomic.Int64
@@ -95,7 +99,11 @@ func openArtifactContentCache(opts artifactContentCacheOptions) (*artifactConten
 			ArtifactSST:   {},
 			ArtifactBloom: {},
 		},
-		dirLock: dirLock,
+		dirLock:       dirLock,
+		syncDirectory: opts.syncDirectory,
+	}
+	if cache.syncDirectory == nil {
+		cache.syncDirectory = syncArtifactContentDirectory
 	}
 	if err := cache.prepare(); err != nil {
 		_ = dirLock.close()
@@ -203,9 +211,9 @@ func (cache *artifactContentCache) takeDirectoryLockIfIdleLocked() *artifactDire
 	return dirLock
 }
 
-// close releases exclusive directory ownership. The eventual Reader facade
-// must drain coalesced fills and close every persistent or transient handle
-// before calling it.
+// close releases exclusive directory ownership. A caller-supplied cache must
+// remain open until every Reader using it has closed. The Reader facade must
+// drain coalesced fills and close every persistent or transient handle first.
 func (cache *artifactContentCache) close() error {
 	if cache == nil {
 		return nil

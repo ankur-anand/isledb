@@ -109,7 +109,10 @@ type readerOptions struct {
 	// Reader is open.
 	CacheDir string
 
-	// ArtifactCache is an optional pre-created persistent SST/Bloom cache.
+	// ArtifactCache is an optional pre-created persistent SST/Bloom cache. A
+	// caller-supplied cache must remain open until all Readers using it have
+	// closed. Closing it early makes local SST staging unavailable and may cause
+	// subsequent reads to fail.
 	ArtifactCache *diskcache.ArtifactCache
 
 	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).

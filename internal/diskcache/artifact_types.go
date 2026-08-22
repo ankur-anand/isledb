@@ -189,8 +189,14 @@ type ArtifactStats struct {
 	PurgeRemovals     int64
 	RecoveryRemovals  int64
 	AdmissionBypasses int64
-	RecoveredEntries  int64
-	RecoveredBytes    int64
+	// SyncFailures counts verified fills that could not be file-synced before
+	// publication and were therefore served transiently.
+	SyncFailures int64
+	// PublicationFailures counts cleanup, directory creation, rename, and
+	// related final-publication failures.
+	PublicationFailures int64
+	RecoveredEntries    int64
+	RecoveredBytes      int64
 
 	ResidentEntries int
 	ResidentBytes   int64

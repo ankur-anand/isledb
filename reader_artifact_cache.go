@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/ankur-anand/isledb/internal/diskcache"
 )
@@ -23,6 +24,30 @@ type sstArtifactLease struct {
 	data   []byte
 	once   sync.Once
 	err    error
+}
+
+const readerDiagnosticLogInterval = time.Minute
+
+// readerDiagnosticLimiter bounds diagnostic logs while leaving metrics exact.
+// It intentionally has no per-SST map, so a stream of unique corrupt objects
+// cannot turn observability into an unbounded memory consumer.
+type readerDiagnosticLimiter struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed uint64
+}
+
+func (limiter *readerDiagnosticLimiter) allow(now time.Time) (bool, uint64) {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if !limiter.last.IsZero() && now.Sub(limiter.last) < readerDiagnosticLogInterval {
+		limiter.suppressed++
+		return false, 0
+	}
+	suppressed := limiter.suppressed
+	limiter.last = now
+	limiter.suppressed = 0
+	return true, suppressed
 }
 
 func newSharedSSTArtifact(handle *diskcache.ArtifactHandle) *sharedSSTArtifact {
@@ -191,13 +216,15 @@ func (r *Reader) observeArtifactCacheDiagnostic(
 		errors.Is(err, diskcache.ErrArtifactCacheClosed)
 	r.metrics.ObserveArtifactCacheDiagnostic(invariantViolation)
 	if invariantViolation {
-		slog.Error(
-			"isledb: artifact cache invariant violation",
-			"operation", operation,
-			"kind", kind,
-			"sst_id", sstID,
-			"error", err,
-		)
+		r.artifactInvariantLogOnce.Do(func() {
+			slog.Error(
+				"isledb: artifact cache invariant violation; further messages are suppressed",
+				"operation", operation,
+				"kind", kind,
+				"sst_id", sstID,
+				"error", err,
+			)
+		})
 	}
 }
 
@@ -206,10 +233,15 @@ func (r *Reader) observeBloomFilterError(sstID string, err error) {
 		return
 	}
 	r.metrics.ObserveBloomFilterError()
+	allowed, suppressed := r.bloomDiagnosticLimiter.allow(time.Now())
+	if !allowed {
+		return
+	}
 	slog.Warn(
 		"isledb: Bloom filter unavailable; continuing with SST lookup",
 		"sst_id", sstID,
 		"error", err,
+		"suppressed_since_last_log", suppressed,
 	)
 }
 
@@ -237,15 +269,17 @@ func (r *Reader) admitRawBloom(
 
 func cacheStatsFromArtifact(stats diskcache.ArtifactStats) CacheStats {
 	return CacheStats{
-		Hits:              stats.Hits,
-		Misses:            stats.Misses,
-		Bytes:             stats.ResidentBytes,
-		MaxBytes:          stats.MaxBytes,
-		EntryCount:        stats.ResidentEntries,
-		PinnedBytes:       stats.PinnedBytes,
-		PinnedEntries:     stats.PinnedEntries,
-		Evictions:         stats.CapacityEvictions,
-		Corruptions:       stats.Corruptions,
-		AdmissionBypasses: stats.AdmissionBypasses,
+		Hits:                stats.Hits,
+		Misses:              stats.Misses,
+		Bytes:               stats.ResidentBytes,
+		MaxBytes:            stats.MaxBytes,
+		EntryCount:          stats.ResidentEntries,
+		PinnedBytes:         stats.PinnedBytes,
+		PinnedEntries:       stats.PinnedEntries,
+		Evictions:           stats.CapacityEvictions,
+		Corruptions:         stats.Corruptions,
+		AdmissionBypasses:   stats.AdmissionBypasses,
+		SyncFailures:        stats.SyncFailures,
+		PublicationFailures: stats.PublicationFailures,
 	}
 }
