@@ -579,6 +579,47 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 	}
 }
 
+func TestWriteMultipleSSTsStreaming_CancelsUploaderAfterProducerError(t *testing.T) {
+	iterErr := errors.New("iterator failed")
+	it := &sliceSSTIter{
+		entries: []internal.MemEntry{
+			{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("x")},
+		},
+		err: iterErr,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeMultipleSSTsStreaming(ctx, it,
+			sstWriterOptions{BlockSize: 4096, Compression: "none"}, 1, 1<<20,
+			func(uploadCtx context.Context, _ string, r io.Reader) error {
+				_, _ = io.Copy(io.Discard, r)
+				<-uploadCtx.Done()
+				return uploadCtx.Err()
+			})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, iterErr) {
+			t.Fatalf("writeMultipleSSTsStreaming error=%v, want %v", err, iterErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// Release the currently stuck uploader before failing the test.
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("writeMultipleSSTsStreaming did not stop after parent cancellation")
+		}
+		t.Fatal("writeMultipleSSTsStreaming did not cancel the uploader after the producer failed")
+	}
+}
+
 func TestWriteMultipleSSTsStreaming_LargeValue(t *testing.T) {
 	value := bytes.Repeat([]byte("large-value-content"), 16<<10)
 	entries := []internal.MemEntry{
