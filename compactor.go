@@ -209,7 +209,7 @@ func (c *compactor) runSelected(
 			c.fenced.Store(true)
 			return nil, err
 		}
-		return nil, fmt.Errorf("L%d to L%d compaction: %w",
+		return nil, fmt.Errorf("compact L%d to L%d: %w",
 			chosen.plan.sourceLevel, chosen.plan.destinationLevel, err)
 	}
 	return &chosen, nil
@@ -657,8 +657,14 @@ func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool) er
 	return nil
 }
 
-func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator, epoch uint64) ([]streamSSTResult, error) {
-	defer iter.close()
+func (c *compactor) writeCompactedSSTs(
+	ctx context.Context,
+	iter *kMergeIterator,
+	epoch uint64,
+) (results []streamSSTResult, err error) {
+	defer func() {
+		err = errors.Join(err, iter.close())
+	}()
 
 	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: c.opts.Output.BloomBitsPerKey,
@@ -674,7 +680,7 @@ func (c *compactor) writeCompactedSSTs(ctx context.Context, iter *kMergeIterator
 		return err
 	}
 
-	results, err := writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.Output.TargetSSTBytes, uploadFn)
+	results, err = writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.Output.TargetSSTBytes, uploadFn)
 	if err != nil {
 		if errors.Is(err, errEmptyIterator) {
 			return nil, nil

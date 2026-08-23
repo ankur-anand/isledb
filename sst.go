@@ -34,10 +34,15 @@ type writeSSTResult struct {
 	SSTData []byte
 }
 
-func writeSST(ctx context.Context, it sstIterator, opts sstWriterOptions, epoch uint64) (writeSSTResult, error) {
-	defer it.Close()
-
-	var result writeSSTResult
+func writeSST(
+	ctx context.Context,
+	it sstIterator,
+	opts sstWriterOptions,
+	epoch uint64,
+) (result writeSSTResult, err error) {
+	defer func() {
+		err = errors.Join(err, it.Close())
+	}()
 
 	sstBuf := new(bytes.Buffer)
 	writable := newHashingWritable(sstBuf)

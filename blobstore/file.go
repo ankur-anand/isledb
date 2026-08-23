@@ -2,6 +2,7 @@ package blobstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,7 +32,9 @@ func newFileTemp(prefix string) (*Store, string, error) {
 
 	store, err := openFile(context.Background(), dir, prefix)
 	if err != nil {
-		os.RemoveAll(dir)
+		if removeErr := os.RemoveAll(dir); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temp directory %s: %w", dir, removeErr))
+		}
 		return nil, "", err
 	}
 

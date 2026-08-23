@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -157,6 +158,44 @@ func TestListIteratorRetainsPositionAcrossBoundedConsumption(t *testing.T) {
 		}
 		if _, err := iter.Next(ctx); !errors.Is(err, io.EOF) {
 			t.Fatalf("Next after prefix exhaustion error=%v want io.EOF", err)
+		}
+	})
+}
+
+func TestListPageReturnsExactPagesWithoutRepeatingObjects(t *testing.T) {
+	forEachStore(t, "list-page", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		want := make([]string, 8)
+		for i := range want {
+			want[i] = h.store.path("pages", fmt.Sprintf("%02d", i))
+			if _, err := h.store.Write(ctx, want[i], []byte{byte(i)}); err != nil {
+				t.Fatalf("write object %d: %v", i, err)
+			}
+		}
+
+		var token []byte
+		var got []string
+		var pageSizes []int
+		for {
+			page, next, err := h.store.ListPage(ctx, token, 3, ListOptions{Prefix: "pages/"})
+			if err != nil {
+				t.Fatalf("list page %d: %v", len(pageSizes)+1, err)
+			}
+			pageSizes = append(pageSizes, len(page.Objects))
+			for _, object := range page.Objects {
+				got = append(got, object.Key)
+			}
+			if next == nil {
+				break
+			}
+			token = next
+		}
+
+		if !slices.Equal(pageSizes, []int{3, 3, 2}) {
+			t.Fatalf("page sizes=%v want=[3 3 2]", pageSizes)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("listed keys=%v want=%v", got, want)
 		}
 	})
 }

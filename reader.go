@@ -697,7 +697,11 @@ func keyInRange(key, minKey, maxKey []byte) bool {
 	return true
 }
 
-func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte) ([]byte, bool, bool, error) {
+func (r *Reader) getFromSST(
+	ctx context.Context,
+	sstMeta sstMetadata,
+	key []byte,
+) (value []byte, found bool, tombstone bool, err error) {
 	if sstMeta.Bloom.Length > 0 {
 		if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
 			if !filter.Has(bloomHashKey(key)) {
@@ -714,7 +718,14 @@ func (r *Reader) getFromSST(ctx context.Context, sstMeta sstMetadata, key []byte
 	if err != nil {
 		return nil, false, false, err
 	}
-	defer iter.Close()
+	defer func() {
+		if closeErr := iter.Close(); closeErr != nil {
+			value = nil
+			found = false
+			tombstone = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
 
 	kv := iter.First()
 	if kv == nil {
@@ -1080,7 +1091,9 @@ func (r *Reader) downloadSSTArtifact(
 		r.observeArtifactCacheDiagnostic("begin-fill", diskcache.ArtifactSST, meta.ID, err)
 		return nil, 0, fmt.Errorf("begin cache fill for sst %s: %w", meta.ID, err)
 	}
-	defer fill.Abort()
+	defer func() {
+		err = errors.Join(err, fill.Abort())
+	}()
 
 	// The enclosing object may append Bloom and trailer bytes after the Pebble
 	// payload. ArtifactFill intentionally rejects overflow, so keep this stream
@@ -1089,11 +1102,13 @@ func (r *Reader) downloadSSTArtifact(
 	if err != nil {
 		return nil, 0, fmt.Errorf("read sst %s: %w", path, err)
 	}
-	defer stream.Close()
-
 	downloadedBytes, err = io.Copy(fill, stream)
+	closeErr := stream.Close()
 	if err != nil {
-		return nil, 0, fmt.Errorf("download sst %s: %w", path, err)
+		return nil, 0, errors.Join(fmt.Errorf("download sst %s: %w", path, err), closeErr)
+	}
+	if closeErr != nil {
+		return nil, 0, fmt.Errorf("close downloaded sst %s: %w", path, closeErr)
 	}
 	handle, admission, err = fill.Commit()
 	if err != nil {
