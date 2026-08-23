@@ -366,8 +366,8 @@ func TestAppendWriterCommitReconcilesAppliedCASAfterLostResponse(t *testing.T) {
 
 	conflict := commit
 	conflict.SSTable.Checksum = "sha256:different"
-	if _, err := manifestStore.AppendWriterCommit(ctx, conflict); !errors.Is(err, ErrWriterCommitConflict) {
-		t.Fatalf("conflicting retry error=%v, want %v", err, ErrWriterCommitConflict)
+	if _, err := manifestStore.AppendWriterCommit(ctx, conflict); !errors.Is(err, ErrFenced) {
+		t.Fatalf("later append error=%v, want terminal %v", err, ErrFenced)
 	}
 }
 

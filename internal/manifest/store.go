@@ -361,6 +361,16 @@ func (s *Store) WriterEpoch() uint64 {
 	return s.writerFence.Epoch
 }
 
+// WriterFenceObservedActive reports whether token still matches the writer
+// fence retained by this Store. It performs no I/O: false means this Store has
+// observed the token being superseded, while true does not replace a remote
+// fence check before publication.
+func (s *Store) WriterFenceObservedActive(token *FenceToken) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return checkFenceToken(token, s.writerFence) == nil
+}
+
 func (s *Store) CompactorEpoch() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -426,6 +436,11 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			current = &Current{NextEpoch: 1}
 		}
 		normalizeCurrent(current)
+		// Reconciliation below may prove that an earlier writer commit
+		// succeeded and return before the ordinary fence check. Remember any
+		// ownership change now so callers can report that old commit as
+		// successful while still treating the local session as terminal.
+		s.observeFenceWithCurrent(role, current)
 
 		if role == FenceRoleWriter && entry.CommitID != "" && entry.Op == LogOpAddSSTable {
 			if applied, err := s.reconcilePendingWriterCommit(ctx, current, entry); applied || err != nil {
@@ -2110,32 +2125,45 @@ func checkFenceToken(local, remote *FenceToken) error {
 }
 
 func (s *Store) checkFenceWithCurrent(role FenceRole, current *Current) error {
+	if !s.observeFenceWithCurrent(role, current) {
+		return ErrFenced
+	}
+	return nil
+}
+
+// observeFenceWithCurrent records fence loss as terminal process-local state.
+// In particular, append reconciliation is allowed to return success for an
+// older commit after a successor takes ownership, but later operations through
+// this Store must then fail before attempting another publication.
+func (s *Store) observeFenceWithCurrent(role FenceRole, current *Current) bool {
 	s.mu.Lock()
-	var localFence *FenceToken
+	defer s.mu.Unlock()
+
+	var localFence, remoteFence *FenceToken
 	switch role {
 	case FenceRoleWriter:
 		localFence = s.writerFence
+		if current != nil {
+			remoteFence = current.WriterFence
+		}
 	case FenceRoleCompactor:
 		localFence = s.compactorFence
+		if current != nil {
+			remoteFence = current.CompactorFence
+		}
+	default:
+		return false
 	}
-	s.mu.Unlock()
-
-	if localFence == nil {
-		return ErrFenced
+	if checkFenceToken(localFence, remoteFence) == nil {
+		return true
 	}
-	if current == nil {
-		return ErrFenced
-	}
-
-	var remoteFence *FenceToken
 	switch role {
 	case FenceRoleWriter:
-		remoteFence = current.WriterFence
+		s.writerFence = nil
 	case FenceRoleCompactor:
-		remoteFence = current.CompactorFence
+		s.compactorFence = nil
 	}
-
-	return checkFenceToken(localFence, remoteFence)
+	return false
 }
 
 func nextEpochFromEntry(current uint64, entry *ManifestLogEntry) uint64 {

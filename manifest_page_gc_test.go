@@ -375,6 +375,53 @@ func TestManifestPageCleanerCorruptionAndBoundedScanningFailClosed(t *testing.T)
 	requireObjectExists(t, ctx, store, badMarkerPath, true)
 }
 
+func TestManifestPageCleanerSpanningPageDoesNotEndListing(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("manifest-page-cleaner-spanning-page")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC()
+	wide := writeStandaloneManifestPageRange(t, ctx, store,
+		fmt.Sprintf("%020d-%020d-wide", 0, 150), 0, 150, createdAt)
+	narrow := writeStandaloneManifestPageRange(t, ctx, store,
+		fmt.Sprintf("%020d-%020d-narrow", 50, 80), 50, 80, createdAt)
+	if wide.Path >= narrow.Path {
+		t.Fatalf("test requires wide page to list first: wide=%q narrow=%q", wide.Path, narrow.Path)
+	}
+
+	writeManifestFloorForPageCleanerTest(t, ctx, store, 100)
+	cleaner := newManifestPageCleaner(store, db.manifestStore, manifestPageCleanerOptions{
+		OrphanGrace:  -1,
+		SafetyMargin: -1,
+		Now:          func() time.Time { return createdAt },
+	})
+
+	first, err := cleaner.discover(ctx, createdAt)
+	if err != nil {
+		t.Fatalf("discover at floor 100: %v", err)
+	}
+	if first.ObjectsScanned != 2 || first.Protected != 1 || first.PagesMarked != 1 {
+		t.Fatalf("discover at floor 100 stats=%+v", first)
+	}
+	requireObjectExists(t, ctx, store, manifestPageRetirementMarkerPath(store, wide.Path), false)
+	requireObjectExists(t, ctx, store, manifestPageRetirementMarkerPath(store, narrow.Path), true)
+
+	writeManifestFloorForPageCleanerTest(t, ctx, store, 151)
+	second, err := cleaner.discover(ctx, createdAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("discover at floor 151: %v", err)
+	}
+	if second.ObjectsScanned != 2 || second.PagesMarked != 1 {
+		t.Fatalf("discover at floor 151 stats=%+v", second)
+	}
+	requireObjectExists(t, ctx, store, manifestPageRetirementMarkerPath(store, wide.Path), true)
+}
+
 func writeStandaloneManifestPage(
 	t *testing.T,
 	ctx context.Context,
@@ -384,14 +431,30 @@ func writeStandaloneManifestPage(
 	createdAt time.Time,
 ) manifest.PageRef {
 	t.Helper()
+	return writeStandaloneManifestPageRange(t, ctx, store, id, seq, seq, createdAt)
+}
+
+func writeStandaloneManifestPageRange(
+	t *testing.T,
+	ctx context.Context,
+	store *blobstore.Store,
+	id string,
+	seqLo, seqHi uint64,
+	createdAt time.Time,
+) manifest.PageRef {
+	t.Helper()
+	entries := make([]manifest.ManifestLogEntry, 0, seqHi-seqLo+1)
+	for seq := seqLo; seq <= seqHi; seq++ {
+		entries = append(entries, manifest.ManifestLogEntry{Seq: seq})
+	}
 	page := &manifest.CommitPage{
 		LayoutVersion: manifest.LayoutVersion,
 		PageType:      manifest.CommitPageTypeLeaf,
 		Level:         0,
-		SeqLo:         seq,
-		SeqHi:         seq,
-		Count:         1,
-		Entries:       []manifest.ManifestLogEntry{{Seq: seq}},
+		SeqLo:         seqLo,
+		SeqHi:         seqHi,
+		Count:         uint32(len(entries)),
+		Entries:       entries,
 		CreatedAt:     createdAt,
 	}
 	data, err := manifest.EncodeCommitPage(page)
@@ -407,6 +470,39 @@ func writeStandaloneManifestPage(
 		t.Fatalf("InspectCommitPage: %v", err)
 	}
 	return ref
+}
+
+func writeManifestFloorForPageCleanerTest(
+	t *testing.T,
+	ctx context.Context,
+	store *blobstore.Store,
+	floor uint64,
+) {
+	t.Helper()
+	backend := manifest.NewBlobStoreBackend(store)
+	data, etag, err := backend.ReadCurrent(ctx)
+	if err != nil && !errors.Is(err, manifest.ErrNotFound) {
+		t.Fatalf("read CURRENT: %v", err)
+	}
+	current := &manifest.Current{}
+	if len(data) > 0 {
+		current, err = manifest.DecodeCurrent(data)
+		if err != nil {
+			t.Fatalf("decode CURRENT: %v", err)
+		}
+	}
+	current.LogSeqStart = floor
+	current.ChangeFeedLogStart = floor
+	if current.NextSeq < floor {
+		current.NextSeq = floor
+	}
+	encoded, err := manifest.EncodeCurrent(current)
+	if err != nil {
+		t.Fatalf("encode CURRENT: %v", err)
+	}
+	if _, err := backend.WriteCurrentCAS(ctx, encoded, etag); err != nil {
+		t.Fatalf("write CURRENT at floor %d: %v", floor, err)
+	}
 }
 
 func jsonMarshalPageMark(mark manifestPageRetirementMark) ([]byte, error) {
