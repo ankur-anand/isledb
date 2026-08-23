@@ -742,6 +742,9 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush retry: %v", err)
 	}
+	if w.fenced.Load() {
+		t.Fatal("writer became fenced while reconciling under the same fence")
+	}
 	ssts, err := store.ListSSTFiles(ctx)
 	if err != nil {
 		t.Fatalf("ListSSTFiles: %v", err)
@@ -854,6 +857,75 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterMultipleSuccessors(t *test
 	}
 	if commits != 1 {
 		t.Fatalf("manifest entries with commit_id=%q: got=%d want=1", commitID, commits)
+	}
+}
+
+func TestWriter_ReconciledCommitMarksSupersededWriterFenced(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-reconciled-commit-fenced")
+	defer store.Close()
+
+	base := manifest.NewBlobStoreBackend(store)
+	lostResponse := errors.New("lost CURRENT response")
+	storage := &applyThenFailOnceStorage{
+		Storage:     base,
+		failOnWrite: 3,
+		failErr:     lostResponse,
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
+		t.Fatalf("first flush error=%v, want %v", err, lostResponse)
+	}
+
+	successor := manifest.NewStoreWithStorage(base)
+	if _, err := successor.ClaimWriter(ctx, "successor-writer"); err != nil {
+		t.Fatalf("successor ClaimWriter: %v", err)
+	}
+	if _, err := successor.AppendWriterCommit(ctx, manifest.WriterCommit{
+		ID: "successor-commit",
+		SSTable: manifest.SSTMeta{
+			ID:    "successor-sst",
+			SeqLo: 2,
+			SeqHi: 2,
+		},
+	}); err != nil {
+		t.Fatalf("successor AppendWriterCommit: %v", err)
+	}
+
+	// The retry must report the original flush as successful even though the
+	// CURRENT value used to reconcile it belongs to the successor writer.
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("reconcile original flush: %v", err)
+	}
+	if !w.fenced.Load() {
+		t.Fatal("writer remained writable after reconciliation observed a successor fence")
+	}
+
+	before, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list SSTs before rejected mutation: %v", err)
+	}
+	if err := w.put(ctx, []byte("b"), []byte("should-not-be-accepted")); !errors.Is(err, manifest.ErrFenced) {
+		t.Fatalf("put after reconciliation error=%v, want %v", err, manifest.ErrFenced)
+	}
+	if err := w.flush(ctx); !errors.Is(err, manifest.ErrFenced) {
+		t.Fatalf("flush after reconciliation error=%v, want %v", err, manifest.ErrFenced)
+	}
+	after, err := store.ListSSTFiles(ctx)
+	if err != nil {
+		t.Fatalf("list SSTs after rejected mutation: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("SST object count changed after terminal fence: before=%d after=%d", len(before), len(after))
 	}
 }
 

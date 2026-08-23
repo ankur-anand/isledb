@@ -630,6 +630,12 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		SSTable:     *pending.sstable,
 		ChangeBatch: pending.changeBatch,
 	})
+	if !w.manifestLog.WriterFenceObservedActive(w.fenceToken) {
+		// Reconciliation can prove the pending commit succeeded after a
+		// successor claimed the writer fence. Preserve success for that commit,
+		// but make this writer terminal before it accepts or uploads more work.
+		w.fenced.Store(true)
+	}
 	if appendErr != nil {
 		if isFenceError(appendErr) {
 			w.fenced.Store(true)
