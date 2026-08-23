@@ -173,19 +173,25 @@ type Attributes struct {
 	Generation int64
 }
 
-func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error) {
+func (s *Store) Read(ctx context.Context, key string) (data []byte, attrs Attributes, err error) {
 	r, err := s.bucket.NewReader(ctx, key, nil)
 	if err != nil {
 		return nil, Attributes{}, s.mapError(err)
 	}
-	defer r.Close()
+	defer func() {
+		if closeErr := r.Close(); closeErr != nil {
+			data = nil
+			attrs = Attributes{}
+			err = errors.Join(err, closeErr)
+		}
+	}()
 
-	data, err := io.ReadAll(r)
+	data, err = io.ReadAll(r)
 	if err != nil {
 		return nil, Attributes{}, err
 	}
 
-	attrs := Attributes{
+	attrs = Attributes{
 		Size:    r.Size(),
 		ModTime: r.ModTime(),
 	}
@@ -224,12 +230,17 @@ func (s *Store) extractReaderAttrs(r *blob.Reader, attrs *Attributes) {
 	}
 }
 
-func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) (data []byte, err error) {
 	r, err := s.bucket.NewRangeReader(ctx, key, offset, length, nil)
 	if err != nil {
 		return nil, s.mapError(err)
 	}
-	defer r.Close()
+	defer func() {
+		if closeErr := r.Close(); closeErr != nil {
+			data = nil
+			err = errors.Join(err, closeErr)
+		}
+	}()
 
 	if length < 0 {
 		return io.ReadAll(r)
@@ -237,7 +248,7 @@ func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64)
 	if uint64(length) > uint64(^uint(0)>>1) {
 		return nil, fmt.Errorf("range length too large: %d", length)
 	}
-	data := make([]byte, int(length))
+	data = make([]byte, int(length))
 	if _, err := io.ReadFull(r, data); err != nil {
 		return nil, err
 	}
@@ -534,6 +545,39 @@ func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error)
 	return &result, nil
 }
 
+// ListPage returns at most pageSize objects and an opaque continuation token.
+// Pass nil as pageToken for the first page. A nil token in the result means
+// the listing is complete and must not be passed back as another page.
+func (s *Store) ListPage(
+	ctx context.Context,
+	pageToken []byte,
+	pageSize int,
+	opts ListOptions,
+) (*ListResult, []byte, error) {
+	if pageToken == nil {
+		pageToken = blob.FirstPageToken
+	}
+	prefix := s.prefix
+	if opts.Prefix != "" {
+		prefix = s.path(opts.Prefix)
+	}
+	objects, nextPageToken, err := s.bucket.ListPage(ctx, pageToken, pageSize, &blob.ListOptions{
+		Prefix:    prefix,
+		Delimiter: opts.Delimiter,
+	})
+	if err != nil {
+		return nil, nil, s.mapError(err)
+	}
+	result := &ListResult{Objects: make([]ObjectInfo, len(objects))}
+	for i, object := range objects {
+		result.Objects[i] = ObjectInfo{Key: object.Key, Size: object.Size, IsDir: object.IsDir}
+	}
+	if len(nextPageToken) == 0 {
+		return result, nil, nil
+	}
+	return result, bytes.Clone(nextPageToken), nil
+}
+
 // Walk streams objects in provider listing order. Returning false from visit
 // stops the listing without materializing the remainder of the prefix.
 func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInfo) (bool, error)) error {
@@ -651,9 +695,9 @@ func (s *Store) DebugString() string {
 	sb.WriteString("Objects:\n")
 	for _, obj := range result.Objects {
 		if obj.IsDir {
-			sb.WriteString(fmt.Sprintf("  [dir] %s\n", obj.Key))
+			fmt.Fprintf(&sb, "  [dir] %s\n", obj.Key)
 		} else {
-			sb.WriteString(fmt.Sprintf("  %s (%d bytes)\n", obj.Key, obj.Size))
+			fmt.Fprintf(&sb, "  %s (%d bytes)\n", obj.Key, obj.Size)
 		}
 	}
 	return sb.String()

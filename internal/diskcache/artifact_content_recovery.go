@@ -209,7 +209,7 @@ func (cache *artifactContentCache) scanRecoveredTier(
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // Recovery deliberately skips unreadable cache entries.
 		}
 		if !info.Mode().IsRegular() || info.Size() <= 0 {
 			_ = removeArtifactContentFile(path)
@@ -235,7 +235,7 @@ func isCanonicalArtifactShard(relative string) bool {
 	}
 	for index := range len(relative) {
 		char := relative[index]
-		if !('0' <= char && char <= '9') && !('a' <= char && char <= 'f') {
+		if ('0' > char || char > '9') && ('a' > char || char > 'f') {
 			return false
 		}
 	}
@@ -256,7 +256,7 @@ func recoveredArtifactContentAddress(
 		return artifactContentAddress{}, false
 	}
 	for _, char := range checksum {
-		if !('0' <= char && char <= '9') && !('a' <= char && char <= 'f') {
+		if ('0' > char || char > '9') && ('a' > char || char > 'f') {
 			return artifactContentAddress{}, false
 		}
 	}

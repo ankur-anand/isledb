@@ -34,10 +34,10 @@ func writeSSTStreaming(
 	epoch uint64,
 	seqLo, seqHi uint64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
-) (streamSSTResult, error) {
-	defer it.Close()
-
-	var result streamSSTResult
+) (result streamSSTResult, err error) {
+	defer func() {
+		err = errors.Join(err, it.Close())
+	}()
 
 	ts := time.Now().UTC()
 	sstID := buildSSTIDWithTimestamp(epoch, seqLo, seqHi, ts)
@@ -86,9 +86,11 @@ func writeSSTStreaming(
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func() (err error) {
 		defer func() {
-			pw.Close()
+			if closeErr := pw.Close(); err == nil {
+				err = closeErr
+			}
 		}()
 
 		for it.Next() {
@@ -247,10 +249,10 @@ func writeMultipleSSTsStreaming(
 	epoch uint64,
 	targetSize int64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
-) ([]streamSSTResult, error) {
-	defer it.Close()
-
-	var results []streamSSTResult
+) (results []streamSSTResult, err error) {
+	defer func() {
+		err = errors.Join(err, it.Close())
+	}()
 
 	wo := sstable.WriterOptions{
 		BlockSize:   opts.BlockSize,
@@ -348,12 +350,15 @@ func writeMultipleSSTsStreaming(
 			}
 		}
 
-		pw.Close()
+		closeErr := pw.Close()
 
 		<-uploadDone
 		uploadCancel()
 		if ue := getUploadErr(); ue != nil {
 			return fmt.Errorf("sst upload: %w", ue)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close sst upload stream: %w", closeErr)
 		}
 
 		hashBytes := writable.sumBytes()

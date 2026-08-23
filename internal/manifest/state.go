@@ -296,7 +296,7 @@ func (m *Manifest) validateLevels(validateArtifacts bool) error {
 			}
 			if validateArtifacts {
 				if err := validateSSTArtifactMetadata(*sst); err != nil {
-					return fmt.Errorf("L%d SST %q: %v", level.Number, sst.ID, err)
+					return fmt.Errorf("validate L%d SST %q: %v", level.Number, sst.ID, err)
 				}
 			}
 		}

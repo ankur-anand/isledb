@@ -3,6 +3,7 @@ package blobstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -157,8 +158,7 @@ func (s *Store) writeIfMatchGCSNative(ctx context.Context, key string, data []by
 	w.ContentType = "application/octet-stream"
 
 	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return Attributes{}, s.mapError(err)
+		return Attributes{}, s.mapError(errors.Join(err, w.Close()))
 	}
 
 	if err := w.Close(); err != nil {
@@ -193,8 +193,7 @@ func (s *Store) writeIfNotExistGCSNative(ctx context.Context, key string, data [
 	w.ContentType = "application/octet-stream"
 
 	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return Attributes{}, s.mapError(err)
+		return Attributes{}, s.mapError(errors.Join(err, w.Close()))
 	}
 
 	if err := w.Close(); err != nil {

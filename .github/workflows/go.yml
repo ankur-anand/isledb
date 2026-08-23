@@ -11,6 +11,8 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -35,6 +37,13 @@ jobs:
             echo "$files"
             exit 1
           fi
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.3
+          only-new-issues: false
+          args: --fix=false --max-issues-per-linter=0 --max-same-issues=0
 
   test:
     runs-on: ubuntu-latest

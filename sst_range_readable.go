@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -104,10 +105,10 @@ func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int)
 		r.m.ObserveSSTRangeRead(time.Since(start), 0, err)
 		return nil, err
 	}
-	defer reader.Close()
 
 	data := make([]byte, length)
-	n, err := io.ReadFull(reader, data)
+	n, readErr := io.ReadFull(reader, data)
+	err = errors.Join(readErr, reader.Close())
 	r.m.ObserveSSTRangeRead(time.Since(start), int64(n), err)
 	if err != nil {
 		return nil, err

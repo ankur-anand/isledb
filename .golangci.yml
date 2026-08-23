@@ -1,0 +1,21 @@
+version: "2"
+
+run:
+  tests: false
+
+linters:
+  enable:
+    - bodyclose
+    - nilerr
+    - sloglint
+  disable:
+    - unused
+
+issues:
+  fix: true
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports

@@ -112,7 +112,7 @@ func (g *coalescedLoadGroup) wait(
 ) (any, error) {
 	select {
 	case <-ctx.Done():
-		g.releaseWaiter(key, call, false)
+		_, _ = g.releaseWaiter(key, call, false)
 		return nil, ctx.Err()
 	case <-call.done:
 		return g.releaseWaiter(key, call, true)

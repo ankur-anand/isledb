@@ -21,7 +21,7 @@ func validateSSTArtifactMetadata(sst SSTMeta) error {
 
 	bloom := sst.Bloom
 	if bloom.Offset != sst.Size {
-		return fmt.Errorf("Bloom offset %d does not equal SST payload size %d",
+		return fmt.Errorf("invalid Bloom offset %d: does not equal SST payload size %d",
 			bloom.Offset, sst.Size)
 	}
 	if bloom.Length < 0 {
@@ -29,12 +29,12 @@ func validateSSTArtifactMetadata(sst SSTMeta) error {
 	}
 	if bloom.Length == 0 {
 		if bloom.Checksum != "" {
-			return fmt.Errorf("Bloom checksum is present without Bloom bytes")
+			return fmt.Errorf("invalid Bloom checksum: present without Bloom bytes")
 		}
 		return nil
 	}
 	if bloom.Offset > math.MaxInt64-bloom.Length {
-		return fmt.Errorf("Bloom extent overflows int64")
+		return fmt.Errorf("invalid Bloom extent: overflows int64")
 	}
 	if bloom.BitsPerKey <= 0 {
 		return fmt.Errorf("invalid Bloom bits_per_key %d", bloom.BitsPerKey)
