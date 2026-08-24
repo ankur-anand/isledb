@@ -700,6 +700,65 @@ func TestWriter_ChangeBatchUploadRetryReusesObjectIdentity(t *testing.T) {
 	}
 }
 
+func TestWriter_SSTUploadRetryReusesObjectIdentity(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-sst-upload-retry")
+	defer store.Close()
+
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	w.mu.Lock()
+	pending := w.newPendingFlushLocked(w.memtable)
+	w.memtable = w.newMemtable()
+	w.mu.Unlock()
+
+	lostResponse := errors.New("lost SST upload response")
+	objects := make(map[string][]byte)
+	var uploadedIDs []string
+	uploads := 0
+	uploadFn := func(_ context.Context, id string, reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		uploadedIDs = append(uploadedIDs, id)
+		objects[id] = data
+		uploads++
+		if uploads == 1 {
+			return lostResponse
+		}
+		return nil
+	}
+
+	if _, err := writeSSTStreaming(ctx, pending.memtable.Iterator(), sstWriterOptions{
+		BlockSize: 4096, Compression: "none",
+	}, pending.sstIdentity, uploadFn); !errors.Is(err, lostResponse) {
+		t.Fatalf("first upload error=%v want=%v", err, lostResponse)
+	}
+	result, err := writeSSTStreaming(ctx, pending.memtable.Iterator(), sstWriterOptions{
+		BlockSize: 4096, Compression: "none",
+	}, pending.sstIdentity, uploadFn)
+	if err != nil {
+		t.Fatalf("retry upload: %v", err)
+	}
+	if len(uploadedIDs) != 2 || uploadedIDs[0] != uploadedIDs[1] {
+		t.Fatalf("uploaded IDs=%v want the same identity on retry", uploadedIDs)
+	}
+	if result.Meta.ID != uploadedIDs[0] {
+		t.Fatalf("result ID=%q want=%q", result.Meta.ID, uploadedIDs[0])
+	}
+	if len(objects) != 1 {
+		t.Fatalf("uploaded objects=%d want=1", len(objects))
+	}
+}
+
 func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-ambiguous-manifest-cas")

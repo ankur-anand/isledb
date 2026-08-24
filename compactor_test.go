@@ -60,6 +60,115 @@ func runCompactorUntilIdle(ctx context.Context, c *compactor) error {
 	return errors.New("compaction test driver exceeded 100 selected work items")
 }
 
+func TestCompactor_CompactionOutputIdentityIsStableAcrossRetry(t *testing.T) {
+	oldest := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	newest := oldest.Add(time.Hour)
+	fence := &manifest.FenceToken{
+		Epoch:     11,
+		Owner:     "maintenance-a",
+		ClaimedAt: oldest.Add(-time.Hour),
+	}
+	plan := &levelCompactionPlan{
+		sourceLevel:      0,
+		destinationLevel: 1,
+		sourceSSTs: []sstMetadata{
+			{ID: "source-a.sst", Checksum: "sha256:source-a", Size: 100, CreatedAt: oldest},
+			{ID: "source-b.sst", Checksum: "sha256:source-b", Size: 200, CreatedAt: newest},
+		},
+		destinationSSTs: []sstMetadata{
+			{ID: "destination.sst", Checksum: "sha256:destination", Size: 300, CreatedAt: oldest.Add(30 * time.Minute)},
+		},
+	}
+	c := &compactor{
+		opts:       normalizeCompactorOptions(compactorOptions{}),
+		fenceToken: fence,
+	}
+
+	first, firstCutoff, err := c.compactionSSTStreamIdentity(plan, 7, newest.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("first compaction identity: %v", err)
+	}
+	retry, retryCutoff, err := c.compactionSSTStreamIdentity(plan, 99, newest.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("retry compaction identity: %v", err)
+	}
+	if first.OutputKey != retry.OutputKey {
+		t.Fatalf("retry changed output key: first=%q retry=%q", first.OutputKey, retry.OutputKey)
+	}
+	if firstCutoff != oldest.UnixMilli() || retryCutoff != firstCutoff {
+		t.Fatalf("expiry cutoff: first=%d retry=%d want=%d", firstCutoff, retryCutoff, oldest.UnixMilli())
+	}
+	firstOutput, err := first.output(1)
+	if err != nil {
+		t.Fatalf("first output identity: %v", err)
+	}
+	retryOutput, err := retry.output(1)
+	if err != nil {
+		t.Fatalf("retry output identity: %v", err)
+	}
+	if firstOutput.ID != retryOutput.ID {
+		t.Fatalf("retry changed object ID: first=%q retry=%q", firstOutput.ID, retryOutput.ID)
+	}
+	if firstOutput.Epoch == retryOutput.Epoch {
+		t.Fatalf("test requires manifest epochs to differ: first=%d retry=%d", firstOutput.Epoch, retryOutput.Epoch)
+	}
+
+	successor := &compactor{
+		opts: c.opts,
+		fenceToken: &manifest.FenceToken{
+			Epoch:     fence.Epoch + 1,
+			Owner:     "maintenance-b",
+			ClaimedAt: fence.ClaimedAt.Add(time.Hour),
+		},
+	}
+	successorIdentity, _, err := successor.compactionSSTStreamIdentity(
+		plan, 100, newest.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("successor compaction identity: %v", err)
+	}
+	if successorIdentity.OutputKey == first.OutputKey {
+		t.Fatal("successor fence reused the previous compactor's output namespace")
+	}
+
+	changedInput := *plan
+	changedInput.sourceSSTs = append([]sstMetadata(nil), plan.sourceSSTs...)
+	changedInput.sourceSSTs[0].Checksum = "sha256:different-source"
+	changed, _, err := c.compactionSSTStreamIdentity(&changedInput, 99, newest.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("changed-input compaction identity: %v", err)
+	}
+	if changed.OutputKey == first.OutputKey {
+		t.Fatal("changing an input checksum did not change the output key")
+	}
+
+	changedOpts := c.opts
+	changedOpts.Output.TargetSSTBytes++
+	changedPolicy := &compactor{opts: changedOpts, fenceToken: fence}
+	changed, _, err = changedPolicy.compactionSSTStreamIdentity(plan, 99, newest.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("changed-policy compaction identity: %v", err)
+	}
+	if changed.OutputKey == first.OutputKey {
+		t.Fatal("changing the output split policy did not change the output key")
+	}
+
+	missingCreationTime := *plan
+	missingCreationTime.sourceSSTs = append([]sstMetadata(nil), plan.sourceSSTs...)
+	missingCreationTime.sourceSSTs[0].CreatedAt = time.Time{}
+	_, cutoff, err := c.compactionSSTStreamIdentity(&missingCreationTime, 99, newest.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("missing-created-at compaction identity: %v", err)
+	}
+	if cutoff != 0 {
+		t.Fatalf("missing input creation time produced expiry cutoff %d, want 0", cutoff)
+	}
+
+	withoutFence := &compactor{opts: c.opts}
+	if _, _, err := withoutFence.compactionSSTStreamIdentity(plan, 100, newest); err == nil {
+		t.Fatal("compaction identity without an active fence succeeded")
+	}
+}
+
 func TestCompactor_RejectsNilContext(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("compactor-nil-context")
