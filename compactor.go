@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -264,6 +265,101 @@ type levelCompactionPlan struct {
 	workUnits        uint32
 }
 
+// compactionOutputIdentityVersion domain-separates revisions of the attempt-key
+// encoding. Cross-process output isolation comes from the compactor fence.
+const compactionOutputIdentityVersion uint64 = 1
+
+// compactionSSTStreamIdentity derives an output namespace scoped to one active
+// compactor fence. The same plan retries to the same names while that ownership
+// remains active; a successor fence receives different names and therefore
+// cannot overwrite an older process's in-flight output.
+func (c *compactor) compactionSSTStreamIdentity(
+	plan *levelCompactionPlan,
+	epoch uint64,
+	createdAt time.Time,
+) (sstStreamSetIdentity, int64, error) {
+	if c == nil || plan == nil || c.fenceToken == nil || c.fenceToken.Epoch == 0 ||
+		c.fenceToken.Owner == "" || c.fenceToken.ClaimedAt.IsZero() {
+		return sstStreamSetIdentity{}, 0, errors.New("incomplete compactor attempt identity")
+	}
+	fence := c.fenceToken
+	cutoff := compactionExpiryCutoff(plan)
+	var cutoffMillis int64
+	if !cutoff.IsZero() {
+		cutoffMillis = cutoff.UnixMilli()
+	}
+
+	var encoded bytes.Buffer
+	writeUint64 := func(value uint64) {
+		_ = binary.Write(&encoded, binary.BigEndian, value)
+	}
+	writeInt64 := func(value int64) {
+		_ = binary.Write(&encoded, binary.BigEndian, value)
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		_, _ = encoded.WriteString(value)
+	}
+	writeSSTs := func(ssts []sstMetadata) {
+		writeUint64(uint64(len(ssts)))
+		for _, sst := range ssts {
+			// Preserve execution order. It participates in duplicate-key
+			// precedence, so sorting only for identity would be unsafe.
+			writeString(sst.ID)
+			writeString(sst.Checksum)
+			writeInt64(sst.Size)
+		}
+	}
+
+	writeUint64(compactionOutputIdentityVersion)
+	writeUint64(fence.Epoch)
+	writeString(fence.Owner)
+	writeInt64(fence.ClaimedAt.UTC().UnixNano())
+	writeUint64(uint64(plan.sourceLevel))
+	writeUint64(uint64(plan.destinationLevel))
+	writeInt64(cutoffMillis)
+	writeInt64(c.opts.Output.TargetSSTBytes)
+	writeInt64(int64(c.opts.Output.BloomBitsPerKey))
+	writeInt64(int64(c.opts.Output.BlockBytes))
+	writeString(strings.ToLower(c.opts.Output.Compression))
+	writeSSTs(plan.sourceSSTs)
+	writeSSTs(plan.destinationSSTs)
+
+	digest := sha256.Sum256(encoded.Bytes())
+	return sstStreamSetIdentity{
+		OutputKey: hex.EncodeToString(digest[:]),
+		Epoch:     epoch,
+		CreatedAt: createdAt.UTC(),
+	}, cutoffMillis, nil
+}
+
+// compactionExpiryCutoff is intentionally derived from immutable inputs rather
+// than wall time. The oldest input creation time is no later than the creation
+// time of the SST containing any entry, so converting only expirations below
+// this floor cannot expire an entry early. It also keeps retry output
+// byte-for-byte stable. A zero timestamp disables expiry rewriting defensively.
+func compactionExpiryCutoff(plan *levelCompactionPlan) time.Time {
+	var cutoff time.Time
+	valid := true
+	consider := func(ssts []sstMetadata) {
+		for _, sst := range ssts {
+			if sst.CreatedAt.IsZero() {
+				valid = false
+				continue
+			}
+			if cutoff.IsZero() || sst.CreatedAt.Before(cutoff) {
+				cutoff = sst.CreatedAt
+			}
+		}
+	}
+	consider(plan.sourceSSTs)
+	consider(plan.destinationSSTs)
+	if !valid {
+		return time.Time{}
+	}
+	return cutoff.UTC()
+}
+
 func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCandidate, error) {
 	if m == nil {
 		return nil, nil
@@ -416,6 +512,11 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 
 	outputs := plan.sourceSSTs
 	if !plan.metadataOnly {
+		identity, expiryCutoffMillis, identityErr := c.compactionSSTStreamIdentity(
+			plan, m.NextEpoch, time.Now().UTC())
+		if identityErr != nil {
+			return identityErr
+		}
 		inputs := append(append([]sstMetadata(nil), plan.sourceSSTs...), plan.destinationSSTs...)
 		iters, readers, openErr := c.openSSTs(ctx, inputs)
 		if openErr != nil {
@@ -426,7 +527,8 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 				_ = reader.Close()
 			}
 		}()
-		results, writeErr := c.writeCompactedSSTs(ctx, newMergeIterator(iters), m.NextEpoch)
+		results, writeErr := c.writeCompactedSSTs(
+			ctx, newMergeIterator(iters), identity, expiryCutoffMillis)
 		if writeErr != nil {
 			return writeErr
 		}
@@ -660,7 +762,8 @@ func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool) er
 func (c *compactor) writeCompactedSSTs(
 	ctx context.Context,
 	iter *kMergeIterator,
-	epoch uint64,
+	identity sstStreamSetIdentity,
+	expiryCutoffMillis int64,
 ) (results []streamSSTResult, err error) {
 	defer func() {
 		err = errors.Join(err, iter.close())
@@ -672,7 +775,7 @@ func (c *compactor) writeCompactedSSTs(
 		Compression:     c.opts.Output.Compression,
 	}
 
-	adapter := &mergeIteratorAdapter{iter: iter, nowMs: time.Now().UnixMilli()}
+	adapter := &mergeIteratorAdapter{iter: iter, nowMs: expiryCutoffMillis}
 
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
 		sstPath := c.store.SSTPath(sstID)
@@ -680,7 +783,8 @@ func (c *compactor) writeCompactedSSTs(
 		return err
 	}
 
-	results, err = writeMultipleSSTsStreaming(ctx, adapter, sstOpts, epoch, c.opts.Output.TargetSSTBytes, uploadFn)
+	results, err = writeMultipleSSTsStreaming(
+		ctx, adapter, sstOpts, identity, c.opts.Output.TargetSSTBytes, uploadFn)
 	if err != nil {
 		if errors.Is(err, errEmptyIterator) {
 			return nil, nil

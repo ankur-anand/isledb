@@ -74,6 +74,7 @@ type writerFailure struct {
 type pendingFlush struct {
 	commitID             string
 	epoch                uint64
+	sstIdentity          sstStreamIdentity
 	memtable             *internal.Memtable
 	sstable              *manifest.SSTMeta
 	changeBatch          *manifest.ChangeBatchMeta
@@ -255,14 +256,16 @@ func (w *writer) newMemtable() *internal.Memtable {
 // newPendingFlushLocked assigns identity and epoch exactly once. The caller
 // holds w.mu.
 func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlush {
+	createdAt := time.Now().UTC()
 	pending := &pendingFlush{
-		commitID: ksuid.New().String(),
-		epoch:    w.epoch,
-		memtable: memtable,
-		changes:  w.changeBuffer,
+		commitID:    ksuid.New().String(),
+		epoch:       w.epoch,
+		sstIdentity: newSSTStreamIdentity(w.epoch, memtable.SeqLo(), memtable.SeqHi(), createdAt),
+		memtable:    memtable,
+		changes:     w.changeBuffer,
 	}
 	if pending.changes != nil {
-		pending.changeBatchCreatedAt = time.Now().UTC()
+		pending.changeBatchCreatedAt = createdAt
 	}
 	w.changeBuffer = nil
 	w.epoch++
@@ -559,10 +562,9 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		return err
 	}
 
-	seqLo, seqHi := pending.memtable.SeqLo(), pending.memtable.SeqHi()
 	buildSST := func(uploadCtx context.Context) (streamSSTResult, error) {
 		result, err := writeSSTStreaming(uploadCtx, pending.memtable.Iterator(), sstOpts,
-			pending.epoch, seqLo, seqHi, uploadFn)
+			pending.sstIdentity, uploadFn)
 		if err != nil {
 			return streamSSTResult{}, fmt.Errorf("stream sst: %w", err)
 		}

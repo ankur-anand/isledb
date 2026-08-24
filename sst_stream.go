@@ -20,6 +20,42 @@ func buildSSTIDWithTimestamp(epoch, seqLo, seqHi uint64, ts time.Time) string {
 	return fmt.Sprintf("%d-%d-%d-%d.sst", epoch, seqLo, seqHi, ts.UnixNano())
 }
 
+type sstStreamIdentity struct {
+	ID        string
+	Epoch     uint64
+	CreatedAt time.Time
+}
+
+func newSSTStreamIdentity(epoch, seqLo, seqHi uint64, createdAt time.Time) sstStreamIdentity {
+	createdAt = createdAt.UTC()
+	return sstStreamIdentity{
+		ID:        buildSSTIDWithTimestamp(epoch, seqLo, seqHi, createdAt),
+		Epoch:     epoch,
+		CreatedAt: createdAt,
+	}
+}
+
+// sstStreamSetIdentity names every output of one deterministic multi-SST
+// build. OutputKey is derived by the compactor from its active fence, immutable
+// inputs, and byte-affecting output policy. Retries within that ownership reuse
+// the same names; a successor compactor receives another namespace.
+type sstStreamSetIdentity struct {
+	OutputKey string
+	Epoch     uint64
+	CreatedAt time.Time
+}
+
+func (identity sstStreamSetIdentity) output(index int) (sstStreamIdentity, error) {
+	if identity.OutputKey == "" || identity.Epoch == 0 || identity.CreatedAt.IsZero() || index <= 0 {
+		return sstStreamIdentity{}, errors.New("incomplete multi-SST stream identity")
+	}
+	return sstStreamIdentity{
+		ID:        fmt.Sprintf("compacted-%s-%04d.sst", identity.OutputKey, index),
+		Epoch:     identity.Epoch,
+		CreatedAt: identity.CreatedAt.UTC(),
+	}, nil
+}
+
 type streamSSTResult struct {
 	Meta sstMetadata
 }
@@ -31,16 +67,15 @@ func writeSSTStreaming(
 	ctx context.Context,
 	it sstIterator,
 	opts sstWriterOptions,
-	epoch uint64,
-	seqLo, seqHi uint64,
+	identity sstStreamIdentity,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
 ) (result streamSSTResult, err error) {
 	defer func() {
 		err = errors.Join(err, it.Close())
 	}()
-
-	ts := time.Now().UTC()
-	sstID := buildSSTIDWithTimestamp(epoch, seqLo, seqHi, ts)
+	if identity.ID == "" || identity.Epoch == 0 || identity.CreatedAt.IsZero() {
+		return result, errors.New("incomplete SST stream identity")
+	}
 
 	pr, pw := io.Pipe()
 	writable := newHashingWritable(pw)
@@ -76,7 +111,7 @@ func writeSSTStreaming(
 
 	// Read from the pipe and upload to object storage.
 	g.Go(func() error {
-		err := uploadFn(gctx, sstID, pr)
+		err := uploadFn(gctx, identity.ID, pr)
 		if err != nil {
 			uploadErr.Store(err)
 			_ = pr.CloseWithError(err)
@@ -224,8 +259,8 @@ func writeSSTStreaming(
 	hashStr := hex.EncodeToString(hashBytes)
 
 	result.Meta = sstMetadata{
-		ID:        sstID,
-		Epoch:     epoch,
+		ID:        identity.ID,
+		Epoch:     identity.Epoch,
 		SeqLo:     pResult.state.seqLo,
 		SeqHi:     pResult.state.seqHi,
 		MinKey:    pResult.state.minKey,
@@ -233,7 +268,7 @@ func writeSSTStreaming(
 		Size:      writable.size,
 		Checksum:  "sha256:" + hashStr,
 		Bloom:     pResult.bloom,
-		CreatedAt: ts,
+		CreatedAt: identity.CreatedAt,
 	}
 
 	return result, nil
@@ -246,7 +281,7 @@ func writeMultipleSSTsStreaming(
 	ctx context.Context,
 	it sstIterator,
 	opts sstWriterOptions,
-	epoch uint64,
+	identity sstStreamSetIdentity,
 	targetSize int64,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
 ) (results []streamSSTResult, err error) {
@@ -269,7 +304,6 @@ func writeMultipleSSTsStreaming(
 	var state *sstBuildState
 	var hashes []uint64
 	var sstID string
-	var ts time.Time
 	var uploadErr atomic.Value
 	var uploadDone chan struct{}
 	var uploadCancel context.CancelFunc
@@ -284,9 +318,12 @@ func writeMultipleSSTsStreaming(
 	}
 
 	startNewSST := func() error {
-		ts = time.Now().UTC()
 		sstIndex++
-		sstID = fmt.Sprintf("%d-0-0-%d-%04d.sst", epoch, ts.UnixNano(), sstIndex)
+		outputIdentity, err := identity.output(sstIndex)
+		if err != nil {
+			return err
+		}
+		sstID = outputIdentity.ID
 
 		pr, pw = io.Pipe()
 		writable = newHashingWritable(pw)
@@ -367,7 +404,7 @@ func writeMultipleSSTsStreaming(
 		result := streamSSTResult{
 			Meta: sstMetadata{
 				ID:       sstID,
-				Epoch:    epoch,
+				Epoch:    identity.Epoch,
 				SeqLo:    state.seqLo,
 				SeqHi:    state.seqHi,
 				MinKey:   state.minKey,
@@ -381,7 +418,7 @@ func writeMultipleSSTsStreaming(
 					Length:     int64(len(bloomBytes)),
 					Checksum:   bloomChecksum(bloomBytes),
 				},
-				CreatedAt: ts,
+				CreatedAt: identity.CreatedAt.UTC(),
 			},
 		}
 
