@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,10 +59,16 @@ type changeFeedCleaner struct {
 	fenceToken   *manifest.FenceToken
 	stageCommand maintenanceCommandStager
 
-	reclaimMu      sync.Mutex
+	// Reclaim passes are serialized by Maintenance.reclaimGates. These fields
+	// are owned by that lane between passes.
 	planIter       *blobstore.ListIterator
 	pendingPlanKey string
 	planCache      *boundedPlanCache[changeFeedDeletionPlan]
+	seenRescan     uint64
+
+	// Plan publication is an inbound signal, never a mutation of lane-owned
+	// state, so control work cannot queue behind object-store I/O.
+	rescan atomic.Uint64
 
 	closed atomic.Bool
 }
@@ -203,6 +208,9 @@ func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFee
 						observedAt, observedAt, updated.PinnedViewAge(), c.opts.DeletionSafetyMargin)
 					if err == nil {
 						_, err = storeChangeFeedDeletionPlan(ctx, c.store, *plan, payload)
+						if err == nil {
+							c.planAvailable()
+						}
 					}
 				}
 			}
@@ -223,26 +231,38 @@ func (c *changeFeedCleaner) runControlOnce(ctx context.Context) (stats ChangeFee
 // It is intentionally fence-independent: CURRENT remains the authority that
 // proves whether every planned change batch is below the committed feed floor.
 func (c *changeFeedCleaner) runReclaimOnce(ctx context.Context, deleter ...objectDeleter) (stats ChangeFeedCleanupStats, err error) {
+	stats, _, err = c.runScheduledReclaimOnce(ctx, deleter...)
+	return stats, err
+}
+
+func (c *changeFeedCleaner) runScheduledReclaimOnce(
+	ctx context.Context,
+	deleter ...objectDeleter,
+) (stats ChangeFeedCleanupStats, schedule reclamationLaneSchedule, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
 	if err := checkContext(ctx); err != nil {
-		return stats, err
+		return stats, schedule, err
 	}
 	if c.closed.Load() {
-		return stats, errors.New("change feed cleaner closed")
+		return stats, schedule, errors.New("change feed cleaner closed")
 	}
 	deleteObjects := objectDeleter(c.store)
 	if len(deleter) > 0 && deleter[0] != nil {
 		deleteObjects = deleter[0]
 	}
-	c.reclaimMu.Lock()
-	defer c.reclaimMu.Unlock()
+	if generation := c.rescan.Load(); generation != c.seenRescan {
+		c.seenRescan = generation
+		c.planIter = nil
+		c.pendingPlanKey = ""
+	}
 	if c.planIter == nil {
 		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: changeFeedDeletionPlanPrefix + "/"})
 	}
+	passNow := time.Now().UTC()
 	sweep, exhausted, restartIterator, sweepErr := reclaimChangeFeedDeletionPlans(
 		ctx, c.store, c.manifestLog, c.opts.SweepBatchSize,
-		defaultChangeFeedDeletionPlanScanLimit, time.Now().UTC(), deleteObjects,
+		defaultChangeFeedDeletionPlanScanLimit, passNow, deleteObjects,
 		c.planIter, c.planCache, &c.pendingPlanKey)
 	if exhausted || restartIterator {
 		c.planIter = nil
@@ -250,13 +270,25 @@ func (c *changeFeedCleaner) runReclaimOnce(ctx context.Context, deleter ...objec
 	if exhausted {
 		c.pendingPlanKey = ""
 	}
+	schedule = reclamationLaneSchedule{
+		observedAt: time.Now().UTC(),
+		nextDue:    sweep.NextDue,
+		idle:       sweepErr == nil && exhausted && sweep.NextDue.IsZero(),
+	}
 	stats.BatchesDeleted = sweep.Deleted
 	stats.BlockedRetained = sweep.BlockedRetained
 	stats.FailedDeletes = sweep.Failed
 	if sweepErr != nil {
-		return stats, fmt.Errorf("reclaim change-feed deletion plans: %w", sweepErr)
+		return stats, schedule, fmt.Errorf("reclaim change-feed deletion plans: %w", sweepErr)
 	}
-	return stats, nil
+	return stats, schedule, nil
+}
+
+func (c *changeFeedCleaner) planAvailable() {
+	if c == nil {
+		return
+	}
+	c.rescan.Add(1)
 }
 
 func mergeChangeFeedCleanupStats(a, b ChangeFeedCleanupStats) ChangeFeedCleanupStats {

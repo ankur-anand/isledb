@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,6 +197,7 @@ func TestSSTReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
 	if _, err := cleaner.markCommandOutcome(ctx, current, command, receipt); err != nil {
 		t.Fatal(err)
 	}
+	storedPlan := listSSTDeletionPlans(t, ctx, store)[0]
 	cleaner.opts.Now = func() time.Time { return firstNow.Add(24 * time.Hour) }
 	badPath := storeKey(store, sstDeletionPlanPrefix, "000-unreadable.json")
 	if _, err := store.Write(ctx, badPath, []byte("not-json")); err != nil {
@@ -214,6 +216,7 @@ func TestSSTReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
 	if _, _, err := store.Read(ctx, target.Key); err == nil {
 		t.Fatalf("valid due plan after unreadable object was starved across passes; target %q still exists", target.Key)
 	}
+	requireObjectExists(t, ctx, store, sstDeletionPlanCanonicalPath(store, storedPlan.PlanID), false)
 }
 
 func TestSSTDeletionPlanReceiptHandoffIsIdempotent(t *testing.T) {
@@ -231,28 +234,89 @@ func TestSSTDeletionPlanReceiptHandoffIsIdempotent(t *testing.T) {
 		t.Fatalf("first handoff stats=%+v", first)
 	}
 	firstPlan := listSSTDeletionPlans(t, ctx, store)[0]
+	requireObjectExists(t, ctx, store, sstDeletionPlanCanonicalPath(store, firstPlan.PlanID), true)
+	firstReadyPath := sstDeletionPlanReadyPath(store, firstPlan.NotBefore, firstPlan.PlanID)
+	if err := store.Delete(ctx, firstReadyPath); err != nil {
+		t.Fatalf("delete ready record before handoff retry: %v", err)
+	}
 
 	cleaner.opts.Now = func() time.Time { return firstNow.Add(time.Hour) }
 	second, err := cleaner.markCommandOutcome(ctx, current, command, receipt)
 	if err != nil {
 		t.Fatalf("retry handoff: %v", err)
 	}
-	if second.PlansPrepared != 0 || second.TargetsPlanned != 1 {
+	if second.PlansPrepared != 1 || second.TargetsPlanned != 1 {
 		t.Fatalf("retry handoff stats=%+v", second)
 	}
 	plans := listSSTDeletionPlans(t, ctx, store)
 	if len(plans) != 1 || plans[0].PlanID != firstPlan.PlanID || !plans[0].NotBefore.Equal(firstPlan.NotBefore) {
-		t.Fatalf("retry replaced immutable plan: first=%+v plans=%+v", firstPlan, plans)
+		t.Fatalf("retry did not restore the first immutable plan: first=%+v plans=%+v", firstPlan, plans)
 	}
 	if _, _, err := store.Read(ctx, target.Key); err != nil {
 		t.Fatalf("target changed during handoff retry: %v", err)
 	}
+	third, err := cleaner.markCommandOutcome(ctx, current, command, receipt)
+	if err != nil {
+		t.Fatalf("idempotent handoff: %v", err)
+	}
+	if third.PlansPrepared != 0 || third.TargetsPlanned != 1 {
+		t.Fatalf("idempotent handoff stats=%+v", third)
+	}
 
 	changedPolicy := current.Clone()
 	changedPolicy.MaxPinnedViewAge += time.Minute
-	if _, err := cleaner.markCommandOutcome(ctx, changedPolicy, command, receipt); err == nil {
-		t.Fatal("existing plan with a different pinned-view policy was accepted")
+	policyCleaner := newSSTCleaner(store, sstCleanerOptions{
+		Now:          func() time.Time { return firstNow.Add(2 * time.Hour) },
+		SafetyMargin: 5 * time.Minute,
+	})
+	adopted, err := policyCleaner.markCommandOutcome(ctx, changedPolicy, command, receipt)
+	if err != nil {
+		t.Fatalf("adopt existing plan under changed timing policy: %v", err)
 	}
+	if adopted.PlansPrepared != 0 || adopted.TargetsPlanned != 1 {
+		t.Fatalf("changed-policy handoff stats=%+v", adopted)
+	}
+	plans = listSSTDeletionPlans(t, ctx, store)
+	if len(plans) != 1 || plans[0].Checksum != firstPlan.Checksum || !plans[0].NotBefore.Equal(firstPlan.NotBefore) {
+		t.Fatalf("changed policy replaced first durable plan: first=%+v plans=%+v", firstPlan, plans)
+	}
+}
+
+func TestSSTDeletionPlanFutureReadyRecordDoesNotReadPayload(t *testing.T) {
+	ctx := context.Background()
+	store, current, command, receipt, target := newSSTDeletionPlanFixture(t, ctx, "future-no-read")
+	defer store.Close()
+	now := time.Now().UTC()
+	plan, payload, err := buildSSTDeletionPlan(
+		store, current, command, receipt, command.Compaction.RetiredObjects, now, 0)
+	if err != nil {
+		t.Fatalf("build future plan: %v", err)
+	}
+	if created, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
+		t.Fatalf("store future plan created=%v error=%v", created, err)
+	}
+	readyPath := sstDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID)
+	if _, err := store.Write(ctx, readyPath, []byte(`{"corrupt":true}`)); err != nil {
+		t.Fatalf("corrupt future ready payload: %v", err)
+	}
+
+	clock := now
+	cleaner := newSSTCleaner(store, sstCleanerOptions{Now: func() time.Time { return clock }})
+	stats, err := cleaner.runOnce(ctx)
+	if err != nil {
+		t.Fatalf("future scan read payload: %v", err)
+	}
+	if stats.PlansScanned != 1 || stats.Deferred != 1 || stats.Failed != 0 || !stats.NextDue.Equal(plan.NotBefore) {
+		t.Fatalf("future scan stats=%+v", stats)
+	}
+	requireObjectExists(t, ctx, store, target.Key, true)
+
+	clock = plan.NotBefore
+	stats, err = cleaner.runOnce(ctx)
+	if err == nil || stats.Failed != 1 || stats.Deleted != 0 {
+		t.Fatalf("due corrupt ready record stats=%+v error=%v", stats, err)
+	}
+	requireObjectExists(t, ctx, store, target.Key, true)
 }
 
 func TestSSTDeletionPlanRejectedReceiptDoesNotCreatePlan(t *testing.T) {
@@ -314,7 +378,64 @@ func TestSSTDeletionPlanReclaimerHonorsDeadlineAndBoundsWork(t *testing.T) {
 	}
 }
 
-func TestSSTDeletionPlanCleanerRetainsListCursorPastDeferredPlan(t *testing.T) {
+func TestSSTReclaimScheduleUsesThePassClock(t *testing.T) {
+	ctx := context.Background()
+	store, current, command, receipt, _ := newSSTDeletionPlanFixture(t, ctx, "schedule-clock")
+	defer store.Close()
+
+	fakeNow := receipt.AppliedAt.Add(time.Minute)
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		SafetyMargin: -1,
+		Now:          func() time.Time { return fakeNow },
+	})
+	if _, err := cleaner.markCommandOutcome(ctx, current, command, receipt); err != nil {
+		t.Fatalf("mark command outcome: %v", err)
+	}
+	wantDue := listSSTDeletionPlans(t, ctx, store)[0].NotBefore
+
+	stats, schedule, err := cleaner.runScheduledOnce(ctx)
+	if err != nil {
+		t.Fatalf("run scheduled reclaim: %v", err)
+	}
+	if stats.Deferred != 1 || !schedule.observedAt.Equal(fakeNow) || !schedule.nextDue.Equal(wantDue) {
+		t.Fatalf("stats=%+v schedule=%+v want now=%s due=%s", stats, schedule, fakeNow, wantDue)
+	}
+	delay, _ := nextReclamationDelay(
+		time.Second, time.Second, schedule.observedAt, schedule.nextDue, schedule.idle)
+	wantDelay := min(wantDue.Sub(fakeNow), defaultReclaimIdleMaxInterval)
+	if delay != wantDelay {
+		t.Fatalf("schedule delay=%s want=%s", delay, wantDelay)
+	}
+}
+
+func TestSSTReclaimScheduleIsNotIdleOnError(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("sst-plan-error-not-idle")
+	defer store.Close()
+
+	malformedPath := storeKey(
+		store,
+		sstDeletionPlanPrefix,
+		deletionPlanReadyName(
+			time.Now().UTC().Add(-time.Hour),
+			strings.Repeat("a", deletionPlanSHA256HexBytes),
+		),
+	)
+	if _, err := store.Write(ctx, malformedPath, []byte(`{"not":"a deletion plan"}`)); err != nil {
+		t.Fatalf("write malformed ready record: %v", err)
+	}
+
+	cleaner := newSSTCleaner(store, sstCleanerOptions{})
+	_, schedule, err := cleaner.runScheduledOnce(ctx)
+	if err == nil {
+		t.Fatal("reclaim malformed SST plan succeeded")
+	}
+	if schedule.idle {
+		t.Fatal("failed SST reclamation pass reported itself idle")
+	}
+}
+
+func TestSSTDeletionPlanCleanerWaitsAtFirstFutureDeadline(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("sst-plan-cached-list-cursor")
 	defer store.Close()
@@ -337,46 +458,56 @@ func TestSSTDeletionPlanCleanerRetainsListCursorPastDeferredPlan(t *testing.T) {
 		}
 		built = append(built, builtPlan{plan: plan, payload: payload, target: target})
 	}
-	sort.Slice(built, func(i, j int) bool {
-		return sstDeletionPlanPath(store, built[i].plan.PlanID) < sstDeletionPlanPath(store, built[j].plan.PlanID)
-	})
-	// Make the lexicographically first plan not due. A stateless prefix scan
-	// with a one-plan budget would rediscover it forever.
-	deferred := built[0].plan
-	deferred.ObservedAt = now
-	deferred.NotBefore = now.Add(deferred.PinnedViewAge).Add(deferred.SafetyMargin)
-	deferred.Checksum = sstDeletionPlanChecksum(*deferred)
-	var err error
-	built[0].payload, err = encodeSSTDeletionPlan(store, *deferred)
-	if err != nil {
-		t.Fatalf("encode deferred plan: %v", err)
+	for i := range built {
+		plan := built[i].plan
+		plan.ObservedAt = now.Add(time.Duration(i) * time.Hour)
+		plan.NotBefore = plan.ObservedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin)
+		plan.Checksum = sstDeletionPlanChecksum(*plan)
+		var err error
+		built[i].payload, err = encodeSSTDeletionPlan(store, *plan)
+		if err != nil {
+			t.Fatalf("encode deferred plan %d: %v", i, err)
+		}
 	}
+	sort.Slice(built, func(i, j int) bool {
+		return sstDeletionPlanReadyPath(store, built[i].plan.NotBefore, built[i].plan.PlanID) <
+			sstDeletionPlanReadyPath(store, built[j].plan.NotBefore, built[j].plan.PlanID)
+	})
 	for i := range built {
 		if created, err := storeSSTDeletionPlan(ctx, store, *built[i].plan, built[i].payload); err != nil || !created {
 			t.Fatalf("store plan %d created=%v error=%v", i, created, err)
 		}
 	}
 
+	clock := now
 	cleaner := newSSTCleaner(store, sstCleanerOptions{
 		DeleteBatchSize: 1,
 		PlanScanLimit:   1,
-		Now:             func() time.Time { return now },
+		Now:             func() time.Time { return clock },
 	})
 	first, err := cleaner.runOnce(ctx)
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if first.Deferred != 1 || first.Deleted != 0 {
+	if first.Deferred != 1 || first.Deleted != 0 || !first.NextDue.Equal(built[0].plan.NotBefore) {
 		t.Fatalf("first stats=%+v", first)
 	}
 	second, err := cleaner.runOnce(ctx)
 	if err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if second.Deleted != 1 || second.PlansDeleted != 1 {
-		t.Fatalf("second stats=%+v; iterator restarted at deferred plan", second)
+	if second.Deferred != 1 || second.Deleted != 0 || !second.NextDue.Equal(built[0].plan.NotBefore) {
+		t.Fatalf("second stats=%+v", second)
 	}
-	requireObjectExists(t, ctx, store, built[0].target.Key, true)
+	clock = built[0].plan.NotBefore
+	third, err := cleaner.runOnce(ctx)
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if third.Deleted != 1 || third.PlansDeleted != 1 {
+		t.Fatalf("third stats=%+v", third)
+	}
+	requireObjectExists(t, ctx, store, built[0].target.Key, false)
 }
 
 func TestSSTDeletionPlanCleanerCarriesBudgetDeferredPlan(t *testing.T) {
@@ -415,7 +546,7 @@ func TestSSTDeletionPlanCleanerCarriesBudgetDeferredPlan(t *testing.T) {
 		if created, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
 			t.Fatalf("store %s plan created=%v error=%v", label, created, err)
 		}
-		return builtPlan{targets: targets, path: sstDeletionPlanPath(store, plan.PlanID)}
+		return builtPlan{targets: targets, path: sstDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID)}
 	}
 	left := buildPlan("budget-left", 64)
 	right := buildPlan("budget-right", 65)
@@ -599,7 +730,7 @@ func TestMaintenanceKeepsCompactionPendingWhenPlanHandoffFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build expected plan: %v", err)
 	}
-	if _, err := store.Write(ctx, sstDeletionPlanPath(store, plan.PlanID), []byte(`{"corrupt":true}`)); err != nil {
+	if _, err := store.Write(ctx, sstDeletionPlanCanonicalPath(store, plan.PlanID), []byte(`{"corrupt":true}`)); err != nil {
 		t.Fatalf("write corrupt plan collision: %v", err)
 	}
 

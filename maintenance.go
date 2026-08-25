@@ -33,6 +33,7 @@ const (
 	defaultSSTReclaimPollInterval             = time.Second
 	defaultChangeReclaimPollInterval          = 5 * time.Second
 	defaultManifestReclaimPollInterval        = time.Minute
+	defaultReclaimIdleMaxInterval             = 5 * time.Minute
 	maxReclaimDeleteConcurrency               = 256
 	maxReclaimObjectsPerPass                  = 4096
 )
@@ -84,6 +85,10 @@ type ReclamationOptions struct {
 
 // DeleterOptions controls one independently paced physical deletion lane.
 type DeleterOptions struct {
+	// PollInterval is the active-work and initial error-retry cadence. Empty
+	// lanes and repeated failures back off to a bounded internal safety
+	// interval, while newly created plans and known deadlines can wake
+	// reclamation earlier.
 	PollInterval time.Duration
 	// MaxObjectsPerPass bounds normal work. One immutable SST retirement plan
 	// can exceed it because a plan is completed atomically and is independently
@@ -392,6 +397,7 @@ type Maintenance struct {
 	activeRuns    sync.WaitGroup
 	runGate       chan struct{}
 	reclaimGates  map[ReclamationFamily]chan struct{}
+	reclaimWake   map[ReclamationFamily]chan struct{}
 	enginesClosed bool
 	callbackMu    sync.Mutex
 
@@ -470,6 +476,10 @@ func newMaintenance(
 			ReclamationSST:        make(chan struct{}, 1),
 			ReclamationChangeFeed: make(chan struct{}, 1),
 			ReclamationManifest:   make(chan struct{}, 1),
+		},
+		reclaimWake: map[ReclamationFamily]chan struct{}{
+			ReclamationSST:        make(chan struct{}, 1),
+			ReclamationChangeFeed: make(chan struct{}, 1),
 		},
 		sstOutput: sstOutput,
 	}
@@ -844,8 +854,10 @@ func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, err
 
 func (m *Maintenance) runReclamationLoop(ctx context.Context, family ReclamationFamily) {
 	interval := m.reclamationInterval(family)
+	idleDelay := interval
+	errorDelay := interval
 	for {
-		stats, err := m.runReclamationOnce(ctx, family)
+		stats, schedule, err := m.runReclamationPass(ctx, family)
 		if err != nil {
 			if ctx.Err() != nil || m.closed.Load() {
 				return
@@ -855,13 +867,41 @@ func (m *Maintenance) runReclamationLoop(ctx context.Context, family Reclamation
 			m.reportReclamationCycle(stats)
 		}
 
-		timer := time.NewTimer(interval)
+		delay := interval
+		if err == nil {
+			errorDelay = interval
+			delay, idleDelay = nextReclamationDelay(
+				interval, idleDelay, schedule.observedAt, schedule.nextDue, schedule.idle)
+		} else {
+			idleDelay = interval
+			delay, errorDelay = nextReclamationErrorDelay(
+				interval, errorDelay, schedule.observedAt, schedule.nextDue)
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+		case <-m.reclaimWake[family]:
+			stopMaintenanceTimer(timer)
+			idleDelay = interval
+			errorDelay = interval
 		case <-ctx.Done():
 			stopMaintenanceTimer(timer)
 			return
 		}
+	}
+}
+
+func (m *Maintenance) notifyReclamation(family ReclamationFamily) {
+	if m == nil {
+		return
+	}
+	wake := m.reclaimWake[family]
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -879,42 +919,50 @@ func (m *Maintenance) reclamationInterval(family ReclamationFamily) time.Duratio
 }
 
 func (m *Maintenance) runReclamationOnce(ctx context.Context, family ReclamationFamily) (stats ReclamationCycleStats, err error) {
+	stats, _, err = m.runReclamationPass(ctx, family)
+	return stats, err
+}
+
+func (m *Maintenance) runReclamationPass(
+	ctx context.Context,
+	family ReclamationFamily,
+) (stats ReclamationCycleStats, schedule reclamationLaneSchedule, err error) {
 	stats.Family = family
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
 	if err := m.beginReclamation(ctx, family); err != nil {
-		return stats, err
+		return stats, schedule, err
 	}
 	defer m.finishReclamation(family)
 
 	switch family {
 	case ReclamationSST:
 		if m.sstGC == nil {
-			return stats, nil
+			return stats, reclamationLaneSchedule{observedAt: time.Now().UTC(), idle: true}, nil
 		}
-		work, err := m.sstGC.runOnce(ctx)
+		work, schedule, err := m.sstGC.runScheduledOnce(ctx)
 		stats.SST = publicSSTCleanupStats(work)
-		return stats, err
+		return stats, schedule, err
 	case ReclamationChangeFeed:
 		if m.changeFeed == nil {
-			return stats, nil
+			return stats, reclamationLaneSchedule{observedAt: time.Now().UTC(), idle: true}, nil
 		}
-		stats.ChangeFeed, err = m.changeFeed.runReclaimOnce(ctx, m.deleter)
-		return stats, err
+		stats.ChangeFeed, schedule, err = m.changeFeed.runScheduledReclaimOnce(ctx, m.deleter)
+		return stats, schedule, err
 	case ReclamationManifest:
 		var snapshotErr, pageErr error
 		if m.snapshotGC != nil {
 			stats.Manifest.Snapshots, snapshotErr = m.snapshotGC.runOnce(ctx)
 			if cancelErr := reclamationCancellation(ctx, snapshotErr); cancelErr != nil {
-				return stats, cancelErr
+				return stats, reclamationLaneSchedule{observedAt: time.Now().UTC()}, cancelErr
 			}
 		}
 		if m.pageGC != nil {
 			stats.Manifest.Pages, pageErr = m.pageGC.runOnce(ctx)
 		}
-		return stats, errors.Join(snapshotErr, pageErr)
+		return stats, reclamationLaneSchedule{observedAt: time.Now().UTC()}, errors.Join(snapshotErr, pageErr)
 	default:
-		return stats, fmt.Errorf("unknown reclamation family %q", family)
+		return stats, schedule, fmt.Errorf("unknown reclamation family %q", family)
 	}
 }
 
@@ -1121,7 +1169,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	if m.changeFeed != nil {
 		changeFeedSafetyMargin = m.changeFeed.opts.DeletionSafetyMargin
 	}
-	if _, err := recordChangeFeedDeletionPlan(
+	_, err = recordChangeFeedDeletionPlan(
 		ctx,
 		m.compactor.store,
 		current,
@@ -1129,8 +1177,16 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		current.MaintenanceReceipt,
 		time.Now().UTC(),
 		changeFeedSafetyMargin,
-	); err != nil {
+	)
+	if err != nil {
 		return false, fmt.Errorf("publish change-feed deletion plan: %w", err)
+	}
+	changeFeedPlanAvailable := head.Pending.Kind == manifest.MaintenanceCommandChangeFeedFloor &&
+		head.Pending.ChangeFeedFloor != nil && len(head.Pending.ChangeFeedFloor.DeletionTargets) > 0 &&
+		current.MaintenanceReceipt.Status == manifest.MaintenanceStatusApplied
+	if changeFeedPlanAvailable && m.changeFeed != nil {
+		m.changeFeed.planAvailable()
+		m.notifyReclamation(ReclamationChangeFeed)
 	}
 	if m.snapshotGC != nil {
 		marked, err := m.snapshotGC.markCheckpointOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
@@ -1146,6 +1202,9 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		m.recordSSTCleanup(cleanup)
 		if err != nil {
 			return false, fmt.Errorf("record SST retirement plan: %w", err)
+		}
+		if cleanup.TargetsPlanned > 0 {
+			m.notifyReclamation(ReclamationSST)
 		}
 	}
 

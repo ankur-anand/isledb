@@ -87,7 +87,10 @@ func TestChangeFeedReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
 		if buildErr != nil {
 			t.Fatal(buildErr)
 		}
-		plans[i] = candidatePlan{candidate: candidate, path: changeFeedDeletionPlanPath(store, plan.PlanID)}
+		plans[i] = candidatePlan{
+			candidate: candidate,
+			path:      changeFeedDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID),
+		}
 	}
 	sort.Slice(plans, func(i, j int) bool { return plans[i].path < plans[j].path })
 
@@ -124,8 +127,10 @@ func TestChangeFeedReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
 		opts:      changeFeedCleanerOptions{SweepBatchSize: 1},
 		planCache: newDeletionPlanCache[changeFeedDeletionPlan](),
 	}
-	if _, err := cleaner.runReclaimOnce(ctx); err == nil {
+	if _, schedule, err := cleaner.runScheduledReclaimOnce(ctx); err == nil {
 		t.Fatal("first pass did not report the unreadable plan")
+	} else if schedule.idle {
+		t.Fatal("failed change-feed reclamation pass reported itself idle")
 	}
 	if _, err := cleaner.runReclaimOnce(ctx); err != nil {
 		t.Fatalf("second pass did not continue past the unreadable plan: %v", err)
@@ -133,6 +138,126 @@ func TestChangeFeedReclaimerRetainsCursorAfterUnreadablePlan(t *testing.T) {
 	if _, _, err := store.Read(ctx, ready.candidate.Path); err == nil {
 		t.Fatalf("ready change-feed plan after scan boundary was starved across passes; target %q still exists",
 			ready.candidate.Path)
+	}
+}
+
+func TestChangeFeedPlanHandoffDoesNotWaitForBlockedReclaim(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("change-feed-plan-handoff-independent-of-reclaim")
+	defer store.Close()
+
+	currentPayload, err := manifest.EncodeCurrent(&manifest.Current{
+		LayoutVersion:      manifest.LayoutVersion,
+		NextEpoch:          1,
+		NextSeq:            3,
+		ChangeFeedEnabled:  true,
+		ChangeFeedLogStart: 2,
+		MaxPinnedViewAge:   time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("encode CURRENT: %v", err)
+	}
+	manifestLog := manifest.NewStoreWithStorage(&changeFeedReclaimerCurrentStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		current: currentPayload,
+	})
+
+	now := time.Now().UTC()
+	firstTarget := changeBatchDeleteCandidate{
+		Path: store.ChangeBatchPath("blocked-reclaim.chg"),
+		ID:   "blocked-reclaim.chg",
+		Seq:  0,
+		Size: 1,
+	}
+	if _, err := store.Write(ctx, firstTarget.Path, []byte("x")); err != nil {
+		t.Fatalf("write first change batch: %v", err)
+	}
+	firstPlan, firstPayload, err := buildDueChangeFeedDeletionPlanForTest(
+		store, []changeBatchDeleteCandidate{firstTarget}, 1, now, 0)
+	if err != nil {
+		t.Fatalf("build first deletion plan: %v", err)
+	}
+	if created, err := storeChangeFeedDeletionPlan(ctx, store, *firstPlan, firstPayload); err != nil || !created {
+		t.Fatalf("store first deletion plan created=%v error=%v", created, err)
+	}
+
+	cleaner := &changeFeedCleaner{
+		store:       store,
+		manifestLog: manifestLog,
+		opts: changeFeedCleanerOptions{
+			SweepBatchSize: 1,
+		},
+		planCache: newDeletionPlanCache[changeFeedDeletionPlan](),
+	}
+	blocked := &blockingObjectDeleter{started: make(chan struct{})}
+	reclaimCtx, cancelReclaim := context.WithCancel(ctx)
+	reclaimDone := make(chan error, 1)
+	go func() {
+		_, err := cleaner.runReclaimOnce(reclaimCtx, blocked)
+		reclaimDone <- err
+	}()
+	select {
+	case <-blocked.started:
+	case <-time.After(2 * time.Second):
+		cancelReclaim()
+		t.Fatal("change-feed reclamation did not reach the blocking delete")
+	}
+
+	secondTarget := changeBatchDeleteCandidate{
+		Path: store.ChangeBatchPath("new-handoff.chg"),
+		ID:   "new-handoff.chg",
+		Seq:  1,
+		Size: 1,
+	}
+	if _, err := store.Write(ctx, secondTarget.Path, []byte("y")); err != nil {
+		cancelReclaim()
+		<-reclaimDone
+		t.Fatalf("write second change batch: %v", err)
+	}
+	secondPlan, secondPayload, err := buildDueChangeFeedDeletionPlanForTest(
+		store, []changeBatchDeleteCandidate{secondTarget}, 2, now.Add(time.Second), 0)
+	if err != nil {
+		cancelReclaim()
+		<-reclaimDone
+		t.Fatalf("build second deletion plan: %v", err)
+	}
+	handoffDone := make(chan error, 1)
+	go func() {
+		_, err := storeChangeFeedDeletionPlan(ctx, store, *secondPlan, secondPayload)
+		if err == nil {
+			cleaner.planAvailable()
+		}
+		handoffDone <- err
+	}()
+
+	blockedControl := false
+	select {
+	case err := <-handoffDone:
+		if err != nil {
+			cancelReclaim()
+			<-reclaimDone
+			t.Fatalf("publish change-feed plan handoff: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		blockedControl = true
+	}
+
+	cancelReclaim()
+	select {
+	case <-reclaimDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked change-feed reclamation did not stop after cancellation")
+	}
+	if blockedControl {
+		select {
+		case err := <-handoffDone:
+			if err != nil {
+				t.Fatalf("publish change-feed handoff after reclaim cancellation: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("change-feed plan handoff remained blocked after reclaim cancellation")
+		}
+		t.Fatal("change-feed plan handoff blocked on an unrelated reclaim operation")
 	}
 }
 
@@ -458,7 +583,10 @@ func TestChangeFeedDeletionPlanReclaimerCarriesBudgetDeferredPlan(t *testing.T) 
 		if created, err := storeChangeFeedDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
 			t.Fatalf("store plan created=%v error=%v", created, err)
 		}
-		return builtPlan{plan: plan, path: changeFeedDeletionPlanPath(store, plan.PlanID)}
+		return builtPlan{
+			plan: plan,
+			path: changeFeedDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID),
+		}
 	}
 	left := buildPlan(candidates[:2])
 	right := buildPlan(candidates[2:])
@@ -784,11 +912,42 @@ func TestChangeFeedDeletionPlanIsIdempotentAndCorruptionFailsClosed(t *testing.T
 	if err != nil || !created {
 		t.Fatalf("first store created=%v error=%v", created, err)
 	}
+	planPath := changeFeedDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID)
+	if err := store.Delete(ctx, planPath); err != nil {
+		t.Fatalf("delete ready record before retry: %v", err)
+	}
+	created, err = storeChangeFeedDeletionPlan(ctx, store, *plan, payload)
+	if err != nil || !created {
+		t.Fatalf("ready repair created=%v error=%v", created, err)
+	}
+	requireObjectExists(t, ctx, store, planPath, true)
 	created, err = storeChangeFeedDeletionPlan(ctx, store, *plan, payload)
 	if err != nil || created {
 		t.Fatalf("idempotent store created=%v error=%v", created, err)
 	}
-	planPath := changeFeedDeletionPlanPath(store, plan.PlanID)
+	changedPlan, changedPayload, err := buildChangeFeedDeletionPlan(
+		store,
+		plan.Targets,
+		plan.TargetFloor,
+		now.Add(time.Hour),
+		2*time.Hour,
+		now.Add(2*time.Hour),
+		now.Add(3*time.Hour),
+		4*time.Hour,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("build changed-policy plan: %v", err)
+	}
+	created, err = storeChangeFeedDeletionPlan(ctx, store, *changedPlan, changedPayload)
+	if err != nil || created {
+		t.Fatalf("adopt existing plan under changed timing policy created=%v error=%v", created, err)
+	}
+	storedPlans, err := listChangeFeedDeletionPlans(ctx, store)
+	if err != nil || len(storedPlans) != 1 || storedPlans[0].Checksum != plan.Checksum ||
+		!storedPlans[0].NotBefore.Equal(plan.NotBefore) {
+		t.Fatalf("changed policy replaced first durable plan: plans=%+v error=%v", storedPlans, err)
+	}
 	if _, err := store.Write(ctx, planPath, []byte(`{"version":1}`)); err != nil {
 		t.Fatalf("corrupt plan: %v", err)
 	}

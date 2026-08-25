@@ -18,6 +18,7 @@ import (
 
 const (
 	changeFeedDeletionPlanPrefix           = "manifest/gc/change-feed/ready"
+	changeFeedDeletionPlanCanonicalPrefix  = "manifest/gc/change-feed/plans"
 	changeFeedDeletionPlanVersion          = 1
 	changeFeedDeletionPlanKind             = "change_feed_retention"
 	defaultChangeFeedSweepBatchSize        = 128
@@ -67,6 +68,7 @@ type changeFeedSweepStats struct {
 	PlansScanned    int
 	PlansDeleted    int
 	Deferred        int
+	NextDue         time.Time
 }
 
 func buildChangeFeedDeletionPlan(
@@ -160,8 +162,12 @@ func decodeChangeFeedDeletionPlan(store *blobstore.Store, planPath string, paylo
 	if err := validateChangeFeedDeletionPlan(store, plan); err != nil {
 		return changeFeedDeletionPlan{}, err
 	}
-	if planPath != changeFeedDeletionPlanPath(store, plan.PlanID) {
-		return changeFeedDeletionPlan{}, fmt.Errorf("change-feed deletion plan path mismatch %q", planPath)
+	if store != nil {
+		canonicalPath := changeFeedDeletionPlanCanonicalPath(store, plan.PlanID)
+		readyPath := changeFeedDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID)
+		if err := validateDeletionPlanObjectPath(planPath, canonicalPath, readyPath); err != nil {
+			return changeFeedDeletionPlan{}, fmt.Errorf("change-feed %w", err)
+		}
 	}
 	return plan, nil
 }
@@ -261,8 +267,12 @@ func changeFeedDeletionPlanChecksum(plan changeFeedDeletionPlan) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
-func changeFeedDeletionPlanPath(store *blobstore.Store, planID string) string {
-	return storeKey(store, changeFeedDeletionPlanPrefix, planID+".json")
+func changeFeedDeletionPlanCanonicalPath(store *blobstore.Store, planID string) string {
+	return storeKey(store, changeFeedDeletionPlanCanonicalPrefix, planID+".json")
+}
+
+func changeFeedDeletionPlanReadyPath(store *blobstore.Store, notBefore time.Time, planID string) string {
+	return storeKey(store, changeFeedDeletionPlanPrefix, deletionPlanReadyName(notBefore, planID))
 }
 
 func storeChangeFeedDeletionPlan(
@@ -271,37 +281,67 @@ func storeChangeFeedDeletionPlan(
 	plan changeFeedDeletionPlan,
 	payload []byte,
 ) (bool, error) {
-	path := changeFeedDeletionPlanPath(store, plan.PlanID)
-	decoded, err := decodeChangeFeedDeletionPlan(store, path, payload)
+	canonicalPath := changeFeedDeletionPlanCanonicalPath(store, plan.PlanID)
+	decoded, err := decodeChangeFeedDeletionPlan(store, canonicalPath, payload)
 	if err != nil {
 		return false, fmt.Errorf("validate change-feed deletion plan payload: %w", err)
 	}
 	if decoded.Checksum != plan.Checksum {
 		return false, errors.New("validate change-feed deletion plan payload: checksum mismatch")
 	}
-	if _, err := store.WriteIfNotExist(ctx, path, payload); err == nil {
+	storedPlan := decoded
+	storedPayload := payload
+	_, writeErr := store.WriteIfNotExist(ctx, canonicalPath, payload)
+	if writeErr != nil {
+		if !errors.Is(writeErr, blobstore.ErrPreconditionFailed) {
+			return false, writeErr
+		}
+		existingPayload, _, err := store.Read(ctx, canonicalPath)
+		if err != nil {
+			return false, err
+		}
+		existing, err := decodeChangeFeedDeletionPlan(store, canonicalPath, existingPayload)
+		if err != nil {
+			return false, err
+		}
+		if err := validateSameChangeFeedDeletionPlan(existing, plan); err != nil {
+			return false, err
+		}
+		storedPlan = existing
+		storedPayload = existingPayload
+	}
+
+	readyPath := changeFeedDeletionPlanReadyPath(store, storedPlan.NotBefore, storedPlan.PlanID)
+	if _, err := store.WriteIfNotExist(ctx, readyPath, storedPayload); err == nil {
 		return true, nil
 	} else if !errors.Is(err, blobstore.ErrPreconditionFailed) {
 		return false, err
 	}
-	existingPayload, _, err := store.Read(ctx, path)
+	existingReady, _, err := store.Read(ctx, readyPath)
 	if err != nil {
 		return false, err
 	}
-	existing, err := decodeChangeFeedDeletionPlan(store, path, existingPayload)
+	readyPlan, err := decodeChangeFeedDeletionPlan(store, readyPath, existingReady)
 	if err != nil {
 		return false, err
 	}
-	if existing.PlanID != plan.PlanID || existing.TargetFloor != plan.TargetFloor ||
-		existing.TargetCount != plan.TargetCount || existing.TargetBytes != plan.TargetBytes {
-		return false, fmt.Errorf("change-feed deletion plan collision id=%q", plan.PlanID)
-	}
-	for i := range existing.Targets {
-		if existing.Targets[i] != plan.Targets[i] {
-			return false, fmt.Errorf("change-feed deletion target collision id=%q index=%d", plan.PlanID, i)
-		}
+	if readyPlan.Checksum != storedPlan.Checksum {
+		return false, fmt.Errorf("change-feed deletion ready record collision id=%q", storedPlan.PlanID)
 	}
 	return false, nil
+}
+
+func validateSameChangeFeedDeletionPlan(existing, requested changeFeedDeletionPlan) error {
+	if existing.PlanID != requested.PlanID || existing.TargetFloor != requested.TargetFloor ||
+		existing.TargetCount != requested.TargetCount || existing.TargetBytes != requested.TargetBytes {
+		return fmt.Errorf("change-feed deletion plan collision id=%q", requested.PlanID)
+	}
+	for i := range existing.Targets {
+		if existing.Targets[i] != requested.Targets[i] {
+			return fmt.Errorf("change-feed deletion target collision id=%q index=%d", requested.PlanID, i)
+		}
+	}
+	return nil
 }
 
 func recordChangeFeedDeletionPlan(
@@ -407,14 +447,8 @@ func reclaimChangeFeedDeletionPlans(
 	if deleter == nil {
 		deleter = store
 	}
-	current, err := manifestLog.ReadCurrentData(ctx)
-	if err != nil {
-		return stats, false, reclamationCancellation(ctx, err) != nil, err
-	}
 	var retainedFloor uint64
-	if current != nil {
-		retainedFloor = current.ChangeFeedLogStart
-	}
+	retainedFloorLoaded := false
 	remaining := deleteBatchSize
 	var reclaimErr error
 	for stats.PlansScanned < scanLimit && remaining > 0 {
@@ -438,6 +472,33 @@ func reclaimChangeFeedDeletionPlans(
 			continue
 		}
 		stats.PlansScanned++
+		readyDeadline, _, pathErr := parseDeletionPlanReadyName(object.Key)
+		if pathErr != nil {
+			stats.Failed++
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("parse change-feed deletion plan path %q: %w", object.Key, pathErr))
+			continue
+		}
+		if now.Before(readyDeadline) {
+			stats.Deferred++
+			stats.NextDue = readyDeadline
+			if pendingPlanKey != nil {
+				*pendingPlanKey = object.Key
+			}
+			return stats, false, false, reclaimErr
+		}
+		if !retainedFloorLoaded {
+			current, err := manifestLog.ReadCurrentData(ctx)
+			if err != nil {
+				if pendingPlanKey != nil {
+					*pendingPlanKey = object.Key
+				}
+				return stats, false, false, errors.Join(reclaimErr, err)
+			}
+			if current != nil {
+				retainedFloor = current.ChangeFeedLogStart
+			}
+			retainedFloorLoaded = true
+		}
 		plan, ok := cache.get(object.Key)
 		if !ok {
 			payload, _, err := store.Read(ctx, object.Key)
@@ -459,10 +520,6 @@ func reclaimChangeFeedDeletionPlans(
 		}
 		if retainedFloor < plan.TargetFloor {
 			stats.BlockedRetained += len(plan.Targets)
-			continue
-		}
-		if now.Before(plan.NotBefore) {
-			stats.Deferred += len(plan.Targets)
 			continue
 		}
 		if len(plan.Targets) > remaining && stats.Attempted > 0 {
@@ -499,6 +556,15 @@ func reclaimChangeFeedDeletionPlans(
 			continue
 		}
 		stats.Deleted += len(keys)
+		canonicalPath := changeFeedDeletionPlanCanonicalPath(store, plan.PlanID)
+		if err := deleter.Delete(ctx, canonicalPath); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
+			}
+			stats.Failed++
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete canonical change-feed plan %q: %w", plan.PlanID, err))
+			continue
+		}
 		if err := deleter.Delete(ctx, object.Key); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				return stats, false, true, errors.Join(reclaimErr, cancelErr)
