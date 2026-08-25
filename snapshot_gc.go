@@ -113,13 +113,35 @@ func newSnapshotCleaner(store *blobstore.Store, manifestLog *manifest.Store, opt
 }
 
 func (c *snapshotCleaner) runOnce(ctx context.Context) (stats ManifestSnapshotCleanupStats, err error) {
+	stats, _, err = c.runScheduledOnce(ctx)
+	return stats, err
+}
+
+func (c *snapshotCleaner) runScheduledOnce(
+	ctx context.Context,
+) (stats ManifestSnapshotCleanupStats, schedule reclamationLaneSchedule, err error) {
+	now := c.opts.Now().UTC()
+	stats, err = c.runOnceAt(ctx, now)
+	c.mu.Lock()
+	schedule = reclamationLaneSchedule{
+		observedAt: now,
+		nextDue:    c.nextAudit,
+		idle:       err == nil && c.snapshotIter == nil && c.markerIter == nil,
+	}
+	c.mu.Unlock()
+	return stats, schedule, err
+}
+
+func (c *snapshotCleaner) runOnceAt(
+	ctx context.Context,
+	now time.Time,
+) (stats ManifestSnapshotCleanupStats, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
 	if err := checkContext(ctx); err != nil {
 		return stats, err
 	}
 
-	now := c.opts.Now().UTC()
 	c.mu.Lock()
 	doSweep := c.nextSweep.IsZero() || !now.Before(c.nextSweep)
 	doAudit := c.nextAudit.IsZero() || !now.Before(c.nextAudit)

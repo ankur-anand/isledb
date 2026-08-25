@@ -204,6 +204,11 @@ func normalizeCurrent(c *Current) {
 	if c.MaxPinnedViewAge == 0 {
 		c.MaxPinnedViewAge = DefaultMaxPinnedViewAge
 	}
+	for i := range c.IndexFrontier {
+		if c.IndexFrontier[i].Level > c.ManifestPageMaxLevel {
+			c.ManifestPageMaxLevel = c.IndexFrontier[i].Level
+		}
+	}
 	if !c.ChangeFeedEnabled && c.ChangeFeedLogStart == 0 {
 		c.ChangeFeedLogStart = c.LogSeqStart
 	}

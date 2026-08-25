@@ -62,12 +62,13 @@ type MaintenanceScheduling struct {
 }
 
 type CheckpointCommand struct {
-	Snapshot          ObjectRef  `json:"snapshot"`
-	BaseSnapshot      *ObjectRef `json:"base_snapshot,omitempty"`
-	BaseLogSeqStart   uint64     `json:"base_log_seq_start"`
-	SnapshotNextSeq   uint64     `json:"snapshot_next_seq"`
-	FoldedReplayPages uint64     `json:"folded_replay_pages"`
-	FoldedReplayBytes uint64     `json:"folded_replay_bytes"`
+	Snapshot                 ObjectRef  `json:"snapshot"`
+	BaseSnapshot             *ObjectRef `json:"base_snapshot,omitempty"`
+	BaseLogSeqStart          uint64     `json:"base_log_seq_start"`
+	SnapshotNextSeq          uint64     `json:"snapshot_next_seq"`
+	FoldedReplayPages        uint64     `json:"folded_replay_pages"`
+	FoldedReplayBytes        uint64     `json:"folded_replay_bytes"`
+	FoldedReplayMaxPageLevel uint8      `json:"folded_replay_max_page_level,omitempty"`
 }
 
 type CompactionCommand struct {

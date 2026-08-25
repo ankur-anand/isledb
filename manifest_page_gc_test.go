@@ -423,7 +423,7 @@ func TestManifestPageCleanerSpanningPageDoesNotEndListing(t *testing.T) {
 }
 
 func writeStandaloneManifestPage(
-	t *testing.T,
+	t testing.TB,
 	ctx context.Context,
 	store *blobstore.Store,
 	id string,
@@ -435,7 +435,7 @@ func writeStandaloneManifestPage(
 }
 
 func writeStandaloneManifestPageRange(
-	t *testing.T,
+	t testing.TB,
 	ctx context.Context,
 	store *blobstore.Store,
 	id string,
@@ -473,7 +473,7 @@ func writeStandaloneManifestPageRange(
 }
 
 func writeManifestFloorForPageCleanerTest(
-	t *testing.T,
+	t testing.TB,
 	ctx context.Context,
 	store *blobstore.Store,
 	floor uint64,

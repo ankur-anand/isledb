@@ -2,11 +2,69 @@ package manifest
 
 import (
 	"context"
+	"path"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
+
+func TestManifestPageObjectKeysOrderBySeqHi(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("manifest-page-key-order")
+	defer store.Close()
+	manifestStore := NewStore(store)
+	now := time.Now().UTC()
+	entries := func(lo, hi uint64) []ManifestLogEntry {
+		result := make([]ManifestLogEntry, 0, hi-lo+1)
+		for seq := lo; seq <= hi; seq++ {
+			result = append(result, ManifestLogEntry{Seq: seq})
+		}
+		return result
+	}
+
+	wideEntries := entries(0, 150)
+	wide, err := manifestStore.writeCommitPage(ctx, &CommitPage{
+		LayoutVersion: LayoutVersion,
+		PageType:      CommitPageTypeLeaf,
+		Level:         0,
+		SeqLo:         0,
+		SeqHi:         150,
+		Count:         uint32(len(wideEntries)),
+		Entries:       wideEntries,
+		CreatedAt:     now,
+	})
+	if err != nil {
+		t.Fatalf("write wide page: %v", err)
+	}
+	narrowEntries := entries(50, 80)
+	narrow, err := manifestStore.writeCommitPage(ctx, &CommitPage{
+		LayoutVersion: LayoutVersion,
+		PageType:      CommitPageTypeLeaf,
+		Level:         0,
+		SeqLo:         50,
+		SeqHi:         80,
+		Count:         uint32(len(narrowEntries)),
+		Entries:       narrowEntries,
+		CreatedAt:     now,
+	})
+	if err != nil {
+		t.Fatalf("write narrow page: %v", err)
+	}
+
+	wideName := strings.TrimSuffix(path.Base(wide.Path), ".page.zst")
+	narrowName := strings.TrimSuffix(path.Base(narrow.Path), ".page.zst")
+	if !strings.HasPrefix(wideName, "h00000000000000000150-l00000000000000000000-") {
+		t.Fatalf("wide page name=%q", wideName)
+	}
+	if !strings.HasPrefix(narrowName, "h00000000000000000080-l00000000000000000050-") {
+		t.Fatalf("narrow page name=%q", narrowName)
+	}
+	if narrow.Path >= wide.Path {
+		t.Fatalf("SeqHi ordering wrong: narrow=%q wide=%q", narrow.Path, wide.Path)
+	}
+}
 
 func TestIsPageReachableTraversesOnlyContainingBranch(t *testing.T) {
 	ctx := context.Background()

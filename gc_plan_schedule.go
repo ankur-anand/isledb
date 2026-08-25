@@ -23,6 +23,25 @@ type reclamationLaneSchedule struct {
 	idle       bool
 }
 
+func earlierReclamationDeadline(left, right time.Time) time.Time {
+	if left.IsZero() || (!right.IsZero() && right.Before(left)) {
+		return right
+	}
+	return left
+}
+
+func mergeReclamationLaneSchedules(left, right reclamationLaneSchedule) reclamationLaneSchedule {
+	observedAt := left.observedAt
+	if right.observedAt.After(observedAt) {
+		observedAt = right.observedAt
+	}
+	return reclamationLaneSchedule{
+		observedAt: observedAt,
+		nextDue:    earlierReclamationDeadline(left.nextDue, right.nextDue),
+		idle:       left.idle && right.idle,
+	}
+}
+
 func deletionPlanReadyName(notBefore time.Time, planID string) string {
 	return notBefore.UTC().Format(deletionPlanDeadlineLayout) + "-" + planID + ".json"
 }
