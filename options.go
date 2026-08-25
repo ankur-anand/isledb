@@ -14,8 +14,13 @@ const (
 )
 
 const (
-	defaultMaxKeyBytes   = 64 * 1024
-	defaultMaxValueBytes = 16 * 1024 * 1024
+	// Badger's skiplist stores the complete internal key length in a uint16.
+	// IsleDB appends an 8-byte sequence number before inserting a user key, so
+	// 65527 is the largest key that the memtable can represent without wrapping.
+	memtableSequenceSuffixBytes = 8
+	maxMemtableUserKeyBytes     = 1<<16 - 1 - memtableSequenceSuffixBytes
+	defaultMaxKeyBytes          = maxMemtableUserKeyBytes
+	defaultMaxValueBytes        = 16 * 1024 * 1024
 )
 
 type WriterOptions struct {
@@ -73,7 +78,8 @@ type WriterMaintenanceOptions struct {
 // ValueOptions controls writer key/value limits. Values are stored inline in
 // SSTs. Zero fields select defaults.
 type ValueOptions struct {
-	// MaxKeyBytes is the largest accepted key size.
+	// MaxKeyBytes is the largest accepted key size. It cannot exceed 65527
+	// bytes because the memtable appends an 8-byte sequence suffix to keys.
 	MaxKeyBytes int
 
 	// MaxValueBytes is the largest accepted value size.

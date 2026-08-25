@@ -204,6 +204,11 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, error) {
 	}
 	values.MaxKeyBytes = cmp.Or(values.MaxKeyBytes, vd.MaxKeyBytes)
 	values.MaxValueBytes = cmp.Or(values.MaxValueBytes, vd.MaxValueBytes)
+	if values.MaxKeyBytes > maxMemtableUserKeyBytes {
+		return WriterOptions{}, fmt.Errorf(
+			"%w: max_key_bytes=%d exceeds memtable key max=%d",
+			ErrInvalidWriterOptions, values.MaxKeyBytes, maxMemtableUserKeyBytes)
+	}
 	opts.Values = values
 
 	if err := validateMemtableArena(opts.Memtable.TargetBytes, values); err != nil {
