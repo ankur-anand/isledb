@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -20,7 +22,7 @@ import (
 
 const (
 	manifestPageObjectPrefix        = "manifest/pages"
-	manifestPageRetirementPrefix    = "manifest/gc/pages"
+	manifestPageRetirementPrefix    = "manifest/gc/page-marks"
 	manifestPageRetirementVersion   = 1
 	defaultManifestPageScanLimit    = 1024
 	defaultManifestPageMarkerLimit  = 1024
@@ -44,6 +46,7 @@ type manifestPageRetirementMark struct {
 
 type manifestPageCleanerOptions struct {
 	DeleteBatchSize  int
+	PlanScanLimit    int
 	PageScanLimit    int
 	MarkerScanLimit  int
 	SweepInterval    time.Duration
@@ -65,11 +68,23 @@ type manifestPageCleaner struct {
 	nextAudit  time.Time
 	pageIter   *blobstore.ListIterator
 	markerIter *blobstore.ListIterator
+
+	// Plan reclaim state is owned by the serialized manifest reclamation lane.
+	planIter        *blobstore.ListIterator
+	pendingPlanKey  string
+	activeReadyKey  string
+	activePlan      *manifestPageDeletionPlan
+	activePageLevel int
+	activePageIter  *blobstore.ListIterator
+	planCache       *boundedPlanCache[manifestPageDeletionPlan]
+	seenRescan      uint64
+	rescan          atomic.Uint64
 }
 
 func defaultManifestPageCleanerOptions() manifestPageCleanerOptions {
 	return manifestPageCleanerOptions{
 		DeleteBatchSize:  defaultSnapshotDeleteBatchSize,
+		PlanScanLimit:    defaultManifestPagePlanScanLimit,
 		PageScanLimit:    defaultManifestPageScanLimit,
 		MarkerScanLimit:  defaultManifestPageMarkerLimit,
 		SweepInterval:    defaultSnapshotSweepInterval,
@@ -84,6 +99,9 @@ func newManifestPageCleaner(store *blobstore.Store, manifestLog *manifest.Store,
 	defaults := defaultManifestPageCleanerOptions()
 	if opts.DeleteBatchSize <= 0 {
 		opts.DeleteBatchSize = defaults.DeleteBatchSize
+	}
+	if opts.PlanScanLimit <= 0 {
+		opts.PlanScanLimit = defaults.PlanScanLimit
 	}
 	if opts.PageScanLimit <= 0 {
 		opts.PageScanLimit = defaults.PageScanLimit
@@ -114,17 +132,61 @@ func newManifestPageCleaner(store *blobstore.Store, manifestLog *manifest.Store,
 	if deleter == nil {
 		deleter = store
 	}
-	return &manifestPageCleaner{store: store, manifestLog: manifestLog, opts: opts, delete: deleter}
+	return &manifestPageCleaner{
+		store: store, manifestLog: manifestLog, opts: opts, delete: deleter,
+		planCache: newDeletionPlanCache[manifestPageDeletionPlan](),
+	}
 }
 
 func (c *manifestPageCleaner) runOnce(ctx context.Context) (stats ManifestPageCleanupStats, err error) {
+	stats, _, err = c.runScheduledOnce(ctx)
+	return stats, err
+}
+
+func (c *manifestPageCleaner) runScheduledOnce(
+	ctx context.Context,
+) (stats ManifestPageCleanupStats, schedule reclamationLaneSchedule, err error) {
+	now := c.opts.Now().UTC()
+	stats, err = c.runOnceAt(ctx, now)
+
+	c.mu.Lock()
+	nextDue := c.nextAudit
+	pageIteratorActive := c.pageIter != nil
+	markerIteratorActive := c.markerIter != nil
+	c.mu.Unlock()
+	if c.pendingPlanKey != "" {
+		if deadline, _, parseErr := parseDeletionPlanReadyName(c.pendingPlanKey); parseErr == nil {
+			nextDue = earlierReclamationDeadline(nextDue, deadline)
+		}
+	}
+	planIteratorActive := c.activePlan != nil || (c.planIter != nil && c.pendingPlanKey == "")
+	schedule = reclamationLaneSchedule{
+		observedAt: now,
+		nextDue:    nextDue,
+		idle:       err == nil && !pageIteratorActive && !markerIteratorActive && !planIteratorActive,
+	}
+	return stats, schedule, err
+}
+
+func (c *manifestPageCleaner) runOnceAt(
+	ctx context.Context,
+	now time.Time,
+) (stats ManifestPageCleanupStats, err error) {
 	start := time.Now()
 	defer func() { stats.Duration = time.Since(start) }()
 	if err := checkContext(ctx); err != nil {
 		return stats, err
 	}
 
-	now := c.opts.Now().UTC()
+	plans, planErr := c.reclaimPlans(ctx, now)
+	mergeManifestPageCleanupStats(&stats, plans)
+	if planErr != nil {
+		if cancelErr := reclamationCancellation(ctx, planErr); cancelErr != nil {
+			return stats, fmt.Errorf("reclaim manifest page plans: %w", cancelErr)
+		}
+		stats.Failures++
+		err = errors.Join(err, fmt.Errorf("reclaim manifest page plans: %w", planErr))
+	}
 	c.mu.Lock()
 	doSweep := c.nextSweep.IsZero() || !now.Before(c.nextSweep)
 	doAudit := c.nextAudit.IsZero() || !now.Before(c.nextAudit)
@@ -132,6 +194,10 @@ func (c *manifestPageCleaner) runOnce(ctx context.Context) (stats ManifestPageCl
 		c.nextSweep = now.Add(c.opts.SweepInterval)
 	}
 	if doAudit {
+		// The audit is the fallback for malformed, skipped, or out-of-range page
+		// objects. Its liveness must not depend on the primary range-plan queue
+		// becoming empty: a continuous stream of future plans, or one stuck plan,
+		// must not suppress fallback discovery indefinitely.
 		c.nextAudit = now.Add(c.opts.OrphanAuditEvery)
 	}
 	c.mu.Unlock()
@@ -175,6 +241,7 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 	iter := c.pageIter
 	c.mu.Unlock()
 
+	floor, floorKnown := manifestPageRetentionFloor(current)
 	for stats.ObjectsScanned < c.opts.PageScanLimit {
 		object, err := iter.Next(ctx)
 		if errors.Is(err, io.EOF) {
@@ -193,10 +260,33 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 			continue
 		}
 		stats.ObjectsScanned++
-		level, ok := manifestPagePathLevel(c.store, object.Key)
+		hint, ok := manifestPageKeyHintFromPath(c.store, object.Key)
 		if !ok {
 			stats.Failures++
 			continue
+		}
+		if floorKnown && hint.HasRange && hint.SeqHi >= floor {
+			// The filename is only a negative filter. A key claiming that a page
+			// is still protected can at worst retain garbage; it can never
+			// authorize deletion.
+			stats.Protected++
+			continue
+		}
+		if floorKnown && hint.HasRange {
+			markerPath := manifestPageRetirementMarkerPath(c.store, object.Key)
+			if _, err := c.store.Attributes(ctx, markerPath); err == nil {
+				// A prior audit already downloaded and proved this candidate. The
+				// sweeper owns the fresh-CURRENT check before physical deletion.
+				stats.Protected++
+				continue
+			} else if !errors.Is(err, blobstore.ErrNotFound) {
+				if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+					c.resetPageIterator(iter)
+					return stats, cancelErr
+				}
+				stats.Failures++
+				continue
+			}
 		}
 		data, _, err := c.store.Read(ctx, object.Key)
 		if err != nil {
@@ -208,7 +298,8 @@ func (c *manifestPageCleaner) discover(ctx context.Context, now time.Time) (Mani
 			continue
 		}
 		candidate, _, err := manifest.InspectCommitPage(object.Key, data)
-		if err != nil || candidate.Level != level {
+		if err != nil || candidate.Level != hint.Level ||
+			(hint.HasRange && (candidate.SeqLo != hint.SeqLo || candidate.SeqHi != hint.SeqHi)) {
 			stats.Failures++
 			continue
 		}
@@ -488,12 +579,9 @@ func validateManifestPageRetirementMark(store *blobstore.Store, mark manifestPag
 }
 
 func manifestPageDeletionProven(current *manifest.Current, page manifest.PageRef) (bool, uint64) {
-	if current == nil {
+	floor, ok := manifestPageRetentionFloor(current)
+	if !ok {
 		return false, 0
-	}
-	floor := current.LogSeqStart
-	if current.ChangeFeedEnabled && current.ChangeFeedLogStart < floor {
-		floor = current.ChangeFeedLogStart
 	}
 	if floor > page.SeqHi {
 		return true, floor
@@ -523,6 +611,58 @@ func manifestPagePathLevel(store *blobstore.Store, objectPath string) (uint8, bo
 	return uint8(level), true
 }
 
+const manifestPageKeySequenceDigits = 20
+
+type manifestPageKeyHint struct {
+	Level    uint8
+	SeqLo    uint64
+	SeqHi    uint64
+	HasRange bool
+}
+
+// manifestPageKeyHintFromPath returns structural path information plus an
+// optional, untrusted sequence-range hint. Missing or legacy range encodings
+// deliberately fall back to the old full-object inspection path.
+func manifestPageKeyHintFromPath(store *blobstore.Store, objectPath string) (manifestPageKeyHint, bool) {
+	level, ok := manifestPagePathLevel(store, objectPath)
+	if !ok {
+		return manifestPageKeyHint{}, false
+	}
+	hint := manifestPageKeyHint{Level: level}
+	name := strings.TrimSuffix(path.Base(objectPath), ".page.zst")
+	const rangePrefixBytes = 1 + manifestPageKeySequenceDigits + 2 + manifestPageKeySequenceDigits + 1
+	if len(name) <= rangePrefixBytes || name[0] != 'h' ||
+		name[1+manifestPageKeySequenceDigits:1+manifestPageKeySequenceDigits+2] != "-l" ||
+		name[rangePrefixBytes-1] != '-' {
+		return hint, true
+	}
+	seqHiText := name[1 : 1+manifestPageKeySequenceDigits]
+	seqLoText := name[1+manifestPageKeySequenceDigits+2 : rangePrefixBytes-1]
+	seqHi, err := strconv.ParseUint(seqHiText, 10, 64)
+	if err != nil || fmt.Sprintf("%020d", seqHi) != seqHiText {
+		return hint, true
+	}
+	seqLo, err := strconv.ParseUint(seqLoText, 10, 64)
+	if err != nil || fmt.Sprintf("%020d", seqLo) != seqLoText || seqHi < seqLo {
+		return hint, true
+	}
+	hint.SeqLo = seqLo
+	hint.SeqHi = seqHi
+	hint.HasRange = true
+	return hint, true
+}
+
+func manifestPageRetentionFloor(current *manifest.Current) (uint64, bool) {
+	if current == nil {
+		return 0, false
+	}
+	floor := current.LogSeqStart
+	if current.ChangeFeedLogStart < floor {
+		floor = current.ChangeFeedLogStart
+	}
+	return floor, floor > 0
+}
+
 func (c *manifestPageCleaner) resetPageIterator(iter *blobstore.ListIterator) {
 	c.mu.Lock()
 	if c.pageIter == iter {
@@ -543,6 +683,9 @@ func mergeManifestPageCleanupStats(dst *ManifestPageCleanupStats, src ManifestPa
 	if dst == nil {
 		return
 	}
+	dst.PlansPrepared += src.PlansPrepared
+	dst.PlansScanned += src.PlansScanned
+	dst.PlansCompleted += src.PlansCompleted
 	dst.PagesMarked += src.PagesMarked
 	dst.PagesDeleted += src.PagesDeleted
 	dst.Protected += src.Protected

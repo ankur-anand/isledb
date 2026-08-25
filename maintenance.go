@@ -258,6 +258,9 @@ type ManifestSnapshotCleanupStats struct {
 // ManifestPageCleanupStats describes bounded page discovery, quarantine, and
 // physical reclamation.
 type ManifestPageCleanupStats struct {
+	PlansPrepared    int
+	PlansScanned     int
+	PlansCompleted   int
 	PagesMarked      int
 	PagesDeleted     int
 	Protected        int
@@ -480,6 +483,7 @@ func newMaintenance(
 		reclaimWake: map[ReclamationFamily]chan struct{}{
 			ReclamationSST:        make(chan struct{}, 1),
 			ReclamationChangeFeed: make(chan struct{}, 1),
+			ReclamationManifest:   make(chan struct{}, 1),
 		},
 		sstOutput: sstOutput,
 	}
@@ -951,16 +955,29 @@ func (m *Maintenance) runReclamationPass(
 		return stats, schedule, err
 	case ReclamationManifest:
 		var snapshotErr, pageErr error
+		schedule = reclamationLaneSchedule{idle: true}
 		if m.snapshotGC != nil {
-			stats.Manifest.Snapshots, snapshotErr = m.snapshotGC.runOnce(ctx)
+			var snapshotSchedule reclamationLaneSchedule
+			stats.Manifest.Snapshots, snapshotSchedule, snapshotErr = m.snapshotGC.runScheduledOnce(ctx)
+			schedule = mergeReclamationLaneSchedules(schedule, snapshotSchedule)
 			if cancelErr := reclamationCancellation(ctx, snapshotErr); cancelErr != nil {
-				return stats, reclamationLaneSchedule{observedAt: time.Now().UTC()}, cancelErr
+				schedule.idle = false
+				return stats, schedule, cancelErr
 			}
 		}
 		if m.pageGC != nil {
-			stats.Manifest.Pages, pageErr = m.pageGC.runOnce(ctx)
+			var pageSchedule reclamationLaneSchedule
+			stats.Manifest.Pages, pageSchedule, pageErr = m.pageGC.runScheduledOnce(ctx)
+			schedule = mergeReclamationLaneSchedules(schedule, pageSchedule)
 		}
-		return stats, reclamationLaneSchedule{observedAt: time.Now().UTC()}, errors.Join(snapshotErr, pageErr)
+		if schedule.observedAt.IsZero() {
+			schedule.observedAt = time.Now().UTC()
+		}
+		manifestErr := errors.Join(snapshotErr, pageErr)
+		if manifestErr != nil {
+			schedule.idle = false
+		}
+		return stats, schedule, manifestErr
 	default:
 		return stats, schedule, fmt.Errorf("unknown reclamation family %q", family)
 	}
@@ -1197,6 +1214,16 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 			m.recordManifestSnapshotMarked()
 		}
 	}
+	if m.pageGC != nil {
+		cleanup, err := m.pageGC.markCommandOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
+		m.recordManifestPageCleanup(cleanup)
+		if err != nil {
+			return false, fmt.Errorf("record manifest page retirement plan: %w", err)
+		}
+		if cleanup.PlansPrepared > 0 {
+			m.notifyReclamation(ReclamationManifest)
+		}
+	}
 	if m.sstGC != nil {
 		cleanup, err := m.sstGC.markCommandOutcome(ctx, current, head.Pending, current.MaintenanceReceipt)
 		m.recordSSTCleanup(cleanup)
@@ -1364,4 +1391,12 @@ func (m *Maintenance) recordManifestSnapshotMarked() {
 		m.currentStats.ManifestCleanup.Snapshots.SnapshotsMarked++
 	}
 	m.statsMu.Unlock()
+}
+
+func (m *Maintenance) recordManifestPageCleanup(stats ManifestPageCleanupStats) {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if m.currentStats != nil {
+		mergeManifestPageCleanupStats(&m.currentStats.ManifestCleanup.Pages, stats)
+	}
 }

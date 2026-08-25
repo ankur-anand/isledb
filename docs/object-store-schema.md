@@ -23,14 +23,22 @@ demo/p000/
         <page-id>.page.zst
       ...
     gc/
+      sst/plans/
+        <plan-id>.json
       sst/ready/
+        <not-before>-<plan-id>.json
+      change-feed/plans/
         <plan-id>.json
       change-feed/ready/
-        <plan-id>.json
+        <not-before>-<plan-id>.json
       snapshots/
         <snapshot-path-hash>.json
-      pages/
+      page-marks/
         <page-path-hash>.json
+      pages/plans/
+        <plan-id>.json
+      pages/ready/
+        <not-before>-<plan-id>.json
   maintenance/
     HEAD
   sstable/
@@ -131,7 +139,7 @@ manifest history in `CURRENT`.
 
 ```text
 manifest/snapshots/<id>.manifest.zst
-manifest/pages/l<level>/<page-id>.page.zst
+manifest/pages/l<level>/h<seq-hi>-l<seq-lo>-<id>.page.zst
 ```
 
 Both object types are immutable. They use a versioned `ISLM` envelope around a
@@ -148,6 +156,12 @@ The current decoder limits are:
 Level `l00` pages contain committed manifest entries. Higher levels contain
 references to lower-level pages. This hierarchy keeps `CURRENT` bounded as
 history grows.
+
+Page keys put the zero-padded `SeqHi` first because physical reclamation asks
+whether a complete page ends below the retained manifest floor. Listing one
+level therefore visits reclaimable ranges before protected ranges. The key is
+only a conservative listing hint: maintenance downloads and validates every
+page selected for deletion before removing it.
 
 These objects are implementation-managed metadata. Operators should copy them
 during backup, but should not decode, rewrite, rename, or delete them manually.
@@ -237,20 +251,39 @@ The JSON objects below `manifest/gc/` are durable deletion work, not user data
 and not temporary files:
 
 ```text
-manifest/gc/sst/ready/<plan-id>.json
-manifest/gc/change-feed/ready/<plan-id>.json
+manifest/gc/sst/plans/<plan-id>.json
+manifest/gc/sst/ready/<not-before>-<plan-id>.json
+manifest/gc/change-feed/plans/<plan-id>.json
+manifest/gc/change-feed/ready/<not-before>-<plan-id>.json
 manifest/gc/snapshots/<snapshot-path-hash>.json
-manifest/gc/pages/<page-path-hash>.json
+manifest/gc/page-marks/<page-path-hash>.json
+manifest/gc/pages/plans/<plan-id>.json
+manifest/gc/pages/ready/<not-before>-<plan-id>.json
 ```
 
+SST, change-feed, and normal manifest-page handoffs use two immutable records. The hash-keyed `plans/`
+record is the canonical retry anchor: reconciliation of the same receipt adopts
+the first durable deadline instead of creating new work. The `ready/` record
+contains the same validated plan under a fixed-width UTC `NotBefore` prefix.
+Lexicographic listing therefore visits due plans first and stops before fetching
+the first future plan. Both records are removed after target deletion succeeds.
+
 SST and change-feed plans contain bounded lists of exact deletion targets.
-Snapshot and page records track one candidate each. The records carry safety
-deadlines so slow physical deletion cannot race readers holding an older,
-still-valid view.
+Manifest-page plans contain a retained sequence floor and maximum page level,
+so one constant-sized record can retire any number of pages folded by a
+checkpoint. Reclamation re-reads `CURRENT`, rejects a regressed floor, validates
+each selected page object, and only then deletes it. `page-marks/` remains the
+low-frequency orphan-audit fallback for pages that were uploaded but never
+became visible. All records carry safety deadlines so slow physical deletion
+cannot race readers holding an older, still-valid view.
 
 Each reclaim lane progresses independently. A slow SST delete does not prevent
 change-feed or metadata cleanup from making progress, and deletion does not
-block ordinary reads and writes.
+block ordinary reads and writes. Publishing a new deletion plan signals its
+lane without mutating lane-owned iterator state, so it also cannot block
+compaction or checkpoint reconciliation behind object-store deletion. Empty
+lanes and repeated failures back off to a bounded safety scan; a newly durable
+plan wakes its lane promptly.
 
 Do not delete GC records manually. Removing a record before its targets are
 deleted can leave unreachable data in the bucket indefinitely.

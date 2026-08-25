@@ -53,6 +53,7 @@ func (c *Current) Clone() *Current {
 		ChangeFeedLogStart:   c.ChangeFeedLogStart,
 		StateReplayPages:     c.StateReplayPages,
 		StateReplayBytes:     c.StateReplayBytes,
+		ManifestPageMaxLevel: c.ManifestPageMaxLevel,
 		MaxPinnedViewAge:     c.MaxPinnedViewAge,
 		WriterFence:          c.WriterFence.Clone(),
 		CompactorFence:       c.CompactorFence.Clone(),

@@ -76,11 +76,13 @@ func (s *pageCASConflictStorage) snapshotReads() int {
 }
 
 func TestCurrentClonePreservesStateReplayAccounting(t *testing.T) {
-	current := &Current{StateReplayPages: 17, StateReplayBytes: 4096}
+	current := &Current{StateReplayPages: 17, StateReplayBytes: 4096, ManifestPageMaxLevel: 3}
 	clone := current.Clone()
-	if clone.StateReplayPages != current.StateReplayPages || clone.StateReplayBytes != current.StateReplayBytes {
-		t.Fatalf("clone replay accounting=(%d pages, %d bytes), want (%d pages, %d bytes)",
-			clone.StateReplayPages, clone.StateReplayBytes, current.StateReplayPages, current.StateReplayBytes)
+	if clone.StateReplayPages != current.StateReplayPages || clone.StateReplayBytes != current.StateReplayBytes ||
+		clone.ManifestPageMaxLevel != current.ManifestPageMaxLevel {
+		t.Fatalf("clone replay accounting=(%d pages, %d bytes, max level %d), want (%d pages, %d bytes, max level %d)",
+			clone.StateReplayPages, clone.StateReplayBytes, clone.ManifestPageMaxLevel,
+			current.StateReplayPages, current.StateReplayBytes, current.ManifestPageMaxLevel)
 	}
 }
 
@@ -157,6 +159,9 @@ func TestStateReplayAccountingIncludesPromotedIndexPage(t *testing.T) {
 	}
 	if current.StateReplayPages != uint64(defaultPageFanout+1) {
 		t.Fatalf("StateReplayPages=%d, want %d", current.StateReplayPages, defaultPageFanout+1)
+	}
+	if current.ManifestPageMaxLevel != 1 {
+		t.Fatalf("ManifestPageMaxLevel=%d, want 1", current.ManifestPageMaxLevel)
 	}
 	wantBytes := leafBytes + current.IndexFrontier[0].EncodedBytes
 	if current.StateReplayBytes != wantBytes {

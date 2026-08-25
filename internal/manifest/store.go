@@ -1034,6 +1034,9 @@ func addStateReplayPage(current *Current, ref PageRef) error {
 	}
 	current.StateReplayPages++
 	current.StateReplayBytes += ref.EncodedBytes
+	if ref.Level > current.ManifestPageMaxLevel {
+		current.ManifestPageMaxLevel = ref.Level
+	}
 	return nil
 }
 
@@ -1092,7 +1095,11 @@ func (s *Store) writeCommitPage(ctx context.Context, page *CommitPage) (PageRef,
 	if err != nil {
 		return PageRef{}, err
 	}
-	id := fmt.Sprintf("%020d-%020d-%s", page.SeqLo, page.SeqHi, ksuid.New().String())
+	// Page reclamation is ordered by the complete-page death predicate
+	// SeqHi < retained floor. Readers navigate pages through exact PageRefs and
+	// never depend on listing order, so put SeqHi first and label both fields to
+	// make lifecycle scans cheap without making the filename authoritative.
+	id := fmt.Sprintf("h%020d-l%020d-%s", page.SeqHi, page.SeqLo, ksuid.New().String())
 	path, err := pages.WritePage(ctx, page.Level, id, data)
 	if err != nil {
 		return PageRef{}, err
@@ -1698,13 +1705,24 @@ func (s *Store) PrepareCheckpoint(ctx context.Context) (CheckpointCommand, error
 		return CheckpointCommand{}, err
 	}
 	return CheckpointCommand{
-		Snapshot:          snapshot,
-		BaseSnapshot:      current.Snapshot.Clone(),
-		BaseLogSeqStart:   current.LogSeqStart,
-		SnapshotNextSeq:   current.NextSeq,
-		FoldedReplayPages: current.StateReplayPages,
-		FoldedReplayBytes: current.StateReplayBytes,
+		Snapshot:                 snapshot,
+		BaseSnapshot:             current.Snapshot.Clone(),
+		BaseLogSeqStart:          current.LogSeqStart,
+		SnapshotNextSeq:          current.NextSeq,
+		FoldedReplayPages:        current.StateReplayPages,
+		FoldedReplayBytes:        current.StateReplayBytes,
+		FoldedReplayMaxPageLevel: maxManifestPageLevel(current.IndexFrontier),
 	}, nil
+}
+
+func maxManifestPageLevel(refs []PageRef) uint8 {
+	var maximum uint8
+	for i := range refs {
+		if refs[i].Level > maximum {
+			maximum = refs[i].Level
+		}
+	}
+	return maximum
 }
 
 func filterEntriesAtOrAfter(entries []ManifestLogEntry, floor uint64) []ManifestLogEntry {

@@ -122,12 +122,13 @@ type Current struct {
 	NextSeq       uint64     `json:"next_seq"`
 	NextEpoch     uint64     `json:"next_epoch"`
 
-	ChangeFeedEnabled  bool              `json:"change_feed_enabled,omitempty"`
-	ChangeFeedPayload  ChangeFeedPayload `json:"change_feed_payload,omitempty"`
-	ChangeFeedLogStart uint64            `json:"change_feed_log_start,omitempty"`
-	StateReplayPages   uint64            `json:"state_replay_pages,omitempty"`
-	StateReplayBytes   uint64            `json:"state_replay_bytes,omitempty"`
-	MaxPinnedViewAge   time.Duration     `json:"max_pinned_view_age_nanos"`
+	ChangeFeedEnabled    bool              `json:"change_feed_enabled,omitempty"`
+	ChangeFeedPayload    ChangeFeedPayload `json:"change_feed_payload,omitempty"`
+	ChangeFeedLogStart   uint64            `json:"change_feed_log_start,omitempty"`
+	StateReplayPages     uint64            `json:"state_replay_pages,omitempty"`
+	StateReplayBytes     uint64            `json:"state_replay_bytes,omitempty"`
+	ManifestPageMaxLevel uint8             `json:"manifest_page_max_level,omitempty"`
+	MaxPinnedViewAge     time.Duration     `json:"max_pinned_view_age_nanos"`
 
 	ActiveEntries []ManifestLogEntry `json:"active_entries,omitempty"`
 	IndexFrontier []PageRef          `json:"index_frontier,omitempty"`
