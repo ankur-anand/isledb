@@ -867,7 +867,7 @@ func (m *Maintenance) runReclamationLoop(ctx context.Context, family Reclamation
 			m.reportReclamationCycle(stats)
 		}
 
-		delay := interval
+		var delay time.Duration
 		if err == nil {
 			errorDelay = interval
 			delay, idleDelay = nextReclamationDelay(
