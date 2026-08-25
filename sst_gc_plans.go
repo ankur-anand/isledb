@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -18,6 +18,7 @@ import (
 
 const (
 	sstDeletionPlanPrefix           = "manifest/gc/sst/ready"
+	sstDeletionPlanCanonicalPrefix  = "manifest/gc/sst/plans"
 	sstDeletionPlanVersion          = 1
 	sstDeletionPlanKind             = "sst_retirement"
 	defaultSSTDeletionPlanScanLimit = 1024
@@ -35,6 +36,7 @@ type sstCleanupWorkStats struct {
 	PlansScanned   int
 	PlansDeleted   int
 	Deferred       int
+	NextDue        time.Time
 }
 
 type sstDeletionPlanSource struct {
@@ -83,10 +85,17 @@ type sstCleaner struct {
 	opts   sstCleanerOptions
 	delete objectDeleter
 
-	mu             sync.Mutex
+	// Reclaim passes are serialized by Maintenance.reclaimGates. The iterator,
+	// carry, cache, and seen generation are therefore owned by that lane.
 	planIter       *blobstore.ListIterator
 	pendingPlanKey string
 	cache          *boundedPlanCache[sstDeletionPlan]
+	seenRescan     uint64
+
+	// Control work only signals that a durable plan may have changed the first
+	// ready key. It never waits for reclaim-lane network I/O. Missing or
+	// coalescing this optimization is safe because periodic scans remain.
+	rescan atomic.Uint64
 }
 
 func defaultSSTCleanerOptions() sstCleanerOptions {
@@ -157,6 +166,7 @@ func (c *sstCleaner) markCommandOutcome(
 	if err != nil {
 		return stats, err
 	}
+	c.planAvailable()
 	if created {
 		stats.PlansPrepared = 1
 	}
@@ -272,8 +282,12 @@ func decodeSSTDeletionPlan(store *blobstore.Store, planPath string, payload []by
 	if err := validateSSTDeletionPlan(store, plan); err != nil {
 		return sstDeletionPlan{}, err
 	}
-	if store != nil && planPath != sstDeletionPlanPath(store, plan.PlanID) {
-		return sstDeletionPlan{}, fmt.Errorf("SST deletion plan path mismatch %q", planPath)
+	if store != nil {
+		canonicalPath := sstDeletionPlanCanonicalPath(store, plan.PlanID)
+		readyPath := sstDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID)
+		if err := validateDeletionPlanObjectPath(planPath, canonicalPath, readyPath); err != nil {
+			return sstDeletionPlan{}, fmt.Errorf("SST %w", err)
+		}
 	}
 	return plan, nil
 }
@@ -368,65 +382,125 @@ func sstDeletionPlanChecksum(plan sstDeletionPlan) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
-func sstDeletionPlanPath(store *blobstore.Store, planID string) string {
-	return storeKey(store, sstDeletionPlanPrefix, planID+".json")
+func sstDeletionPlanCanonicalPath(store *blobstore.Store, planID string) string {
+	return storeKey(store, sstDeletionPlanCanonicalPrefix, planID+".json")
+}
+
+func sstDeletionPlanReadyPath(store *blobstore.Store, notBefore time.Time, planID string) string {
+	return storeKey(store, sstDeletionPlanPrefix, deletionPlanReadyName(notBefore, planID))
 }
 
 func storeSSTDeletionPlan(ctx context.Context, store *blobstore.Store, plan sstDeletionPlan, payload []byte) (bool, error) {
-	path := sstDeletionPlanPath(store, plan.PlanID)
-	encoded, err := decodeSSTDeletionPlan(store, path, payload)
+	canonicalPath := sstDeletionPlanCanonicalPath(store, plan.PlanID)
+	encoded, err := decodeSSTDeletionPlan(store, canonicalPath, payload)
 	if err != nil {
 		return false, fmt.Errorf("validate SST deletion plan payload: %w", err)
 	}
 	if encoded.Checksum != plan.Checksum {
 		return false, fmt.Errorf("SST deletion plan payload mismatch id=%q", plan.PlanID)
 	}
-	if _, err := store.WriteIfNotExist(ctx, path, payload); err == nil {
+
+	storedPlan := encoded
+	storedPayload := payload
+	_, writeErr := store.WriteIfNotExist(ctx, canonicalPath, payload)
+	if writeErr != nil {
+		if !errors.Is(writeErr, blobstore.ErrPreconditionFailed) {
+			return false, writeErr
+		}
+		existingPayload, _, err := store.Read(ctx, canonicalPath)
+		if err != nil {
+			return false, err
+		}
+		existing, err := decodeSSTDeletionPlan(store, canonicalPath, existingPayload)
+		if err != nil {
+			return false, fmt.Errorf("validate existing SST deletion plan: %w", err)
+		}
+		if err := validateSameSSTDeletionPlan(existing, plan); err != nil {
+			return false, err
+		}
+		// The first durable observation owns NotBefore. A reconciliation retry
+		// adopts it instead of extending the grace window or creating another
+		// deadline-addressed ready record.
+		storedPlan = existing
+		storedPayload = existingPayload
+	}
+
+	readyPath := sstDeletionPlanReadyPath(store, storedPlan.NotBefore, storedPlan.PlanID)
+	if _, err := store.WriteIfNotExist(ctx, readyPath, storedPayload); err == nil {
 		return true, nil
 	} else if !errors.Is(err, blobstore.ErrPreconditionFailed) {
 		return false, err
 	}
-
-	existingPayload, _, err := store.Read(ctx, path)
+	existingReady, _, err := store.Read(ctx, readyPath)
 	if err != nil {
 		return false, err
 	}
-	existing, err := decodeSSTDeletionPlan(store, path, existingPayload)
+	readyPlan, err := decodeSSTDeletionPlan(store, readyPath, existingReady)
 	if err != nil {
-		return false, fmt.Errorf("validate existing SST deletion plan: %w", err)
+		return false, fmt.Errorf("validate existing SST deletion ready record: %w", err)
 	}
-	if existing.PlanID != plan.PlanID || existing.Source != plan.Source || !existing.AppliedAt.Equal(plan.AppliedAt) ||
-		existing.PinnedViewAge != plan.PinnedViewAge || existing.SafetyMargin != plan.SafetyMargin ||
-		existing.TargetCount != plan.TargetCount || existing.TargetBytes != plan.TargetBytes {
-		return false, fmt.Errorf("SST deletion plan collision id=%q", plan.PlanID)
-	}
-	for i := range existing.Targets {
-		if existing.Targets[i] != plan.Targets[i] {
-			return false, fmt.Errorf("SST deletion plan target collision id=%q index=%d", plan.PlanID, i)
-		}
+	if readyPlan.Checksum != storedPlan.Checksum {
+		return false, fmt.Errorf("SST deletion ready record collision id=%q", storedPlan.PlanID)
 	}
 	return false, nil
 }
 
-func (c *sstCleaner) runOnce(ctx context.Context) (sstCleanupWorkStats, error) {
-	if err := checkContext(ctx); err != nil {
-		return sstCleanupWorkStats{}, err
+func validateSameSSTDeletionPlan(existing, requested sstDeletionPlan) error {
+	if existing.PlanID != requested.PlanID || existing.Source != requested.Source ||
+		!existing.AppliedAt.Equal(requested.AppliedAt) ||
+		existing.TargetCount != requested.TargetCount || existing.TargetBytes != requested.TargetBytes {
+		return fmt.Errorf("SST deletion plan collision id=%q", requested.PlanID)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for i := range existing.Targets {
+		if existing.Targets[i] != requested.Targets[i] {
+			return fmt.Errorf("SST deletion plan target collision id=%q index=%d", requested.PlanID, i)
+		}
+	}
+	return nil
+}
+
+func (c *sstCleaner) runOnce(ctx context.Context) (sstCleanupWorkStats, error) {
+	stats, _, err := c.runScheduledOnce(ctx)
+	return stats, err
+}
+
+func (c *sstCleaner) runScheduledOnce(
+	ctx context.Context,
+) (sstCleanupWorkStats, reclamationLaneSchedule, error) {
+	if err := checkContext(ctx); err != nil {
+		return sstCleanupWorkStats{}, reclamationLaneSchedule{}, err
+	}
+	if generation := c.rescan.Load(); generation != c.seenRescan {
+		c.seenRescan = generation
+		c.planIter = nil
+		c.pendingPlanKey = ""
+	}
 	if c.planIter == nil {
 		c.planIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"})
 	}
+	passNow := c.opts.Now().UTC()
 	stats, exhausted, restartIterator, err := reclaimSSTDeletionPlans(
 		ctx, c.store, c.delete, c.opts.DeleteBatchSize, c.opts.PlanScanLimit,
-		c.opts.Now().UTC(), c.planIter, c.cache, &c.pendingPlanKey)
+		passNow, c.planIter, c.cache, &c.pendingPlanKey)
 	if exhausted || restartIterator {
 		c.planIter = nil
 	}
 	if exhausted {
 		c.pendingPlanKey = ""
 	}
-	return stats, err
+	schedule := reclamationLaneSchedule{
+		observedAt: c.opts.Now().UTC(),
+		nextDue:    stats.NextDue,
+		idle:       err == nil && exhausted && stats.NextDue.IsZero(),
+	}
+	return stats, schedule, err
+}
+
+func (c *sstCleaner) planAvailable() {
+	if c == nil {
+		return
+	}
+	c.rescan.Add(1)
 }
 
 func runSSTDeletionPlanReclaimer(
@@ -493,6 +567,22 @@ func reclaimSSTDeletionPlans(
 			continue
 		}
 		stats.PlansScanned++
+		readyDeadline, _, pathErr := parseDeletionPlanReadyName(object.Key)
+		if pathErr != nil {
+			stats.Failed++
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("parse SST deletion plan path %q: %w", object.Key, pathErr))
+			continue
+		}
+		if now.Before(readyDeadline) {
+			stats.Deferred++
+			stats.NextDue = readyDeadline
+			if pendingPlanKey != nil {
+				*pendingPlanKey = object.Key
+			}
+			// Ready-record names are ordered by NotBefore. Every valid key after
+			// this one is also in the future, so no payload GET is necessary.
+			return stats, false, false, reclaimErr
+		}
 		plan, ok := cache.get(object.Key)
 		if !ok {
 			payload, _, err := store.Read(ctx, object.Key)
@@ -511,10 +601,6 @@ func reclaimSSTDeletionPlans(
 				continue
 			}
 			cache.put(object.Key, plan, len(payload))
-		}
-		if now.Before(plan.NotBefore) {
-			stats.Deferred++
-			continue
 		}
 		if len(plan.Targets) > remaining && stats.Attempted > 0 {
 			stats.Deferred++
@@ -551,6 +637,15 @@ func reclaimSSTDeletionPlans(
 			continue
 		}
 		stats.Deleted += len(keys)
+		canonicalPath := sstDeletionPlanCanonicalPath(store, plan.PlanID)
+		if err := deleteObjects.Delete(ctx, canonicalPath); err != nil {
+			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+				return stats, false, true, errors.Join(reclaimErr, cancelErr)
+			}
+			stats.Failed++
+			reclaimErr = errors.Join(reclaimErr, fmt.Errorf("delete canonical SST plan %q: %w", plan.PlanID, err))
+			continue
+		}
 		if err := deleteObjects.Delete(ctx, object.Key); err != nil {
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				return stats, false, true, errors.Join(reclaimErr, cancelErr)
