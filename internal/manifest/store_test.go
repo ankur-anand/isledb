@@ -1798,7 +1798,7 @@ func TestStoreRejectsFixedCurrentMetadataLargerThanLimit(t *testing.T) {
 	ms := NewStore(store)
 	ms.maxCurrentBytes = 1
 	current := &Current{NextSeq: 1, NextEpoch: 1}
-	if err := ms.rotateActiveEntriesForCurrentSize(ctx, current); !errors.Is(err, ErrCurrentTooLarge) {
+	if _, err := ms.encodeCurrentForCASWithRotation(ctx, current); !errors.Is(err, ErrCurrentTooLarge) {
 		t.Fatalf("rotate error=%v, want %v", err, ErrCurrentTooLarge)
 	}
 }

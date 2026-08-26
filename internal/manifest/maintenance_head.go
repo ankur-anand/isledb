@@ -448,10 +448,11 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 		if status == MaintenanceStatusApplied {
 			advanceMaintenanceScheduler(updated, &command)
 		}
-		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
+		data, err := s.encodeCurrentForCASWithRotation(ctx, updated)
+		if err != nil {
 			return MaintenanceApplyResult{}, err
 		}
-		if err := s.writeCurrentWithCAS(ctx, updated, etag); err != nil {
+		if err := s.writeEncodedCurrentWithCAS(ctx, updated, data, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
 				if attempt+1 < currentCASMaxRetries {
 					if err := sleepBeforeCurrentCASRetry(ctx, attempt); err != nil {

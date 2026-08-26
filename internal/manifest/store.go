@@ -520,11 +520,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			}
 			updated.LastWriterCommit = writerMarker
 		}
-		if err := s.rotateActiveEntriesForCurrentSize(ctx, updated); err != nil {
-			return err
-		}
-
-		data, err := s.encodeCurrentForCAS(updated)
+		data, err := s.encodeCurrentForCASWithRotation(ctx, updated)
 		if err != nil {
 			return err
 		}
@@ -936,43 +932,20 @@ func (s *Store) currentByteLimit() int {
 	return s.maxCurrentBytes
 }
 
-// rotateActiveEntriesForCurrentSize moves the active tail into the immutable
-// page tree when CURRENT crosses its byte limit. Entry count remains the
-// normal rollover trigger; this guards variable-sized manifest entries.
-func (s *Store) rotateActiveEntriesForCurrentSize(ctx context.Context, current *Current) error {
-	if current == nil {
-		return nil
+// encodeCurrentForCASWithRotation encodes CURRENT once for both its byte-limit
+// check and the CAS write. If it is oversized, the active tail is rotated into
+// the immutable page tree and only the resulting CURRENT is encoded again.
+// Entry count remains the normal rollover trigger; this guards variable-sized
+// manifest entries.
+func (s *Store) encodeCurrentForCASWithRotation(ctx context.Context, current *Current) ([]byte, error) {
+	data, err := s.encodeCurrentForCAS(current)
+	if err == nil || !errors.Is(err, ErrCurrentTooLarge) || current == nil || len(current.ActiveEntries) == 0 {
+		return data, err
 	}
-	size, err := encodedCurrentSize(current)
-	if err != nil {
-		return err
+	if err := s.rotateActiveEntries(ctx, current); err != nil {
+		return nil, err
 	}
-	limit := s.currentByteLimit()
-	if size <= limit {
-		return nil
-	}
-
-	if len(current.ActiveEntries) > 0 {
-		if err := s.rotateActiveEntries(ctx, current); err != nil {
-			return err
-		}
-		size, err = encodedCurrentSize(current)
-		if err != nil {
-			return err
-		}
-	}
-	if size > limit {
-		return fmt.Errorf("%w: size=%d limit=%d", ErrCurrentTooLarge, size, limit)
-	}
-	return nil
-}
-
-func encodedCurrentSize(current *Current) (int, error) {
-	data, err := EncodeCurrent(current)
-	if err != nil {
-		return 0, err
-	}
-	return len(data), nil
+	return s.encodeCurrentForCAS(current)
 }
 
 func (s *Store) rotateActiveEntries(ctx context.Context, current *Current) error {
