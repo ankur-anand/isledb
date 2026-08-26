@@ -2,6 +2,7 @@ package isledb
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -208,6 +209,28 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 	}
 }
 
+func TestTTL_WriterRejectsNegativeTTL(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("ttl-negative")
+	defer store.Close()
+
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	if err := w.putWithTTL(ctx, []byte("negative"), []byte("value"), -time.Nanosecond); !errors.Is(err, ErrInvalidMutation) {
+		t.Fatalf("negative TTL error=%v, want %v", err, ErrInvalidMutation)
+	}
+	if !w.memtable.Empty() {
+		t.Fatal("negative-TTL put mutated the memtable")
+	}
+	if err := w.putWithTTL(ctx, []byte("permanent"), []byte("value"), 0); err != nil {
+		t.Fatalf("zero TTL: %v", err)
+	}
+}
+
 func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")
@@ -330,7 +353,7 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	}
 }
 
-func TestTTL_ExpiredEntryDoesNotShadowOlder(t *testing.T) {
+func TestTTL_ExpiredEntryShadowsOlder(t *testing.T) {
 
 	ctx := context.Background()
 	store := blobstore.NewMemory("")

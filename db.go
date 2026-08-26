@@ -122,7 +122,8 @@ func (w *Writer) Put(ctx context.Context, key, value []byte) error {
 
 // PutWithTTL writes a key-value pair with a time-to-live duration.
 //
-// ttl <= 0 means no expiration. Expired values are filtered by readers.
+// A zero ttl means no expiration. A negative ttl is rejected with
+// ErrInvalidMutation. Expired values are filtered by readers.
 func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error {
 	return w.w.putWithTTL(ctx, key, value, ttl)
 }
