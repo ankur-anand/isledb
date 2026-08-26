@@ -254,6 +254,10 @@ type sstWriterOptions struct {
 }
 
 type IteratorOptions struct {
+	// MinKey is the inclusive lower bound. Nil or empty means the beginning of
+	// the keyspace.
 	MinKey []byte
+	// MaxKey is the exclusive upper bound. Nil or empty means the end of the
+	// keyspace.
 	MaxKey []byte
 }

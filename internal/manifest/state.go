@@ -337,6 +337,33 @@ func (l *Level) OverlappingSSTs(minKey, maxKey []byte) []SSTMeta {
 	return l.SSTs[lo:hi]
 }
 
+// OverlappingSSTsHalfOpen returns SSTs whose closed manifest key spans
+// overlap the half-open query range [minKey, maxKey). Empty bounds are
+// unbounded. It is intentionally separate from OverlappingSSTs, whose closed
+// range semantics are used by compaction planning.
+func (l *Level) OverlappingSSTsHalfOpen(minKey, maxKey []byte) []SSTMeta {
+	if l == nil || len(l.SSTs) == 0 {
+		return nil
+	}
+	if len(minKey) > 0 && len(maxKey) > 0 && bytes.Compare(minKey, maxKey) >= 0 {
+		return nil
+	}
+
+	lo := 0
+	if len(minKey) > 0 {
+		lo = sort.Search(len(l.SSTs), func(i int) bool {
+			return bytes.Compare(l.SSTs[i].MaxKey, minKey) >= 0
+		})
+	}
+	hi := len(l.SSTs)
+	if len(maxKey) > 0 {
+		hi = lo + sort.Search(len(l.SSTs)-lo, func(i int) bool {
+			return bytes.Compare(l.SSTs[lo+i].MinKey, maxKey) >= 0
+		})
+	}
+	return l.SSTs[lo:hi]
+}
+
 func (l *Level) TotalSize() int64 {
 	var total int64
 	if l != nil {
