@@ -1745,6 +1745,72 @@ func TestWriter_MetricsFlushAndTTLPaths(t *testing.T) {
 	}
 }
 
+func TestWriterRejectsOperationsAfterClose(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-use-after-close")
+	defer store.Close()
+
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), testWriterOptions(1<<20, 0))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("put before close: %v", err)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := w.put(ctx, []byte("other"), []byte("value")); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("put after close error=%v, want %v", err, ErrWriterClosed)
+	}
+	if err := w.delete(ctx, []byte("key")); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("delete after close error=%v, want %v", err, ErrWriterClosed)
+	}
+	if err := w.flush(ctx); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("flush after close error=%v, want %v", err, ErrWriterClosed)
+	}
+}
+
+func TestWriterMutationValidationErrors(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-invalid-mutations")
+	defer store.Close()
+
+	opts := testWriterOptions(1<<20, 0)
+	opts.Values.MaxKeyBytes = 4
+	opts.Values.MaxValueBytes = 4
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "put empty key", run: func() error { return w.put(ctx, nil, []byte("v")) }},
+		{name: "put oversized key", run: func() error { return w.put(ctx, []byte("12345"), []byte("v")) }},
+		{name: "put oversized value", run: func() error { return w.put(ctx, []byte("key"), []byte("12345")) }},
+		{name: "put negative TTL", run: func() error {
+			return w.putWithTTL(ctx, []byte("key"), []byte("v"), -time.Second)
+		}},
+		{name: "delete empty key", run: func() error { return w.delete(ctx, nil) }},
+		{name: "delete oversized key", run: func() error { return w.delete(ctx, []byte("12345")) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); !errors.Is(err, ErrInvalidMutation) {
+				t.Fatalf("error=%v, want %v", err, ErrInvalidMutation)
+			}
+		})
+	}
+	if !w.memtable.Empty() {
+		t.Fatal("invalid mutations changed the memtable")
+	}
+}
+
 func TestWriterFlushAppliesPendingMaintenanceWithoutUserData(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-maintenance-poll")

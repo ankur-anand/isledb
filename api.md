@@ -248,7 +248,10 @@ func (w *Writer) Close(ctx context.Context) error
 ```
 
 - `Put`, `PutWithTTL`, and `Delete` return after buffering the mutation locally.
-- `ttl <= 0` means no expiration.
+- `ttl == 0` means no expiration. Negative TTL values are rejected with
+  `ErrInvalidMutation`.
+- Empty or oversized keys and oversized values also return an error wrapping
+  `ErrInvalidMutation`, allowing callers to avoid retrying invalid input.
 - Expired values are filtered by readers. TTL expiration is not an immediate
   object deletion operation.
 - `Flush` publishes all currently buffered and frozen memtables.
@@ -1163,7 +1166,9 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | Error | Meaning |
 |---|---|
 | `ErrBackpressure` | Pending memtable limit reached before accepting the mutation |
+| `ErrInvalidMutation` | Empty or oversized key, oversized value, or negative TTL |
 | `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or arena configuration |
+| `ErrWriterClosed` | Operation attempted after writer close |
 | `ErrWriterFailed` | Terminal background flush failure; wraps the cause |
 | `ErrNilContext` | A nil context was supplied |
 

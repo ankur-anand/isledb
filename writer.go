@@ -20,8 +20,10 @@ import (
 
 var (
 	ErrBackpressure         = errors.New("writer backpressure")
+	ErrInvalidMutation      = errors.New("invalid mutation")
 	ErrNilContext           = errors.New("nil context")
 	ErrInvalidWriterOptions = errors.New("invalid writer options")
+	ErrWriterClosed         = errors.New("writer closed")
 	ErrWriterFailed         = errors.New("writer failed")
 )
 
@@ -282,7 +284,7 @@ func (w *writer) ensureWritable() error {
 		return err
 	}
 	if w.closed.Load() {
-		return errors.New("writer closed")
+		return ErrWriterClosed
 	}
 	if w.fenced.Load() {
 		return manifest.ErrFenced
@@ -305,15 +307,20 @@ func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Dur
 	if err := w.ensureWritable(); err != nil {
 		return err
 	}
+	if ttl < 0 {
+		return fmt.Errorf("%w: negative TTL %s", ErrInvalidMutation, ttl)
+	}
 
 	if len(key) == 0 {
-		return errors.New("empty key")
+		return fmt.Errorf("%w: empty key", ErrInvalidMutation)
 	}
 	if len(key) > w.opts.Values.MaxKeyBytes {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), w.opts.Values.MaxKeyBytes)
+		return fmt.Errorf("%w: key size %d exceeds max %d",
+			ErrInvalidMutation, len(key), w.opts.Values.MaxKeyBytes)
 	}
 	if int64(len(value)) > w.opts.Values.MaxValueBytes {
-		return fmt.Errorf("value size %d exceeds max %d", len(value), w.opts.Values.MaxValueBytes)
+		return fmt.Errorf("%w: value size %d exceeds max %d",
+			ErrInvalidMutation, len(value), w.opts.Values.MaxValueBytes)
 	}
 
 	var expireAt int64
@@ -357,10 +364,11 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 	}
 
 	if len(key) == 0 {
-		return errors.New("empty key")
+		return fmt.Errorf("%w: empty key", ErrInvalidMutation)
 	}
 	if len(key) > w.opts.Values.MaxKeyBytes {
-		return fmt.Errorf("key size %d exceeds max %d", len(key), w.opts.Values.MaxKeyBytes)
+		return fmt.Errorf("%w: key size %d exceeds max %d",
+			ErrInvalidMutation, len(key), w.opts.Values.MaxKeyBytes)
 	}
 
 	w.mu.Lock()
@@ -410,6 +418,12 @@ func (w *writer) ensureCapacityLocked() error {
 }
 
 func (w *writer) flush(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if err := w.ensureWritable(); err != nil {
+		return err
+	}
 	return w.flushInternal(ctx, false, false, false)
 }
 
