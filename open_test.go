@@ -83,3 +83,35 @@ func TestOpenBucketValidatesRequiredInputs(t *testing.T) {
 		t.Fatalf("OpenBucket(empty name) error=%v, want %v", err, ErrInvalidDBOptions)
 	}
 }
+
+func TestOpenBucketRejectsMissingCurrentWithExistingDatabaseObjects(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	const prefix = "missing-current"
+	db, err := OpenBucket(ctx, bucket, "memory", DBOptions{Prefix: prefix})
+	if err != nil {
+		t.Fatalf("OpenBucket: %v", err)
+	}
+	writer, err := db.OpenWriter(ctx, WriterOptions{})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Writer.Close: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("DB.Close: %v", err)
+	}
+
+	if err := bucket.Delete(ctx, prefix+"/manifest/CURRENT"); err != nil {
+		t.Fatalf("delete CURRENT: %v", err)
+	}
+	if _, err := OpenBucket(ctx, bucket, "memory", DBOptions{Prefix: prefix}); !errors.Is(err, ErrManifestUnavailable) {
+		t.Fatalf("OpenBucket after deleting CURRENT error=%v, want %v", err, ErrManifestUnavailable)
+	}
+}

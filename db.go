@@ -30,6 +30,11 @@ var ErrChangeFeedPayloadMismatch = manifest.ErrChangeFeedPayloadMismatch
 // needed to prove whether that commit succeeded.
 var ErrCommitIndeterminate = manifest.ErrCommitIndeterminate
 
+// ErrManifestUnavailable is returned when a database that has already been
+// initialized loses its manifest/CURRENT root. Operations fail closed rather
+// than publishing or serving an empty replacement database.
+var ErrManifestUnavailable = manifest.ErrCurrentUnavailable
+
 // ChangeFeedPayload controls whether committed PUT records retain their value.
 // A zero value is invalid when ChangeFeedOptions is present.
 type ChangeFeedPayload uint8
@@ -236,7 +241,7 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		return nil, err
 	}
 	manifestStore := newManifestStore(store, opts.manifestStorage)
-	if _, err := manifestStore.Replay(ctx); err != nil {
+	if _, err := replayManifestForOpen(ctx, store, manifestStore, false); err != nil {
 		return nil, err
 	}
 	if opts.changeFeedPayload != "" {

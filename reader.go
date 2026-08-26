@@ -78,7 +78,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 
 	ms := newManifestStoreWithCache(store, &opts)
 	viewLoadedAt := time.Now()
-	m, err := ms.ReplayWithArtifactValidation(ctx)
+	m, err := replayManifestForOpen(ctx, store, ms, true)
 	if err != nil {
 		return nil, err
 	}

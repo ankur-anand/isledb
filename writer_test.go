@@ -1232,7 +1232,7 @@ func TestWriterOptions_Defaults(t *testing.T) {
 	if got, want := DefaultWriterOptions().Memtable.MaxPendingMemtables, 4; got != want {
 		t.Fatalf("default max pending memtables=%d, want=%d", got, want)
 	}
-	if got, want := DefaultWriterOptions().Values.MaxKeyBytes, 64<<10; got != want {
+	if got, want := DefaultWriterOptions().Values.MaxKeyBytes, maxMemtableUserKeyBytes; got != want {
 		t.Fatalf("default max key bytes=%d, want=%d", got, want)
 	}
 	if got, want := DefaultWriterOptions().Values.MaxValueBytes, int64(16<<20); got != want {
@@ -1289,6 +1289,9 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 		{name: "negative flush interval", mutate: func(o *WriterOptions) { o.Flush.Interval = -time.Nanosecond }},
 		{name: "negative maintenance poll interval", mutate: func(o *WriterOptions) { o.Maintenance.PollInterval = -time.Nanosecond }},
 		{name: "negative max key bytes", mutate: func(o *WriterOptions) { o.Values.MaxKeyBytes = -1 }},
+		{name: "max key bytes exceeds memtable representation", mutate: func(o *WriterOptions) {
+			o.Values.MaxKeyBytes = maxMemtableUserKeyBytes + 1
+		}},
 		{name: "negative max value bytes", mutate: func(o *WriterOptions) { o.Values.MaxValueBytes = -1 }},
 		{name: "target exceeds arena", mutate: func(o *WriterOptions) { o.Memtable.TargetBytes = maxMemtableArenaBytes + 1 }},
 		{name: "inline entry exceeds arena", mutate: func(o *WriterOptions) {
@@ -1306,6 +1309,89 @@ func TestWriterOptions_RejectInvalidValues(t *testing.T) {
 				t.Fatalf("normalizeWriterOptions error=%v, want %v", err, ErrInvalidWriterOptions)
 			}
 		})
+	}
+}
+
+func TestWriter_KeySizeBoundaryDoesNotPoisonMemtable(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-key-size-boundary")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	maxKey := bytes.Repeat([]byte("z"), maxMemtableUserKeyBytes)
+	if err := w.put(ctx, maxKey, []byte("boundary")); err != nil {
+		t.Fatalf("put maximum key: %v", err)
+	}
+
+	overlongKey := append(append([]byte(nil), maxKey...), 'z')
+	if err := w.put(ctx, overlongKey, []byte("rejected")); err == nil {
+		t.Fatalf("put %d-byte key succeeded, want rejection", len(overlongKey))
+	}
+	if err := w.delete(ctx, overlongKey); err == nil {
+		t.Fatalf("delete %d-byte key succeeded, want rejection", len(overlongKey))
+	}
+
+	// A rejected key must not consume a sequence number or corrupt the active
+	// skiplist. The following mutation and flush exercise traversal of the
+	// maximum-size key, which is where the old uint16 length wrap surfaced.
+	if err := w.put(ctx, []byte("after-rejection"), []byte("ok")); err != nil {
+		t.Fatalf("put after rejected key: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush after rejected key: %v", err)
+	}
+
+	state, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if got, want := state.MaxSeqNum(), uint64(2); got != want {
+		t.Fatalf("max sequence=%d, want=%d", got, want)
+	}
+	if len(state.L0SSTs) != 1 {
+		t.Fatalf("L0 SSTs=%d, want=1", len(state.L0SSTs))
+	}
+	if !bytes.Equal(state.L0SSTs[0].MaxKey, maxKey) {
+		t.Fatalf("maximum key was not preserved in flushed SST: got=%d bytes want=%d",
+			len(state.L0SSTs[0].MaxKey), len(maxKey))
+	}
+}
+
+func TestOpenWriterRejectsMissingObservedCurrent(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-missing-current")
+	defer store.Close()
+
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	writer, err := db.OpenWriter(ctx, DefaultWriterOptions())
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Writer.Close: %v", err)
+	}
+	if err := store.Delete(ctx, store.ManifestPath()); err != nil {
+		t.Fatalf("delete CURRENT: %v", err)
+	}
+
+	if _, err := db.OpenWriter(ctx, DefaultWriterOptions()); !errors.Is(err, ErrManifestUnavailable) {
+		t.Fatalf("OpenWriter after deleting CURRENT error=%v, want %v", err, ErrManifestUnavailable)
 	}
 }
 

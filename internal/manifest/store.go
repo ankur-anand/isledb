@@ -31,6 +31,7 @@ var (
 	ErrInvalidRetirement         = errors.New("invalid retired object batch")
 	ErrInvalidManifest           = errors.New("invalid manifest topology")
 	ErrStorePolicyMismatch       = errors.New("store policy mismatch")
+	ErrCurrentUnavailable        = errors.New("manifest CURRENT is unavailable")
 )
 
 const (
@@ -90,6 +91,10 @@ type Store struct {
 	current       *Current
 	commitCurrent *Current
 	currentETag   string
+	// currentObserved is monotonic. Once this Store has read or published a
+	// valid CURRENT, a later missing head is an availability failure rather than
+	// permission to reinterpret the database as empty.
+	currentObserved bool
 
 	writerFence    *FenceToken
 	compactorFence *FenceToken
@@ -1973,14 +1978,15 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 	data, _, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			s.clearObservedCurrent()
+			if s.hasObservedCurrent() {
+				return nil, ErrCurrentUnavailable
+			}
 			return nil, nil
 		}
 		return nil, err
 	}
 	if len(data) == 0 {
-		s.clearObservedCurrent()
-		return nil, nil
+		return nil, fmt.Errorf("%w: CURRENT object is empty", ErrCurrentUnavailable)
 	}
 	current, err := DecodeCurrent(data)
 	if err != nil {
@@ -1989,6 +1995,7 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 	normalizeCurrent(current)
 	s.mu.Lock()
 	s.current = current.Clone()
+	s.currentObserved = true
 	s.mu.Unlock()
 	return current, nil
 }
@@ -1997,14 +2004,15 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	data, etag, err := s.storage.ReadCurrent(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			s.clearCurrentCache()
+			if s.hasObservedCurrent() {
+				return nil, "", ErrCurrentUnavailable
+			}
 			return nil, "", nil
 		}
 		return nil, "", err
 	}
 	if len(data) == 0 {
-		s.clearCurrentCache()
-		return nil, etag, nil
+		return nil, "", fmt.Errorf("%w: CURRENT object is empty", ErrCurrentUnavailable)
 	}
 	current, err := DecodeCurrent(data)
 	if err != nil {
@@ -2015,6 +2023,7 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	s.current = current.Clone()
 	s.commitCurrent = current.Clone()
 	s.currentETag = etag
+	s.currentObserved = true
 	s.mu.Unlock()
 	return current, etag, nil
 }
@@ -2027,10 +2036,10 @@ func (s *Store) clearCurrentCache() {
 	s.mu.Unlock()
 }
 
-func (s *Store) clearObservedCurrent() {
+func (s *Store) hasObservedCurrent() bool {
 	s.mu.Lock()
-	s.current = nil
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	return s.currentObserved
 }
 
 func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag string) error {
@@ -2072,6 +2081,7 @@ func (s *Store) writeEncodedCurrentWithCAS(
 	s.current = current.Clone()
 	s.commitCurrent = current.Clone()
 	s.currentETag = newETag
+	s.currentObserved = true
 	s.mu.Unlock()
 	return nil
 }

@@ -1,7 +1,9 @@
 package isledb
 
 import (
+	"context"
 	"errors"
+	"fmt"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/cachestore"
@@ -43,6 +45,41 @@ func newManifestStoreWithCache(store *blobstore.Store, opts *readerOptions) *man
 		storage = opts.ManifestStorage
 	}
 	return manifest.NewStoreWithStorage(resolveManifestStorageWithCache(store, storage, opts))
+}
+
+func replayManifestForOpen(
+	ctx context.Context,
+	store *blobstore.Store,
+	manifestStore *manifest.Store,
+	validateArtifacts bool,
+) (*manifestState, error) {
+	replay := manifestStore.Replay
+	if validateArtifacts {
+		replay = manifestStore.ReplayWithArtifactValidation
+	}
+
+	state, err := replay(ctx)
+	if err != nil || manifestStore.CurrentData() != nil {
+		return state, err
+	}
+	occupied, err := store.HasImmutableDatabaseObjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check database prefix after missing CURRENT: %w", err)
+	}
+	if !occupied {
+		return state, nil
+	}
+
+	// A concurrent first writer may have created CURRENT between the replay and
+	// listing. Re-read once before declaring the non-empty prefix headless.
+	state, err = replay(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if manifestStore.CurrentData() == nil {
+		return nil, fmt.Errorf("%w: database prefix contains immutable state", ErrManifestUnavailable)
+	}
+	return state, nil
 }
 
 func isFenceError(err error) bool {

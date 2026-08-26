@@ -12,7 +12,31 @@ import (
 
 	"github.com/aws/smithy-go"
 	"gocloud.dev/blob"
+	"gocloud.dev/blob/memblob"
 )
+
+func TestHasImmutableDatabaseObjectsHonorsOwnedPrefixes(t *testing.T) {
+	ctx := context.Background()
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+	store := New(bucket, "memory", "db")
+
+	if err := bucket.WriteAll(ctx, "db-backup/object", []byte("sibling"), nil); err != nil {
+		t.Fatalf("write sibling object: %v", err)
+	}
+	if _, err := store.Write(ctx, store.MaintenanceHeadPath(), []byte("control")); err != nil {
+		t.Fatalf("write control object: %v", err)
+	}
+	if found, err := store.HasImmutableDatabaseObjects(ctx); err != nil || found {
+		t.Fatalf("HasImmutableDatabaseObjects with sibling/control objects = (%v, %v), want (false, nil)", found, err)
+	}
+	if _, err := store.Write(ctx, store.SSTPath("state.sst"), []byte("owned")); err != nil {
+		t.Fatalf("write immutable database object: %v", err)
+	}
+	if found, err := store.HasImmutableDatabaseObjects(ctx); err != nil || !found {
+		t.Fatalf("HasImmutableDatabaseObjects with SST = (%v, %v), want (true, nil)", found, err)
+	}
+}
 
 func TestMapErrorClassifiesS3ConditionalRequestConflictAsPreconditionFailure(t *testing.T) {
 	awsConflict := &smithy.GenericAPIError{

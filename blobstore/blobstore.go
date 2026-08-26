@@ -306,6 +306,31 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 	return exists, nil
 }
 
+// HasImmutableDatabaseObjects reports whether the database prefix contains
+// durable data or manifest-history objects that cannot exist before CURRENT
+// is initialized. Control records such as maintenance/HEAD and manifest/gc
+// are intentionally excluded because they may be staged before the first
+// writer claims its fence.
+func (s *Store) HasImmutableDatabaseObjects(ctx context.Context) (bool, error) {
+	for _, relativePrefix := range []string{
+		"sstable",
+		"changes",
+		"manifest/pages",
+		"manifest/snapshots",
+	} {
+		prefix := s.path(relativePrefix) + "/"
+		iter := s.bucket.List(&blob.ListOptions{Prefix: prefix})
+		_, err := iter.Next(ctx)
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, io.EOF) {
+			return false, s.mapError(err)
+		}
+	}
+	return false, nil
+}
+
 func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes, error) {
 	if _, err := s.WriteReader(ctx, key, bytes.NewReader(data), nil); err != nil {
 		return Attributes{}, err
