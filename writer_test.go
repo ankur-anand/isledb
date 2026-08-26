@@ -1365,6 +1365,36 @@ func TestWriter_KeySizeBoundaryDoesNotPoisonMemtable(t *testing.T) {
 	}
 }
 
+func TestOpenWriterRejectsMissingObservedCurrent(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-missing-current")
+	defer store.Close()
+
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	writer, err := db.OpenWriter(ctx, DefaultWriterOptions())
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Writer.Close: %v", err)
+	}
+	if err := store.Delete(ctx, store.ManifestPath()); err != nil {
+		t.Fatalf("delete CURRENT: %v", err)
+	}
+
+	if _, err := db.OpenWriter(ctx, DefaultWriterOptions()); !errors.Is(err, ErrManifestUnavailable) {
+		t.Fatalf("OpenWriter after deleting CURRENT error=%v, want %v", err, ErrManifestUnavailable)
+	}
+}
+
 type maintenanceReadCountingStorage struct {
 	*manifest.BlobStoreBackend
 	reads atomic.Int64

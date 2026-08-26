@@ -147,6 +147,49 @@ func TestReader_Get_MultiLevelValues(t *testing.T) {
 	}
 }
 
+func TestReaderRefreshRetainsPinnedViewWhenCurrentMissing(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		breakCurrent func(*testing.T, context.Context, *blobstore.Store)
+	}{
+		{
+			name: "missing",
+			breakCurrent: func(t *testing.T, ctx context.Context, store *blobstore.Store) {
+				if err := store.Delete(ctx, store.ManifestPath()); err != nil {
+					t.Fatalf("delete CURRENT: %v", err)
+				}
+			},
+		},
+		{
+			name: "empty",
+			breakCurrent: func(t *testing.T, ctx context.Context, store *blobstore.Store) {
+				if _, err := store.Write(ctx, store.ManifestPath(), nil); err != nil {
+					t.Fatalf("empty CURRENT: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reader, ctx, cleanup := setupReaderFixture(t)
+			defer cleanup()
+
+			value, found, err := reader.Get(ctx, []byte("b"))
+			if err != nil || !found || !bytes.Equal(value, []byte("l0-b")) {
+				t.Fatalf("Get before breaking CURRENT = (%q, %v, %v)", value, found, err)
+			}
+			test.breakCurrent(t, ctx, reader.store)
+
+			if err := reader.Refresh(ctx); !errors.Is(err, ErrManifestUnavailable) {
+				t.Fatalf("Refresh error=%v, want %v", err, ErrManifestUnavailable)
+			}
+			value, found, err = reader.Get(ctx, []byte("b"))
+			if err != nil || !found || !bytes.Equal(value, []byte("l0-b")) {
+				t.Fatalf("pinned Get after failed Refresh = (%q, %v, %v)", value, found, err)
+			}
+		})
+	}
+}
+
 func TestReader_Scan_Range(t *testing.T) {
 	reader, ctx, cleanup := setupReaderFixture(t)
 	defer cleanup()

@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -204,7 +205,7 @@ func TestAppendEntry_UsesUpdatedETagAcrossAppends(t *testing.T) {
 	}
 }
 
-func TestReadCurrentWithETag_ClearsCacheOnNotFound(t *testing.T) {
+func TestReadCurrentWithETag_MissingObservedCurrentFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	storage := newETagStorage()
 	currentData, err := EncodeCurrent(&Current{NextEpoch: 1, NextSeq: 1})
@@ -227,12 +228,11 @@ func TestReadCurrentWithETag_ClearsCacheOnNotFound(t *testing.T) {
 	storage.current = nil
 	storage.mu.Unlock()
 
-	if current, etag, err := ms.readCurrentWithETag(ctx); err != nil {
-		t.Fatalf("read missing current: %v", err)
-	} else if current != nil || etag != "" {
-		t.Fatalf("expected missing current, got current=%v etag=%q", current, etag)
+	if current, etag, err := ms.readCurrentWithETag(ctx); !errors.Is(err, ErrCurrentUnavailable) {
+		t.Fatalf("read missing current error=%v, want %v (current=%v etag=%q)",
+			err, ErrCurrentUnavailable, current, etag)
 	}
-	if ms.current != nil || ms.currentETag != "" {
-		t.Fatalf("expected current cache to be cleared, current=%v etag=%q", ms.current, ms.currentETag)
+	if ms.current == nil || ms.currentETag == "" {
+		t.Fatalf("expected pinned current cache to be retained, current=%v etag=%q", ms.current, ms.currentETag)
 	}
 }
