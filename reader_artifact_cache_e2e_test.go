@@ -291,13 +291,13 @@ func artifactCacheTestSSTForKey(
 ) sstMetadata {
 	t.Helper()
 	for _, meta := range manifest.L0SSTs {
-		if keyInRange(key, meta.MinKey, meta.MaxKey) {
+		if keyInSSTRange(key, meta.MinKey, meta.MaxKey) {
 			return meta
 		}
 	}
 	for _, level := range manifest.Levels {
 		for _, meta := range level.SSTs {
-			if keyInRange(key, meta.MinKey, meta.MaxKey) {
+			if keyInSSTRange(key, meta.MinKey, meta.MaxKey) {
 				return meta
 			}
 		}

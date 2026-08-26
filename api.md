@@ -382,8 +382,12 @@ func (r *Reader) Close() error
 
 `Get` returns `found == false` for a missing, deleted, or expired key.
 
-`Scan`, `ScanLimit`, `IteratorOptions`, and `Snapshot.ScanLimit` use an inclusive
-range: `[minKey, maxKey]`. A nil or empty bound leaves that side unbounded.
+Every reader range is half-open: `[minKey, maxKey)`. This includes `Scan`,
+`ScanLimit`, `IteratorOptions`, `Snapshot.ScanLimit`, snapshot iterators, and
+`PrefetchOptions.Range`. A nil or empty bound leaves that side unbounded.
+
+Because the upper bound is exclusive, `PrefixRange(prefix)` can be passed
+directly to any range API without admitting the first key after the prefix.
 
 `Scan` allocates and returns the complete result. `ScanLimit` also materializes
 its result, but stops after a positive `limit`. A zero or negative limit has the
@@ -398,7 +402,7 @@ type KV struct {
 
 type IteratorOptions struct {
     MinKey []byte // Inclusive; nil means beginning
-    MaxKey []byte // Inclusive; nil means end
+    MaxKey []byte // Exclusive; nil means end
 }
 ```
 
@@ -525,7 +529,7 @@ published `CURRENT`. Close `view.Snapshot` when materialization finishes.
 
 ### Prefetch selected SSTs
 
-Prefetch uses a half-open `KeyRange`, unlike the inclusive scan APIs.
+`Prefetch` uses the same half-open `KeyRange` contract as scans and iterators.
 
 ```go
 type KeyRange struct {

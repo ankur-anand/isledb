@@ -67,7 +67,7 @@ func TestReader_ScanLimit(t *testing.T) {
 		t.Errorf("Expected 100 results (unlimited), got %d", len(results))
 	}
 
-	results, err = r.ScanLimit(ctx, []byte("key:050"), []byte("key:059"), 100)
+	results, err = r.ScanLimit(ctx, []byte("key:050"), []byte("key:060"), 100)
 	if err != nil {
 		t.Fatalf("ScanLimit failed: %v", err)
 	}

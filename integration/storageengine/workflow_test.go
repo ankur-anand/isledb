@@ -940,11 +940,11 @@ func verifyStorageState(ctx context.Context, reader *isledb.Reader, lastGenerati
 		return err
 	}
 
-	// Reader ranges have inclusive upper bounds. Use a binary upper bound that
-	// includes the ordering fixtures prefixed by "a" without also admitting
-	// the adjacent key "b".
-	prefixMin := []byte{'a'}
-	prefixMax := []byte{'a', 0xff}
+	// Reader ranges are half-open, so PrefixRange expresses every binary key
+	// prefixed by "a" without admitting the adjacent key "b".
+	prefixRange := isledb.PrefixRange([]byte{'a'})
+	prefixMin := prefixRange.Min
+	prefixMax := prefixRange.Max
 	prefixRows, err := reader.Scan(ctx, prefixMin, prefixMax)
 	if err != nil {
 		return fmt.Errorf("scan prefix a: %w", err)
@@ -959,7 +959,7 @@ func verifyStorageState(ctx context.Context, reader *isledb.Reader, lastGenerati
 		return fmt.Errorf("scan [a,b]: %w", err)
 	}
 	boundedKeys := storageKeysInRange(keys, []byte{'a'}, []byte{'b'})
-	if err := verifyStorageRows("bounded inclusive scan", boundedRows, boundedKeys, expected); err != nil {
+	if err := verifyStorageRows("bounded half-open scan", boundedRows, boundedKeys, expected); err != nil {
 		return err
 	}
 
@@ -1007,7 +1007,7 @@ func storageKeysInRange(keys []string, minKey, maxKey []byte) []string {
 		if minKey != nil && bytes.Compare(keyBytes, minKey) < 0 {
 			continue
 		}
-		if maxKey != nil && bytes.Compare(keyBytes, maxKey) > 0 {
+		if maxKey != nil && bytes.Compare(keyBytes, maxKey) >= 0 {
 			continue
 		}
 		result = append(result, key)

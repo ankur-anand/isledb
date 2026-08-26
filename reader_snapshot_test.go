@@ -563,7 +563,7 @@ func TestReaderSnapshotScanLimitAndIterator(t *testing.T) {
 	if err := iter.Err(); err != nil {
 		t.Fatalf("iterator err: %v", err)
 	}
-	if want := []string{"b", "c"}; !sameStrings(got, want) {
+	if want := []string{"b"}; !sameStrings(got, want) {
 		t.Fatalf("unexpected iterator keys: got=%v want=%v", got, want)
 	}
 }

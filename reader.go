@@ -498,7 +498,7 @@ func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []by
 	}
 
 	for _, sst := range m.L0SSTs {
-		if !keyInRange(key, sst.MinKey, sst.MaxKey) {
+		if !keyInSSTRange(key, sst.MinKey, sst.MaxKey) {
 			continue
 		}
 		val, got, deleted, err := r.getFromSST(ctx, sst, key)
@@ -534,7 +534,8 @@ func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []by
 	return nil, false, nil
 }
 
-// Scan returns all key-value pairs in the given key range.
+// Scan returns all key-value pairs in the half-open range [minKey, maxKey).
+// A nil or empty bound leaves that side unbounded.
 func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err error) {
 	start := time.Now()
 	defer func() {
@@ -557,6 +558,9 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 	return out, readViewError(readCtx, err)
 }
 
+// ScanLimit returns at most limit key-value pairs in the half-open range
+// [minKey, maxKey). A nil or empty bound leaves that side unbounded. A
+// non-positive limit means no limit.
 func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) (out []KV, err error) {
 	start := time.Now()
 	defer func() {
@@ -609,7 +613,7 @@ func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState,
 		if len(minKey) > 0 && bytes.Compare(entry.Key, minKey) < 0 {
 			continue
 		}
-		if len(maxKey) > 0 && bytes.Compare(entry.Key, maxKey) > 0 {
+		if len(maxKey) > 0 && bytes.Compare(entry.Key, maxKey) >= 0 {
 			break
 		}
 
@@ -653,22 +657,22 @@ func (r *Reader) openRangeSources(
 	minKey, maxKey []byte,
 	detachNarrowLevels bool,
 ) []mergeIteratorSource {
-	var sources []mergeIteratorSource
-	upper := maxKey
-	if len(maxKey) > 0 {
-		upper = incrementKey(maxKey)
+	if len(minKey) > 0 && len(maxKey) > 0 && bytes.Compare(minKey, maxKey) >= 0 {
+		return nil
 	}
 
+	var sources []mergeIteratorSource
+
 	for _, sst := range m.L0SSTs {
-		if !internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+		if !sstOverlapsHalfOpenRange(sst, KeyRange{Min: minKey, Max: maxKey}) {
 			continue
 		}
 		sources = append(sources, newLevelMergeIteratorSourceWithMetadata(
-			r, ctx, []sstMetadata{sst}, minKey, upper))
+			r, ctx, []sstMetadata{sst}, minKey, maxKey))
 	}
 
 	for i := range m.Levels {
-		overlapping := m.Levels[i].OverlappingSSTs(minKey, maxKey)
+		overlapping := m.Levels[i].OverlappingSSTsHalfOpen(minKey, maxKey)
 		if len(overlapping) > 0 {
 			// Reader manifests are immutable after publication. Borrowing their
 			// metadata is therefore safe. A narrow long-lived iterator copies its
@@ -676,10 +680,10 @@ func (r *Reader) openRangeSources(
 			// level already needs all of that metadata, so copying saves no memory.
 			if detachNarrowLevels && len(overlapping) < len(m.Levels[i].SSTs) {
 				sources = append(sources,
-					newLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
+					newLevelMergeIteratorSource(r, ctx, overlapping, minKey, maxKey))
 			} else {
 				sources = append(sources,
-					newBorrowedLevelMergeIteratorSource(r, ctx, overlapping, minKey, upper))
+					newBorrowedLevelMergeIteratorSource(r, ctx, overlapping, minKey, maxKey))
 			}
 		}
 	}
@@ -687,7 +691,9 @@ func (r *Reader) openRangeSources(
 	return sources
 }
 
-func keyInRange(key, minKey, maxKey []byte) bool {
+// keyInSSTRange checks an SST's closed manifest span. It is not a
+// caller-visible query range; reader query ranges are half-open.
+func keyInSSTRange(key, minKey, maxKey []byte) bool {
 	if len(minKey) > 0 && bytes.Compare(key, minKey) < 0 {
 		return false
 	}
@@ -1329,7 +1335,7 @@ func (it *Iterator) next() bool {
 		if len(it.minKey) > 0 && bytes.Compare(entry.Key, it.minKey) < 0 {
 			continue
 		}
-		if len(it.maxKey) > 0 && bytes.Compare(entry.Key, it.maxKey) > 0 {
+		if len(it.maxKey) > 0 && bytes.Compare(entry.Key, it.maxKey) >= 0 {
 			return false
 		}
 

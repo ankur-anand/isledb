@@ -112,6 +112,13 @@ func TestLevelFindAndOverlap(t *testing.T) {
 	if len(overlaps) != 3 {
 		t.Fatalf("overlaps=%v", overlaps)
 	}
+	halfOpen := level.OverlappingSSTsHalfOpen([]byte("c"), []byte("k"))
+	if len(halfOpen) != 2 || halfOpen[0].ID != "a" || halfOpen[1].ID != "b" {
+		t.Fatalf("half-open overlaps=%v, want [a b]", halfOpen)
+	}
+	if got := level.OverlappingSSTsHalfOpen([]byte("k"), []byte("k")); len(got) != 0 {
+		t.Fatalf("empty half-open range overlaps=%v", got)
+	}
 }
 
 func TestManifestValidateLevels(t *testing.T) {

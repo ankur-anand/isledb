@@ -194,7 +194,7 @@ func TestReader_Scan_Range(t *testing.T) {
 	reader, ctx, cleanup := setupReaderFixture(t)
 	defer cleanup()
 
-	results, err := reader.Scan(ctx, []byte("a"), []byte("d"))
+	results, err := reader.Scan(ctx, []byte("a"), []byte("e"))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -214,6 +214,91 @@ func TestReader_Scan_Range(t *testing.T) {
 		if !bytes.Equal(results[i].Value, expected[i].Value) {
 			t.Fatalf("scan value[%d]: got %q want %q", i, results[i].Value, expected[i].Value)
 		}
+	}
+}
+
+func TestReaderRangeAPIsUseHalfOpenBounds(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-half-open-ranges")
+	defer store.Close()
+
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("va")},
+		{Key: []byte("a1"), Seq: 2, Kind: internal.OpPut, Value: []byte("va1")},
+		{Key: []byte{'a', 0xff}, Seq: 3, Kind: internal.OpPut, Value: []byte("vaff")},
+		{Key: []byte("b"), Seq: 4, Kind: internal.OpPut, Value: []byte("vb")},
+		{Key: []byte{0xff}, Seq: 5, Kind: internal.OpPut, Value: []byte("vff")},
+		{Key: []byte{0xff, 0x00}, Seq: 6, Kind: internal.OpPut, Value: []byte("vff00")},
+	}, 0, 1)
+
+	reader := openTestReader(t, ctx, store)
+	defer reader.Close()
+	keyRange := PrefixRange([]byte("a"))
+	want := []string{"a", "a1", string([]byte{'a', 0xff})}
+
+	assertRows := func(name string, rows []KV, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		got := make([]string, 0, len(rows))
+		for _, row := range rows {
+			got = append(got, string(row.Key))
+		}
+		if !sameStrings(got, want) {
+			t.Fatalf("%s keys=%q, want %q", name, got, want)
+		}
+	}
+
+	rows, err := reader.Scan(ctx, keyRange.Min, keyRange.Max)
+	assertRows("Scan", rows, err)
+	rows, err = reader.ScanLimit(ctx, keyRange.Min, keyRange.Max, len(want)+1)
+	assertRows("ScanLimit", rows, err)
+
+	collectIterator := func(name string, iter *Iterator, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s open: %v", name, err)
+		}
+		var got []string
+		for iter.Next() {
+			got = append(got, string(iter.Key()))
+		}
+		if iterErr := iter.Err(); iterErr != nil {
+			t.Fatalf("%s iterate: %v", name, iterErr)
+		}
+		if closeErr := iter.Close(); closeErr != nil {
+			t.Fatalf("%s close: %v", name, closeErr)
+		}
+		if !sameStrings(got, want) {
+			t.Fatalf("%s keys=%q, want %q", name, got, want)
+		}
+	}
+
+	iter, err := reader.NewIterator(ctx, IteratorOptions{MinKey: keyRange.Min, MaxKey: keyRange.Max})
+	collectIterator("Reader.NewIterator", iter, err)
+
+	snapshot, err := reader.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	defer snapshot.Close()
+	rows, err = snapshot.ScanLimit(ctx, keyRange.Min, keyRange.Max, len(want)+1)
+	assertRows("Snapshot.ScanLimit", rows, err)
+	iter, err = snapshot.NewIterator(ctx, IteratorOptions{MinKey: keyRange.Min, MaxKey: keyRange.Max})
+	collectIterator("Snapshot.NewIterator", iter, err)
+
+	empty, err := reader.Scan(ctx, []byte("b"), []byte("b"))
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty range = %q, %v; want no rows", empty, err)
+	}
+
+	allFFRange := PrefixRange([]byte{0xff})
+	rows, err = reader.Scan(ctx, allFFRange.Min, allFFRange.Max)
+	if err != nil || len(rows) != 2 || !bytes.Equal(rows[0].Key, []byte{0xff}) ||
+		!bytes.Equal(rows[1].Key, []byte{0xff, 0x00}) {
+		t.Fatalf("all-ff prefix rows = %x, %v", rows, err)
 	}
 }
 
@@ -241,7 +326,7 @@ func TestReader_Scan_DedupesL0BySeq(t *testing.T) {
 	}
 	defer reader.Close()
 
-	results, err := reader.Scan(ctx, []byte("k"), []byte("k"))
+	results, err := reader.Scan(ctx, []byte("k"), []byte("l"))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -350,7 +435,7 @@ func TestReader_Scan_L1NonOverlapping(t *testing.T) {
 	}
 	defer reader.Close()
 
-	results, err := reader.Scan(ctx, []byte("a"), []byte("e"))
+	results, err := reader.Scan(ctx, []byte("a"), []byte("f"))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -712,7 +797,7 @@ func TestReader_Scan_TombstoneShadowsLowerLevel(t *testing.T) {
 	}
 	defer reader.Close()
 
-	results, err := reader.Scan(ctx, []byte("k"), []byte("m"))
+	results, err := reader.Scan(ctx, []byte("k"), []byte("n"))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -885,7 +970,7 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 		t.Fatalf("expected Get error for empty key")
 	}
 
-	results, err := reader.Scan(ctx, []byte("a"), []byte("d"))
+	results, err := reader.Scan(ctx, []byte("a"), []byte("f"))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -895,11 +980,11 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := reader.Scan(cancelCtx, []byte("a"), []byte("d")); err == nil {
+	if _, err := reader.Scan(cancelCtx, []byte("a"), []byte("f")); err == nil {
 		t.Fatalf("expected Scan error with canceled context")
 	}
 
-	results, err = reader.ScanLimit(ctx, []byte("a"), []byte("d"), 2)
+	results, err = reader.ScanLimit(ctx, []byte("a"), []byte("f"), 2)
 	if err != nil {
 		t.Fatalf("ScanLimit: %v", err)
 	}
@@ -907,7 +992,7 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 		t.Fatalf("unexpected ScanLimit result count: got=%d want=2", len(results))
 	}
 
-	if _, err := reader.ScanLimit(cancelCtx, []byte("a"), []byte("d"), 2); err == nil {
+	if _, err := reader.ScanLimit(cancelCtx, []byte("a"), []byte("f"), 2); err == nil {
 		t.Fatalf("expected ScanLimit error with canceled context")
 	}
 

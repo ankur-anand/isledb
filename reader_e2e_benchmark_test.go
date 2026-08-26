@@ -996,12 +996,12 @@ func kvBenchmarkOverlappingSSTCount(state *manifestState, minKey, maxKey []byte)
 	}
 	count := 0
 	for _, sst := range state.L0SSTs {
-		if internal.OverlapsRange(sst.MinKey, sst.MaxKey, minKey, maxKey) {
+		if sstOverlapsHalfOpenRange(sst, KeyRange{Min: minKey, Max: maxKey}) {
 			count++
 		}
 	}
 	for i := range state.Levels {
-		count += len(state.Levels[i].OverlappingSSTs(minKey, maxKey))
+		count += len(state.Levels[i].OverlappingSSTsHalfOpen(minKey, maxKey))
 	}
 	return count
 }
@@ -1267,7 +1267,7 @@ func getKVReaderBenchmarkWindowed(
 	}
 
 	for _, sst := range state.L0SSTs {
-		if !keyInRange(key, sst.MinKey, sst.MaxKey) {
+		if !keyInSSTRange(key, sst.MinKey, sst.MaxKey) {
 			continue
 		}
 		value, got, deleted, err := reader.getFromSST(ctx, sst, key)

@@ -95,6 +95,9 @@ func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iter
 	return it, nil
 }
 
+// ScanLimit returns at most limit key-value pairs from this snapshot in the
+// half-open range [minKey, maxKey). Empty bounds are unbounded and a
+// non-positive limit means no limit.
 func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error) {
 	done, err := s.beginRead()
 	if err != nil {

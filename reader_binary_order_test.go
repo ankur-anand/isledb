@@ -55,9 +55,9 @@ func TestReaderBinaryKeyOrdering(t *testing.T) {
 
 	bounded, err := reader.Scan(ctx, []byte{'a'}, []byte{'b'})
 	if err != nil {
-		t.Fatalf("Scan [a,b]: %v", err)
+		t.Fatalf("Scan [a,b): %v", err)
 	}
-	assertBinaryOrderingRows(t, bounded, keys[2:7], values)
+	assertBinaryOrderingRows(t, bounded, keys[2:6], values)
 
 	iterator, err := reader.NewIterator(ctx, IteratorOptions{})
 	if err != nil {
