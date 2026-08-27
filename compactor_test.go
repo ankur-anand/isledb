@@ -1203,6 +1203,19 @@ func TestCompactor_ValidateSSTChecksum(t *testing.T) {
 	}
 }
 
+func TestVerifyMoveSourcesRejectsCanceledContext(t *testing.T) {
+	c := &compactor{opts: compactorOptions{InputReadParallelism: 2}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.verifyMoveSources(ctx, []sstMetadata{
+		{ID: "first", Size: 1},
+		{ID: "second", Size: 1},
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifyMoveSources error = %v, want context.Canceled", err)
+	}
+}
+
 func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 	store := blobstore.NewMemory("test")
 	ctx := context.Background()

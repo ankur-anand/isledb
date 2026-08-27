@@ -186,6 +186,11 @@ type compactorOptions struct {
 	// Safety controls source SST validation before compaction.
 	Safety compactionSafetyOptions
 
+	// OnPlanningBlocked reports a level that has compaction work waiting but
+	// could not produce a plan. Without it the failure is invisible: the
+	// scheduler simply sees no candidate for that level and moves on.
+	OnPlanningBlocked func(sourceLevel uint32, sstCount int, critical bool, err error)
+
 	OnCompactionStart func(compactionJob)
 	OnCompactionEnd   func(compactionJob, error)
 }

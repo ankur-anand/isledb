@@ -213,10 +213,28 @@ func (state MaintenanceState) String() string {
 
 // SSTCompactionStats describes SST compaction work completed in one cycle.
 type SSTCompactionStats struct {
-	Jobs        int
-	InputSSTs   int
-	OutputSSTs  int
+	Jobs       int
+	InputSSTs  int
+	OutputSSTs int
+	// OutputBytes is the total size of the SSTs the cycle's jobs published. It
+	// includes files a metadata-only job relocated between levels, so it is not
+	// the amount of data compaction actually moved through the object store.
 	OutputBytes int64
+	// MovedJobs and MovedBytes are the metadata-only subset. A plan whose
+	// sources do not overlap each other and overlap nothing in the destination
+	// publishes the same immutable files at a new level. They are never
+	// rewritten or re-uploaded, but may be read for checksum verification; that
+	// cost is included in ReadBytes.
+	MovedJobs  int
+	MovedBytes int64
+	// ReadBytes is what compaction pulled from the object store: the inputs of
+	// every rewrite, plus the sources of any move that was checksum-verified.
+	// It is the GET side of the cost; RewrittenBytes is the PUT side.
+	ReadBytes int64
+	// RewrittenBytes is what compaction genuinely wrote, and the figure that
+	// tracks object-store cost and write amplification. Reading OutputBytes
+	// instead overstates both, by the whole of MovedBytes.
+	RewrittenBytes int64
 }
 
 // SSTCleanupStats describes durable retirement handoff and bounded physical
@@ -303,6 +321,19 @@ func (task MaintenanceTask) String() string {
 	}
 }
 
+// CompactionBlocked describes a level that has compaction work waiting but
+// could not produce a plan. A blocked level makes no progress while the
+// scheduler keeps finding work elsewhere, so it is reported explicitly rather
+// than showing up as an absent candidate.
+type CompactionBlocked struct {
+	SourceLevel uint32
+	SSTCount    int
+	// Critical repeats L0's depth signal, which is a property of the level
+	// rather than of whether it could be planned.
+	Critical bool
+	Reason   string
+}
+
 // MaintenanceScheduleStats explains the primary-work decision made in one
 // cycle. CompactionSourceLevel is meaningful when Selected is compaction.
 type MaintenanceScheduleStats struct {
@@ -314,6 +345,8 @@ type MaintenanceScheduleStats struct {
 	CheckpointUrgent      bool
 	ReplayPages           uint64
 	ReplayBytes           uint64
+	// Blocked lists levels that had work but could not be planned this cycle.
+	Blocked []CompactionBlocked
 }
 
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
@@ -668,7 +701,8 @@ func (m *Maintenance) compactorOptions() compactorOptions {
 			BlockBytes:      m.sstOutput.BlockBytes,
 			Compression:     m.sstOutput.Compression,
 		},
-		OnCompactionEnd: m.recordCompaction,
+		OnPlanningBlocked: m.recordPlanningBlocked,
+		OnCompactionEnd:   m.recordCompaction,
 	}
 }
 
@@ -1346,19 +1380,47 @@ func stopMaintenanceTimer(timer *time.Timer) {
 	}
 }
 
-func (m *Maintenance) recordCompaction(job compactionJob, err error) {
-	if err == nil {
-		m.statsMu.Lock()
-		if m.currentStats != nil {
-			m.currentStats.SSTCompaction.Jobs++
-			m.currentStats.SSTCompaction.InputSSTs += len(job.InputSSTs)
-			m.currentStats.SSTCompaction.OutputSSTs += len(job.OutputSSTs)
-			for _, sst := range job.OutputSSTs {
-				m.currentStats.SSTCompaction.OutputBytes += sst.Bytes
-			}
-		}
-		m.statsMu.Unlock()
+func (m *Maintenance) recordPlanningBlocked(sourceLevel uint32, sstCount int, critical bool, err error) {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if m.currentStats == nil {
+		return
 	}
+	m.currentStats.Scheduling.Blocked = append(m.currentStats.Scheduling.Blocked, CompactionBlocked{
+		SourceLevel: sourceLevel,
+		SSTCount:    sstCount,
+		Critical:    critical,
+		Reason:      err.Error(),
+	})
+}
+
+func (m *Maintenance) recordCompaction(job compactionJob, err error) {
+	if err != nil {
+		return
+	}
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if m.currentStats == nil {
+		return
+	}
+
+	stats := &m.currentStats.SSTCompaction
+	stats.Jobs++
+	stats.InputSSTs += len(job.InputSSTs)
+	stats.OutputSSTs += len(job.OutputSSTs)
+
+	var bytes int64
+	for _, sst := range job.OutputSSTs {
+		bytes += sst.Bytes
+	}
+	stats.OutputBytes += bytes
+	stats.ReadBytes += job.ReadBytes
+	if job.MetadataOnly {
+		stats.MovedJobs++
+		stats.MovedBytes += bytes
+		return
+	}
+	stats.RewrittenBytes += bytes
 }
 
 func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {
