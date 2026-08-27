@@ -32,6 +32,11 @@ const (
 var errCompactorClosed = errors.New("compactor closed")
 
 type compactionJob struct {
+	// ReadBytes is what the job pulled from the object store: the inputs of a
+	// rewrite, the verified sources of a checked move, and nothing at all for
+	// an unchecked move.
+	ReadBytes int64
+
 	Type             compactionJobType
 	SourceLevel      uint32
 	DestinationLevel uint32
@@ -367,6 +372,11 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
 	if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount {
+		// Criticality is a property of L0's depth, not of whether a plan could
+		// be built for it. Computing it before the attempt means a level that
+		// cannot be planned still reports as critical, instead of going quiet
+		// exactly when it is most backed up.
+		critical := l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount)
 		inputs := m.L0SSTs
 		if len(inputs) > c.opts.Trigger.MaxInputSSTs {
 			inputs = inputs[len(inputs)-c.opts.Trigger.MaxInputSSTs:]
@@ -374,6 +384,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		plan, err := c.buildLevelPlan(m, 0, 1, inputs)
 		if err != nil {
 			firstPlanningErr = err
+			c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
 		} else {
 			inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
 			plan.workUnits = workUnits
@@ -381,7 +392,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				plan:       plan,
 				inputBytes: inputBytes,
 				workUnits:  workUnits,
-				critical:   l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount),
+				critical:   critical,
 			})
 		}
 	}
@@ -396,6 +407,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 			if firstPlanningErr == nil {
 				firstPlanningErr = err
 			}
+			c.reportPlanningBlocked(level.Number, len(level.SSTs), false, err)
 			continue
 		}
 		inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
@@ -410,6 +422,12 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		return nil, firstPlanningErr
 	}
 	return candidates, nil
+}
+
+func (c *compactor) reportPlanningBlocked(sourceLevel uint32, sstCount int, critical bool, err error) {
+	if c.opts.OnPlanningBlocked != nil {
+		c.opts.OnPlanningBlocked(sourceLevel, sstCount, critical, err)
+	}
 }
 
 func (c *compactor) levelTargetBytes(level uint32) int64 {
@@ -436,9 +454,13 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		if level := m.Level(destinationLevel); level != nil {
 			destination = level.OverlappingSSTs(minKey, maxKey)
 		}
-		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source) &&
-			!c.opts.Safety.ValidateSSTChecksum
-		if metadataOnly || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
+		// Move eligibility is structural: disjoint sources with nothing to
+		// merge in the destination can change level by manifest edit alone.
+		// Checksum validation does not disqualify a move, it only means the
+		// sources are read and verified before the move is committed.
+		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source)
+		uncheckedMove := metadataOnly && !c.opts.Safety.ValidateSSTChecksum
+		if uncheckedMove || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
 			plan := &levelCompactionPlan{
 				sourceLevel:      sourceLevel,
 				destinationLevel: destinationLevel,
@@ -447,12 +469,34 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 				metadataOnly:     metadataOnly,
 			}
 			inputBytes, _ := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
-			if metadataOnly || inputBytes <= c.opts.Trigger.MaxInputBytes || count == 1 {
+			// An unchecked move performs no object I/O, so the byte target is
+			// irrelevant. A verified move is still metadata-only, but its reads
+			// are real work and stay within the same soft target as a rewrite.
+			if uncheckedMove || inputBytes <= c.opts.Trigger.MaxInputBytes || count == 1 {
 				return plan, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("compaction overlap exceeds max input SSTs=%d for L%d to L%d", c.opts.Trigger.MaxInputSSTs, sourceLevel, destinationLevel)
+	// Report the widest source the loop tried and how much of the destination
+	// it had to drag along: naming only the option that tripped hides the fact
+	// that shrinking the source cannot help when the sources span the whole
+	// key range and the destination overlap never shrinks with them.
+	destinationCount := 0
+	if len(candidates) > 0 {
+		if level := m.Level(destinationLevel); level != nil {
+			oneSource := candidates[:1]
+			if sourceLevel == 0 {
+				oneSource = candidates[len(candidates)-1:]
+			}
+			minKey, maxKey := sstBounds(oneSource)
+			destinationCount = len(level.OverlappingSSTs(minKey, maxKey))
+		}
+	}
+	return nil, fmt.Errorf(
+		"compaction L%d to L%d cannot be planned: one source plus %d destination SSTs "+
+			"requires %d inputs, over the %d limit on inputs and retirement records per job",
+		sourceLevel, destinationLevel, destinationCount, destinationCount+1,
+		c.opts.Trigger.MaxInputSSTs)
 }
 
 func sstBounds(ssts []sstMetadata) ([]byte, []byte) {
@@ -511,7 +555,24 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 	}()
 
 	outputs := plan.sourceSSTs
-	if !plan.metadataOnly {
+	if plan.metadataOnly {
+		// A move publishes the same objects at a new level, so verification
+		// costs the read a rewrite would have done anyway and skips the write
+		// entirely: no new objects, no retirement records, no reclamation.
+		if c.opts.Safety.ValidateSSTChecksum {
+			readBytes, verifyErr := c.verifyMoveSources(ctx, plan.sourceSSTs)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			job.ReadBytes = readBytes
+		}
+	} else {
+		for _, sst := range plan.sourceSSTs {
+			job.ReadBytes += sst.Size
+		}
+		for _, sst := range plan.destinationSSTs {
+			job.ReadBytes += sst.Size
+		}
 		identity, expiryCutoffMillis, identityErr := c.compactionSSTStreamIdentity(
 			plan, m.NextEpoch, time.Now().UTC())
 		if identityErr != nil {
@@ -601,6 +662,96 @@ func (c *compactor) IsFenced() bool {
 
 func (c *compactor) FenceToken() *manifest.FenceToken {
 	return c.fenceToken
+}
+
+// verifyMoveSources reads and checksums the sources of a move. It reuses the
+// job's read parallelism and returns the bytes fetched so the cost of a
+// verified move is visible next to the cost of a rewrite.
+func (c *compactor) verifyMoveSources(ctx context.Context, ssts []sstMetadata) (int64, error) {
+	if len(ssts) == 0 {
+		return 0, nil
+	}
+
+	parentCtx := ctx
+	parallelism := min(max(c.opts.InputReadParallelism, 1), len(ssts))
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	errs := make([]error, len(ssts))
+	completed := make([]bool, len(ssts))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < parallelism; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if err := ctx.Err(); err != nil {
+					errs[i] = err
+					completed[i] = true
+					continue
+				}
+				if errs[i] = c.verifyOneSST(ctx, ssts[i]); errs[i] != nil {
+					cancel()
+				}
+				completed[i] = true
+			}
+		}()
+	}
+sendJobs:
+	for i := range ssts {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	var cancellationErr error
+	for i := range errs {
+		if errs[i] == nil {
+			continue
+		}
+		if !errors.Is(errs[i], context.Canceled) {
+			return 0, errs[i]
+		}
+		if cancellationErr == nil {
+			cancellationErr = errs[i]
+		}
+	}
+	if cancellationErr != nil {
+		return 0, cancellationErr
+	}
+
+	var readBytes int64
+	for i := range completed {
+		if !completed[i] {
+			if err := parentCtx.Err(); err != nil {
+				return 0, err
+			}
+			return 0, fmt.Errorf("verify move source %s: verification did not complete", ssts[i].ID)
+		}
+		readBytes += ssts[i].Size
+	}
+	return readBytes, nil
+}
+
+func (c *compactor) verifyOneSST(ctx context.Context, sst sstMetadata) error {
+	path := c.store.SSTPath(sst.ID)
+	var data []byte
+	var err error
+	if sst.Size > 0 {
+		data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
+	} else {
+		data, _, err = c.store.Read(ctx, path)
+	}
+	if err != nil {
+		return fmt.Errorf("read sst %s for verified move: %w", sst.ID, err)
+	}
+	return validateSSTDataForCompaction(sst, data, true)
 }
 
 type openSSTResult struct {
