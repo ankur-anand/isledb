@@ -26,7 +26,6 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 			L0SSTCount:          1,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
-			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,

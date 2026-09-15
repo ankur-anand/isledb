@@ -2,10 +2,13 @@ package isledb
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +17,13 @@ import (
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"golang.org/x/sync/errgroup"
+)
+
+const (
+	compactionSSTIDPrefix = "compacted-"
+	compactionSSTIDSuffix = ".sst"
+	compactionSSTHashLen  = sha256.Size * 2
+	compactionSSTIndexLen = 4
 )
 
 func buildSSTIDWithTimestamp(epoch, seqLo, seqHi uint64, ts time.Time) string {
@@ -35,6 +45,28 @@ func newSSTStreamIdentity(epoch, seqLo, seqHi uint64, createdAt time.Time) sstSt
 	}
 }
 
+func writerSSTEpoch(id string) (uint64, bool) {
+	if !strings.HasSuffix(id, compactionSSTIDSuffix) || isCompactionSSTID(id) {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimSuffix(id, compactionSSTIDSuffix), "-")
+	if len(parts) != 4 {
+		return 0, false
+	}
+	values := make([]uint64, len(parts))
+	for i := range parts {
+		value, err := strconv.ParseUint(parts[i], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		values[i] = value
+	}
+	if values[0] == 0 || values[1] > values[2] || values[3] == 0 {
+		return 0, false
+	}
+	return values[0], true
+}
+
 // sstStreamSetIdentity names every output of one deterministic multi-SST
 // build. OutputKey is derived by the compactor from its active fence, immutable
 // inputs, and byte-affecting output policy. Retries within that ownership reuse
@@ -50,10 +82,31 @@ func (identity sstStreamSetIdentity) output(index int) (sstStreamIdentity, error
 		return sstStreamIdentity{}, errors.New("incomplete multi-SST stream identity")
 	}
 	return sstStreamIdentity{
-		ID:        fmt.Sprintf("compacted-%s-%04d.sst", identity.OutputKey, index),
+		ID: fmt.Sprintf("%s%s-%0*d%s", compactionSSTIDPrefix, identity.OutputKey,
+			compactionSSTIndexLen, index, compactionSSTIDSuffix),
 		Epoch:     identity.Epoch,
 		CreatedAt: identity.CreatedAt.UTC(),
 	}, nil
+}
+
+// isCompactionSSTID recognizes the exact immutable output grammar. Writer
+// flushes use a different grammar; newly written compaction outputs use this
+// one, while metadata-only moves retain their existing IDs. Orphan reclamation
+// uses the distinction, so the parser stays beside the formatter.
+func isCompactionSSTID(id string) bool {
+	if !strings.HasPrefix(id, compactionSSTIDPrefix) || !strings.HasSuffix(id, compactionSSTIDSuffix) {
+		return false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(id, compactionSSTIDPrefix), compactionSSTIDSuffix)
+	hash, index, ok := strings.Cut(body, "-")
+	if !ok || len(hash) != compactionSSTHashLen || len(index) != compactionSSTIndexLen {
+		return false
+	}
+	if _, err := hex.DecodeString(hash); err != nil {
+		return false
+	}
+	n, err := strconv.Atoi(index)
+	return err == nil && n > 0
 }
 
 type streamSSTResult struct {

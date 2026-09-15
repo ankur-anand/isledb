@@ -594,6 +594,28 @@ func TestReadStream(t *testing.T) {
 	})
 }
 
+func TestScratchNamespaceIsStableAndSeparatesStores(t *testing.T) {
+	bucket := memblob.OpenBucket(nil)
+	first := New(bucket, "bucket-a", "database")
+	second := New(bucket, "bucket-a", "database/")
+	otherBucket := New(bucket, "bucket-b", "database")
+	otherPrefix := New(bucket, "bucket-a", "other-database")
+
+	if first.ScratchNamespace() == "" {
+		t.Fatal("empty scratch namespace")
+	}
+	if first.ScratchNamespace() != second.ScratchNamespace() {
+		t.Fatalf("equivalent stores have different namespaces: %q != %q",
+			first.ScratchNamespace(), second.ScratchNamespace())
+	}
+	if first.ScratchNamespace() == otherBucket.ScratchNamespace() {
+		t.Fatal("different buckets share a scratch namespace")
+	}
+	if first.ScratchNamespace() == otherPrefix.ScratchNamespace() {
+		t.Fatal("different prefixes share a scratch namespace")
+	}
+}
+
 func TestReadRangeReturnsExactRequestedBytes(t *testing.T) {
 	forEachStore(t, "range-read", func(t *testing.T, h storeHarness) {
 		ctx := context.Background()

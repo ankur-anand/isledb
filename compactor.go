@@ -22,12 +22,10 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
-type compactionJobType int
-
-const (
-	compactionL0ToL1 compactionJobType = iota
-	compactionLevelToLevel
-)
+// A compaction is published in one manifest entry. The manifest format bounds
+// both removed and added objects, so this is a format invariant rather than a
+// tuning knob.
+const maxCompactionSSTsPerJob = manifest.MaxRetiredObjectsPerEntry
 
 var errCompactorClosed = errors.New("compactor closed")
 
@@ -37,8 +35,6 @@ type compactionJob struct {
 	// an unchecked move.
 	ReadBytes int64
 
-	Type             compactionJobType
-	SourceLevel      uint32
 	DestinationLevel uint32
 	InputSSTs        []string
 	OutputSSTs       []compactionOutput
@@ -68,6 +64,7 @@ type compactor struct {
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
+	scratch    *compactionScratchWorkspace
 
 	closed atomic.Bool
 }
@@ -95,7 +92,9 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 		runGate:     make(chan struct{}, 1),
 	}
 
+	scratchOwner := compactionScratchMaintenance
 	if fence == nil {
+		scratchOwner = compactionScratchStandalone
 		ownerID := opts.OwnerID
 		if ownerID == "" {
 			ownerID = fmt.Sprintf("compactor-%d-%d", time.Now().UnixNano(), m.NextEpoch)
@@ -108,6 +107,13 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 	}
 	token := *fence
 	c.fenceToken = &token
+	scratch, err := openCompactionScratchWorkspace(
+		opts.ScratchDir, store.ScratchNamespace(), scratchOwner, token.Epoch)
+	if err != nil {
+		return nil, fmt.Errorf("open compaction scratch: %w", err)
+	}
+	c.scratch = scratch
+	c.opts.ScratchDir = scratch.Path()
 
 	return c, nil
 }
@@ -125,12 +131,6 @@ func normalizeCompactorOptions(opts compactorOptions) compactorOptions {
 	}
 	if opts.Trigger.LevelSizeMultiplier < 2 {
 		opts.Trigger.LevelSizeMultiplier = d.Trigger.LevelSizeMultiplier
-	}
-	if opts.Trigger.MaxInputSSTs <= 0 || opts.Trigger.MaxInputSSTs > manifest.MaxRetiredObjectsPerEntry {
-		opts.Trigger.MaxInputSSTs = d.Trigger.MaxInputSSTs
-	}
-	if opts.Trigger.MaxInputBytes <= 0 {
-		opts.Trigger.MaxInputBytes = d.Trigger.MaxInputBytes
 	}
 	if opts.Output.BloomBitsPerKey == 0 {
 		opts.Output.BloomBitsPerKey = d.Output.BloomBitsPerKey
@@ -152,7 +152,10 @@ func (c *compactor) Close(ctx context.Context) error {
 	c.lifecycleMu.Lock()
 	c.closed.Store(true)
 	c.lifecycleMu.Unlock()
-	return waitGroupContext(ctx, &c.activeRuns)
+	if err := waitGroupContext(ctx, &c.activeRuns); err != nil {
+		return err
+	}
+	return c.scratch.Close()
 }
 
 func (c *compactor) closeDB() error {
@@ -267,7 +270,6 @@ type levelCompactionPlan struct {
 	sourceSSTs       []sstMetadata
 	destinationSSTs  []sstMetadata
 	metadataOnly     bool
-	workUnits        uint32
 }
 
 // compactionOutputIdentityVersion domain-separates revisions of the attempt-key
@@ -371,38 +373,42 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
-	if m.L0SSTCount() >= c.opts.Trigger.L0SSTCount {
+	if c.l0NeedsPlanning(m) {
 		// Criticality is a property of L0's depth, not of whether a plan could
 		// be built for it. Computing it before the attempt means a level that
 		// cannot be planned still reports as critical, instead of going quiet
 		// exactly when it is most backed up.
 		critical := l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount)
 		inputs := m.L0SSTs
-		if len(inputs) > c.opts.Trigger.MaxInputSSTs {
-			inputs = inputs[len(inputs)-c.opts.Trigger.MaxInputSSTs:]
+		if len(inputs) > maxCompactionSSTsPerJob {
+			inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
 		}
-		plan, err := c.buildLevelPlan(m, 0, 1, inputs)
+		plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
 		if err != nil {
 			firstPlanningErr = err
 			c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
 		} else {
-			inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
-			plan.workUnits = workUnits
 			candidates = append(candidates, compactionCandidate{
-				plan:       plan,
-				inputBytes: inputBytes,
-				workUnits:  workUnits,
-				critical:   critical,
+				plan:      plan,
+				workUnits: 1,
+				critical:  critical && plan.sourceLevel == 0,
 			})
 		}
+	}
+	plannedLevels := make(map[uint32]struct{}, len(candidates))
+	for i := range candidates {
+		plannedLevels[candidates[i].plan.sourceLevel] = struct{}{}
 	}
 	for i := range m.Levels {
 		level := &m.Levels[i]
 		if level.TotalSize() <= c.levelTargetBytes(level.Number) {
 			continue
 		}
-		limit := min(c.opts.Trigger.MaxInputSSTs, len(level.SSTs))
-		plan, err := c.buildLevelPlan(m, level.Number, level.Number+1, level.SSTs[:limit])
+		if _, exists := plannedLevels[level.Number]; exists {
+			continue
+		}
+		limit := min(maxCompactionSSTsPerJob, len(level.SSTs))
+		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, level.SSTs[:limit])
 		if err != nil {
 			if firstPlanningErr == nil {
 				firstPlanningErr = err
@@ -410,24 +416,77 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 			c.reportPlanningBlocked(level.Number, len(level.SSTs), false, err)
 			continue
 		}
-		inputBytes, workUnits := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
-		plan.workUnits = workUnits
+		if _, exists := plannedLevels[plan.sourceLevel]; exists {
+			continue
+		}
 		candidates = append(candidates, compactionCandidate{
-			plan:       plan,
-			inputBytes: inputBytes,
-			workUnits:  workUnits,
+			plan:      plan,
+			workUnits: 1,
 		})
+		plannedLevels[plan.sourceLevel] = struct{}{}
 	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].plan.sourceLevel < candidates[j].plan.sourceLevel
+	})
 	if len(candidates) == 0 && firstPlanningErr != nil {
 		return nil, firstPlanningErr
 	}
 	return candidates, nil
 }
 
+func (c *compactor) l0NeedsPlanning(m *manifestState) bool {
+	return m != nil && len(m.L0SSTs) >= c.opts.Trigger.L0SSTCount
+}
+
 func (c *compactor) reportPlanningBlocked(sourceLevel uint32, sstCount int, critical bool, err error) {
 	if c.opts.OnPlanningBlocked != nil {
 		c.opts.OnPlanningBlocked(sourceLevel, sstCount, critical, err)
 	}
+}
+
+// buildLevelPlanWithDrain returns the requested promotion when it fits in one
+// manifest entry. If the destination is too fragmented, it recursively moves
+// or compacts that destination downward first. Every successful plan still
+// targets exactly one adjacent level; the caller retries the original
+// promotion on the next maintenance cycle.
+func (c *compactor) buildLevelPlanWithDrain(
+	m *manifestState,
+	sourceLevel, destinationLevel uint32,
+	candidates []sstMetadata,
+) (*levelCompactionPlan, error) {
+	plan, err := c.buildLevelPlan(m, sourceLevel, destinationLevel, candidates)
+	if err == nil {
+		return plan, nil
+	}
+	if len(candidates) == 0 || destinationLevel == ^uint32(0) {
+		return nil, err
+	}
+
+	// buildLevelPlan shrinks to one source before failing. Reproduce that final
+	// source here to identify the exact destination range that must drain.
+	blockingSource := candidates[:1]
+	if sourceLevel == 0 {
+		blockingSource = candidates[len(candidates)-1:]
+	}
+	minKey, maxKey := sstBounds(blockingSource)
+	destination := m.Level(destinationLevel)
+	if destination == nil {
+		return nil, err
+	}
+	blockers := destination.OverlappingSSTs(minKey, maxKey)
+	if len(blockers) == 0 {
+		return nil, err
+	}
+	if len(blockers) > maxCompactionSSTsPerJob {
+		blockers = blockers[:maxCompactionSSTsPerJob]
+	}
+
+	drain, drainErr := c.buildLevelPlanWithDrain(
+		m, destinationLevel, destinationLevel+1, blockers)
+	if drainErr != nil {
+		return nil, fmt.Errorf("%w; drain L%d first: %v", err, destinationLevel, drainErr)
+	}
+	return drain, nil
 }
 
 func (c *compactor) levelTargetBytes(level uint32) int64 {
@@ -459,8 +518,7 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		// Checksum validation does not disqualify a move, it only means the
 		// sources are read and verified before the move is committed.
 		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source)
-		uncheckedMove := metadataOnly && !c.opts.Safety.ValidateSSTChecksum
-		if uncheckedMove || len(source)+len(destination) <= c.opts.Trigger.MaxInputSSTs {
+		if len(source)+len(destination) <= maxCompactionSSTsPerJob {
 			plan := &levelCompactionPlan{
 				sourceLevel:      sourceLevel,
 				destinationLevel: destinationLevel,
@@ -468,13 +526,7 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 				destinationSSTs:  destination,
 				metadataOnly:     metadataOnly,
 			}
-			inputBytes, _ := compactionPlanWorkUnits(plan, c.opts.Trigger.MaxInputBytes)
-			// An unchecked move performs no object I/O, so the byte target is
-			// irrelevant. A verified move is still metadata-only, but its reads
-			// are real work and stay within the same soft target as a rewrite.
-			if uncheckedMove || inputBytes <= c.opts.Trigger.MaxInputBytes || count == 1 {
-				return plan, nil
-			}
+			return plan, nil
 		}
 	}
 	// Report the widest source the loop tried and how much of the destination
@@ -496,7 +548,7 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		"compaction L%d to L%d cannot be planned: one source plus %d destination SSTs "+
 			"requires %d inputs, over the %d limit on inputs and retirement records per job",
 		sourceLevel, destinationLevel, destinationCount, destinationCount+1,
-		c.opts.Trigger.MaxInputSSTs)
+		maxCompactionSSTsPerJob)
 }
 
 func sstBounds(ssts []sstMetadata) ([]byte, []byte) {
@@ -529,13 +581,7 @@ func sstsDoNotOverlap(ssts []sstMetadata) bool {
 }
 
 func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan) (err error) {
-	jobType := compactionLevelToLevel
-	if plan.sourceLevel == 0 {
-		jobType = compactionL0ToL1
-	}
 	job := compactionJob{
-		Type:             jobType,
-		SourceLevel:      plan.sourceLevel,
 		DestinationLevel: plan.destinationLevel,
 		MetadataOnly:     plan.metadataOnly,
 	}
@@ -615,10 +661,10 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 		DestinationLevel: plan.destinationLevel,
 		AddSSTables:      outputs,
 	}
-	return c.appendCompaction(ctx, m, payload, plan.workUnits)
+	return c.appendCompaction(ctx, m, payload)
 }
 
-func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload, workUnits uint32) error {
+func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload) error {
 	added := make(map[string]struct{}, len(payload.AddSSTables))
 	for _, sst := range payload.AddSSTables {
 		added[sst.ID] = struct{}{}
@@ -637,7 +683,7 @@ func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payl
 		return c.stageCommand(ctx, manifest.MaintenanceCommand{
 			Kind: manifest.MaintenanceCommandCompaction,
 			Scheduling: manifest.MaintenanceScheduling{
-				WorkUnits: workUnits,
+				WorkUnits: 1,
 			},
 			Compaction: &manifest.CompactionCommand{
 				Payload:        payload,
@@ -740,18 +786,10 @@ sendJobs:
 }
 
 func (c *compactor) verifyOneSST(ctx context.Context, sst sstMetadata) error {
-	path := c.store.SSTPath(sst.ID)
-	var data []byte
-	var err error
-	if sst.Size > 0 {
-		data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
-	} else {
-		data, _, err = c.store.Read(ctx, path)
+	if err := verifyCompactionSST(ctx, c.store, sst); err != nil {
+		return fmt.Errorf("verify move source %s: %w", sst.ID, err)
 	}
-	if err != nil {
-		return fmt.Errorf("read sst %s for verified move: %w", sst.ID, err)
-	}
-	return validateSSTDataForCompaction(sst, data, true)
+	return nil
 }
 
 type openSSTResult struct {
@@ -837,28 +875,14 @@ sendJobs:
 }
 
 func (c *compactor) openOneSST(ctx context.Context, sst sstMetadata) openSSTResult {
-	path := c.store.SSTPath(sst.ID)
-	var data []byte
-	var err error
-	if sst.Size > 0 {
-		data, err = c.store.ReadRange(ctx, path, 0, sst.Size)
-	} else {
-		data, _, err = c.store.Read(ctx, path)
-	}
-	if err != nil {
-		return openSSTResult{err: fmt.Errorf("read sst %s: %w", sst.ID, err)}
-	}
-	if err := validateSSTDataForCompaction(sst, data, c.opts.Safety.ValidateSSTChecksum); err != nil {
-		return openSSTResult{err: err}
-	}
-
-	data, err = trimSSTData(sst, data)
+	readable, err := stageCompactionSST(ctx, c.store, sst, c.opts.ScratchDir, c.opts.Safety.ValidateSSTChecksum)
 	if err != nil {
 		return openSSTResult{err: err}
 	}
 
-	reader, err := sstable.NewReader(ctx, newSSTReadable(data), sstable.ReaderOptions{})
+	reader, err := sstable.NewReader(ctx, readable, sstable.ReaderOptions{})
 	if err != nil {
+		_ = readable.Close()
 		return openSSTResult{err: err}
 	}
 
@@ -880,34 +904,6 @@ func cleanupOpenResults(results []openSSTResult) {
 			_ = result.reader.Close()
 		}
 	}
-}
-
-func validateSSTDataForCompaction(meta sstMetadata, data []byte, verify bool) error {
-	if !verify {
-		return nil
-	}
-
-	var err error
-	data, err = trimSSTData(meta, data)
-	if err != nil {
-		return err
-	}
-
-	sum := sha256.Sum256(data)
-	hashHex := hex.EncodeToString(sum[:])
-
-	if meta.Checksum == "" {
-		return fmt.Errorf("sst %s: missing checksum", meta.ID)
-	}
-	algo, expected, ok := strings.Cut(meta.Checksum, ":")
-	if !ok || algo != "sha256" {
-		return fmt.Errorf("sst %s: unsupported checksum %q", meta.ID, meta.Checksum)
-	}
-	if expected != hashHex {
-		return fmt.Errorf("sst %s: checksum mismatch", meta.ID)
-	}
-
-	return nil
 }
 
 func (c *compactor) writeCompactedSSTs(

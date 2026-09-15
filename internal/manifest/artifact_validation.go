@@ -1,11 +1,10 @@
 package manifest
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"math"
-	"strings"
+
+	internalchecksum "github.com/ankur-anand/isledb/internal/checksum"
 )
 
 func validateSSTArtifactMetadata(sst SSTMeta) error {
@@ -46,12 +45,7 @@ func validateSSTArtifactMetadata(sst SSTMeta) error {
 }
 
 func validateArtifactSHA256(field, checksum string) error {
-	const prefix = "sha256:"
-	if !strings.HasPrefix(checksum, prefix) ||
-		len(checksum) != len(prefix)+hex.EncodedLen(sha256.Size) {
-		return fmt.Errorf("invalid %s %q", field, checksum)
-	}
-	if _, err := hex.DecodeString(checksum[len(prefix):]); err != nil {
+	if _, err := internalchecksum.ParseSHA256(checksum); err != nil {
 		return fmt.Errorf("invalid %s %q", field, checksum)
 	}
 	return nil

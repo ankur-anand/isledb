@@ -2,7 +2,6 @@ package isledb
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 )
 
@@ -44,6 +43,48 @@ func TestLevelPlannerRewritesOverlappingL0AndDestination(t *testing.T) {
 	}
 }
 
+func TestLevelPlannerPromotesWideL0Directly(t *testing.T) {
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	for i := 0; i < c.opts.Trigger.L0SSTCount; i++ {
+		sst := plannerSST(0, 0, 100)
+		sst.ID = fmt.Sprintf("l0-wide-%03d", i)
+		sst.Size = 1 << 20
+		m.AddL0SST(sst)
+	}
+	destination := plannerSST(1, 0, 100)
+	destination.Size = 64 << 20
+	m.AddLevelSSTs(1, []sstMetadata{destination})
+
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || plan.sourceLevel != 0 || plan.destinationLevel != 1 {
+		t.Fatalf("plan=%+v, want direct L0-to-L1 promotion", plan)
+	}
+	if got := len(plan.sourceSSTs); got != c.opts.Trigger.L0SSTCount {
+		t.Fatalf("promotion sources=%d want=%d", got, c.opts.Trigger.L0SSTCount)
+	}
+	if len(plan.destinationSSTs) != 1 {
+		t.Fatalf("promotion destination=%+v, want the complete overlap", plan.destinationSSTs)
+	}
+}
+
+func TestLevelPlannerLeavesOrdinaryShallowL0Alone(t *testing.T) {
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	m.AddL0SST(plannerSST(0, 0, 0))
+
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != nil {
+		t.Fatalf("ordinary L0 below trigger unexpectedly planned: %+v", plan)
+	}
+}
+
 func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 	c := plannerOnlyCompactor()
 	c.opts.Trigger.BaseLevelBytes = 1
@@ -59,24 +100,9 @@ func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 	}
 }
 
-func TestLevelPlannerRejectsUnboundedOverlap(t *testing.T) {
-	c := plannerOnlyCompactor()
-	c.opts.Trigger.MaxInputSSTs = 2
-	m := &manifestState{}
-	for i := 0; i < 8; i++ {
-		m.AddL0SST(plannerSST(0, 0, 100))
-	}
-	m.AddLevelSSTs(1, []sstMetadata{plannerSST(1, 0, 49), plannerSST(1, 50, 100)})
-
-	if _, err := plannedCandidateForLevel(c, m, 0); err == nil {
-		t.Fatal("expected bounded-input error")
-	}
-}
-
-func TestLevelPlannerBoundsRewriteByInputBytes(t *testing.T) {
+func TestLevelPlannerSelectsWidestValidSourceBatch(t *testing.T) {
 	c := plannerOnlyCompactor()
 	c.opts.Trigger.L0SSTCount = 3
-	c.opts.Trigger.MaxInputBytes = 100 << 20
 	m := &manifestState{}
 	for i := 0; i < 3; i++ {
 		m.AddL0SST(plannerSST(0, i, i+2))
@@ -87,8 +113,30 @@ func TestLevelPlannerBoundsRewriteByInputBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planCompactionCandidates: %v", err)
 	}
-	if got := len(plan.sourceSSTs); got != 1 {
-		t.Fatalf("source SSTs=%d, want one indivisible oversized source", got)
+	if got := len(plan.sourceSSTs); got != 3 {
+		t.Fatalf("source SSTs=%d, want widest valid batch of 3", got)
+	}
+}
+
+func TestLevelPlannerLargeDestinationDoesNotShrinkSourceBatch(t *testing.T) {
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	for i := 0; i < 8; i++ {
+		sst := plannerSST(0, 0, 100)
+		sst.ID = fmt.Sprintf("wide-source-%d", i)
+		sst.Size = 16 << 20
+		m.AddL0SST(sst)
+	}
+	destination := plannerSST(1, 0, 100)
+	destination.Size = 512 << 20
+	m.AddLevelSSTs(1, []sstMetadata{destination})
+
+	plan, err := c.buildLevelPlan(m, 0, 1, m.L0SSTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(plan.sourceSSTs); got != 8 {
+		t.Fatalf("source SSTs=%d want=8; an indivisible destination must not shrink the source batch", got)
 	}
 }
 
@@ -139,53 +187,11 @@ func TestLevelPlannerStillMovesWhenChecksumValidationIsOn(t *testing.T) {
 	}
 }
 
-func TestLevelPlannerBoundsVerifiedMoveBytesWithoutForcingRewrite(t *testing.T) {
-	c := plannerOnlyCompactor()
-	c.opts.Safety.ValidateSSTChecksum = true
-	c.opts.Trigger.L0SSTCount = 1
-	c.opts.Trigger.MaxInputBytes = 2 * (64 << 20)
-	m := &manifestState{}
-	for i := 0; i < 4; i++ {
-		m.AddL0SST(plannerSST(0, i, i))
-	}
-
-	plan, err := plannedCandidateForLevel(c, m, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan == nil || !plan.metadataOnly {
-		t.Fatalf("verified move became a rewrite: %+v", plan)
-	}
-	if got := len(plan.sourceSSTs); got != 2 {
-		t.Fatalf("verified move sources = %d, want 2 within byte target", got)
-	}
-
-	// Without verification the same move performs no object I/O, so the byte
-	// target must not fragment it into extra manifest-only jobs.
-	c.opts.Safety.ValidateSSTChecksum = false
-	plan, err = plannedCandidateForLevel(c, m, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(plan.sourceSSTs); got != 4 {
-		t.Fatalf("unchecked move sources = %d, want all 4", got)
-	}
-}
-
-// A level that cannot be planned must say so. The scheduler otherwise sees an
-// absent candidate, finds work at another level, and reports a healthy cycle
-// while the blocked level never drains.
-func TestLevelPlannerReportsBlockedL0(t *testing.T) {
+func TestLevelPlannerDrainsDestinationBeforeBlockedPromotion(t *testing.T) {
 	c := plannerOnlyCompactor()
 	var blocked []string
-	var sawCritical bool
-	var sawCount int
-	var reason string
 	c.opts.OnPlanningBlocked = func(sourceLevel uint32, sstCount int, critical bool, err error) {
 		blocked = append(blocked, fmt.Sprintf("L%d", sourceLevel))
-		sawCritical = critical
-		sawCount = sstCount
-		reason = err.Error()
 	}
 
 	m := &manifestState{}
@@ -198,31 +204,90 @@ func TestLevelPlannerReportsBlockedL0(t *testing.T) {
 	}
 	// More L1 files under that span than a single job may retire, so shrinking
 	// the source count can never bring the plan under the limit.
-	l1 := make([]sstMetadata, 0, c.opts.Trigger.MaxInputSSTs+1)
-	for i := 0; i <= c.opts.Trigger.MaxInputSSTs; i++ {
+	l1 := make([]sstMetadata, 0, maxCompactionSSTsPerJob)
+	for i := 0; i < maxCompactionSSTsPerJob; i++ {
 		l1 = append(l1, plannerSST(1, i, i))
 	}
 	m.AddLevelSSTs(1, l1)
 
-	plan, err := plannedCandidateForLevel(c, m, 0)
+	candidates, err := c.planCompactionCandidates(m)
 	if err != nil {
-		t.Fatalf("planning should not fail the cycle when another level has work: %v", err)
+		t.Fatalf("plan destination drain: %v", err)
 	}
-	if plan != nil {
-		t.Fatalf("expected no L0 candidate, got %+v", plan)
+	if len(candidates) == 0 {
+		t.Fatal("no compaction candidate")
 	}
-	if len(blocked) != 1 || blocked[0] != "L0" {
-		t.Fatalf("blocked levels = %v, want [L0]", blocked)
+	plan := candidates[0].plan
+	if plan.sourceLevel != 1 || plan.destinationLevel != 2 || !plan.metadataOnly {
+		t.Fatalf("plan=%+v, want L1-to-L2 drain", plan)
 	}
-	if !sawCritical {
-		t.Fatal("a critically deep L0 reported as not critical because planning failed")
+	if len(plan.sourceSSTs) != maxCompactionSSTsPerJob {
+		t.Fatalf("drain sources=%d, want %d", len(plan.sourceSSTs), maxCompactionSSTsPerJob)
 	}
-	if sawCount != l0Count {
-		t.Fatalf("blocked sst count = %d, want %d", sawCount, l0Count)
+	if len(blocked) != 0 {
+		t.Fatalf("recoverable L0 pressure reported blocked: %v", blocked)
 	}
-	wantReason := fmt.Sprintf("one source plus %d destination SSTs requires %d inputs",
-		c.opts.Trigger.MaxInputSSTs+1, c.opts.Trigger.MaxInputSSTs+2)
-	if !strings.Contains(reason, wantReason) {
-		t.Fatalf("blocked reason = %q, want it to contain %q", reason, wantReason)
+
+	ids := make([]string, len(plan.sourceSSTs))
+	for i := range plan.sourceSSTs {
+		ids[i] = plan.sourceSSTs[i].ID
+	}
+	m.RemoveCompactionInputs(1, 2, ids)
+	m.AddLevelSSTs(2, plan.sourceSSTs)
+	next, err := c.buildLevelPlanWithDrain(m, 0, 1, m.L0SSTs)
+	if err != nil {
+		t.Fatalf("plan L0 after drain: %v", err)
+	}
+	if next.sourceLevel != 0 || next.destinationLevel != 1 {
+		t.Fatalf("next plan=%+v, want original L0-to-L1 promotion", next)
+	}
+}
+
+func TestLevelPlannerRecursivelyDrainsDeepestBlockingLevel(t *testing.T) {
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	for i := 0; i < c.opts.Trigger.L0SSTCount; i++ {
+		sst := plannerSST(0, 0, 0)
+		sst.ID = fmt.Sprintf("l0-wide-%03d", i)
+		sst.MinKey = []byte("a000")
+		sst.MaxKey = []byte("z999")
+		m.AddL0SST(sst)
+	}
+
+	l1 := make([]sstMetadata, 0, maxCompactionSSTsPerJob)
+	first := plannerSST(1, 0, 0)
+	first.ID = "l1-wide-first"
+	first.MinKey = []byte("a000")
+	first.MaxKey = []byte("a999")
+	l1 = append(l1, first)
+	for i := 1; i < maxCompactionSSTsPerJob; i++ {
+		key := []byte(fmt.Sprintf("b%03d", i))
+		sst := plannerSST(1, i, i)
+		sst.MinKey = key
+		sst.MaxKey = key
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	l2 := make([]sstMetadata, 0, maxCompactionSSTsPerJob)
+	for i := 0; i < maxCompactionSSTsPerJob; i++ {
+		key := []byte(fmt.Sprintf("a%03d", i))
+		sst := plannerSST(2, i, i)
+		sst.MinKey = key
+		sst.MaxKey = key
+		l2 = append(l2, sst)
+	}
+	m.AddLevelSSTs(2, l2)
+
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		t.Fatalf("plan recursive drain: %v", err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("no compaction candidate")
+	}
+	plan := candidates[0].plan
+	if plan.sourceLevel != 2 || plan.destinationLevel != 3 || !plan.metadataOnly {
+		t.Fatalf("plan=%+v, want deepest L2-to-L3 drain", plan)
 	}
 }

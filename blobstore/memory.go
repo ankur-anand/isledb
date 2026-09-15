@@ -1,6 +1,7 @@
 package blobstore
 
 import (
+	"fmt"
 	"strings"
 
 	"gocloud.dev/blob"
@@ -11,9 +12,10 @@ import (
 func NewMemory(prefix string) *Store {
 	bkt := memblob.OpenBucket(nil)
 	return &Store{
-		bucket: bkt,
-		prefix: strings.TrimSuffix(prefix, "/"),
-		owns:   true,
+		bucket:           bkt,
+		prefix:           strings.TrimSuffix(prefix, "/"),
+		scratchNamespace: localScratchNamespace(fmt.Sprintf("memory:%p", bkt), prefix),
+		owns:             true,
 	}
 }
 

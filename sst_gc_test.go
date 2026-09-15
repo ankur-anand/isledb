@@ -774,6 +774,221 @@ func TestManifestRejectsIncompleteRetirementBatch(t *testing.T) {
 	}
 }
 
+func TestSSTOrphanAuditDeletesOnlyUnownedPredecessorFenceObjects(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("sst-orphan-audit-safety")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("initial replay: %v", err)
+	}
+
+	oldWriter, err := manifestStore.ClaimWriter(ctx, "orphan-audit-writer-old")
+	if err != nil {
+		t.Fatalf("claim old writer: %v", err)
+	}
+	liveID := buildSSTIDWithTimestamp(oldWriter.Epoch, 1, 1, time.Now().UTC())
+	oldWriterOrphanID := buildSSTIDWithTimestamp(oldWriter.Epoch, 2, 2, time.Now().UTC())
+	headProtectedID := buildSSTIDWithTimestamp(oldWriter.Epoch, 3, 3, time.Now().UTC())
+	planProtectedID := buildSSTIDWithTimestamp(oldWriter.Epoch, 4, 4, time.Now().UTC())
+	for _, id := range []string{liveID, oldWriterOrphanID, headProtectedID, planProtectedID} {
+		if _, err := store.Write(ctx, store.SSTPath(id), []byte("sst-"+id)); err != nil {
+			t.Fatalf("write writer SST %q: %v", id, err)
+		}
+	}
+	if _, err := manifestStore.AppendAddSSTableWithFence(ctx, manifest.SSTMeta{
+		ID: liveID, Epoch: oldWriter.Epoch, SeqLo: 1, SeqHi: 1, Level: 0,
+	}); err != nil {
+		t.Fatalf("publish live SST: %v", err)
+	}
+	newWriter, err := manifestStore.ClaimWriter(ctx, "orphan-audit-writer-new")
+	if err != nil {
+		t.Fatalf("claim successor writer: %v", err)
+	}
+	currentWriterOrphanID := buildSSTIDWithTimestamp(newWriter.Epoch, 5, 5, time.Now().UTC())
+	if _, err := store.Write(ctx, store.SSTPath(currentWriterOrphanID), []byte("current-writer")); err != nil {
+		t.Fatalf("write current-writer SST: %v", err)
+	}
+
+	if _, err := manifestStore.ClaimCompactor(ctx, "orphan-audit-compactor-old"); err != nil {
+		t.Fatalf("claim old compactor: %v", err)
+	}
+	oldCompactorOrphanID := testCompactionSSTID('a', 1)
+	if _, err := store.Write(ctx, store.SSTPath(oldCompactorOrphanID), []byte("old-compactor")); err != nil {
+		t.Fatalf("write old-compactor SST: %v", err)
+	}
+	// Compaction IDs intentionally do not expose their fence. Their LIST
+	// modification time must be strictly before a successor fence claim.
+	time.Sleep(time.Millisecond)
+	if _, err := manifestStore.ClaimCompactor(ctx, "orphan-audit-compactor-new"); err != nil {
+		t.Fatalf("claim successor compactor: %v", err)
+	}
+	currentCompactorOrphanID := testCompactionSSTID('b', 1)
+	if _, err := store.Write(ctx, store.SSTPath(currentCompactorOrphanID), []byte("current-compactor")); err != nil {
+		t.Fatalf("write current-compactor SST: %v", err)
+	}
+	foreignID := "operator-sidecar.sst"
+	if _, err := store.Write(ctx, store.SSTPath(foreignID), []byte("foreign")); err != nil {
+		t.Fatalf("write foreign object: %v", err)
+	}
+
+	maintenanceFence, err := manifestStore.ClaimMaintenance(ctx, "orphan-audit-maintenance")
+	if err != nil {
+		t.Fatalf("claim maintenance: %v", err)
+	}
+	headTarget := manifest.RetiredObject{
+		Kind: manifest.RetiredObjectSST, ID: headProtectedID, Key: store.SSTPath(headProtectedID),
+	}
+	if _, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
+		ID:   "orphan-audit-pending",
+		Kind: manifest.MaintenanceCommandRemoveSSTables,
+		RemoveSSTables: &manifest.RemoveSSTablesCommand{
+			SSTableIDs:     []string{headProtectedID},
+			RetiredObjects: []manifest.RetiredObject{headTarget},
+		},
+	}, maintenanceFence); err != nil {
+		t.Fatalf("stage protected pending command: %v", err)
+	}
+
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read CURRENT: %v", err)
+	}
+	auditNow := time.Now().UTC().Add(48 * time.Hour)
+	planTarget := manifest.RetiredObject{
+		Kind: manifest.RetiredObjectSST, ID: planProtectedID, Key: store.SSTPath(planProtectedID),
+	}
+	planCommand := &manifest.MaintenanceCommand{
+		ID:         "orphan-audit-durable-plan",
+		Epoch:      maintenanceFence.Epoch,
+		Generation: 100,
+		Kind:       manifest.MaintenanceCommandRemoveSSTables,
+		CreatedAt:  auditNow.Add(-time.Minute),
+		RemoveSSTables: &manifest.RemoveSSTablesCommand{
+			SSTableIDs:     []string{planProtectedID},
+			RetiredObjects: []manifest.RetiredObject{planTarget},
+		},
+	}
+	planReceipt := &manifest.MaintenanceReceipt{
+		CommandID: planCommand.ID, Epoch: planCommand.Epoch, Generation: planCommand.Generation,
+		Status: manifest.MaintenanceStatusApplied, AppliedAt: auditNow,
+	}
+	plan, payload, err := buildSSTDeletionPlan(
+		store, current, planCommand, planReceipt, []manifest.RetiredObject{planTarget}, auditNow, 0)
+	if err != nil {
+		t.Fatalf("build protected deletion plan: %v", err)
+	}
+	if _, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil {
+		t.Fatalf("store protected deletion plan: %v", err)
+	}
+
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		DeleteBatchSize:  16,
+		PlanScanLimit:    16,
+		SafetyMargin:     -1,
+		OrphanAuditEvery: time.Hour,
+		OrphanGrace:      -1,
+		OrphanScanLimit:  128,
+		ManifestLog:      manifestStore,
+		Now:              func() time.Time { return auditNow },
+	})
+	stats, _, err := cleaner.runScheduledOnce(ctx)
+	if err != nil {
+		t.Fatalf("run orphan audit: %v", err)
+	}
+	if stats.OrphansDeleted != 2 || stats.Deleted != 2 || stats.Failed != 0 {
+		t.Fatalf("orphan audit stats=%+v want two predecessor-fence deletions", stats)
+	}
+
+	for _, id := range []string{oldWriterOrphanID, oldCompactorOrphanID} {
+		requireObjectExists(t, ctx, store, store.SSTPath(id), false)
+	}
+	for _, id := range []string{
+		liveID, headProtectedID, planProtectedID,
+		currentWriterOrphanID, currentCompactorOrphanID, foreignID,
+	} {
+		requireObjectExists(t, ctx, store, store.SSTPath(id), true)
+	}
+	requireObjectExists(t, ctx, store, sstDeletionPlanCanonicalPath(store, plan.PlanID), true)
+	requireObjectExists(t, ctx, store, sstDeletionPlanReadyPath(store, plan.NotBefore, plan.PlanID), true)
+}
+
+func TestSSTOrphanAuditCompletesProtectionScanBeforeListingSSTs(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("sst-orphan-audit-protection-budget")
+	defer store.Close()
+	manifestStore := manifest.NewStore(store)
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("initial replay: %v", err)
+	}
+	oldWriter, err := manifestStore.ClaimWriter(ctx, "orphan-audit-budget-old")
+	if err != nil {
+		t.Fatalf("claim old writer: %v", err)
+	}
+	protectedIDs := []string{
+		buildSSTIDWithTimestamp(oldWriter.Epoch, 10, 10, time.Now().UTC()),
+		buildSSTIDWithTimestamp(oldWriter.Epoch, 11, 11, time.Now().UTC()),
+	}
+	for _, id := range protectedIDs {
+		if _, err := store.Write(ctx, store.SSTPath(id), []byte(id)); err != nil {
+			t.Fatalf("write protected SST %q: %v", id, err)
+		}
+	}
+	if _, err := manifestStore.ClaimWriter(ctx, "orphan-audit-budget-new"); err != nil {
+		t.Fatalf("claim successor writer: %v", err)
+	}
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("read CURRENT: %v", err)
+	}
+	auditNow := time.Now().UTC().Add(48 * time.Hour)
+	for i, id := range protectedIDs {
+		target := manifest.RetiredObject{Kind: manifest.RetiredObjectSST, ID: id, Key: store.SSTPath(id)}
+		command := &manifest.MaintenanceCommand{
+			ID: "orphan-audit-budget-plan-" + id, Epoch: 1, Generation: uint64(i + 1),
+			Kind: manifest.MaintenanceCommandRemoveSSTables, CreatedAt: auditNow.Add(-time.Minute),
+			RemoveSSTables: &manifest.RemoveSSTablesCommand{
+				SSTableIDs: []string{id}, RetiredObjects: []manifest.RetiredObject{target},
+			},
+		}
+		receipt := &manifest.MaintenanceReceipt{
+			CommandID: command.ID, Epoch: command.Epoch, Generation: command.Generation,
+			Status: manifest.MaintenanceStatusApplied, AppliedAt: auditNow,
+		}
+		plan, payload, err := buildSSTDeletionPlan(
+			store, current, command, receipt, []manifest.RetiredObject{target}, auditNow, 0)
+		if err != nil {
+			t.Fatalf("build plan %d: %v", i, err)
+		}
+		if _, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil {
+			t.Fatalf("store plan %d: %v", i, err)
+		}
+	}
+
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		DeleteBatchSize: 8, SafetyMargin: -1, OrphanGrace: -1,
+		OrphanAuditEvery: time.Hour, OrphanScanLimit: 1,
+		ManifestLog: manifestStore, Now: func() time.Time { return auditNow },
+	})
+	for pass := 0; pass < len(protectedIDs); pass++ {
+		stats, err := cleaner.runOrphanAudit(ctx, auditNow, 8)
+		if err != nil {
+			t.Fatalf("protection pass %d: %v", pass, err)
+		}
+		if stats.OrphanObjectsScanned != 0 || stats.OrphansDeleted != 0 {
+			t.Fatalf("protection pass %d reached SST listing early: %+v", pass, stats)
+		}
+		for _, id := range protectedIDs {
+			requireObjectExists(t, ctx, store, store.SSTPath(id), true)
+		}
+	}
+}
+
+func testCompactionSSTID(hashByte byte, output int) string {
+	return fmt.Sprintf("%s%s-%04d%s", compactionSSTIDPrefix,
+		strings.Repeat(string(hashByte), compactionSSTHashLen), output, compactionSSTIDSuffix)
+}
+
 func newSSTDeletionPlanFixture(
 	t *testing.T,
 	ctx context.Context,

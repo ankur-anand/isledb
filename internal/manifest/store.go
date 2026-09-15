@@ -803,7 +803,8 @@ func (s *Store) AppendCompactionWithFence(ctx context.Context, payload Compactio
 }
 
 func validateCompactionPayload(payload CompactionLogPayload) error {
-	if payload.SourceLevel == ^uint32(0) || payload.DestinationLevel != payload.SourceLevel+1 {
+	adjacent := payload.SourceLevel != ^uint32(0) && payload.DestinationLevel == payload.SourceLevel+1
+	if !adjacent {
 		return fmt.Errorf("%w: compaction source=L%d destination=L%d must target the adjacent level",
 			ErrInvalidManifest, payload.SourceLevel, payload.DestinationLevel)
 	}
@@ -1228,7 +1229,10 @@ func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Ma
 		if err := validateReplayEntry(entry); err != nil {
 			return nil, false
 		}
-		m = ApplyLogEntry(m, entry)
+		m, err = ApplyLogEntry(m, entry)
+		if err != nil {
+			return nil, false
+		}
 	}
 
 	// epoch and sequence bookkeeping.
@@ -1384,7 +1388,10 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 		if err := validateReplayEntry(entry); err != nil {
 			return nil, err
 		}
-		m = ApplyLogEntry(m, entry)
+		m, err = ApplyLogEntry(m, entry)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// THIS is IMP: never reuse the same epoch so Set NextEpoch

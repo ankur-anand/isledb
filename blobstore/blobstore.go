@@ -3,6 +3,7 @@ package blobstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -63,10 +64,11 @@ func (e *BatchDeleteError) Error() string {
 }
 
 type Store struct {
-	bucket     *blob.Bucket
-	bucketName string
-	prefix     string
-	owns       bool
+	bucket           *blob.Bucket
+	bucketName       string
+	prefix           string
+	scratchNamespace string
+	owns             bool
 }
 
 func Open(ctx context.Context, bucketURL, prefix string) (*Store, error) {
@@ -88,22 +90,37 @@ func Open(ctx context.Context, bucketURL, prefix string) (*Store, error) {
 		return nil, fmt.Errorf("open bucket %q: %w", bucketURL, err)
 	}
 	return &Store{
-		bucket:     bkt,
-		bucketName: bucketName,
-		prefix:     strings.TrimSuffix(prefix, "/"),
-		owns:       true,
+		bucket:           bkt,
+		bucketName:       bucketName,
+		prefix:           strings.TrimSuffix(prefix, "/"),
+		scratchNamespace: localScratchNamespace(bucketURL, prefix),
+		owns:             true,
 	}, nil
 }
 
 // New wraps an existing bucket. For cloud providers, bucketName is required
 // for CAS writes; use Open() when possible.
 func New(bkt *blob.Bucket, bucketName, prefix string) *Store {
-	return &Store{
-		bucket:     bkt,
-		bucketName: bucketName,
-		prefix:     strings.TrimSuffix(prefix, "/"),
-		owns:       false,
+	identity := bucketName
+	if identity == "" {
+		// A wrapped bucket without an external name has no stable identity across
+		// process restarts. The pointer still isolates simultaneously open stores;
+		// callers that need cross-restart scratch cleanup should provide a bucket
+		// name or construct the store with Open.
+		identity = fmt.Sprintf("%T:%p", bkt, bkt)
 	}
+	return &Store{
+		bucket:           bkt,
+		bucketName:       bucketName,
+		prefix:           strings.TrimSuffix(prefix, "/"),
+		scratchNamespace: localScratchNamespace(identity, prefix),
+		owns:             false,
+	}
+}
+
+func localScratchNamespace(storageIdentity, prefix string) string {
+	digest := sha256.Sum256([]byte(storageIdentity + "\x00" + strings.TrimSuffix(prefix, "/")))
+	return fmt.Sprintf("%x", digest[:16])
 }
 
 func (s *Store) Close() error {
@@ -119,6 +136,14 @@ func (s *Store) Bucket() *blob.Bucket {
 
 func (s *Store) Prefix() string {
 	return s.prefix
+}
+
+// ScratchNamespace returns an opaque local namespace for temporary files
+// associated with this store. It is stable across reopens when the store was
+// constructed with Open or New with a bucket name, and contains no bucket URL
+// or prefix text.
+func (s *Store) ScratchNamespace() string {
+	return s.scratchNamespace
 }
 
 func (s *Store) path(parts ...string) string {
@@ -521,9 +546,10 @@ type ListResult struct {
 }
 
 type ObjectInfo struct {
-	Key   string
-	Size  int64
-	IsDir bool
+	Key     string
+	Size    int64
+	ModTime time.Time
+	IsDir   bool
 }
 
 // ListIterator retains the provider continuation state for a bounded,
@@ -556,7 +582,7 @@ func (it *ListIterator) Next(ctx context.Context) (ObjectInfo, error) {
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	return ObjectInfo{Key: object.Key, Size: object.Size, IsDir: object.IsDir}, nil
+	return ObjectInfo{Key: object.Key, Size: object.Size, ModTime: object.ModTime, IsDir: object.IsDir}, nil
 }
 
 func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error) {
@@ -595,7 +621,7 @@ func (s *Store) ListPage(
 	}
 	result := &ListResult{Objects: make([]ObjectInfo, len(objects))}
 	for i, object := range objects {
-		result.Objects[i] = ObjectInfo{Key: object.Key, Size: object.Size, IsDir: object.IsDir}
+		result.Objects[i] = ObjectInfo{Key: object.Key, Size: object.Size, ModTime: object.ModTime, IsDir: object.IsDir}
 	}
 	if len(nextPageToken) == 0 {
 		return result, nil, nil

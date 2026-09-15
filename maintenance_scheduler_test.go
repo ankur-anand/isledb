@@ -123,28 +123,6 @@ func TestPlanCompactionCandidatesIncludesEveryOverBudgetLevel(t *testing.T) {
 	}
 }
 
-func TestCompactionPlanWorkUnits(t *testing.T) {
-	plan := &levelCompactionPlan{
-		sourceSSTs:      []sstMetadata{{Size: 300}, {Size: 300}},
-		destinationSSTs: []sstMetadata{{Size: 300}},
-	}
-	bytes, units := compactionPlanWorkUnits(plan, 400)
-	if bytes != 900 || units != 3 {
-		t.Fatalf("bytes=%d units=%d, want 900 and 3", bytes, units)
-	}
-	plan.metadataOnly = true
-	_, units = compactionPlanWorkUnits(plan, 400)
-	if units != 1 {
-		t.Fatalf("metadata-only units=%d, want 1", units)
-	}
-	plan.metadataOnly = false
-	plan.sourceSSTs[0].Size = 10_000
-	_, units = compactionPlanWorkUnits(plan, 400)
-	if units != maxPrimaryCompactionBurstUnits {
-		t.Fatalf("oversized units=%d, want saturation=%d", units, maxPrimaryCompactionBurstUnits)
-	}
-}
-
 func TestCheckpointPressureUsesPagesAndBytes(t *testing.T) {
 	opts := ManifestCheckpointOptions{TargetReplayPages: 64, TargetReplayBytes: 1 << 20}
 	for _, test := range []struct {
@@ -277,7 +255,6 @@ func schedulerCandidate(level uint32, critical bool, units uint32) compactionCan
 		plan: &levelCompactionPlan{
 			sourceLevel:      level,
 			destinationLevel: level + 1,
-			workUnits:        units,
 		},
 		workUnits: units,
 		critical:  critical,

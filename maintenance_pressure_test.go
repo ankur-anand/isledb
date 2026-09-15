@@ -273,13 +273,16 @@ func maintenancePressureOptions() MaintenanceOptions {
 	opts.IdleInterval = time.Millisecond
 	opts.SSTCompaction.ReadConcurrency = 4
 	opts.SSTCompaction.L0TriggerSSTs = 4
-	opts.SSTCompaction.BaseLevelBytes = 64 << 10
+	// Keep L1 deliberately smaller than the compressed live set so the test
+	// exercises lower-level scheduling even when L0 is drained in wide jobs.
+	opts.SSTCompaction.BaseLevelBytes = 8 << 10
 	opts.SSTCompaction.LevelGrowthFactor = 2
-	opts.SSTCompaction.MaxInputSSTsPerJob = 24
-	opts.SSTCompaction.MaxInputBytesPerJob = 256 << 10
 	opts.SSTCompaction.TargetSSTBytes = 64 << 10
 	opts.ManifestCheckpoint.TargetReplayPages = 2
-	opts.ManifestCheckpoint.TargetReplayBytes = 8 << 10
+	// Wider source batches produce larger compaction entries. Keep the byte
+	// trigger from preempting the page-count pressure this test explicitly
+	// asserts; byte-trigger behavior is covered independently.
+	opts.ManifestCheckpoint.TargetReplayBytes = 32 << 20
 	return opts
 }
 
@@ -482,8 +485,8 @@ func assertMaintenancePressureTopology(
 		t.Fatalf("L0 remained eligible after drain: count=%d trigger=%d",
 			state.L0SSTCount(), opts.SSTCompaction.L0TriggerSSTs)
 	}
-	if len(state.Levels) < 2 {
-		t.Fatalf("lower-level pressure did not create multiple levels: levels=%d", len(state.Levels))
+	if len(state.Levels) == 0 || state.Levels[len(state.Levels)-1].Number < 2 {
+		t.Fatalf("lower-level pressure did not move data below L1: levels=%+v", state.Levels)
 	}
 	current := db.manifestStore.CurrentData()
 	if current == nil || current.Snapshot == nil {

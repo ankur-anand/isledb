@@ -177,6 +177,12 @@ type compactorOptions struct {
 	// compaction job. Values <= 0 use the default.
 	InputReadParallelism int
 
+	// ScratchDir is the base for an isolated per-store, per-fence workspace that
+	// stores transient streamed input SSTs. Empty uses the current user's
+	// operating-system cache directory, with a per-user temporary-directory
+	// fallback when that location is unavailable.
+	ScratchDir string
+
 	// Trigger controls when compaction work is selected.
 	Trigger compactionTriggerOptions
 
@@ -205,13 +211,6 @@ type compactionTriggerOptions struct {
 
 	// LevelSizeMultiplier controls geometric growth of L1..Ln.
 	LevelSizeMultiplier int
-
-	// MaxInputSSTs bounds one atomic compaction and its retirement record.
-	MaxInputSSTs int
-
-	// MaxInputBytes softly bounds the total source and destination SST bytes in
-	// one compaction. One indivisible plan may exceed the limit.
-	MaxInputBytes int64
 }
 
 type compactionOutputOptions struct {
@@ -240,8 +239,6 @@ func defaultCompactorOptions() compactorOptions {
 			L0SSTCount:          8,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
-			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
-			MaxInputBytes:       512 * 1024 * 1024,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,

@@ -2,10 +2,10 @@ package diskcache
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
+
+	internalchecksum "github.com/ankur-anand/isledb/internal/checksum"
 )
 
 const (
@@ -88,35 +88,18 @@ func (d ArtifactDescriptor) validate() error {
 }
 
 func validateSHA256Checksum(checksum string) error {
-	const prefix = "sha256:"
-	if len(checksum) != len(prefix)+hex.EncodedLen(sha256.Size) ||
-		!strings.HasPrefix(checksum, prefix) {
+	if _, err := internalchecksum.ParseSHA256(checksum); err != nil {
 		return fmt.Errorf("unsupported or invalid SHA-256 checksum %q", checksum)
-	}
-	for index := len(prefix); index < len(checksum); index++ {
-		if !isHexDigit(checksum[index]) {
-			return fmt.Errorf("invalid SHA-256 checksum %q", checksum)
-		}
 	}
 	return nil
 }
 
 func parseSHA256Checksum(checksum string) ([sha256.Size]byte, error) {
-	var expected [sha256.Size]byte
-	if err := validateSHA256Checksum(checksum); err != nil {
-		return expected, err
-	}
-	_, err := hex.Decode(expected[:], []byte(checksum[len("sha256:"):]))
+	expected, err := internalchecksum.ParseSHA256(checksum)
 	if err != nil {
 		return expected, fmt.Errorf("invalid SHA-256 checksum %q", checksum)
 	}
 	return expected, nil
-}
-
-func isHexDigit(value byte) bool {
-	return value >= '0' && value <= '9' ||
-		value >= 'a' && value <= 'f' ||
-		value >= 'A' && value <= 'F'
 }
 
 // ArtifactPresence is a side-effect-free result from Probe.

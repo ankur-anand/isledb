@@ -907,11 +907,10 @@ Control-lane defaults:
 |---|---:|
 | `IdleInterval` | 5 seconds |
 | `SSTCompaction.ReadConcurrency` | 4 |
+| `SSTCompaction.ScratchDir` | user cache directory, with a per-user temporary-directory fallback |
 | `SSTCompaction.L0TriggerSSTs` | 8 |
 | `SSTCompaction.BaseLevelBytes` | 512 MiB |
 | `SSTCompaction.LevelGrowthFactor` | 8 |
-| `SSTCompaction.MaxInputSSTsPerJob` | 128 |
-| `SSTCompaction.MaxInputBytesPerJob` | 512 MiB soft limit |
 | `SSTCompaction.TargetSSTBytes` | 64 MiB |
 | `ManifestCheckpoint.TargetReplayPages` | 64 pages |
 | `ManifestCheckpoint.TargetReplayBytes` | 32 MiB |
@@ -919,13 +918,12 @@ Control-lane defaults:
 
 ```go
 type SSTCompactionOptions struct {
-    ReadConcurrency     int
-    L0TriggerSSTs       int
-    BaseLevelBytes      int64
-    LevelGrowthFactor   int
-    MaxInputSSTsPerJob  int
-    MaxInputBytesPerJob int64
-    TargetSSTBytes      int64
+    ReadConcurrency            int
+    ScratchDir                 string
+    L0TriggerSSTs              int
+    BaseLevelBytes             int64
+    LevelGrowthFactor          int
+    TargetSSTBytes             int64
 }
 
 type ManifestCheckpointOptions struct {
@@ -934,8 +932,20 @@ type ManifestCheckpointOptions struct {
 }
 ```
 
-One indivisible compaction plan may exceed `MaxInputBytesPerJob`.
-`MaxInputSSTsPerJob` cannot exceed 128. Compacted SST encoding comes from
+The manifest format permits at most 128 removed and 128 added objects in one
+entry. This is an internal format invariant, not a tuning option. The planner
+chooses the widest source batch whose complete destination overlap fits. If
+even one source overlaps too many files in the next level, it first compacts
+that destination level downward and retries the original promotion on a later
+cycle.
+
+Rewrite inputs are streamed to `ScratchDir`, so a job is not constrained by
+heap residency. IsleDB creates a private session below that base directory for
+each store, fence role, and fence epoch. A graceful close removes the current
+session; a later epoch makes a best-effort attempt to remove abandoned older
+sessions. Cleanup failure does not prevent maintenance from opening. The
+configured base directory and unrecognized entries below IsleDB's per-store
+root are never deleted. Compacted SST encoding comes from
 `DBOptions.SSTOutput.Compacted`.
 
 Physical reclamation defaults:

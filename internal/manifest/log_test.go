@@ -32,13 +32,13 @@ func TestLogEntryRoundTrip(t *testing.T) {
 }
 
 func TestApplyLogEntryAddRemoveAndCompaction(t *testing.T) {
-	m := ApplyLogEntry(nil, &ManifestLogEntry{Seq: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a", Epoch: 1, MinKey: []byte("a"), MaxKey: []byte("c")}})
-	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 2, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "b", Epoch: 2, MinKey: []byte("d"), MaxKey: []byte("f")}})
+	m := mustApplyLogEntry(t, nil, &ManifestLogEntry{Seq: 1, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "a", Epoch: 1, MinKey: []byte("a"), MaxKey: []byte("c")}})
+	m = mustApplyLogEntry(t, m, &ManifestLogEntry{Seq: 2, Op: LogOpAddSSTable, SSTable: &SSTMeta{ID: "b", Epoch: 2, MinKey: []byte("d"), MaxKey: []byte("f")}})
 	if len(m.L0SSTs) != 2 || m.L0SSTs[0].ID != "b" || m.NextEpoch != 3 {
 		t.Fatalf("after add=%+v", m)
 	}
 
-	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 3, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
+	m = mustApplyLogEntry(t, m, &ManifestLogEntry{Seq: 3, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
 		RemoveSSTableIDs: []string{"a", "b"},
 		SourceLevel:      0,
 		DestinationLevel: 1,
@@ -48,7 +48,7 @@ func TestApplyLogEntryAddRemoveAndCompaction(t *testing.T) {
 		t.Fatalf("after compaction=%+v", m)
 	}
 
-	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 4, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
+	m = mustApplyLogEntry(t, m, &ManifestLogEntry{Seq: 4, Op: LogOpCompaction, Compaction: &CompactionLogPayload{
 		RemoveSSTableIDs: []string{"c"},
 		SourceLevel:      1,
 		DestinationLevel: 2,
@@ -58,7 +58,7 @@ func TestApplyLogEntryAddRemoveAndCompaction(t *testing.T) {
 		t.Fatalf("after promotion=%+v", m)
 	}
 
-	m = ApplyLogEntry(m, &ManifestLogEntry{Seq: 5, Op: LogOpRemoveSSTable, RemoveSSTableIDs: []string{"c"}})
+	m = mustApplyLogEntry(t, m, &ManifestLogEntry{Seq: 5, Op: LogOpRemoveSSTable, RemoveSSTableIDs: []string{"c"}})
 	if len(m.Levels) != 0 {
 		t.Fatalf("after remove=%+v", m)
 	}
@@ -66,8 +66,17 @@ func TestApplyLogEntryAddRemoveAndCompaction(t *testing.T) {
 
 func TestApplyCheckpoint(t *testing.T) {
 	checkpoint := &Manifest{Version: 2, LogSeq: 4, Levels: []Level{{Number: 1, SSTs: []SSTMeta{{ID: "a"}}}}}
-	got := ApplyLogEntry(&Manifest{}, &ManifestLogEntry{Seq: 9, Op: LogOpCheckpoint, Checkpoint: checkpoint})
+	got := mustApplyLogEntry(t, &Manifest{}, &ManifestLogEntry{Seq: 9, Op: LogOpCheckpoint, Checkpoint: checkpoint})
 	if got != checkpoint || got.LogSeq != 9 {
 		t.Fatalf("checkpoint=%+v", got)
 	}
+}
+
+func mustApplyLogEntry(t *testing.T, m *Manifest, entry *ManifestLogEntry) *Manifest {
+	t.Helper()
+	got, err := ApplyLogEntry(m, entry)
+	if err != nil {
+		t.Fatalf("ApplyLogEntry: %v", err)
+	}
+	return got
 }

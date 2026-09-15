@@ -78,24 +78,24 @@ func DecodeLogEntry(data []byte) (*ManifestLogEntry, error) {
 	return &entry, nil
 }
 
-func ApplyLogEntries(m *Manifest, entries []*ManifestLogEntry) *Manifest {
+func ApplyLogEntries(m *Manifest, entries []*ManifestLogEntry) (*Manifest, error) {
 	current := m
 	for _, entry := range entries {
-		current = ApplyLogEntry(current, entry)
+		var err error
+		current, err = ApplyLogEntry(current, entry)
+		if err != nil {
+			return current, err
+		}
 	}
-	return current
+	return current, nil
 }
 
-func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
+func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) (*Manifest, error) {
 	if m == nil {
 		m = &Manifest{}
 	}
 	if entry == nil {
-		return m
-	}
-
-	if entry.Seq > m.LogSeq {
-		m.LogSeq = entry.Seq
+		return m, nil
 	}
 
 	switch entry.Op {
@@ -117,20 +117,14 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 			if entry.Seq > entry.Checkpoint.LogSeq {
 				entry.Checkpoint.LogSeq = entry.Seq
 			}
-			return entry.Checkpoint
+			return entry.Checkpoint, nil
 		}
 
 	case LogOpCompaction:
 		if entry.Compaction != nil {
 			c := entry.Compaction
 			m.RemoveCompactionInputs(c.SourceLevel, c.DestinationLevel, c.RemoveSSTableIDs)
-			if c.DestinationLevel == 0 {
-				for i := len(c.AddSSTables) - 1; i >= 0; i-- {
-					m.AddL0SST(c.AddSSTables[i])
-				}
-			} else {
-				m.AddLevelSSTs(c.DestinationLevel, c.AddSSTables)
-			}
+			m.AddLevelSSTs(c.DestinationLevel, c.AddSSTables)
 			for _, sst := range c.AddSSTables {
 				if sst.Epoch >= m.NextEpoch {
 					m.NextEpoch = sst.Epoch + 1
@@ -139,5 +133,8 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) *Manifest {
 		}
 	}
 
-	return m
+	if entry.Seq > m.LogSeq {
+		m.LogSeq = entry.Seq
+	}
+	return m, nil
 }

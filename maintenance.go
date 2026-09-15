@@ -108,6 +108,13 @@ type ManifestDeleterOptions struct {
 type SSTCompactionOptions struct {
 	// ReadConcurrency bounds concurrent input-SST reads within one job.
 	ReadConcurrency int
+	// ScratchDir is the base directory for transient compaction input SSTs.
+	// Empty uses the current user's operating-system cache directory, with a
+	// per-user temporary-directory fallback. IsleDB creates an
+	// isolated per-store, per-fence session below it, removes abandoned sessions
+	// from older fence epochs on startup, and removes the current session on
+	// graceful close. Individual files are removed as their readers close.
+	ScratchDir string
 	// L0TriggerSSTs starts L0 compaction at this many files.
 	L0TriggerSSTs int
 	// BaseLevelBytes is the target size of L1.
@@ -115,11 +122,6 @@ type SSTCompactionOptions struct {
 	// LevelGrowthFactor scales the target size of each successive level. It
 	// must be at least 2.
 	LevelGrowthFactor int
-	// MaxInputSSTsPerJob bounds the inputs and retirement records in one job.
-	MaxInputSSTsPerJob int
-	// MaxInputBytesPerJob softly bounds source and destination bytes in one
-	// job. One indivisible oversized plan may exceed this value.
-	MaxInputBytesPerJob int64
 	// TargetSSTBytes is the approximate output-file size. Encoding settings
 	// come from DBOptions.SSTOutput.
 	TargetSSTBytes int64
@@ -240,14 +242,18 @@ type SSTCompactionStats struct {
 // SSTCleanupStats describes durable retirement handoff and bounded physical
 // deletion work completed in one maintenance cycle.
 type SSTCleanupStats struct {
-	SSTsPlanned    int
-	PlansPrepared  int
-	PlansScanned   int
-	PlansCompleted int
-	DeleteAttempts int
-	SSTsDeleted    int
-	DeferredPlans  int
-	Failures       int
+	SSTsPlanned          int
+	PlansPrepared        int
+	PlansScanned         int
+	PlansCompleted       int
+	DeleteAttempts       int
+	SSTsDeleted          int
+	DeferredPlans        int
+	Failures             int
+	OrphanPlansScanned   int
+	OrphanObjectsScanned int
+	OrphanCandidates     int
+	OrphansDeleted       int
 }
 
 // ManifestCheckpointStats describes a manifest checkpoint staged in one cycle.
@@ -369,13 +375,11 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 	return MaintenanceOptions{
 		IdleInterval: defaultMaintenanceIdleInterval,
 		SSTCompaction: SSTCompactionOptions{
-			ReadConcurrency:     compaction.InputReadParallelism,
-			L0TriggerSSTs:       compaction.Trigger.L0SSTCount,
-			BaseLevelBytes:      compaction.Trigger.BaseLevelBytes,
-			LevelGrowthFactor:   compaction.Trigger.LevelSizeMultiplier,
-			MaxInputSSTsPerJob:  compaction.Trigger.MaxInputSSTs,
-			MaxInputBytesPerJob: compaction.Trigger.MaxInputBytes,
-			TargetSSTBytes:      compaction.Output.TargetSSTBytes,
+			ReadConcurrency:   compaction.InputReadParallelism,
+			L0TriggerSSTs:     compaction.Trigger.L0SSTCount,
+			BaseLevelBytes:    compaction.Trigger.BaseLevelBytes,
+			LevelGrowthFactor: compaction.Trigger.LevelSizeMultiplier,
+			TargetSSTBytes:    compaction.Output.TargetSSTBytes,
 		},
 		ManifestCheckpoint: ManifestCheckpointOptions{
 			TargetReplayPages: defaultCheckpointReplayPages,
@@ -491,6 +495,7 @@ func newMaintenance(
 		opts:        normalized,
 		sstGC: newSSTCleaner(store, sstCleanerOptions{
 			DeleteBatchSize: normalized.reclamation.SST.MaxObjectsPerPass,
+			ManifestLog:     manifestLog,
 			Deleter:         deleter,
 		}),
 		snapshotGC: newSnapshotCleaner(store, manifestLog, snapshotCleanerOptions{
@@ -632,17 +637,11 @@ func normalizeDeleterOptions(name string, opts, defaults DeleterOptions) (Delete
 
 func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTCompactionOptions, error) {
 	if opts.ReadConcurrency < 0 || opts.L0TriggerSSTs < 0 ||
-		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.MaxInputSSTsPerJob < 0 || opts.MaxInputBytesPerJob < 0 ||
-		opts.TargetSSTBytes < 0 {
-		return SSTCompactionOptions{}, fmt.Errorf("%w: negative SST compaction option", ErrInvalidMaintenanceOptions)
+		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.TargetSSTBytes < 0 {
+		return SSTCompactionOptions{}, fmt.Errorf("%w: invalid SST compaction option", ErrInvalidMaintenanceOptions)
 	}
 	if opts.LevelGrowthFactor == 1 {
 		return SSTCompactionOptions{}, fmt.Errorf("%w: level growth factor must be at least 2", ErrInvalidMaintenanceOptions)
-	}
-	if opts.MaxInputSSTsPerJob > manifest.MaxRetiredObjectsPerEntry {
-		return SSTCompactionOptions{}, fmt.Errorf(
-			"%w: max input SSTs per job=%d exceeds %d",
-			ErrInvalidMaintenanceOptions, opts.MaxInputSSTsPerJob, manifest.MaxRetiredObjectsPerEntry)
 	}
 	if opts.ReadConcurrency == 0 {
 		opts.ReadConcurrency = defaults.ReadConcurrency
@@ -655,12 +654,6 @@ func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTComp
 	}
 	if opts.LevelGrowthFactor == 0 {
 		opts.LevelGrowthFactor = defaults.LevelGrowthFactor
-	}
-	if opts.MaxInputSSTsPerJob == 0 {
-		opts.MaxInputSSTsPerJob = defaults.MaxInputSSTsPerJob
-	}
-	if opts.MaxInputBytesPerJob == 0 {
-		opts.MaxInputBytesPerJob = defaults.MaxInputBytesPerJob
 	}
 	if opts.TargetSSTBytes == 0 {
 		opts.TargetSSTBytes = defaults.TargetSSTBytes
@@ -688,12 +681,11 @@ func (m *Maintenance) compactorOptions() compactorOptions {
 	return compactorOptions{
 		OwnerID:              m.fenceToken.Owner,
 		InputReadParallelism: p.ReadConcurrency,
+		ScratchDir:           p.ScratchDir,
 		Trigger: compactionTriggerOptions{
 			L0SSTCount:          p.L0TriggerSSTs,
 			BaseLevelBytes:      p.BaseLevelBytes,
 			LevelSizeMultiplier: p.LevelGrowthFactor,
-			MaxInputSSTs:        p.MaxInputSSTsPerJob,
-			MaxInputBytes:       p.MaxInputBytesPerJob,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  p.TargetSSTBytes,
@@ -1070,14 +1062,18 @@ func (m *Maintenance) reportReclamationCycle(stats ReclamationCycleStats) {
 
 func publicSSTCleanupStats(stats sstCleanupWorkStats) SSTCleanupStats {
 	return SSTCleanupStats{
-		SSTsPlanned:    stats.TargetsPlanned,
-		PlansPrepared:  stats.PlansPrepared,
-		PlansScanned:   stats.PlansScanned,
-		PlansCompleted: stats.PlansDeleted,
-		DeleteAttempts: stats.Attempted,
-		SSTsDeleted:    stats.Deleted,
-		DeferredPlans:  stats.Deferred,
-		Failures:       stats.Failed,
+		SSTsPlanned:          stats.TargetsPlanned,
+		PlansPrepared:        stats.PlansPrepared,
+		PlansScanned:         stats.PlansScanned,
+		PlansCompleted:       stats.PlansDeleted,
+		DeleteAttempts:       stats.Attempted,
+		SSTsDeleted:          stats.Deleted,
+		DeferredPlans:        stats.Deferred,
+		Failures:             stats.Failed,
+		OrphanPlansScanned:   stats.OrphanPlansScanned,
+		OrphanObjectsScanned: stats.OrphanObjectsScanned,
+		OrphanCandidates:     stats.OrphanCandidates,
+		OrphansDeleted:       stats.OrphansDeleted,
 	}
 }
 
@@ -1093,6 +1089,10 @@ func mergeSSTCleanupStats(dst *SSTCleanupStats, src SSTCleanupStats) {
 	dst.SSTsDeleted += src.SSTsDeleted
 	dst.DeferredPlans += src.DeferredPlans
 	dst.Failures += src.Failures
+	dst.OrphanPlansScanned += src.OrphanPlansScanned
+	dst.OrphanObjectsScanned += src.OrphanObjectsScanned
+	dst.OrphanCandidates += src.OrphanCandidates
+	dst.OrphansDeleted += src.OrphansDeleted
 }
 
 func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
@@ -1443,6 +1443,10 @@ func (m *Maintenance) recordSSTCleanup(stats sstCleanupWorkStats) {
 		cleanup.SSTsDeleted += stats.Deleted
 		cleanup.DeferredPlans += stats.Deferred
 		cleanup.Failures += stats.Failed
+		cleanup.OrphanPlansScanned += stats.OrphanPlansScanned
+		cleanup.OrphanObjectsScanned += stats.OrphanObjectsScanned
+		cleanup.OrphanCandidates += stats.OrphanCandidates
+		cleanup.OrphansDeleted += stats.OrphansDeleted
 	}
 	m.statsMu.Unlock()
 }

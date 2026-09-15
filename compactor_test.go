@@ -667,7 +667,6 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			L0SSTCount:          2,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
-			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -1034,7 +1033,6 @@ func TestConsecutiveCompaction_SequenceNumberCorrectness(t *testing.T) {
 			L0SSTCount:          2,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
-			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,
@@ -1227,7 +1225,6 @@ func TestConsecutiveCompaction_MergePreservesData(t *testing.T) {
 			L0SSTCount:          1,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
-			MaxInputSSTs:        manifest.MaxRetiredObjectsPerEntry,
 		},
 		Output: compactionOutputOptions{
 			BloomBitsPerKey: 10,

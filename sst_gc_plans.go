@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"sync/atomic"
 	"time"
 
@@ -25,18 +26,25 @@ const (
 	defaultSSTDeletionSafetyMargin  = time.Minute
 	maxSSTDeletionPlanEncodedBytes  = 256 << 10
 	defaultSSTDeletionPlanBatchSize = 128
+	defaultSSTOrphanAuditEvery      = 24 * time.Hour
+	defaultSSTOrphanGrace           = 24 * time.Hour
+	defaultSSTOrphanScanLimit       = 1024
 )
 
 type sstCleanupWorkStats struct {
-	Attempted      int
-	Deleted        int
-	Failed         int
-	TargetsPlanned int
-	PlansPrepared  int
-	PlansScanned   int
-	PlansDeleted   int
-	Deferred       int
-	NextDue        time.Time
+	Attempted            int
+	Deleted              int
+	Failed               int
+	TargetsPlanned       int
+	PlansPrepared        int
+	PlansScanned         int
+	PlansDeleted         int
+	Deferred             int
+	NextDue              time.Time
+	OrphanPlansScanned   int
+	OrphanObjectsScanned int
+	OrphanCandidates     int
+	OrphansDeleted       int
 }
 
 type sstDeletionPlanSource struct {
@@ -73,11 +81,15 @@ type sstDeletionPlan struct {
 }
 
 type sstCleanerOptions struct {
-	DeleteBatchSize int
-	PlanScanLimit   int
-	SafetyMargin    time.Duration
-	Now             func() time.Time
-	Deleter         objectDeleter
+	DeleteBatchSize  int
+	PlanScanLimit    int
+	SafetyMargin     time.Duration
+	OrphanAuditEvery time.Duration
+	OrphanGrace      time.Duration
+	OrphanScanLimit  int
+	ManifestLog      *manifest.Store
+	Now              func() time.Time
+	Deleter          objectDeleter
 }
 
 type sstCleaner struct {
@@ -92,18 +104,31 @@ type sstCleaner struct {
 	cache          *boundedPlanCache[sstDeletionPlan]
 	seenRescan     uint64
 
+	nextOrphanAudit time.Time
+	orphanAudit     *sstOrphanAuditState
+
 	// Control work only signals that a durable plan may have changed the first
 	// ready key. It never waits for reclaim-lane network I/O. Missing or
 	// coalescing this optimization is safe because periodic scans remain.
 	rescan atomic.Uint64
 }
 
+type sstOrphanAuditState struct {
+	protected  map[string]struct{}
+	current    *manifest.Current
+	planIter   *blobstore.ListIterator
+	objectIter *blobstore.ListIterator
+}
+
 func defaultSSTCleanerOptions() sstCleanerOptions {
 	return sstCleanerOptions{
-		DeleteBatchSize: defaultSSTDeletionPlanBatchSize,
-		PlanScanLimit:   defaultSSTDeletionPlanScanLimit,
-		SafetyMargin:    defaultSSTDeletionSafetyMargin,
-		Now:             func() time.Time { return time.Now().UTC() },
+		DeleteBatchSize:  defaultSSTDeletionPlanBatchSize,
+		PlanScanLimit:    defaultSSTDeletionPlanScanLimit,
+		SafetyMargin:     defaultSSTDeletionSafetyMargin,
+		OrphanAuditEvery: defaultSSTOrphanAuditEvery,
+		OrphanGrace:      defaultSSTOrphanGrace,
+		OrphanScanLimit:  defaultSSTOrphanScanLimit,
+		Now:              func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -122,6 +147,17 @@ func newSSTCleaner(store *blobstore.Store, opts sstCleanerOptions) *sstCleaner {
 		opts.SafetyMargin = 0
 	} else if opts.SafetyMargin == 0 {
 		opts.SafetyMargin = defaults.SafetyMargin
+	}
+	if opts.OrphanAuditEvery <= 0 {
+		opts.OrphanAuditEvery = defaults.OrphanAuditEvery
+	}
+	if opts.OrphanGrace < 0 {
+		opts.OrphanGrace = 0
+	} else if opts.OrphanGrace == 0 {
+		opts.OrphanGrace = defaults.OrphanGrace
+	}
+	if opts.OrphanScanLimit <= 0 {
+		opts.OrphanScanLimit = defaults.OrphanScanLimit
 	}
 	if opts.Now == nil {
 		opts.Now = defaults.Now
@@ -488,12 +524,36 @@ func (c *sstCleaner) runScheduledOnce(
 	if exhausted {
 		c.pendingPlanKey = ""
 	}
+	remainingDeletes := c.opts.DeleteBatchSize - stats.Attempted
+	auditDue := c.orphanAudit != nil || c.nextOrphanAudit.IsZero() || !passNow.Before(c.nextOrphanAudit)
+	if err == nil && c.opts.ManifestLog != nil && auditDue && remainingDeletes > 0 {
+		auditStats, auditErr := c.runOrphanAudit(ctx, passNow, remainingDeletes)
+		mergeSSTCleanupWorkStats(&stats, &auditStats)
+		err = errors.Join(err, auditErr)
+	}
+	nextDue := stats.NextDue
+	if c.orphanAudit == nil && !c.nextOrphanAudit.IsZero() {
+		nextDue = earlierReclamationDeadline(nextDue, c.nextOrphanAudit)
+	}
 	schedule := reclamationLaneSchedule{
 		observedAt: c.opts.Now().UTC(),
-		nextDue:    stats.NextDue,
-		idle:       err == nil && exhausted && stats.NextDue.IsZero(),
+		nextDue:    nextDue,
+		idle:       err == nil && exhausted && c.orphanAudit == nil && stats.NextDue.IsZero(),
 	}
 	return stats, schedule, err
+}
+
+func mergeSSTCleanupWorkStats(dst, src *sstCleanupWorkStats) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Attempted += src.Attempted
+	dst.Deleted += src.Deleted
+	dst.Failed += src.Failed
+	dst.OrphanPlansScanned += src.OrphanPlansScanned
+	dst.OrphanObjectsScanned += src.OrphanObjectsScanned
+	dst.OrphanCandidates += src.OrphanCandidates
+	dst.OrphansDeleted += src.OrphansDeleted
 }
 
 func (c *sstCleaner) planAvailable() {
@@ -501,6 +561,231 @@ func (c *sstCleaner) planAvailable() {
 		return
 	}
 	c.rescan.Add(1)
+}
+
+// runOrphanAudit discovers immutable SST uploads that no manifest history or
+// durable retirement plan owns. The proof is deliberately conservative:
+// candidates must predate the current owner fence, outlive the orphan grace,
+// and remain absent from a fresh manifest immediately before deletion.
+func (c *sstCleaner) runOrphanAudit(
+	ctx context.Context,
+	now time.Time,
+	deleteBudget int,
+) (stats sstCleanupWorkStats, err error) {
+	if c == nil || c.opts.ManifestLog == nil || deleteBudget <= 0 {
+		return stats, nil
+	}
+	if c.orphanAudit == nil {
+		state, err := c.startOrphanAudit(ctx)
+		if err != nil {
+			c.nextOrphanAudit = now.Add(c.opts.OrphanAuditEvery)
+			return stats, err
+		}
+		// A brand-new empty database has no CURRENT and therefore no ownership
+		// fence with which to prove an SST orphan. There is nothing safe to scan
+		// yet; retry on the ordinary audit cadence after a writer initializes it.
+		if state == nil {
+			c.nextOrphanAudit = now.Add(c.opts.OrphanAuditEvery)
+			return stats, nil
+		}
+		c.orphanAudit = state
+	}
+	state := c.orphanAudit
+
+	// Build a complete protection set before listing SSTs. This phase is
+	// resumable and bounded; deletion cannot begin from a partial plan scan.
+	for state.objectIter == nil && stats.OrphanPlansScanned < c.opts.OrphanScanLimit {
+		object, err := state.planIter.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			state.planIter = nil
+			state.objectIter = c.store.NewListIterator(blobstore.ListOptions{Prefix: "sstable/"})
+			break
+		}
+		if err != nil {
+			c.resetOrphanAudit(now)
+			return stats, err
+		}
+		if object.IsDir {
+			continue
+		}
+		stats.OrphanPlansScanned++
+		payload, _, err := c.store.Read(ctx, object.Key)
+		if err != nil {
+			c.resetOrphanAudit(now)
+			return stats, fmt.Errorf("read SST plan while protecting orphan audit %q: %w", object.Key, err)
+		}
+		plan, err := decodeSSTDeletionPlan(c.store, object.Key, payload)
+		if err != nil {
+			c.resetOrphanAudit(now)
+			return stats, fmt.Errorf("decode SST plan while protecting orphan audit %q: %w", object.Key, err)
+		}
+		for i := range plan.Targets {
+			state.protected[plan.Targets[i].Key] = struct{}{}
+		}
+	}
+	if state.objectIter == nil {
+		return stats, nil
+	}
+
+	candidates := make([]string, 0, deleteBudget)
+	for stats.OrphanObjectsScanned < c.opts.OrphanScanLimit && len(candidates) < deleteBudget {
+		object, err := state.objectIter.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			c.orphanAudit = nil
+			c.nextOrphanAudit = now.Add(c.opts.OrphanAuditEvery)
+			break
+		}
+		if err != nil {
+			c.resetOrphanAudit(now)
+			return stats, err
+		}
+		if object.IsDir {
+			continue
+		}
+		stats.OrphanObjectsScanned++
+		if _, protected := state.protected[object.Key]; protected {
+			continue
+		}
+		id := path.Base(object.Key)
+		if c.store.SSTPath(id) != object.Key || !orphanSSTPredatesCurrentFence(
+			id, object.ModTime, now, state.current, c.opts.OrphanGrace, c.opts.SafetyMargin) {
+			continue
+		}
+		stats.OrphanCandidates++
+		candidates = append(candidates, object.Key)
+	}
+	if len(candidates) == 0 {
+		return stats, nil
+	}
+
+	// Refresh the manifest and fences after candidate discovery. Normal
+	// publication can only prepend current-fence objects, but this final check
+	// also fails closed across ownership changes and administrative restores.
+	live, current, err := c.opts.ManifestLog.ReplayWithCurrent(ctx)
+	if err != nil {
+		c.resetOrphanAudit(now)
+		return stats, err
+	}
+	if !sameSSTAuditFences(state.current, current) {
+		c.orphanAudit = nil
+		c.nextOrphanAudit = time.Time{}
+		return stats, nil
+	}
+	liveKeys := manifestSSTKeys(c.store, live)
+	deleteKeys := candidates[:0]
+	for _, key := range candidates {
+		if _, live := liveKeys[key]; !live {
+			deleteKeys = append(deleteKeys, key)
+		}
+	}
+	if len(deleteKeys) == 0 {
+		return stats, nil
+	}
+	stats.Attempted += len(deleteKeys)
+	if err := c.delete.BatchDelete(ctx, deleteKeys); err != nil {
+		if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
+			return stats, cancelErr
+		}
+		failed := len(deleteKeys)
+		var batchErr *blobstore.BatchDeleteError
+		if errors.As(err, &batchErr) {
+			failed = len(batchErr.Failed)
+			stats.Deleted += len(deleteKeys) - failed
+			stats.OrphansDeleted += len(deleteKeys) - failed
+		}
+		stats.Failed += failed
+		return stats, fmt.Errorf("delete orphan SSTs: %w", err)
+	}
+	stats.Deleted += len(deleteKeys)
+	stats.OrphansDeleted += len(deleteKeys)
+	return stats, nil
+}
+
+func (c *sstCleaner) startOrphanAudit(ctx context.Context) (*sstOrphanAuditState, error) {
+	live, current, err := c.opts.ManifestLog.ReplayWithCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, nil
+	}
+	protected := manifestSSTKeys(c.store, live)
+	// Read HEAD after the manifest snapshot. If a retirement applied before the
+	// replay, its pending command is visible here; if it applies afterwards,
+	// the replay still protects the formerly-live input.
+	head, _, err := c.opts.ManifestLog.ReadMaintenanceHead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if head != nil && head.Pending != nil {
+		if retired, ok := retiredObjectsFromMaintenanceCommand(head.Pending); ok {
+			for i := range retired {
+				protected[retired[i].Key] = struct{}{}
+			}
+		}
+	}
+	return &sstOrphanAuditState{
+		protected: protected,
+		current:   current,
+		planIter:  c.store.NewListIterator(blobstore.ListOptions{Prefix: sstDeletionPlanPrefix + "/"}),
+	}, nil
+}
+
+func (c *sstCleaner) resetOrphanAudit(now time.Time) {
+	c.orphanAudit = nil
+	c.nextOrphanAudit = now.Add(c.opts.OrphanAuditEvery)
+}
+
+func manifestSSTKeys(store *blobstore.Store, m *manifest.Manifest) map[string]struct{} {
+	keys := make(map[string]struct{})
+	if store == nil || m == nil {
+		return keys
+	}
+	for i := range m.L0SSTs {
+		keys[store.SSTPath(m.L0SSTs[i].ID)] = struct{}{}
+	}
+	for i := range m.Levels {
+		for j := range m.Levels[i].SSTs {
+			keys[store.SSTPath(m.Levels[i].SSTs[j].ID)] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func orphanSSTPredatesCurrentFence(
+	id string,
+	modifiedAt, now time.Time,
+	current *manifest.Current,
+	orphanGrace, safetyMargin time.Duration,
+) bool {
+	if current == nil || modifiedAt.IsZero() || now.Before(modifiedAt.Add(orphanGrace)) {
+		return false
+	}
+	if isCompactionSSTID(id) {
+		fence := current.CompactorFence
+		return fence != nil && !fence.ClaimedAt.IsZero() &&
+			modifiedAt.Add(safetyMargin).Before(fence.ClaimedAt)
+	}
+	epoch, ok := writerSSTEpoch(id)
+	if !ok || current.WriterFence == nil || epoch >= current.WriterFence.Epoch {
+		return false
+	}
+	return true
+}
+
+func sameSSTAuditFences(a, b *manifest.Current) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return sameSSTAuditFence(a.WriterFence, b.WriterFence) &&
+		sameSSTAuditFence(a.CompactorFence, b.CompactorFence)
+}
+
+func sameSSTAuditFence(a, b *manifest.FenceToken) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Epoch == b.Epoch && a.Owner == b.Owner && a.ClaimedAt.Equal(b.ClaimedAt)
 }
 
 func runSSTDeletionPlanReclaimer(

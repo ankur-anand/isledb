@@ -21,10 +21,9 @@ type checkpointPressure struct {
 }
 
 type compactionCandidate struct {
-	plan       *levelCompactionPlan
-	inputBytes int64
-	workUnits  uint32
-	critical   bool
+	plan      *levelCompactionPlan
+	workUnits uint32
+	critical  bool
 }
 
 type maintenanceDecision struct {
@@ -136,30 +135,6 @@ func nextLowerCompaction(candidates []compactionCandidate, next uint32) *compact
 	return first
 }
 
-func compactionPlanWorkUnits(plan *levelCompactionPlan, maxInputBytes int64) (int64, uint32) {
-	if plan == nil {
-		return 0, 0
-	}
-	var inputBytes int64
-	for _, sst := range plan.sourceSSTs {
-		inputBytes = saturatingAddInt64(inputBytes, sst.Size)
-	}
-	for _, sst := range plan.destinationSSTs {
-		inputBytes = saturatingAddInt64(inputBytes, sst.Size)
-	}
-	if plan.metadataOnly || maxInputBytes <= 0 || inputBytes <= maxInputBytes {
-		return inputBytes, 1
-	}
-	units := uint64(inputBytes / maxInputBytes)
-	if inputBytes%maxInputBytes != 0 {
-		units++
-	}
-	if units > uint64(maxPrimaryCompactionBurstUnits) {
-		units = uint64(maxPrimaryCompactionBurstUnits)
-	}
-	return inputBytes, uint32(units)
-}
-
 func l0CompactionCritical(l0Count, trigger int) bool {
 	if trigger <= 0 {
 		return false
@@ -175,14 +150,4 @@ func saturatingMultiply(value, multiplier uint64) uint64 {
 		return math.MaxUint64
 	}
 	return value * multiplier
-}
-
-func saturatingAddInt64(a, b int64) int64 {
-	if b > 0 && a > math.MaxInt64-b {
-		return math.MaxInt64
-	}
-	if b < 0 && a < math.MinInt64-b {
-		return math.MinInt64
-	}
-	return a + b
 }

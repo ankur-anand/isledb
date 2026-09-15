@@ -30,6 +30,46 @@ func testSSTStreamSetIdentity(epoch uint64) sstStreamSetIdentity {
 	}
 }
 
+func TestCompactionSSTIDGrammar(t *testing.T) {
+	valid := fmt.Sprintf("%s%s-%04d%s", compactionSSTIDPrefix,
+		strings.Repeat("a", compactionSSTHashLen), 1, compactionSSTIDSuffix)
+	for _, test := range []struct {
+		id   string
+		want bool
+	}{
+		{id: valid, want: true},
+		{id: strings.TrimSuffix(valid, compactionSSTIDSuffix), want: false},
+		{id: "compacted-tier-attempt-0001.sst", want: false},
+		{id: fmt.Sprintf("%s%s-%04d%s", compactionSSTIDPrefix,
+			strings.Repeat("g", compactionSSTHashLen), 1, compactionSSTIDSuffix), want: false},
+		{id: fmt.Sprintf("%s%s-%04d%s", compactionSSTIDPrefix,
+			strings.Repeat("a", compactionSSTHashLen), 0, compactionSSTIDSuffix), want: false},
+	} {
+		if got := isCompactionSSTID(test.id); got != test.want {
+			t.Fatalf("isCompactionSSTID(%q)=%v want=%v", test.id, got, test.want)
+		}
+	}
+}
+
+func TestWriterSSTIDGrammar(t *testing.T) {
+	valid := buildSSTIDWithTimestamp(7, 10, 20, time.Unix(0, 123).UTC())
+	if epoch, ok := writerSSTEpoch(valid); !ok || epoch != 7 {
+		t.Fatalf("writerSSTEpoch(%q)=(%d,%v), want (7,true)", valid, epoch, ok)
+	}
+	for _, id := range []string{
+		"0-10-20-123.sst",
+		"7-20-10-123.sst",
+		"7-10-20-0.sst",
+		"7-10-20.sst",
+		fmt.Sprintf("%s%s-%04d%s", compactionSSTIDPrefix,
+			strings.Repeat("a", compactionSSTHashLen), 1, compactionSSTIDSuffix),
+	} {
+		if _, ok := writerSSTEpoch(id); ok {
+			t.Fatalf("writerSSTEpoch(%q) accepted invalid ID", id)
+		}
+	}
+}
+
 func TestWriteSSTStreaming_Basic(t *testing.T) {
 	entries := []internal.MemEntry{
 		{Key: []byte("a"), Seq: 2, Kind: internal.OpPut, Value: []byte("x")},

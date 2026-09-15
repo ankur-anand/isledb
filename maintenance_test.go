@@ -41,7 +41,7 @@ func TestMaintenanceCompleteCycleStatsWithoutActiveCycle(t *testing.T) {
 
 func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 	opts := MaintenanceOptions{
-		SSTCompaction: SSTCompactionOptions{L0TriggerSSTs: 12},
+		SSTCompaction: SSTCompactionOptions{L0TriggerSSTs: 12, ScratchDir: "compaction-scratch"},
 	}
 	normalized, err := normalizeMaintenanceOptions(opts)
 	if err != nil {
@@ -50,6 +50,9 @@ func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 	defaults := DefaultMaintenanceOptions()
 	if normalized.sstCompaction.L0TriggerSSTs != 12 {
 		t.Fatalf("L0TriggerSSTs=%d, want 12", normalized.sstCompaction.L0TriggerSSTs)
+	}
+	if normalized.sstCompaction.ScratchDir != "compaction-scratch" {
+		t.Fatalf("ScratchDir=%q, want compaction-scratch", normalized.sstCompaction.ScratchDir)
 	}
 	if normalized.sstCompaction.ReadConcurrency != defaults.SSTCompaction.ReadConcurrency ||
 		normalized.sstCompaction.LevelGrowthFactor != defaults.SSTCompaction.LevelGrowthFactor {
@@ -61,9 +64,7 @@ func TestNormalizeMaintenanceSSTCompactionOptions(t *testing.T) {
 		opts SSTCompactionOptions
 	}{
 		{name: "negative", opts: SSTCompactionOptions{ReadConcurrency: -1}},
-		{name: "negative input bytes", opts: SSTCompactionOptions{MaxInputBytesPerJob: -1}},
 		{name: "invalid growth", opts: SSTCompactionOptions{LevelGrowthFactor: 1}},
-		{name: "too many inputs", opts: SSTCompactionOptions{MaxInputSSTsPerJob: manifest.MaxRetiredObjectsPerEntry + 1}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
