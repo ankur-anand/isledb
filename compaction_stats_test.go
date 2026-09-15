@@ -49,11 +49,45 @@ func TestCompactionStatsSeparateMovedBytesFromRewrittenBytes(t *testing.T) {
 func TestCompactionStatsIgnoreFailedJobs(t *testing.T) {
 	m := &Maintenance{currentStats: &MaintenanceStats{}}
 	m.recordCompaction(compactionJob{
-		OutputSSTs: []compactionOutput{{ID: "a", Bytes: 100}},
+		DestinationLevel:    4,
+		ForcedLevelCreation: true,
+		OutputSSTs:          []compactionOutput{{ID: "a", Bytes: 100}},
 	}, errCompactorClosed)
 
-	if stats := m.currentStats.SSTCompaction; stats.Jobs != 0 || stats.OutputBytes != 0 {
+	if stats := m.currentStats.SSTCompaction; stats.Jobs != 0 || stats.OutputBytes != 0 ||
+		stats.ForcedLevelCreations != 0 || stats.DeepestForcedLevel != 0 {
 		t.Fatalf("a failed job was counted: %+v", stats)
+	}
+}
+
+func TestCompactionStatsRecordForcedLevelCreation(t *testing.T) {
+	m := &Maintenance{currentStats: &MaintenanceStats{}}
+
+	m.recordCompaction(compactionJob{
+		DestinationLevel:    2,
+		ForcedLevelCreation: true,
+		MetadataOnly:        true,
+		OutputSSTs:          []compactionOutput{{ID: "a", Bytes: 100}},
+	}, nil)
+	m.recordCompaction(compactionJob{
+		DestinationLevel:    4,
+		ForcedLevelCreation: true,
+		MetadataOnly:        true,
+		OutputSSTs:          []compactionOutput{{ID: "b", Bytes: 200}},
+	}, nil)
+	// Ordinary bottom-level growth is intentionally excluded from this signal.
+	m.recordCompaction(compactionJob{
+		DestinationLevel: 5,
+		MetadataOnly:     true,
+		OutputSSTs:       []compactionOutput{{ID: "c", Bytes: 300}},
+	}, nil)
+
+	stats := m.currentStats.SSTCompaction
+	if stats.ForcedLevelCreations != 2 {
+		t.Fatalf("forced level creations = %d, want 2", stats.ForcedLevelCreations)
+	}
+	if stats.DeepestForcedLevel != 4 {
+		t.Fatalf("deepest forced level = %d, want 4", stats.DeepestForcedLevel)
 	}
 }
 

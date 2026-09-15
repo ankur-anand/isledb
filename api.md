@@ -939,6 +939,19 @@ even one source overlaps too many files in the next level, it first compacts
 that destination level downward and retries the original promotion on a later
 cycle.
 
+If that prerequisite drain reaches the current bottom of the tree, IsleDB
+creates one deeper level. For sorted source levels this is normally a
+metadata-only move: the immutable SSTs keep their IDs and bytes and only their
+manifest level changes. This is a correctness-preserving escape hatch for the
+manifest's 128-input limit, not the normal level-sizing path. Repeated forced
+creation can increase read depth and postpone merging tombstones or overwritten
+values, so completed occurrences are exposed as
+`SSTCompactionStats.ForcedLevelCreations`; `DeepestForcedLevel` records the
+deepest destination reached. Ordinary size-driven creation of a new bottom
+level is not counted. The statistic records a successfully staged maintenance
+job; as with every compaction, the new manifest state becomes visible only
+after the active writer applies that command.
+
 Rewrite inputs are streamed to `ScratchDir`, so a job is not constrained by
 heap residency. IsleDB creates a private session below that base directory for
 each store, fence role, and fence epoch. A graceful close removes the current
@@ -1065,10 +1078,16 @@ type MaintenanceScheduleStats struct {
 }
 
 type SSTCompactionStats struct {
-    Jobs        int
-    InputSSTs   int
-    OutputSSTs  int
-    OutputBytes int64
+    Jobs                 int
+    InputSSTs            int
+    OutputSSTs           int
+    ForcedLevelCreations int
+    DeepestForcedLevel   uint32
+    OutputBytes          int64
+    MovedJobs            int
+    MovedBytes           int64
+    ReadBytes            int64
+    RewrittenBytes       int64
 }
 
 type SSTCleanupStats struct {

@@ -98,6 +98,9 @@ func TestLevelPlannerMovesOverBudgetLevelDown(t *testing.T) {
 	if plan == nil || plan.sourceLevel != 1 || plan.destinationLevel != 2 || !plan.metadataOnly {
 		t.Fatalf("plan=%+v", plan)
 	}
+	if plan.forcedLevelCreation {
+		t.Fatal("ordinary size-driven creation of L2 was marked forced")
+	}
 }
 
 func TestLevelPlannerSelectsWidestValidSourceBatch(t *testing.T) {
@@ -221,6 +224,9 @@ func TestLevelPlannerDrainsDestinationBeforeBlockedPromotion(t *testing.T) {
 	if plan.sourceLevel != 1 || plan.destinationLevel != 2 || !plan.metadataOnly {
 		t.Fatalf("plan=%+v, want L1-to-L2 drain", plan)
 	}
+	if !plan.forcedLevelCreation {
+		t.Fatal("L0 prerequisite drain into absent L2 was not marked as forced level creation")
+	}
 	if len(plan.sourceSSTs) != maxCompactionSSTsPerJob {
 		t.Fatalf("drain sources=%d, want %d", len(plan.sourceSSTs), maxCompactionSSTsPerJob)
 	}
@@ -289,5 +295,8 @@ func TestLevelPlannerRecursivelyDrainsDeepestBlockingLevel(t *testing.T) {
 	plan := candidates[0].plan
 	if plan.sourceLevel != 2 || plan.destinationLevel != 3 || !plan.metadataOnly {
 		t.Fatalf("plan=%+v, want deepest L2-to-L3 drain", plan)
+	}
+	if !plan.forcedLevelCreation {
+		t.Fatal("recursive prerequisite drain into absent L3 was not marked as forced level creation")
 	}
 }

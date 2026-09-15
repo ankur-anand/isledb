@@ -35,10 +35,11 @@ type compactionJob struct {
 	// an unchecked move.
 	ReadBytes int64
 
-	DestinationLevel uint32
-	InputSSTs        []string
-	OutputSSTs       []compactionOutput
-	MetadataOnly     bool
+	DestinationLevel    uint32
+	InputSSTs           []string
+	OutputSSTs          []compactionOutput
+	MetadataOnly        bool
+	ForcedLevelCreation bool
 }
 
 // compactionOutput describes one SST produced or repositioned by a compaction.
@@ -265,11 +266,12 @@ func (c *compactor) releaseRun() {
 }
 
 type levelCompactionPlan struct {
-	sourceLevel      uint32
-	destinationLevel uint32
-	sourceSSTs       []sstMetadata
-	destinationSSTs  []sstMetadata
-	metadataOnly     bool
+	sourceLevel         uint32
+	destinationLevel    uint32
+	sourceSSTs          []sstMetadata
+	destinationSSTs     []sstMetadata
+	metadataOnly        bool
+	forcedLevelCreation bool
 }
 
 // compactionOutputIdentityVersion domain-separates revisions of the attempt-key
@@ -388,11 +390,18 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 			firstPlanningErr = err
 			c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
 		} else {
-			candidates = append(candidates, compactionCandidate{
+			candidate := compactionCandidate{
 				plan:      plan,
 				workUnits: 1,
-				critical:  critical && plan.sourceLevel == 0,
-			})
+				critical:  critical,
+			}
+			if plan.sourceLevel != 0 {
+				// This lower-level plan is a prerequisite selected specifically to
+				// unblock L0. Run it before unrelated level work; otherwise the
+				// lower-level round robin can delay the drain while L0 keeps growing.
+				return []compactionCandidate{candidate}, nil
+			}
+			candidates = append(candidates, candidate)
 		}
 	}
 	plannedLevels := make(map[uint32]struct{}, len(candidates))
@@ -485,6 +494,15 @@ func (c *compactor) buildLevelPlanWithDrain(
 		m, destinationLevel, destinationLevel+1, blockers)
 	if drainErr != nil {
 		return nil, fmt.Errorf("%w; drain L%d first: %v", err, destinationLevel, drainErr)
+	}
+	// A recursively selected drain may reach past the current bottom level.
+	// Materializing that level is the bounded escape hatch for a destination
+	// whose overlap cannot fit in one manifest entry. It is deliberately
+	// distinguished from ordinary size-driven bottom-level growth: repeated
+	// forced creation increases read depth and can defer overwrite/tombstone
+	// reclamation, so operators need a visible signal when it happens.
+	if m.Level(drain.destinationLevel) == nil {
+		drain.forcedLevelCreation = true
 	}
 	return drain, nil
 }
@@ -582,8 +600,9 @@ func sstsDoNotOverlap(ssts []sstMetadata) bool {
 
 func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan) (err error) {
 	job := compactionJob{
-		DestinationLevel: plan.destinationLevel,
-		MetadataOnly:     plan.metadataOnly,
+		DestinationLevel:    plan.destinationLevel,
+		MetadataOnly:        plan.metadataOnly,
+		ForcedLevelCreation: plan.forcedLevelCreation,
 	}
 	for _, sst := range plan.sourceSSTs {
 		job.InputSSTs = append(job.InputSSTs, sst.ID)

@@ -123,6 +123,80 @@ func TestPlanCompactionCandidatesIncludesEveryOverBudgetLevel(t *testing.T) {
 	}
 }
 
+func TestCriticalL0PrerequisiteDrainRetainsPriority(t *testing.T) {
+	c := plannerOnlyCompactor()
+	c.opts.Trigger.BaseLevelBytes = 1
+	c.opts.Trigger.LevelSizeMultiplier = 2
+	m := &manifestState{}
+
+	// Every L0 file spans all of L1. At the critical threshold, even one L0
+	// source plus all 128 overlapping L1 files exceeds the manifest input cap,
+	// so the L0 planner must first drain L1 into L2.
+	for i := 0; i < c.opts.Trigger.L0SSTCount*l0CriticalTriggerMultiplier; i++ {
+		sst := plannerSST(0, 0, 0)
+		sst.ID = fmt.Sprintf("critical-l0-%03d", i)
+		sst.MinKey = []byte("a000")
+		sst.MaxKey = []byte("z999")
+		m.AddL0SST(sst)
+	}
+	l1 := make([]sstMetadata, 0, maxCompactionSSTsPerJob)
+	for i := 0; i < maxCompactionSSTsPerJob; i++ {
+		key := []byte(fmt.Sprintf("a%03d", i))
+		sst := plannerSST(1, i, i)
+		sst.MinKey = key
+		sst.MaxKey = key
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	// Unrelated over-target levels make the lost priority observable: the lower-
+	// level round robin has other valid work to choose instead of the L1 drain.
+	l2 := plannerSST(2, 0, 0)
+	l2.ID = "unrelated-l2"
+	l2.MinKey = []byte("x000")
+	l2.MaxKey = []byte("x000")
+	m.AddLevelSSTs(2, []sstMetadata{l2})
+	l3 := plannerSST(3, 0, 0)
+	l3.ID = "unrelated-l3"
+	l3.MinKey = []byte("y000")
+	l3.MaxKey = []byte("y000")
+	m.AddLevelSSTs(3, []sstMetadata{l3})
+
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		t.Fatalf("planCompactionCandidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates=%d, want only the critical L0 prerequisite drain", len(candidates))
+	}
+	drain := &candidates[0]
+	if drain.plan.sourceLevel != 1 || drain.plan.destinationLevel != 2 {
+		t.Fatalf("planned L%d-to-L%d, want critical L0 prerequisite drain L1-to-L2",
+			drain.plan.sourceLevel, drain.plan.destinationLevel)
+	}
+	if !drain.critical {
+		t.Error("critical L0 prerequisite drain lost critical checkpoint priority")
+	}
+
+	state := manifest.MaintenanceSchedulerState{
+		NextLowerLevel:                 2,
+		LastPrimary:                    manifest.MaintenanceCommandCompaction,
+		CompactionUnitsSinceCheckpoint: 0,
+	}
+	selected := selectCompactionCandidate(candidates, state)
+	if selected == nil {
+		t.Fatal("no compaction candidate selected")
+	}
+	if selected.plan.sourceLevel != 1 || selected.plan.destinationLevel != 2 {
+		t.Errorf("selected L%d-to-L%d, want critical L0 prerequisite drain L1-to-L2",
+			selected.plan.sourceLevel, selected.plan.destinationLevel)
+	}
+	decision := selectMaintenancePrimary(drain, checkpointPressure{eligible: true}, state)
+	if decision.task != MaintenanceTaskSSTCompaction {
+		t.Errorf("primary task=%v, want critical prerequisite compaction", decision.task)
+	}
+}
+
 func TestCheckpointPressureUsesPagesAndBytes(t *testing.T) {
 	opts := ManifestCheckpointOptions{TargetReplayPages: 64, TargetReplayBytes: 1 << 20}
 	for _, test := range []struct {

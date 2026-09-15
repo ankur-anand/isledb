@@ -218,6 +218,14 @@ type SSTCompactionStats struct {
 	Jobs       int
 	InputSSTs  int
 	OutputSSTs int
+	// ForcedLevelCreations counts prerequisite drain jobs whose staged manifest
+	// command targets a previously absent level. Ordinary size-driven creation
+	// of the next level is not included. DeepestForcedLevel records the greatest
+	// such destination and is meaningful when the count is non-zero. As with all
+	// command-producing maintenance stats, the writer must apply the command
+	// before the level is visible.
+	ForcedLevelCreations int
+	DeepestForcedLevel   uint32
 	// OutputBytes is the total size of the SSTs the cycle's jobs published. It
 	// includes files a metadata-only job relocated between levels, so it is not
 	// the amount of data compaction actually moved through the object store.
@@ -1408,6 +1416,10 @@ func (m *Maintenance) recordCompaction(job compactionJob, err error) {
 	stats.Jobs++
 	stats.InputSSTs += len(job.InputSSTs)
 	stats.OutputSSTs += len(job.OutputSSTs)
+	if job.ForcedLevelCreation {
+		stats.ForcedLevelCreations++
+		stats.DeepestForcedLevel = max(stats.DeepestForcedLevel, job.DestinationLevel)
+	}
 
 	var bytes int64
 	for _, sst := range job.OutputSSTs {
