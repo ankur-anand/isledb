@@ -31,7 +31,7 @@ jobs:
             --publish 9000:9000 \
             --env MINIO_ROOT_USER=minioadmin \
             --env MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            quay.io/minio/minio:latest server /data
 
       - name: Run MinIO storage-engine integration
         env:
@@ -77,4 +77,3 @@ jobs:
       - name: Print Azurite logs on failure
         if: failure()
         run: docker logs ${{ job.services.azurite.id }}
-
