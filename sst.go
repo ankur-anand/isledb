@@ -14,7 +14,6 @@ import (
 
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -48,13 +47,7 @@ func writeSST(
 	writable := newHashingWritable(sstBuf)
 	var hashes []uint64
 
-	wo := sstable.WriterOptions{
-		BlockSize:   opts.BlockSize,
-		Compression: compressionFromString(opts.Compression),
-	}
-	if opts.BloomBitsPerKey > 0 {
-		wo.FilterPolicy = bloom.FilterPolicy(opts.BloomBitsPerKey)
-	}
+	wo := pebbleWriterOptions(opts)
 
 	sst := sstable.NewWriter(writable, wo)
 
@@ -152,6 +145,19 @@ func writeSST(
 		MetaOffset: metaOffset,
 	}
 	return result, nil
+}
+
+// pebbleWriterOptions builds the Pebble options shared by every SST writer.
+// It sets no FilterPolicy: isledb filters keys with the Bloom sidecar appended
+// after the SST, checked before the SST is opened. Pebble consults its own
+// filter block only from SeekPrefixGE with a registered policy, which isledb
+// never uses, so writing one would only enlarge the metadata region readers
+// fetch.
+func pebbleWriterOptions(opts sstWriterOptions) sstable.WriterOptions {
+	return sstable.WriterOptions{
+		BlockSize:   opts.BlockSize,
+		Compression: compressionFromString(opts.Compression),
+	}
 }
 
 // sstMetaOffset returns where a closed SST's metadata begins. Pebble writes

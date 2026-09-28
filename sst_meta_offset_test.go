@@ -234,3 +234,59 @@ func TestSSTRangeReadable_UseMetaRegionIgnoresUnusableOffsets(t *testing.T) {
 		})
 	}
 }
+
+// TestSSTWriters_OmitPebbleFilter checks that new SSTs carry only the isledb
+// Bloom sidecar. Pebble's filter block is never read, and writing it would
+// double the metadata region readers fetch.
+func TestSSTWriters_OmitPebbleFilter(t *testing.T) {
+	ctx := context.Background()
+	opts := sstWriterOptions{BlockSize: 4096, BloomBitsPerKey: 10, Compression: "snappy"}
+
+	requireNoPebbleFilter := func(t *testing.T, meta sstMetadata, data []byte) {
+		t.Helper()
+		if meta.Bloom.Length == 0 {
+			t.Fatalf("SST %s has no Bloom sidecar", meta.ID)
+		}
+		reader, err := sstable.NewReader(ctx, newMemReadable(sstPayload(t, meta, data)), sstable.ReaderOptions{})
+		if err != nil {
+			t.Fatalf("open SST: %v", err)
+		}
+		defer func() { _ = reader.Close() }()
+		layout, err := reader.Layout()
+		if err != nil {
+			t.Fatalf("SST layout: %v", err)
+		}
+		if len(layout.Filter) != 0 {
+			t.Fatalf("SST has Pebble filter blocks %v", layout.Filter)
+		}
+		props, err := reader.ReadPropertiesBlock(ctx, nil)
+		if err != nil {
+			t.Fatalf("SST properties: %v", err)
+		}
+		if props.FilterPolicyName != "" || props.FilterSize != 0 {
+			t.Fatalf("SST filter policy=%q size=%d, want none", props.FilterPolicyName, props.FilterSize)
+		}
+	}
+
+	t.Run("writeSST", func(t *testing.T) {
+		result, err := writeSST(ctx, &sliceSSTIter{entries: metaOffsetTestEntries(1_000)}, opts, 1)
+		if err != nil {
+			t.Fatalf("writeSST: %v", err)
+		}
+		requireNoPebbleFilter(t, result.Meta, result.SSTData)
+	})
+	t.Run("writeSSTStreaming", func(t *testing.T) {
+		var uploaded []byte
+		result, err := writeSSTStreaming(ctx, &sliceSSTIter{entries: metaOffsetTestEntries(1_000)}, opts,
+			testSSTStreamIdentity(1, 1, 1_000),
+			func(_ context.Context, _ string, r io.Reader) error {
+				var err error
+				uploaded, err = io.ReadAll(r)
+				return err
+			})
+		if err != nil {
+			t.Fatalf("writeSSTStreaming: %v", err)
+		}
+		requireNoPebbleFilter(t, result.Meta, uploaded)
+	})
+}

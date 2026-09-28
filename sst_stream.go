@@ -14,7 +14,6 @@ import (
 
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"golang.org/x/sync/errgroup"
 )
@@ -134,13 +133,7 @@ func writeSSTStreaming(
 	writable := newHashingWritable(pw)
 	var hashes []uint64
 
-	wo := sstable.WriterOptions{
-		BlockSize:   opts.BlockSize,
-		Compression: compressionFromString(opts.Compression),
-	}
-	if opts.BloomBitsPerKey > 0 {
-		wo.FilterPolicy = bloom.FilterPolicy(opts.BloomBitsPerKey)
-	}
+	wo := pebbleWriterOptions(opts)
 
 	sst := sstable.NewWriter(writable, wo)
 	state := newSSTBuildState()
@@ -346,13 +339,7 @@ func writeMultipleSSTsStreaming(
 		err = errors.Join(err, it.Close())
 	}()
 
-	wo := sstable.WriterOptions{
-		BlockSize:   opts.BlockSize,
-		Compression: compressionFromString(opts.Compression),
-	}
-	if opts.BloomBitsPerKey > 0 {
-		wo.FilterPolicy = bloom.FilterPolicy(opts.BloomBitsPerKey)
-	}
+	wo := pebbleWriterOptions(opts)
 
 	var pr *io.PipeReader
 	var pw *io.PipeWriter
