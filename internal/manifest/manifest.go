@@ -53,6 +53,11 @@ type SSTMeta struct {
 	Bloom     BloomMeta `json:"bloom"`
 	CreatedAt time.Time `json:"created_at"`
 
+	// MetaOffset is where the SST's trailing metadata begins: the filter,
+	// index, properties, metaindex and footer all live in [MetaOffset, Size).
+	// Readers use it to fetch that region in one request. Zero means unknown.
+	MetaOffset int64 `json:"meta_offset,omitempty"`
+
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
 	Level uint32 `json:"level"`

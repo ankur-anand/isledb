@@ -14,6 +14,9 @@ func validateSSTArtifactMetadata(sst SSTMeta) error {
 	if sst.Size <= 0 {
 		return fmt.Errorf("invalid size %d", sst.Size)
 	}
+	if sst.MetaOffset != 0 && (sst.MetaOffset < 0 || sst.MetaOffset >= sst.Size) {
+		return fmt.Errorf("invalid meta offset %d for SST size %d", sst.MetaOffset, sst.Size)
+	}
 	if err := validateArtifactSHA256("SST checksum", sst.Checksum); err != nil {
 		return err
 	}

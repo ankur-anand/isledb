@@ -48,6 +48,15 @@ func TestManifestValidateLevelsValidatesArtifacts(t *testing.T) {
 		{name: "absent Bloom", edit: func(sst *SSTMeta) {
 			sst.Bloom = BloomMeta{Offset: sst.Size}
 		}},
+		{name: "meta offset inside payload", edit: func(sst *SSTMeta) {
+			sst.MetaOffset = sst.Size - 64
+		}},
+		{name: "negative meta offset", edit: func(sst *SSTMeta) {
+			sst.MetaOffset = -1
+		}, want: "invalid meta offset"},
+		{name: "meta offset at payload end", edit: func(sst *SSTMeta) {
+			sst.MetaOffset = sst.Size
+		}, want: "invalid meta offset"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

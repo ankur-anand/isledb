@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
@@ -19,7 +20,22 @@ type sstRangeReadable struct {
 	cache *ristretto.Cache[string, []byte]
 	loads *coalescedLoadGroup
 	m     *ReaderMetrics
+
+	// metaOffset, when positive, marks where the SST's trailing metadata
+	// begins. Reads inside [metaOffset, size) are served from that whole
+	// region, fetched once and cached under one key.
+	metaOffset int64
+
+	// metaMu guards metaBytes, the region retained for this open SST. The
+	// block cache applies sets asynchronously, so relying on it alone lets
+	// Pebble's next metadata read miss and fetch the region again.
+	metaMu    sync.Mutex
+	metaBytes []byte
 }
+
+// maxSSTMetaRegionBytes bounds the metadata region fetched in one request. A
+// larger region falls back to Pebble's read-before hints.
+const maxSSTMetaRegionBytes = 4 << 20
 
 func newSSTRangeReadable(
 	store *blobstore.Store,
@@ -41,7 +57,25 @@ func newSSTRangeReadable(
 	return r
 }
 
+// useMetaRegion enables whole-region metadata reads for an SST whose writer
+// recorded where its metadata begins. Offsets outside the SST, or regions too
+// large to fetch at once, leave the readable unchanged.
+func (r *sstRangeReadable) useMetaRegion(offset int64) {
+	if offset <= 0 || offset >= r.size || r.size-offset > maxSSTMetaRegionBytes {
+		return
+	}
+	r.metaOffset = offset
+}
+
 func (r *sstRangeReadable) ReadAt(ctx context.Context, p []byte, off int64) error {
+	if r.inMetaRegion(off, len(p)) {
+		region, err := r.metaRegion(ctx)
+		if err != nil {
+			return err
+		}
+		copy(p, region[off-r.metaOffset:])
+		return nil
+	}
 	data, err := r.read(ctx, off, len(p))
 	if err != nil {
 		return err
@@ -116,8 +150,12 @@ func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int)
 	return data, nil
 }
 
-// Close is a no-op because sstRangeReadable does not hold open resources.
+// Close releases the retained metadata region; the readable holds no other
+// resources.
 func (r *sstRangeReadable) Close() error {
+	r.metaMu.Lock()
+	r.metaBytes = nil
+	r.metaMu.Unlock()
 	return nil
 }
 
@@ -125,10 +163,33 @@ func (r *sstRangeReadable) Size() int64 {
 	return r.size
 }
 
+func (r *sstRangeReadable) inMetaRegion(off int64, length int) bool {
+	return r.metaOffset > 0 && off >= r.metaOffset && off+int64(length) <= r.size
+}
+
+func (r *sstRangeReadable) metaRegion(ctx context.Context) ([]byte, error) {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	if r.metaBytes == nil {
+		data, err := r.read(ctx, r.metaOffset, int(r.size-r.metaOffset))
+		if err != nil {
+			return nil, err
+		}
+		r.metaBytes = data
+	}
+	return r.metaBytes, nil
+}
+
 func (r *sstRangeReadable) NewReadHandle(requested objstorage.ReadBeforeSize) objstorage.ReadHandle {
+	readBeforeSize := rangeReadBeforeSize(r.size, requested)
+	if r.metaOffset > 0 {
+		// Pebble asks for read-before only on its metadata reads, and the
+		// metadata region already covers those.
+		readBeforeSize = 0
+	}
 	return &sstRangeReadHandle{
 		readable:       r,
-		readBeforeSize: rangeReadBeforeSize(r.size, requested),
+		readBeforeSize: readBeforeSize,
 	}
 }
 

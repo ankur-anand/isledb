@@ -108,6 +108,7 @@ func writeSST(
 	}
 
 	sstSize := writable.size
+	metaOffset := sstMetaOffset(sst)
 	var bloomBytes []byte
 	var bloomK int
 	if opts.BloomBitsPerKey > 0 {
@@ -147,9 +148,22 @@ func writeSST(
 			Length:     int64(len(bloomBytes)),
 			Checksum:   bloomChecksum(bloomBytes),
 		},
-		CreatedAt: time.Now().UTC(),
+		CreatedAt:  time.Now().UTC(),
+		MetaOffset: metaOffset,
 	}
 	return result, nil
+}
+
+// sstMetaOffset returns where a closed SST's metadata begins. Pebble writes
+// every data block before the filter, index, properties, metaindex and footer,
+// and records that boundary as the DataSize property. The offset is only a
+// fetch hint, so a writer that cannot report it yields zero.
+func sstMetaOffset(w *sstable.Writer) int64 {
+	meta, err := w.Metadata()
+	if err != nil {
+		return 0
+	}
+	return int64(meta.Properties.DataSize)
 }
 
 type sstBuildState struct {

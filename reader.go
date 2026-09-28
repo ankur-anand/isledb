@@ -952,6 +952,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 	}
 	readable := newSSTRangeReadable(
 		r.store, path, sstMeta.ID, size, r.blockCache, &r.sstRangeLoads, r.metrics)
+	readable.useMetaRegion(sstMeta.MetaOffset)
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil)
 }
 

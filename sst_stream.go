@@ -146,9 +146,10 @@ func writeSSTStreaming(
 	state := newSSTBuildState()
 
 	type producerResult struct {
-		state *sstBuildState
-		bloom bloomMetadata
-		err   error
+		state      *sstBuildState
+		bloom      bloomMetadata
+		metaOffset int64
+		err        error
 	}
 	producerDone := make(chan producerResult, 1)
 
@@ -257,6 +258,7 @@ func writeSSTStreaming(
 		}
 
 		sstSize := writable.size
+		metaOffset := sstMetaOffset(sst)
 		var bloomBytes []byte
 		var bloomK int
 		if opts.BloomBitsPerKey > 0 {
@@ -288,7 +290,8 @@ func writeSSTStreaming(
 		}
 
 		producerDone <- producerResult{
-			state: state,
+			state:      state,
+			metaOffset: metaOffset,
 			bloom: bloomMetadata{
 				BitsPerKey: opts.BloomBitsPerKey,
 				K:          bloomK,
@@ -312,16 +315,17 @@ func writeSSTStreaming(
 	hashStr := hex.EncodeToString(hashBytes)
 
 	result.Meta = sstMetadata{
-		ID:        identity.ID,
-		Epoch:     identity.Epoch,
-		SeqLo:     pResult.state.seqLo,
-		SeqHi:     pResult.state.seqHi,
-		MinKey:    pResult.state.minKey,
-		MaxKey:    pResult.state.maxKey,
-		Size:      writable.size,
-		Checksum:  "sha256:" + hashStr,
-		Bloom:     pResult.bloom,
-		CreatedAt: identity.CreatedAt,
+		ID:         identity.ID,
+		Epoch:      identity.Epoch,
+		SeqLo:      pResult.state.seqLo,
+		SeqHi:      pResult.state.seqHi,
+		MinKey:     pResult.state.minKey,
+		MaxKey:     pResult.state.maxKey,
+		Size:       writable.size,
+		Checksum:   "sha256:" + hashStr,
+		Bloom:      pResult.bloom,
+		CreatedAt:  identity.CreatedAt,
+		MetaOffset: pResult.metaOffset,
 	}
 
 	return result, nil
@@ -413,6 +417,7 @@ func writeMultipleSSTsStreaming(
 		}
 
 		sstSize := writable.size
+		metaOffset := sstMetaOffset(sst)
 		var bloomBytes []byte
 		var bloomK int
 		if opts.BloomBitsPerKey > 0 {
@@ -471,7 +476,8 @@ func writeMultipleSSTsStreaming(
 					Length:     int64(len(bloomBytes)),
 					Checksum:   bloomChecksum(bloomBytes),
 				},
-				CreatedAt: identity.CreatedAt.UTC(),
+				CreatedAt:  identity.CreatedAt.UTC(),
+				MetaOffset: metaOffset,
 			},
 		}
 
