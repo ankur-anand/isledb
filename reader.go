@@ -987,7 +987,7 @@ func (it *sstIterWithClose) Close() error {
 	}
 	it.closed = true
 
-	iterErr := it.Iterator.Error()
+	iterErr := it.Error()
 	err := it.Iterator.Close()
 	if it.onCorruption != nil && (pebble.IsCorruptionError(iterErr) || pebble.IsCorruptionError(err)) {
 		it.onCorruption()
