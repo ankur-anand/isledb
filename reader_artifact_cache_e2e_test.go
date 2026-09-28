@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/filecache"
 )
 
 // TestReaderArtifactCacheLifecycle is the in-process end-to-end test for the
-// persistent Reader cache. Focused diskcache tests inject syscall failures;
+// persistent Reader cache. Focused filecache tests cover failure handling;
 // this test verifies the user-visible lifecycle through fake S3 and real
 // temporary cache directories without requiring an integration environment.
 func TestReaderArtifactCacheLifecycle(t *testing.T) {
@@ -57,8 +57,8 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		// A second DB using the same local cache directory must fail while the
 		// first Reader owns it, then the directory must be reusable after Close.
 		contender := openArtifactCacheTestDB(t, ctx, bucketURL, "persistent")
-		if _, err := contender.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir)); !errors.Is(err, diskcache.ErrArtifactCacheLocked) {
-			t.Fatalf("contending Reader error=%v, want %v", err, diskcache.ErrArtifactCacheLocked)
+		if _, err := contender.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir)); !errors.Is(err, filecache.ErrLocked) {
+			t.Fatalf("contending Reader error=%v, want %v", err, filecache.ErrLocked)
 		}
 		if err := contender.Close(); err != nil {
 			t.Fatalf("close contender: %v", err)
@@ -70,9 +70,9 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		// Same-size corruption of both tiers must be removed and healed from
 		// fake S3 rather than poisoning subsequent reads.
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v1", "sst", "*", "*.sst"))
+			t, filepath.Join(cacheDir, "artifacts", "v2", "sst", "*", "*"))
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v1", "bloom", "*", "*.bloom"))
+			t, filepath.Join(cacheDir, "artifacts", "v2", "bloom", "*", "*"))
 		healingReader := openArtifactCacheTestReader(t, ctx, db, cacheDir, 0)
 		assertArtifactCacheRecoveredTiers(t, healingReader, 1, 1)
 		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
@@ -171,16 +171,16 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		defer reader.Close()
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
 		stats := reader.SSTCacheStats()
-		if stats.EntryCount != 0 || stats.Bytes != 0 || stats.AdmissionBypasses != 1 ||
-			stats.SyncFailures != 0 || stats.PublicationFailures != 0 {
+		if stats.EntryCount != 0 || stats.Bytes != 0 || stats.Bypasses != 1 ||
+			stats.Failures != 0 {
 			t.Fatalf("oversized bypass stats=%+v", stats)
 		}
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
 	})
 
-	t.Run("pinned capacity bypass then admission", func(t *testing.T) {
-		cacheDir := filepath.Join(cacheRoot, "pinned-capacity")
-		db := openArtifactCacheTestDB(t, ctx, bucketURL, "pinned-capacity")
+	t.Run("evicts SST still in use", func(t *testing.T) {
+		cacheDir := filepath.Join(cacheRoot, "evict-in-use")
+		db := openArtifactCacheTestDB(t, ctx, bucketURL, "evict-in-use")
 		defer db.Close()
 		writeArtifactCacheTestBatches(t, ctx, db, []map[string]string{
 			{"a": "first"},
@@ -188,7 +188,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		})
 		manifest, err := db.manifestStore.ReplayWithArtifactValidation(ctx)
 		if err != nil {
-			t.Fatalf("replay pinned-capacity manifest: %v", err)
+			t.Fatalf("replay evict-in-use manifest: %v", err)
 		}
 		first := artifactCacheTestSSTForKey(t, manifest, []byte("a"))
 		second := artifactCacheTestSSTForKey(t, manifest, []byte("b"))
@@ -199,26 +199,34 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		if err := reader.cacheSST(ctx, &first, db.store.SSTPath(first.ID)); err != nil {
 			t.Fatalf("prime first SST: %v", err)
 		}
-		_, releaseFirst, hit, err := reader.acquireSST(first)
-		if err != nil || !hit {
-			t.Fatalf("pin first SST: hit=%t err=%v", hit, err)
+		held, hit := reader.acquireSST(first)
+		if !hit {
+			t.Fatal("first SST not cached")
 		}
-		defer releaseFirst()
+		defer held.Close()
 
+		// Caching the second SST evicts the first while it is still open.
 		assertArtifactCacheTestValue(t, ctx, reader, "b", "second")
 		stats := reader.SSTCacheStats()
-		if stats.EntryCount != 1 || stats.Bytes != first.Size ||
-			stats.PinnedBytes != first.Size || stats.AdmissionBypasses != 1 {
-			t.Fatalf("pinned-capacity bypass stats=%+v", stats)
+		if stats.EntryCount != 1 || stats.Bytes != second.Size ||
+			stats.Evictions != 1 || stats.Bypasses != 0 {
+			t.Fatalf("evict-in-use stats=%+v", stats)
+		}
+		if reader.sstResident(first) {
+			t.Fatal("first SST still cached")
 		}
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
 
-		releaseFirst()
-		assertArtifactCacheTestValue(t, ctx, reader, "b", "second")
-		stats = reader.SSTCacheStats()
-		if stats.EntryCount != 1 || stats.Bytes != second.Size ||
-			stats.PinnedBytes != 0 || stats.Evictions != 1 || stats.AdmissionBypasses != 1 {
-			t.Fatalf("post-release admission stats=%+v", stats)
+		heldBytes := make([]byte, first.Size)
+		if _, err := held.ReadAt(heldBytes, 0); err != nil {
+			t.Fatalf("read evicted SST still in use: %v", err)
+		}
+		origin, _, err := db.store.Read(ctx, db.store.SSTPath(first.ID))
+		if err != nil {
+			t.Fatalf("read first SST from origin: %v", err)
+		}
+		if !bytes.Equal(heldBytes, origin[:first.Size]) {
+			t.Fatal("evicted SST in use changed")
 		}
 	})
 }
@@ -328,20 +336,20 @@ func assertArtifactCacheHealthyStats(
 ) {
 	t.Helper()
 	sst := reader.SSTCacheStats()
-	if sst.EntryCount != wantSSTEntries || sst.AdmissionBypasses != 0 ||
-		sst.SyncFailures != 0 || sst.PublicationFailures != 0 {
+	if sst.EntryCount != wantSSTEntries || sst.Bypasses != 0 ||
+		sst.Failures != 0 {
 		t.Fatalf("SST cache stats=%+v", sst)
 	}
 	bloom := reader.BloomDiskCacheStats()
-	if bloom.EntryCount != wantBloomEntries || bloom.AdmissionBypasses != 0 ||
-		bloom.SyncFailures != 0 || bloom.PublicationFailures != 0 {
+	if bloom.EntryCount != wantBloomEntries || bloom.Bypasses != 0 ||
+		bloom.Failures != 0 {
 		t.Fatalf("Bloom cache stats=%+v", bloom)
 	}
 }
 
 func assertArtifactCacheIncomingEmpty(t *testing.T, cacheDir string) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "incoming"))
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v2", "incoming"))
 	if err != nil {
 		t.Fatalf("read incoming cache directory: %v", err)
 	}

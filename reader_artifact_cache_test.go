@@ -12,7 +12,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/filecache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -53,15 +53,6 @@ func TestReaderDiagnosticLimiterBoundsLogsAndReportsSuppression(t *testing.T) {
 	if ok, suppressed := concurrent.allow(now.Add(readerDiagnosticLogInterval)); !ok || suppressed != callers-1 {
 		t.Fatalf("concurrent suppression=(%t,%d), want (true,%d)",
 			ok, suppressed, callers-1)
-	}
-}
-
-func TestReaderCacheStatsExposeArtifactFailureCounters(t *testing.T) {
-	stats := cacheStatsFromArtifact(diskcache.ArtifactStats{
-		SyncFailures: 2, PublicationFailures: 3,
-	})
-	if stats.SyncFailures != 2 || stats.PublicationFailures != 3 {
-		t.Fatalf("reader cache stats=%+v", stats)
 	}
 }
 
@@ -139,8 +130,8 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v1", "sst", "*", "*.sst"))
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v1", "bloom", "*", "*.bloom"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v2", "sst", "*", "*"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v2", "bloom", "*", "*"))
 
 	reopened, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
@@ -223,9 +214,7 @@ func TestPinnedSnapshotReadsRetiredArtifactsWithoutOrigin(t *testing.T) {
 	reader.publishManifestView(&manifestState{}, &manifest.Current{
 		MaxPinnedViewAge: time.Hour,
 	}, time.Now())
-	if err := reader.clearBloomDiskCache(); err != nil {
-		t.Fatal(err)
-	}
+	reader.clearBloomDiskCache()
 	if err := store.Delete(ctx, store.SSTPath(result.Meta.ID)); err != nil {
 		t.Fatal(err)
 	}
@@ -246,8 +235,8 @@ func TestReaderArtifactCacheExclusivelyLocksCacheDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir}); !errors.Is(err, diskcache.ErrArtifactCacheLocked) {
-		t.Fatalf("second Reader error=%v want=%v", err, diskcache.ErrArtifactCacheLocked)
+	if _, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir}); !errors.Is(err, filecache.ErrLocked) {
+		t.Fatalf("second Reader error=%v want=%v", err, filecache.ErrLocked)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
@@ -258,29 +247,6 @@ func TestReaderArtifactCacheExclusivelyLocksCacheDirectory(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestReaderArtifactCacheRemovesLegacySSTCacheOnUpgrade(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("reader-artifact-legacy-cleanup")
-	defer store.Close()
-	cacheDir := t.TempDir()
-	legacyDir := filepath.Join(cacheDir, "sst")
-	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacyDir, "sst-orphan"), []byte("legacy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	if _, err := os.Stat(legacyDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy SST cache survived upgrade: %v", err)
 	}
 }
 

@@ -164,15 +164,13 @@ type ReaderMetrics struct {
 	ScanLimitLatency prometheus.Histogram
 	ScanLimitResults prometheus.Counter
 
-	SSTCacheHits                     prometheus.Counter
-	SSTCacheMisses                   prometheus.Counter
-	ArtifactCacheErrors              prometheus.Counter
-	ArtifactCacheInvariantViolations prometheus.Counter
-	BloomFilterErrors                prometheus.Counter
-	SSTDownloadTotal                 prometheus.Counter
-	SSTDownloadErrors                prometheus.Counter
-	SSTDownloadLatency               prometheus.Histogram
-	SSTDownloadBytes                 prometheus.Counter
+	SSTCacheHits       prometheus.Counter
+	SSTCacheMisses     prometheus.Counter
+	BloomFilterErrors  prometheus.Counter
+	SSTDownloadTotal   prometheus.Counter
+	SSTDownloadErrors  prometheus.Counter
+	SSTDownloadLatency prometheus.Histogram
+	SSTDownloadBytes   prometheus.Counter
 
 	SSTRangeBlockCacheHits   prometheus.Counter
 	SSTRangeBlockCacheMisses prometheus.Counter
@@ -270,16 +268,6 @@ func (m *ReaderMetrics) ObserveSSTCacheLookup(hit bool) {
 		return
 	}
 	m.incCounter(m.SSTCacheMisses)
-}
-
-func (m *ReaderMetrics) ObserveArtifactCacheDiagnostic(invariantViolation bool) {
-	if m == nil {
-		return
-	}
-	m.incCounter(m.ArtifactCacheErrors)
-	if invariantViolation {
-		m.incCounter(m.ArtifactCacheInvariantViolations)
-	}
 }
 
 func (m *ReaderMetrics) ObserveBloomFilterError() {
@@ -456,20 +444,6 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "sst_cache_misses_total",
 			Help:        "Total number of SST cache misses.",
-			ConstLabels: constLabels,
-		}),
-		ArtifactCacheErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "artifact_cache_errors_total",
-			Help:        "Total advisory artifact-cache operation errors.",
-			ConstLabels: constLabels,
-		}),
-		ArtifactCacheInvariantViolations: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "artifact_cache_invariant_violations_total",
-			Help:        "Total artifact-cache errors that violate Reader/cache lifecycle or descriptor invariants.",
 			ConstLabels: constLabels,
 		}),
 		BloomFilterErrors: prometheus.NewCounter(prometheus.CounterOpts{

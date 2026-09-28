@@ -4,13 +4,13 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/cachestore"
-	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/filecache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 const (
-	defaultSSTCacheSize       = 1 << 30
-	defaultBloomDiskCacheSize = 64 << 20
+	defaultSSTCacheSize       = 8 << 30
+	defaultBloomDiskCacheSize = 512 << 20
 )
 
 const (
@@ -115,16 +115,16 @@ type readerOptions struct {
 	// Reader is open.
 	CacheDir string
 
-	// ArtifactCache is an optional pre-created persistent SST/Bloom cache. A
-	// caller-supplied cache must remain open until all Readers using it have
-	// closed. Closing it early makes local SST staging unavailable and may cause
-	// subsequent reads to fail.
-	ArtifactCache *diskcache.ArtifactCache
+	// FileCache is an optional pre-opened local SST/Bloom cache. A
+	// caller-supplied cache must stay open until every Reader using it has
+	// closed; afterwards, downloads can no longer be staged locally.
+	FileCache *filecache.Cache
 
-	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
+	// SSTCacheSize is the maximum bytes of SSTs cached on disk (default 8 GiB).
 	SSTCacheSize int64
 
-	// BloomDiskCacheSize is the maximum bytes for verified raw Bloom sidecars.
+	// BloomDiskCacheSize is the maximum bytes of Bloom filters cached on disk
+	// (default 512 MiB).
 	BloomDiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes for the in-memory block cache used
@@ -150,7 +150,7 @@ type readerOptions struct {
 	DisableManifestPageCache bool
 
 	// ValidateSSTChecksum verifies SST checksums on read paths that can
-	// otherwise skip it. Persistent ArtifactCache admissions always verify.
+	// otherwise skip it. Files entering the local cache are always verified.
 	ValidateSSTChecksum bool
 
 	ViewPolicy ReaderViewPolicy

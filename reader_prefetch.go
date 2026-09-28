@@ -145,13 +145,7 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		}
 		stats.MatchedSSTs++
 
-		resident, err := r.sstResident(sst)
-		if err != nil {
-			// Descriptor errors will be returned by prefetchSST for selected
-			// entries; presence probing itself must not inflate hit/miss metrics.
-			resident = false
-		}
-		if resident {
+		if r.sstResident(sst) {
 			stats.SkippedSSTs++
 			return
 		}
@@ -184,18 +178,11 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 
 func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (bool, int64, error) {
 	path := r.store.SSTPath(sst.ID)
-	if resident, err := r.sstResident(sst); err != nil {
-		return false, 0, fmt.Errorf("probe sst %s: %w", sst.ID, err)
-	} else if resident {
+	if r.sstResident(sst) {
 		return true, 0, nil
 	}
-
 	if err := r.cacheSST(ctx, &sst, path); err != nil {
 		return false, 0, err
 	}
-	resident, err := r.sstResident(sst)
-	if err != nil {
-		return false, sst.Size, fmt.Errorf("probe prefetched sst %s: %w", sst.ID, err)
-	}
-	return resident, sst.Size, nil
+	return r.sstResident(sst), sst.Size, nil
 }

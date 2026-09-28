@@ -89,7 +89,7 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	assertArtifactCacheTierBound(
 		t, "retained Bloom L2", reader.BloomDiskCacheStats(), 3,
 		shrunkSSTOptions.BloomDiskCacheSize)
-	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.AdmissionBypasses != 0 {
+	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
 		t.Fatalf("SST L2 did not evict cleanly under its reduced budget: %+v", stats)
 	}
 	if stats := reader.BloomDiskCacheStats(); stats.Hits == 0 || stats.Evictions != 0 {
@@ -117,10 +117,10 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 		t, "bounded Bloom L2", reader.BloomDiskCacheStats(), 1, oneBloomBytes)
 	assertArtifactCacheTierBound(
 		t, "bounded decoded Bloom L1", reader.BloomCacheStats(), 1, oneLoadedBloomBytes)
-	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.AdmissionBypasses != 0 {
+	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
 		t.Fatalf("bounded SST L2 churn stats=%+v", stats)
 	}
-	if stats := reader.BloomDiskCacheStats(); stats.Evictions == 0 || stats.AdmissionBypasses != 0 {
+	if stats := reader.BloomDiskCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
 		t.Fatalf("bounded Bloom L2 churn stats=%+v", stats)
 	}
 }
@@ -324,8 +324,7 @@ func assertArtifactCacheTierBound(
 	t.Helper()
 	if stats.EntryCount != wantEntries || stats.MaxBytes != wantMaxBytes ||
 		stats.Bytes <= 0 || stats.Bytes > stats.MaxBytes ||
-		stats.PinnedEntries != 0 || stats.PinnedBytes != 0 ||
-		stats.SyncFailures != 0 || stats.PublicationFailures != 0 {
+		stats.Failures != 0 {
 		t.Fatalf("%s stats=%+v, want entries=%d max_bytes=%d",
 			label, stats, wantEntries, wantMaxBytes)
 	}

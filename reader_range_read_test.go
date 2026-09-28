@@ -177,7 +177,7 @@ func cachedDataBlocks(t *testing.T, reader *Reader, store *blobstore.Store, sstI
 		t.Fatalf("read sst: %v", err)
 	}
 
-	r, err := sstable.NewReader(context.Background(), newSSTReadable(data), sstable.ReaderOptions{})
+	r, err := sstable.NewReader(context.Background(), newMemReadable(data), sstable.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("new reader: %v", err)
 	}

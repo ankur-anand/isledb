@@ -196,9 +196,3 @@ func (k *sstBloomKeys) build(sstSize int64) ([]byte, manifest.BloomMeta, error) 
 func hasUsableBloom(meta manifest.SSTMeta) bool {
 	return meta.Bloom.Length > 0 && meta.Bloom.Format == manifest.BloomFormatExactV1
 }
-
-// parseOwnedSSTBloomFilter parses a copy of data, so the filter never aliases
-// memory that a cache handle or caller may release or reuse.
-func parseOwnedSSTBloomFilter(data []byte) (sstBloomFilter, error) {
-	return parseSSTBloomFilter(bytes.Clone(data))
-}

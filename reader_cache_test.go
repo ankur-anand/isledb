@@ -2,15 +2,26 @@ package isledb
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/filecache"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
+
+// readCachedSST returns the bytes of an SST opened from the local cache and
+// closes it.
+func readCachedSST(t *testing.T, file *os.File, size int64) []byte {
+	t.Helper()
+	defer func() { _ = file.Close() }()
+	data := make([]byte, size)
+	_, err := file.ReadAt(data, 0)
+	require.NoError(t, err)
+	return data
+}
 
 func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Context, sstMetadata, []byte, string, func()) {
 	t.Helper()
@@ -39,18 +50,16 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 	return reader, ctx, res.Meta, res.SSTData, store.SSTPath(res.Meta.ID), cleanup
 }
 
-func TestReader_cacheSST_StreamedToArtifactCache(t *testing.T) {
+func TestReader_cacheSST_StreamedToFileCache(t *testing.T) {
 	reader, ctx, meta, data, path, cleanup := setupReaderCacheFixture(t, true)
 	defer cleanup()
 
 	err := reader.cacheSST(ctx, &meta, path)
 	require.NoError(t, err)
 
-	got, release, ok, err := reader.acquireSST(meta)
-	require.NoError(t, err)
+	file, ok := reader.acquireSST(meta)
 	require.True(t, ok)
-	require.Equal(t, data, got)
-	release()
+	require.Equal(t, data[:meta.Size], readCachedSST(t, file, meta.Size))
 	require.Equal(t, 1, reader.SSTCacheStats().EntryCount)
 }
 
@@ -64,29 +73,24 @@ func TestReader_cacheSSTArtifact_ChecksumMismatch(t *testing.T) {
 	err = reader.cacheSST(ctx, &meta, path)
 	require.Error(t, err)
 
-	_, _, ok, acquireErr := reader.acquireSST(meta)
-	require.NoError(t, acquireErr)
+	_, ok := reader.acquireSST(meta)
 	require.False(t, ok)
 	require.Equal(t, 0, reader.SSTCacheStats().EntryCount)
 }
 
-func TestReaderArtifactCacheDescriptorRejectionIsObservableMiss(t *testing.T) {
-	cache, err := diskcache.OpenArtifactCache(diskcache.ArtifactCacheOptions{
+func TestReaderFileCacheInvalidDescriptorIsMiss(t *testing.T) {
+	cache, err := filecache.Open(filecache.Options{
 		Dir: t.TempDir(), SSTMaxBytes: 1 << 20, BloomMaxBytes: 1 << 20,
 	})
 	require.NoError(t, err)
 	defer cache.Close()
-	metrics := DefaultReaderMetrics(nil)
-	reader := &Reader{artifactCache: cache, metrics: metrics}
+	reader := &Reader{fileCache: cache}
 
-	_, _, ok, err := reader.acquireSST(sstMetadata{
+	_, ok := reader.acquireSST(sstMetadata{
 		ID: "accepted-by-reader", Size: 1, Checksum: "invalid",
 	})
-	require.NoError(t, err)
 	require.False(t, ok)
-	require.EqualValues(t, 1, testutil.ToFloat64(metrics.ArtifactCacheErrors))
-	require.EqualValues(t, 1,
-		testutil.ToFloat64(metrics.ArtifactCacheInvariantViolations))
+	require.False(t, reader.sstResident(sstMetadata{ID: "accepted-by-reader", Size: 1, Checksum: "invalid"}))
 }
 
 func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T) {
@@ -103,15 +107,17 @@ func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T)
 		Size:     int64(len(data)),
 		Checksum: bloomChecksum(data),
 	}
-	handle, _, err := reader.artifactCache.AdmitBytes(sstArtifactDescriptor(meta), data)
-	require.NoError(t, err)
-	require.NoError(t, handle.Close())
+	require.NoError(t, reader.fileCache.Put(sstFileDescriptor(meta), data))
 
-	_, _, parseErr := reader.openSSTIterFromData(ctx, meta, data, nil, nil, nil)
+	file, ok := reader.acquireSST(meta)
+	require.True(t, ok)
+	_, _, parseErr := reader.openSSTIterFromFile(ctx, meta, file, nil, nil, func() { _ = file.Close() })
 	require.Error(t, parseErr)
 	_, _, err = reader.openSSTIterBounded(ctx, meta, nil, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, parseErr.Error())
+	// An SST that cannot be opened is dropped from the cache.
+	require.False(t, reader.sstResident(meta))
 }
 
 func TestReader_OversizedSSTBypassesCacheAndServesRead(t *testing.T) {
@@ -141,12 +147,14 @@ func TestReader_OversizedSSTBypassesCacheAndServesRead(t *testing.T) {
 	stats := reader.SSTCacheStats()
 	require.Zero(t, stats.EntryCount)
 	require.Zero(t, stats.Bytes)
-	require.EqualValues(t, 1, stats.AdmissionBypasses)
+	require.EqualValues(t, 1, stats.Bypasses)
 }
 
-func TestReader_PinnedCapacityBypassServesRead(t *testing.T) {
+// TestReader_EvictsSSTInUseAndServesRead fills a one-SST cache while the first
+// SST is still open. The first is evicted, yet its open file stays readable.
+func TestReader_EvictsSSTInUseAndServesRead(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("pinned-sst-cache-bypass")
+	store := blobstore.NewMemory("evict-sst-in-use")
 	defer store.Close()
 	manifestStore := manifest.NewStore(store)
 	first := writeTestSST(t, ctx, store, manifestStore, []internal.MemEntry{
@@ -164,10 +172,8 @@ func TestReader_PinnedCapacityBypassServesRead(t *testing.T) {
 	defer reader.Close()
 
 	require.NoError(t, reader.cacheSST(ctx, &first.Meta, store.SSTPath(first.Meta.ID)))
-	_, releaseFirst, ok, err := reader.acquireSST(first.Meta)
-	require.NoError(t, err)
+	held, ok := reader.acquireSST(first.Meta)
 	require.True(t, ok)
-	defer releaseFirst()
 
 	value, found, err := reader.Get(ctx, []byte("b"))
 	require.NoError(t, err)
@@ -176,7 +182,41 @@ func TestReader_PinnedCapacityBypassServesRead(t *testing.T) {
 
 	stats := reader.SSTCacheStats()
 	require.Equal(t, 1, stats.EntryCount)
-	require.Equal(t, first.Meta.Size, stats.Bytes)
-	require.Equal(t, first.Meta.Size, stats.PinnedBytes)
-	require.EqualValues(t, 1, stats.AdmissionBypasses)
+	require.Equal(t, second.Meta.Size, stats.Bytes)
+	require.EqualValues(t, 1, stats.Evictions)
+	require.False(t, reader.sstResident(first.Meta))
+
+	firstBytes, _, err := store.Read(ctx, store.SSTPath(first.Meta.ID))
+	require.NoError(t, err)
+	require.Equal(t, firstBytes[:first.Meta.Size], readCachedSST(t, held, first.Meta.Size))
+}
+
+// TestReader_CorruptBlockInCachedSSTIsDroppedAndRefetched corrupts a data
+// block of a cached SST without changing its size. Opening the SST still
+// succeeds, so the corruption surfaces while reading: that read fails, the SST
+// is dropped from the cache, and the next read downloads it again.
+func TestReader_CorruptBlockInCachedSSTIsDroppedAndRefetched(t *testing.T) {
+	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, false)
+	defer cleanup()
+	require.NoError(t, reader.cacheSST(ctx, &meta, path))
+
+	file, ok := reader.acquireSST(meta)
+	require.True(t, ok)
+	cachedPath := file.Name()
+	require.NoError(t, file.Close())
+	cached, err := os.ReadFile(cachedPath)
+	require.NoError(t, err)
+	cached[0] ^= 0xff // the first data block starts at offset 0
+	require.NoError(t, os.WriteFile(cachedPath, cached, 0o600))
+
+	_, _, err = reader.Get(ctx, []byte("a"))
+	require.Error(t, err)
+	require.False(t, reader.sstResident(meta))
+	require.EqualValues(t, 1, reader.SSTCacheStats().Corruptions)
+
+	value, found, err := reader.Get(ctx, []byte("a"))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, []byte("value"), value)
+	require.True(t, reader.sstResident(meta))
 }

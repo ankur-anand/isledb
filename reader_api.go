@@ -24,41 +24,40 @@ type ReaderViewPolicy struct {
 // limits are zero for entry-count-bounded caches; MaxEntries is zero for
 // byte-bounded caches.
 type CacheStats struct {
-	Hits              int64
-	Misses            int64
-	Bytes             int64
-	MaxBytes          int64
-	EntryCount        int
-	MaxEntries        int
-	PinnedBytes       int64
-	PinnedEntries     int
-	Evictions         int64
-	Corruptions       int64
-	AdmissionBypasses int64
-	// SyncFailures counts verified fills that could not be made durable and
-	// were therefore served transiently instead of entering the cache.
-	SyncFailures int64
-	// PublicationFailures counts failures while cleaning capacity victims or
-	// publishing an artifact at its final cache path.
-	PublicationFailures int64
+	Hits        int64
+	Misses      int64
+	Bytes       int64
+	MaxBytes    int64
+	EntryCount  int
+	MaxEntries  int
+	Evictions   int64
+	Corruptions int64
+	// Bypasses counts downloaded files too large for the cache's whole
+	// budget; they are served without being cached.
+	Bypasses int64
+	// Failures counts downloaded files that could not be synced or renamed
+	// into the cache; they are served without being cached.
+	Failures int64
 }
 
 // ReaderOpenOptions configures a read-only handle.
 type ReaderOpenOptions struct {
 	// CacheDir is the directory for disk caches. It must be non-empty, may be
 	// owned by only one live Reader process at a time, and must remain writable
-	// with enough free space to stage SST downloads for the Reader's lifetime.
-	// A read that needs a full SST fails if local staging cannot be created;
-	// IsleDB does not fall back to buffering an unbounded SST in memory. Once a
-	// download has completed and passed checksum verification, later cache
-	// publication failures are served from the staged file transiently.
+	// for the Reader's lifetime. Beyond the cache budgets, it needs room for
+	// SST downloads in progress: a read that needs a full SST fails if the
+	// download cannot be written locally, since IsleDB never buffers a whole
+	// SST in memory. A verified download that cannot be kept in the cache is
+	// still served. Opening logs a warning when the directory's filesystem
+	// cannot hold the budgets.
 	CacheDir string
 
-	// SSTCacheSize is the maximum bytes for SST cache (default 1GB).
+	// SSTCacheSize is the maximum bytes of SSTs cached on disk. Zero selects
+	// the default (8 GiB).
 	SSTCacheSize int64
 
-	// BloomDiskCacheSize is the maximum bytes for persistent, verified raw
-	// Bloom sidecars. Zero selects the default (64 MiB).
+	// BloomDiskCacheSize is the maximum bytes of Bloom filters cached on disk.
+	// Zero selects the default (512 MiB).
 	BloomDiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes for the in-memory block cache used

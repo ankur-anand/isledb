@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/filecache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -199,7 +199,7 @@ func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
 		t.Fatalf("oversized prefetch stats=%+v", stats)
 	}
 	cacheStats := reader.SSTCacheStats()
-	if cacheStats.EntryCount != 0 || cacheStats.Bytes != 0 || cacheStats.AdmissionBypasses != 1 {
+	if cacheStats.EntryCount != 0 || cacheStats.Bytes != 0 || cacheStats.Bypasses != 1 {
 		t.Fatalf("oversized cache stats=%+v", cacheStats)
 	}
 }
@@ -296,9 +296,7 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 {
 		t.Fatalf("stats after error = %+v, want matched=1 cached=0", stats)
 	}
-	if resident, probeErr := reader.sstResident(m.L0SSTs[0]); probeErr != nil {
-		t.Fatal(probeErr)
-	} else if resident {
+	if reader.sstResident(m.L0SSTs[0]) {
 		t.Fatal("corrupted SST was cached")
 	}
 }
@@ -401,18 +399,11 @@ func TestReader_EvictsInvalidCachedSSTAndRedownloads(t *testing.T) {
 	}
 	defer reader.Close()
 	truncated := valid[:len(valid)/2]
-	handle, _, err := reader.artifactCache.AdmitBytes(diskcache.ArtifactDescriptor{
-		Key: diskcache.ArtifactKey{
-			Kind:  diskcache.ArtifactSST,
-			SSTID: m.L0SSTs[0].ID,
-		},
+	if err := reader.fileCache.Put(filecache.Descriptor{
+		Kind:     filecache.KindSST,
 		Size:     int64(len(truncated)),
 		Checksum: bloomChecksum(truncated),
-	}, truncated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := handle.Close(); err != nil {
+	}, truncated); err != nil {
 		t.Fatal(err)
 	}
 
