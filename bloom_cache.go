@@ -3,14 +3,12 @@ package isledb
 import (
 	"container/list"
 	"sync"
-
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 const (
 	defaultBloomCacheSize = 64 << 20
 	// Account for the cache entry, list node, map bucket share, string header,
-	// and Bloom slice header in addition to the bytes reported by Bloom itself.
+	// and filter slice header in addition to the filter's bit array.
 	// The exact Go heap cost is runtime-dependent, so the cache deliberately
 	// uses a conservative fixed allowance per entry.
 	bloomCacheEntryOverhead = 128
@@ -18,11 +16,11 @@ const (
 
 type bloomCacheEntry struct {
 	id     string
-	filter *z.Bloom
+	filter sstBloomFilter
 	bytes  int64
 }
 
-// bloomFilterCache bounds decoded bloom filters by their accounted heap cost.
+// bloomFilterCache bounds loaded bloom filters by their accounted heap cost.
 // Eviction is safe because every filter can be reloaded from its immutable SST
 // sidecar on the next point lookup.
 type bloomFilterCache struct {
@@ -45,19 +43,19 @@ func newBloomFilterCache(maxBytes int64) *bloomFilterCache {
 	}
 }
 
-func (c *bloomFilterCache) get(id string) (*z.Bloom, bool) {
+func (c *bloomFilterCache) get(id string) (sstBloomFilter, bool) {
 	return c.lookup(id, true)
 }
 
 // peek rechecks the cache after joining a coalesced load without counting
 // an additional application-level lookup.
-func (c *bloomFilterCache) peek(id string) (*z.Bloom, bool) {
+func (c *bloomFilterCache) peek(id string) (sstBloomFilter, bool) {
 	return c.lookup(id, false)
 }
 
-func (c *bloomFilterCache) lookup(id string, record bool) (*z.Bloom, bool) {
+func (c *bloomFilterCache) lookup(id string, record bool) (sstBloomFilter, bool) {
 	if c == nil {
-		return nil, false
+		return sstBloomFilter{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,7 +64,7 @@ func (c *bloomFilterCache) lookup(id string, record bool) (*z.Bloom, bool) {
 		if record {
 			c.misses++
 		}
-		return nil, false
+		return sstBloomFilter{}, false
 	}
 	if record {
 		c.hits++
@@ -75,8 +73,8 @@ func (c *bloomFilterCache) lookup(id string, record bool) (*z.Bloom, bool) {
 	return element.Value.(*bloomCacheEntry).filter, true
 }
 
-func (c *bloomFilterCache) put(id string, filter *z.Bloom) {
-	if c == nil || id == "" || filter == nil {
+func (c *bloomFilterCache) put(id string, filter sstBloomFilter) {
+	if c == nil || id == "" || filter.sizeBytes() == 0 {
 		return
 	}
 	bytes := bloomFilterCacheCost(id, filter)
@@ -142,6 +140,6 @@ func (c *bloomFilterCache) removeElement(element *list.Element) {
 	c.lru.Remove(element)
 }
 
-func bloomFilterCacheCost(id string, filter *z.Bloom) int64 {
-	return int64(filter.TotalSize()) + int64(len(id)) + bloomCacheEntryOverhead
+func bloomFilterCacheCost(id string, filter sstBloomFilter) int64 {
+	return int64(filter.sizeBytes()) + int64(len(id)) + bloomCacheEntryOverhead
 }

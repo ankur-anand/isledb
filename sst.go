@@ -45,7 +45,7 @@ func writeSST(
 
 	sstBuf := new(bytes.Buffer)
 	writable := newHashingWritable(sstBuf)
-	var hashes []uint64
+	bloomKeys := newSSTBloomKeys(opts.BloomBitsPerKey)
 
 	wo := pebbleWriterOptions(opts)
 
@@ -65,9 +65,7 @@ func writeSST(
 
 		e := it.Entry()
 		k := append([]byte(nil), e.Key...)
-		if opts.BloomBitsPerKey > 0 {
-			hashes = append(hashes, bloomHashKey(k))
-		}
+		bloomKeys.add(k)
 
 		keyEntry := buildKeyEntry(e, k)
 		encodedValue := internal.EncodeKeyEntry(keyEntry)
@@ -102,22 +100,12 @@ func writeSST(
 
 	sstSize := writable.size
 	metaOffset := sstMetaOffset(sst)
-	var bloomBytes []byte
-	var bloomK int
-	if opts.BloomBitsPerKey > 0 {
-		var err error
-		bloomBytes, bloomK, err = buildBloomBytes(hashes, opts.BloomBitsPerKey)
-		if err != nil {
-			return result, err
-		}
-		if len(bloomBytes) > 0 {
-			if _, err := sstBuf.Write(bloomBytes); err != nil {
-				return result, err
-			}
-			if err := appendBloomTrailer(sstBuf, int64(len(bloomBytes))); err != nil {
-				return result, err
-			}
-		}
+	bloomData, bloom, err := bloomKeys.build(sstSize)
+	if err != nil {
+		return result, err
+	}
+	if err := writeBloomSidecar(sstBuf, bloomData); err != nil {
+		return result, err
 	}
 
 	hashBytes := writable.sumBytes()
@@ -126,21 +114,15 @@ func writeSST(
 	result.SSTData = sstBuf.Bytes()
 
 	result.Meta = sstMetadata{
-		ID:       buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
-		Epoch:    epoch,
-		SeqLo:    state.seqLo,
-		SeqHi:    state.seqHi,
-		MinKey:   state.minKey,
-		MaxKey:   state.maxKey,
-		Size:     sstSize,
-		Checksum: "sha256:" + hashStr,
-		Bloom: bloomMetadata{
-			BitsPerKey: opts.BloomBitsPerKey,
-			K:          bloomK,
-			Offset:     sstSize,
-			Length:     int64(len(bloomBytes)),
-			Checksum:   bloomChecksum(bloomBytes),
-		},
+		ID:         buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
+		Epoch:      epoch,
+		SeqLo:      state.seqLo,
+		SeqHi:      state.seqHi,
+		MinKey:     state.minKey,
+		MaxKey:     state.maxKey,
+		Size:       sstSize,
+		Checksum:   "sha256:" + hashStr,
+		Bloom:      bloom,
 		CreatedAt:  time.Now().UTC(),
 		MetaOffset: metaOffset,
 	}

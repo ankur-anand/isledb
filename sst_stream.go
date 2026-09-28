@@ -131,7 +131,7 @@ func writeSSTStreaming(
 
 	pr, pw := io.Pipe()
 	writable := newHashingWritable(pw)
-	var hashes []uint64
+	bloomKeys := newSSTBloomKeys(opts.BloomBitsPerKey)
 
 	wo := pebbleWriterOptions(opts)
 
@@ -189,9 +189,7 @@ func writeSSTStreaming(
 
 			e := it.Entry()
 			k := append([]byte(nil), e.Key...)
-			if opts.BloomBitsPerKey > 0 {
-				hashes = append(hashes, bloomHashKey(k))
-			}
+			bloomKeys.add(k)
 
 			keyEntry := buildKeyEntry(e, k)
 			encodedValue := internal.EncodeKeyEntry(keyEntry)
@@ -252,46 +250,23 @@ func writeSSTStreaming(
 
 		sstSize := writable.size
 		metaOffset := sstMetaOffset(sst)
-		var bloomBytes []byte
-		var bloomK int
-		if opts.BloomBitsPerKey > 0 {
-			var err error
-			bloomBytes, bloomK, err = buildBloomBytes(hashes, opts.BloomBitsPerKey)
-			if err != nil {
-				producerDone <- producerResult{err: err}
-				pw.CloseWithError(err)
-				return fmt.Errorf("sst producer: %w", err)
+		bloomData, bloom, err := bloomKeys.build(sstSize)
+		if err == nil {
+			err = writeBloomSidecar(pw, bloomData)
+		}
+		if err != nil {
+			if ue := getUploadErr(); ue != nil && errors.Is(err, io.ErrClosedPipe) {
+				err = fmt.Errorf("sst upload: %w", ue)
 			}
-			if len(bloomBytes) > 0 {
-				if _, err := pw.Write(bloomBytes); err != nil {
-					if ue := getUploadErr(); ue != nil && errors.Is(err, io.ErrClosedPipe) {
-						err = fmt.Errorf("sst upload: %w", ue)
-					}
-					producerDone <- producerResult{err: err}
-					pw.CloseWithError(err)
-					return fmt.Errorf("sst producer: %w", err)
-				}
-				if err := appendBloomTrailer(pw, int64(len(bloomBytes))); err != nil {
-					if ue := getUploadErr(); ue != nil && errors.Is(err, io.ErrClosedPipe) {
-						err = fmt.Errorf("sst upload: %w", ue)
-					}
-					producerDone <- producerResult{err: err}
-					pw.CloseWithError(err)
-					return fmt.Errorf("sst producer: %w", err)
-				}
-			}
+			producerDone <- producerResult{err: err}
+			pw.CloseWithError(err)
+			return fmt.Errorf("sst producer: %w", err)
 		}
 
 		producerDone <- producerResult{
 			state:      state,
 			metaOffset: metaOffset,
-			bloom: bloomMetadata{
-				BitsPerKey: opts.BloomBitsPerKey,
-				K:          bloomK,
-				Offset:     sstSize,
-				Length:     int64(len(bloomBytes)),
-				Checksum:   bloomChecksum(bloomBytes),
-			},
+			bloom:      bloom,
 		}
 		return nil
 	})
@@ -346,7 +321,7 @@ func writeMultipleSSTsStreaming(
 	var writable *hashingWritable
 	var sst *sstable.Writer
 	var state *sstBuildState
-	var hashes []uint64
+	bloomKeys := newSSTBloomKeys(opts.BloomBitsPerKey)
 	var sstID string
 	var uploadErr atomic.Value
 	var uploadDone chan struct{}
@@ -373,7 +348,7 @@ func writeMultipleSSTsStreaming(
 		writable = newHashingWritable(pw)
 		sst = sstable.NewWriter(writable, wo)
 		state = newSSTBuildState()
-		hashes = nil
+		bloomKeys.reset()
 		uploadErr = atomic.Value{}
 		uploadDone = make(chan struct{})
 		uploadCtx, cancelUpload := context.WithCancel(ctx)
@@ -405,31 +380,15 @@ func writeMultipleSSTsStreaming(
 
 		sstSize := writable.size
 		metaOffset := sstMetaOffset(sst)
-		var bloomBytes []byte
-		var bloomK int
-		if opts.BloomBitsPerKey > 0 {
-			var err error
-			bloomBytes, bloomK, err = buildBloomBytes(hashes, opts.BloomBitsPerKey)
-			if err != nil {
-				pw.CloseWithError(err)
-				uploadCancel()
-				<-uploadDone
-				return err
-			}
-			if len(bloomBytes) > 0 {
-				if _, err := pw.Write(bloomBytes); err != nil {
-					pw.CloseWithError(err)
-					uploadCancel()
-					<-uploadDone
-					return err
-				}
-				if err := appendBloomTrailer(pw, int64(len(bloomBytes))); err != nil {
-					pw.CloseWithError(err)
-					uploadCancel()
-					<-uploadDone
-					return err
-				}
-			}
+		bloomData, bloom, err := bloomKeys.build(sstSize)
+		if err == nil {
+			err = writeBloomSidecar(pw, bloomData)
+		}
+		if err != nil {
+			pw.CloseWithError(err)
+			uploadCancel()
+			<-uploadDone
+			return err
 		}
 
 		closeErr := pw.Close()
@@ -448,21 +407,15 @@ func writeMultipleSSTsStreaming(
 
 		result := streamSSTResult{
 			Meta: sstMetadata{
-				ID:       sstID,
-				Epoch:    identity.Epoch,
-				SeqLo:    state.seqLo,
-				SeqHi:    state.seqHi,
-				MinKey:   state.minKey,
-				MaxKey:   state.maxKey,
-				Size:     sstSize,
-				Checksum: "sha256:" + hashStr,
-				Bloom: bloomMetadata{
-					BitsPerKey: opts.BloomBitsPerKey,
-					K:          bloomK,
-					Offset:     sstSize,
-					Length:     int64(len(bloomBytes)),
-					Checksum:   bloomChecksum(bloomBytes),
-				},
+				ID:         sstID,
+				Epoch:      identity.Epoch,
+				SeqLo:      state.seqLo,
+				SeqHi:      state.seqHi,
+				MinKey:     state.minKey,
+				MaxKey:     state.maxKey,
+				Size:       sstSize,
+				Checksum:   "sha256:" + hashStr,
+				Bloom:      bloom,
 				CreatedAt:  identity.CreatedAt.UTC(),
 				MetaOffset: metaOffset,
 			},
@@ -519,9 +472,7 @@ func writeMultipleSSTsStreaming(
 
 		e := it.Entry()
 		k := append([]byte(nil), e.Key...)
-		if opts.BloomBitsPerKey > 0 {
-			hashes = append(hashes, bloomHashKey(k))
-		}
+		bloomKeys.add(k)
 
 		keyEntry := buildKeyEntry(e, k)
 		encodedValue := internal.EncodeKeyEntry(keyEntry)

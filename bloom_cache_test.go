@@ -2,73 +2,13 @@ package isledb
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
-
-func TestBuildBloomBytesHonorsBitsPerKey(t *testing.T) {
-	const (
-		keyCount   = 4096
-		bitsPerKey = 10
-	)
-
-	hashes := make([]uint64, keyCount)
-	for i := range hashes {
-		hashes[i] = bloomHashKey([]byte(fmt.Sprintf("present-%08d", i)))
-	}
-	data, _, err := buildBloomBytes(hashes, bitsPerKey)
-	if err != nil {
-		t.Fatalf("build bloom: %v", err)
-	}
-
-	var sidecar bloomSidecar
-	if err := json.Unmarshal(data, &sidecar); err != nil {
-		t.Fatalf("decode bloom sidecar: %v", err)
-	}
-	minimumBytes := (keyCount*bitsPerKey + 7) / 8
-	if len(sidecar.FilterSet) < minimumBytes {
-		t.Fatalf("bloom bit vector bytes=%d want at least %d for %d keys at %d bits/key",
-			len(sidecar.FilterSet), minimumBytes, keyCount, bitsPerKey)
-	}
-
-	filter, err := parseBloomFilter(data)
-	if err != nil {
-		t.Fatalf("parse bloom: %v", err)
-	}
-	for i, hash := range hashes {
-		if !filter.Has(hash) {
-			t.Fatalf("inserted key %d is absent from bloom", i)
-		}
-	}
-
-	falsePositives := 0
-	for i := range keyCount {
-		hash := bloomHashKey([]byte(fmt.Sprintf("absent-%08d", i)))
-		if filter.Has(hash) {
-			falsePositives++
-		}
-	}
-	// Ten configured bits per key should remain comfortably below this
-	// deterministic five-percent ceiling. The old one-bit-per-key allocation
-	// returns true for nearly every absent key.
-	if falsePositives > keyCount/20 {
-		t.Fatalf("bloom false positives=%d/%d exceed 5%%", falsePositives, keyCount)
-	}
-}
-
-func TestBuildBloomBytesRejectsOversizedFilter(t *testing.T) {
-	_, _, err := buildBloomBytes(
-		[]uint64{bloomHashKey([]byte("key"))}, int(maxBloomBitsetBits)+1)
-	if err == nil {
-		t.Fatal("oversized bloom filter was accepted")
-	}
-}
 
 func TestBloomChecksumValidation(t *testing.T) {
 	data := []byte("encoded-bloom")
@@ -90,8 +30,7 @@ func TestBloomChecksumValidation(t *testing.T) {
 }
 
 func TestBloomFilterCacheEvictsLeastRecentlyUsedWithinByteLimit(t *testing.T) {
-	filter := z.NewBloomFilter(64, 2)
-	filter.Add(1)
+	filter := bloomFilterForCacheTest(t, []byte("key"))
 	entryBytes := bloomFilterCacheCost("a", filter)
 	cache := newBloomFilterCache(2 * entryBytes)
 
@@ -121,7 +60,7 @@ func TestBloomFilterCacheEvictsLeastRecentlyUsedWithinByteLimit(t *testing.T) {
 }
 
 func TestBloomFilterCacheRejectsOversizedFilter(t *testing.T) {
-	filter := z.NewBloomFilter(64, 2)
+	filter := bloomFilterForCacheTest(t, []byte("key"))
 	cache := newBloomFilterCache(bloomFilterCacheCost("oversized", filter) - 1)
 	cache.put("oversized", filter)
 
@@ -143,6 +82,7 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	metaA := sstMetadata{
 		ID: "sst-a",
 		Bloom: bloomMetadata{
+			Format:   manifest.BloomFormatExactV1,
 			Offset:   0,
 			Length:   int64(len(dataA)),
 			Checksum: bloomChecksum(dataA),
@@ -151,6 +91,7 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	metaB := sstMetadata{
 		ID: "sst-b",
 		Bloom: bloomMetadata{
+			Format:   manifest.BloomFormatExactV1,
 			Offset:   0,
 			Length:   int64(len(dataB)),
 			Checksum: bloomChecksum(dataB),
@@ -163,10 +104,7 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 		t.Fatalf("write bloom B: %v", err)
 	}
 
-	filterA, err := parseBloomFilter(dataA)
-	if err != nil {
-		t.Fatalf("parse bloom A: %v", err)
-	}
+	filterA := bloomFilterForCacheTest(t, keyA)
 	metrics := DefaultReaderMetrics(nil)
 	reader := &Reader{
 		store:      store,
@@ -218,6 +156,7 @@ func TestReaderRejectsBloomChecksumMismatchBeforeCaching(t *testing.T) {
 	meta := sstMetadata{
 		ID: "sst-corrupt-bloom",
 		Bloom: bloomMetadata{
+			Format:   manifest.BloomFormatExactV1,
 			Length:   int64(len(data)),
 			Checksum: bloomChecksum(data),
 		},
@@ -252,7 +191,7 @@ func TestReaderBloomWithoutChecksumFailsOpen(t *testing.T) {
 	data := bloomBytesForCacheTest(t, key)
 	meta := sstMetadata{
 		ID:    "sst-legacy-bloom",
-		Bloom: bloomMetadata{Length: int64(len(data))},
+		Bloom: bloomMetadata{Format: manifest.BloomFormatExactV1, Length: int64(len(data))},
 	}
 	if _, err := store.Write(ctx, store.SSTPath(meta.ID), data); err != nil {
 		t.Fatalf("write legacy bloom: %v", err)
@@ -267,9 +206,18 @@ func TestReaderBloomWithoutChecksumFailsOpen(t *testing.T) {
 
 func bloomBytesForCacheTest(t testing.TB, key []byte) []byte {
 	t.Helper()
-	data, _, err := buildBloomBytes([]uint64{bloomHashKey(key)}, 10)
+	data, err := buildSSTBloomFilter([]uint64{bloomHashKey(key)}, 12)
 	if err != nil {
 		t.Fatalf("build bloom for %q: %v", key, err)
 	}
 	return data
+}
+
+func bloomFilterForCacheTest(t testing.TB, key []byte) sstBloomFilter {
+	t.Helper()
+	filter, err := parseSSTBloomFilter(bloomBytesForCacheTest(t, key))
+	if err != nil {
+		t.Fatalf("parse bloom for %q: %v", key, err)
+	}
+	return filter
 }

@@ -33,7 +33,13 @@ type Level struct {
 	SSTs   []SSTMeta `json:"ssts,omitempty"`
 }
 
+// BloomFormatExactV1 identifies the exact-size Bloom filter sidecar. Readers
+// use only filters in this format; any other format, including the JSON
+// sidecars written by earlier versions, is skipped without being fetched.
+const BloomFormatExactV1 = "exact-v1"
+
 type BloomMeta struct {
+	Format     string `json:"format,omitempty"`
 	BitsPerKey int    `json:"bits_per_key"`
 	K          int    `json:"k"`
 	Offset     int64  `json:"offset"`

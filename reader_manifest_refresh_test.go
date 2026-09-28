@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 func TestPublishManifestViewDoesNotConsultBloomCache(t *testing.T) {
@@ -46,8 +45,7 @@ func TestPublishManifestViewDoesNotConsultBloomCache(t *testing.T) {
 
 func TestPublishManifestViewRetainsRetiredDecodedBloom(t *testing.T) {
 	const retiredID = "retired-sst"
-	filter := z.NewBloomFilter(64, 2)
-	filter.Add(1)
+	filter := bloomFilterForCacheTest(t, []byte("key"))
 	cache := newBloomFilterCache(bloomFilterCacheCost(retiredID, filter))
 	cache.put(retiredID, filter)
 	reader := &Reader{

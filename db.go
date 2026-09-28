@@ -79,13 +79,20 @@ type SSTEncodingOptions struct {
 
 // DefaultSSTOutputOptions returns the current production SST encoding for both
 // writer flushes and compacted output.
+//
+// L0 filters get more bits per key than compacted ones: every overlapping L0
+// SST is checked on a point lookup, yet L0 holds few keys, so extra bits there
+// remove many false positives for little memory. At 16 and 12 bits per key the
+// filters answer "may contain" for about 0.05% and 0.3% of absent keys.
 func DefaultSSTOutputOptions() SSTOutputOptions {
-	encoding := SSTEncodingOptions{
+	l0 := SSTEncodingOptions{
 		Compression:     "snappy",
 		BlockBytes:      4096,
-		BloomBitsPerKey: 10,
+		BloomBitsPerKey: 16,
 	}
-	return SSTOutputOptions{L0: encoding, Compacted: encoding}
+	compacted := l0
+	compacted.BloomBitsPerKey = 12
+	return SSTOutputOptions{L0: l0, Compacted: compacted}
 }
 
 // Writer provides write access to the database.

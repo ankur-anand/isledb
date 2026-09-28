@@ -36,16 +36,16 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 
 	oneSSTBytes := metas[0].Size
 	oneBloomBytes := metas[0].Bloom.Length
-	oneDecodedBloomBytes := artifactCacheTestDecodedBloomCost(t, ctx, db, metas[0])
+	oneLoadedBloomBytes := artifactCacheTestLoadedBloomCost(t, ctx, db, metas[0])
 	for _, meta := range metas[1:] {
 		if meta.Size != oneSSTBytes || meta.Bloom.Length != oneBloomBytes {
 			t.Fatalf(
 				"fixture artifacts have unequal sizes: first=(%d,%d) %s=(%d,%d)",
 				oneSSTBytes, oneBloomBytes, meta.ID, meta.Size, meta.Bloom.Length)
 		}
-		if cost := artifactCacheTestDecodedBloomCost(t, ctx, db, meta); cost != oneDecodedBloomBytes {
+		if cost := artifactCacheTestLoadedBloomCost(t, ctx, db, meta); cost != oneLoadedBloomBytes {
 			t.Fatalf("fixture decoded Bloom cost=%d for %s, want=%d",
-				cost, meta.ID, oneDecodedBloomBytes)
+				cost, meta.ID, oneLoadedBloomBytes)
 		}
 	}
 
@@ -53,7 +53,7 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	largeOptions.SSTCacheSize = int64(len(metas)) * oneSSTBytes
 	largeOptions.BloomDiskCacheSize = int64(len(metas)) * oneBloomBytes
 	// The decoded Bloom L1 intentionally holds only one of the three filters.
-	largeOptions.BloomCacheSize = oneDecodedBloomBytes
+	largeOptions.BloomCacheSize = oneLoadedBloomBytes
 	reader := openArtifactCacheTestReaderWithOptions(t, ctx, db, largeOptions)
 	defer func() {
 		if reader != nil {
@@ -116,7 +116,7 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	assertArtifactCacheTierBound(
 		t, "bounded Bloom L2", reader.BloomDiskCacheStats(), 1, oneBloomBytes)
 	assertArtifactCacheTierBound(
-		t, "bounded decoded Bloom L1", reader.BloomCacheStats(), 1, oneDecodedBloomBytes)
+		t, "bounded decoded Bloom L1", reader.BloomCacheStats(), 1, oneLoadedBloomBytes)
 	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.AdmissionBypasses != 0 {
 		t.Fatalf("bounded SST L2 churn stats=%+v", stats)
 	}
@@ -256,7 +256,7 @@ func artifactCacheTestSortedSSTs(manifest *manifestState) []sstMetadata {
 	return metas
 }
 
-func artifactCacheTestDecodedBloomCost(
+func artifactCacheTestLoadedBloomCost(
 	t *testing.T,
 	ctx context.Context,
 	db *DB,
@@ -268,7 +268,7 @@ func artifactCacheTestDecodedBloomCost(
 	if err != nil {
 		t.Fatalf("read Bloom %s: %v", meta.ID, err)
 	}
-	filter, err := parseBloomFilter(data)
+	filter, err := parseSSTBloomFilter(data)
 	if err != nil {
 		t.Fatalf("parse Bloom %s: %v", meta.ID, err)
 	}

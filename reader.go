@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/dgraph-io/ristretto/v2"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 type Reader struct {
@@ -708,9 +707,9 @@ func (r *Reader) getFromSST(
 	sstMeta sstMetadata,
 	key []byte,
 ) (value []byte, found bool, tombstone bool, err error) {
-	if sstMeta.Bloom.Length > 0 {
+	if hasUsableBloom(sstMeta) {
 		if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
-			if !filter.Has(bloomHashKey(key)) {
+			if !filter.mayContain(bloomHashKey(key)) {
 				return nil, false, false, nil
 			}
 		} else if resident, _ := r.sstResident(sstMeta); !resident {
@@ -771,7 +770,7 @@ func (r *Reader) getFromSST(
 // failure returns true so Bloom availability can never suppress an SST read.
 func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
 	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
-		return filter.Has(bloomHashKey(key))
+		return filter.mayContain(bloomHashKey(key))
 	}
 
 	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
@@ -779,7 +778,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 			return filter, nil
 		}
 		if handle, ok, _ := r.acquireRawBloom(sstMeta); ok {
-			filter, parseErr := parseBloomFilter(handle.Bytes())
+			filter, parseErr := parseOwnedSSTBloomFilter(handle.Bytes())
 			closeErr := handle.Close()
 			if parseErr != nil {
 				removeErr := r.artifactCache.Remove(
@@ -787,8 +786,8 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 				r.observeBloomFilterError(
 					sstMeta.ID, errors.Join(parseErr, closeErr, removeErr))
 			} else {
-				// Cleanup errors are cache diagnostics. The decoded heap copy is
-				// independent of the persistent handle and remains safe to use.
+				// Cleanup errors are cache diagnostics. The filter owns a copy of
+				// its bytes and remains safe to use after the handle closes.
 				r.observeArtifactCacheDiagnostic(
 					"release", diskcache.ArtifactBloom, sstMeta.ID, closeErr)
 				r.bloomCache.put(sstMeta.ID, filter)
@@ -818,7 +817,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		if handle != nil {
 			bloomData = handle.Bytes()
 		}
-		filter, err := parseBloomFilter(bloomData)
+		filter, err := parseOwnedSSTBloomFilter(bloomData)
 		if err != nil {
 			var closeErr error
 			var removeErr error
@@ -843,13 +842,13 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 		r.observeBloomFilterError(sstMeta.ID, err)
 		return true
 	}
-	filter, ok := value.(*z.Bloom)
-	if !ok || filter == nil {
+	filter, ok := value.(sstBloomFilter)
+	if !ok {
 		err := fmt.Errorf("bloom load %s returned %T", sstMeta.ID, value)
 		r.observeBloomFilterError(sstMeta.ID, err)
 		return true
 	}
-	return filter.Has(bloomHashKey(key))
+	return filter.mayContain(bloomHashKey(key))
 }
 
 func (r *Reader) entryValue(_ context.Context, entry internal.CompactionEntry) ([]byte, error) {
