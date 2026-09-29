@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"cmp"
 	"strconv"
 	"strings"
 
@@ -9,22 +10,19 @@ import (
 
 const defaultBlockSize = 4 << 10
 
-func initBlockCache(opts readerOptions) (*ristretto.Cache[string, []byte], bool, error) {
-	if opts.BlockCacheSize <= 0 {
-		return nil, false, nil
+// initBlockCache returns the range-read block cache, or nil when range reads
+// are disabled.
+func initBlockCache(opts readerOptions) (*ristretto.Cache[string, []byte], error) {
+	if !opts.RangeRead {
+		return nil, nil
 	}
-
-	numCounters := blockCacheCounters(opts.BlockCacheSize)
-	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
-		NumCounters:        numCounters,
-		MaxCost:            opts.BlockCacheSize,
+	maxCost := cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)
+	return ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters:        blockCacheCounters(maxCost),
+		MaxCost:            maxCost,
 		BufferItems:        64,
 		IgnoreInternalCost: true,
 	})
-	if err != nil {
-		return nil, false, err
-	}
-	return cache, true, nil
 }
 
 func blockCacheCounters(maxCost int64) int64 {

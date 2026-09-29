@@ -317,7 +317,7 @@ func TestReader_ChunkedRangeReadsServeGetsAndScans(t *testing.T) {
 	store := blobstore.NewMemory("chunked-reader")
 	defer store.Close()
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir: t.TempDir(), BlockCacheSize: 16 << 20,
+		CacheDir: t.TempDir(), RangeRead: true, BlockCacheSize: 16 << 20,
 		RangeReadMinSSTSize: 1, RangeReadChunkSize: 8 << 10,
 	})
 	if err != nil {

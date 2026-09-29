@@ -180,8 +180,10 @@ func TestS3E2E_WriteCompactRead(t *testing.T) {
 	}
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
-		CacheDir:       t.TempDir(),
-		BlockCacheSize: 64 << 10,
+		CacheDir:            t.TempDir(),
+		RangeRead:           true,
+		RangeReadMinSSTSize: 1,
+		BlockCacheSize:      64 << 10,
 	})
 	defer reader.Close()
 	assertReaderHasAll(t, ctx, reader, expected)
@@ -284,8 +286,10 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	defer db.Close()
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
-		CacheDir:       t.TempDir(),
-		BlockCacheSize: 64 << 10,
+		CacheDir:            t.TempDir(),
+		RangeRead:           true,
+		RangeReadMinSSTSize: 1,
+		BlockCacheSize:      64 << 10,
 	})
 	defer reader.Close()
 
