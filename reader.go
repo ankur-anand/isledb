@@ -37,12 +37,12 @@ type Reader struct {
 	sstRangeLoads coalescedLoadGroup
 	manifestLoads coalescedLoadGroup
 
+	rangeRead           bool
 	rangeReadMinSSTSize int64
 	rangeReadChunkSize  int64
 
-	ownsFileCache  bool
-	ownsBlockCache bool
-	cacheDir       string
+	ownsFileCache bool
+	cacheDir      string
 
 	lifecycleMu            sync.RWMutex
 	iteratorsMu            sync.Mutex
@@ -95,11 +95,11 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		}
 	}()
 
-	blockCache, ownsBlockCache, err := initBlockCache(opts)
+	blockCache, err := initBlockCache(opts)
 	if err != nil {
 		return nil, err
 	}
-	cleanupBlockCache := ownsBlockCache
+	cleanupBlockCache := blockCache != nil
 	defer func() {
 		if cleanupBlockCache {
 			blockCache.Close()
@@ -124,10 +124,10 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		blockCache:          blockCache,
 		bloomCache:          newBloomFilterCache(opts.BloomCacheSize),
 		metaCache:           newSSTMetaCache(opts.MetaCacheSize),
-		rangeReadMinSSTSize: opts.RangeReadMinSSTSize,
-		rangeReadChunkSize:  opts.RangeReadChunkSize,
+		rangeRead:           opts.RangeRead,
+		rangeReadMinSSTSize: cmp.Or(opts.RangeReadMinSSTSize, defaultRangeReadMinSSTSize),
+		rangeReadChunkSize:  cmp.Or(opts.RangeReadChunkSize, defaultRangeReadChunkSize),
 		ownsFileCache:       ownsFileCache,
-		ownsBlockCache:      ownsBlockCache,
 		cacheDir:            opts.CacheDir,
 		metrics:             opts.Metrics,
 	}
@@ -326,7 +326,7 @@ func (r *Reader) Close() error {
 		}
 	}
 
-	if r.blockCache != nil && r.ownsBlockCache {
+	if r.blockCache != nil {
 		r.blockCache.Close()
 	}
 	r.bloomCache.clear()
@@ -862,10 +862,10 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 		r.metrics.ObserveSSTCacheLookup(false)
 	}
 
-	if ok, size, err := r.shouldRangeRead(sstMeta); err != nil {
+	if ok, err := r.shouldRangeRead(sstMeta); err != nil {
 		return nil, nil, errors.Join(cachedOpenErr, err)
 	} else if ok {
-		reader, iter, err := r.openSSTIterRange(ctx, sstMeta, path, lower, upper, size)
+		reader, iter, err := r.openSSTIterRange(ctx, sstMeta, path, lower, upper)
 		if err != nil {
 			err = errors.Join(cachedOpenErr, err)
 		}
@@ -885,45 +885,23 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 	return reader, iter, err
 }
 
-func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, int64, error) {
-	if r.blockCache == nil {
-		return false, 0, nil
+// shouldRangeRead reports whether an SST is read by byte range rather than
+// downloaded whole: only when range reads are enabled and the SST is at least
+// the minimum size.
+func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, error) {
+	if !r.rangeRead {
+		return false, nil
 	}
-
-	size := sstMeta.Size
-	if r.rangeReadMinSSTSize > 0 {
-		if size <= 0 {
-			s, err := r.sstPayloadSize(sstMeta)
-			if err != nil {
-				return false, 0, err
-			}
-			size = s
-		}
-		if size < r.rangeReadMinSSTSize {
-			return false, 0, nil
-		}
+	size, err := r.sstPayloadSize(sstMeta)
+	if err != nil {
+		return false, err
 	}
-
-	if size <= 0 {
-		size = sstMeta.Size
-		if size <= 0 {
-			size = 0
-		}
-	}
-
-	return true, size, nil
+	return size >= r.rangeReadMinSSTSize, nil
 }
 
-func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path string, lower, upper []byte, size int64) (*sstable.Reader, sstable.Iterator, error) {
-	if size <= 0 {
-		var err error
-		size, err = r.sstPayloadSize(sstMeta)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
+func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path string, lower, upper []byte) (*sstable.Reader, sstable.Iterator, error) {
 	readable := newSSTRangeReadable(
-		r.store, path, sstMeta.ID, size, r.blockCache, &r.sstRangeLoads, r.metrics)
+		r.store, path, sstMeta.ID, sstMeta.Size, r.blockCache, &r.sstRangeLoads, r.metrics)
 	readable.useMetaRegion(sstMeta.MetaOffset)
 	readable.useMetaCache(r.metaCache)
 	readable.useChunks(r.rangeReadChunkSize)

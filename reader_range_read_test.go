@@ -41,6 +41,7 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 
 	opts := readerOptions{
 		CacheDir:            t.TempDir(),
+		RangeRead:           true,
 		BlockCacheSize:      1 << 20,
 		RangeReadMinSSTSize: 32 << 10,
 	}
@@ -125,6 +126,7 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	opts := readerOptions{
 		CacheDir:            t.TempDir(),
 		Metrics:             metrics,
+		RangeRead:           true,
 		BlockCacheSize:      1 << 20,
 		RangeReadMinSSTSize: 32 << 10,
 	}
@@ -194,4 +196,91 @@ func cachedDataBlocks(t *testing.T, reader *Reader, store *blobstore.Store, sstI
 		}
 	}
 	return cached
+}
+
+func TestReader_RangeRead_DefaultsDownloadSmallSSTsWhole(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := blobstore.NewMemory("range-read-defaults")
+	ms := manifest.NewStore(store)
+	t.Cleanup(func() { _ = store.Close() })
+
+	value := bytes.Repeat([]byte("v"), 2048)
+	entries := make([]internal.MemEntry, 0, 200)
+	for i := 0; i < 200; i++ {
+		entries = append(entries, internal.MemEntry{
+			Key:   []byte(fmt.Sprintf("key-%06d", i)),
+			Value: value,
+			Kind:  internal.OpPut,
+			Seq:   uint64(i + 1),
+		})
+	}
+	res := writeTestSST(t, ctx, store, ms, entries, 0, 1)
+
+	opts := defaultReaderOptions()
+	opts.CacheDir = t.TempDir()
+	reader, err := newReader(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+
+	if reader.blockCache == nil || reader.blockCache.MaxCost() != defaultBlockCacheSize {
+		t.Fatalf("block cache not created with the default budget")
+	}
+	if reader.rangeReadMinSSTSize != defaultRangeReadMinSSTSize ||
+		reader.rangeReadChunkSize != defaultRangeReadChunkSize {
+		t.Fatalf("range read sizes min=%d chunk=%d, want defaults",
+			reader.rangeReadMinSSTSize, reader.rangeReadChunkSize)
+	}
+
+	for _, test := range []struct {
+		size int64
+		want bool
+	}{
+		{size: defaultRangeReadMinSSTSize - 1, want: false},
+		{size: defaultRangeReadMinSSTSize, want: true},
+	} {
+		got, err := reader.shouldRangeRead(sstMetadata{ID: "sized", Size: test.size})
+		if err != nil || got != test.want {
+			t.Fatalf("shouldRangeRead(size=%d)=%v, %v; want %v", test.size, got, err, test.want)
+		}
+	}
+	if _, err := reader.shouldRangeRead(sstMetadata{ID: "unsized"}); err == nil {
+		t.Fatal("shouldRangeRead without a size: want error")
+	}
+
+	// The fixture SST is under the default threshold, so a lookup downloads it
+	// whole into the disk cache.
+	if res.Meta.Size >= defaultRangeReadMinSSTSize {
+		t.Fatalf("fixture SST is %d bytes, want under %d", res.Meta.Size, defaultRangeReadMinSSTSize)
+	}
+	if _, found, err := reader.Get(ctx, []byte("key-000100")); err != nil || !found {
+		t.Fatalf("Get: found=%v err=%v", found, err)
+	}
+	if got := reader.SSTCacheStats().EntryCount; got != 1 {
+		t.Fatalf("SST cache entries=%d, want 1", got)
+	}
+}
+
+func TestReader_RangeRead_DisabledDownloadsWhole(t *testing.T) {
+	t.Parallel()
+
+	opts := defaultReaderOptions()
+	opts.CacheDir = t.TempDir()
+	opts.RangeRead = false
+	reader, err := newReader(context.Background(), blobstore.NewMemory("range-read-off"), opts)
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+
+	if reader.blockCache != nil {
+		t.Fatal("block cache created with range reads disabled")
+	}
+	got, err := reader.shouldRangeRead(sstMetadata{ID: "large", Size: 1 << 30})
+	if err != nil || got {
+		t.Fatalf("shouldRangeRead=%v, %v; want false", got, err)
+	}
 }

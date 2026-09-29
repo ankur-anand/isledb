@@ -42,7 +42,10 @@ func BenchmarkFakeS3_KVReaderBlockSize(b *testing.B) {
 }
 
 type kvBlockSizeFixture struct {
-	reader  *Reader
+	reader *Reader
+	// whole reads the same SST by downloading it whole into the local file
+	// cache, as a reader without a block cache does.
+	whole   *Reader
 	state   *manifestState
 	counts  *kvS3ReadCounts
 	meta    manifest.SSTMeta
@@ -80,6 +83,7 @@ func prepareKVBlockSizeFixture(
 	// but no manifest. The benchmark passes its own manifest to each read.
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:            b.TempDir(),
+		RangeRead:           true,
 		BlockCacheSize:      256 << 20,
 		RangeReadMinSSTSize: 1,
 		RangeReadChunkSize:  chunkSize,
@@ -89,6 +93,14 @@ func prepareKVBlockSizeFixture(
 		b.Fatalf("open reader: %v", err)
 	}
 	b.Cleanup(func() { _ = reader.Close() })
+	whole, err := newReader(ctx, store, readerOptions{
+		CacheDir: b.TempDir(),
+		Metrics:  DefaultReaderMetrics(nil),
+	})
+	if err != nil {
+		b.Fatalf("open whole-SST reader: %v", err)
+	}
+	b.Cleanup(func() { _ = whole.Close() })
 
 	entries := make([]internal.MemEntry, records)
 	values := kvBlockSizeValues(records)
@@ -119,7 +131,7 @@ func prepareKVBlockSizeFixture(
 	}
 
 	return kvBlockSizeFixture{
-		reader: reader, state: state, counts: counts,
+		reader: reader, whole: whole, state: state, counts: counts,
 		meta: result.Meta, props: props, records: records,
 	}
 }
@@ -436,4 +448,94 @@ func BenchmarkFakeS3_KVReaderChunkedRangeRead(b *testing.B) {
 			})
 		}
 	}
+}
+
+// BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize measures, for SSTs of several
+// sizes, whether range reads or whole-SST downloads serve reads better from a
+// cold start. Each ranged GET is delayed to model object storage: 20 ms plus
+// transfer at 100 MB/s. Before every iteration the range reader's block and
+// metadata caches and the whole reader's file cache are emptied, so each
+// workload includes first access to the SST; Bloom filters stay loaded in
+// both modes.
+func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	defer cancel()
+
+	sizes := []struct {
+		bytes    int
+		blockKiB int
+	}{
+		{256 << 10, 4}, {1 << 20, 4}, {4 << 20, 4}, {16 << 20, 4}, {64 << 20, 16},
+	}
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("sst=%dKiB", size.bytes>>10), func(b *testing.B) {
+			f := prepareKVBlockSizeFixture(b, ctx, size.bytes, sstWriterOptions{
+				BlockSize:       size.blockKiB << 10,
+				BloomBitsPerKey: 12,
+				Compression:     "snappy",
+			}, 128<<10)
+			f = f.withMetaOffset(f.meta.MetaOffset)
+			for _, reader := range []*Reader{f.reader, f.whole} {
+				assertKVReaderBenchmarkManifestGet(
+					b, ctx, reader, f.state, kvLeveledBenchmarkKey(0), true, kvBlockSizeValueBytes)
+				waitKVReaderBenchmarkCache(reader)
+			}
+			f.counts.sstDelay = 20 * time.Millisecond
+			f.counts.sstBytesPerSecond = 100e6
+
+			modes := []struct {
+				name   string
+				reader *Reader
+				reset  func()
+			}{
+				{"range", f.reader, func() {
+					waitKVReaderBenchmarkCache(f.reader)
+					f.reader.blockCache.Clear()
+					f.reader.metaCache.clear()
+				}},
+				{"whole", f.whole, f.whole.clearSSTCache},
+			}
+			for _, mode := range modes {
+				for _, gets := range []int{1, 10, 100} {
+					b.Run(fmt.Sprintf("%s/gets=%d", mode.name, gets), func(b *testing.B) {
+						runKVRangeVsWholeCold(b, f, mode.reset, func() {
+							for i := 0; i < gets; i++ {
+								key := kvLeveledBenchmarkKey((i*f.records/gets + f.records/(2*gets)) % f.records)
+								assertKVReaderBenchmarkManifestGet(
+									b, ctx, mode.reader, f.state, key, true, kvBlockSizeValueBytes)
+							}
+						})
+					})
+				}
+				b.Run(mode.name+"/scan-all", func(b *testing.B) {
+					runKVRangeVsWholeCold(b, f, mode.reset, func() {
+						assertKVReaderBenchmarkScanLimitRange(
+							b, ctx, mode.reader, f.state, nil, nil, f.records)
+					})
+				})
+			}
+		})
+	}
+}
+
+// runKVRangeVsWholeCold runs op after reset each iteration and reports its
+// latency, requests and downloaded bytes.
+func runKVRangeVsWholeCold(b *testing.B, f kvBlockSizeFixture, reset, op func()) {
+	b.Helper()
+	var gets, bytes int64
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		reset()
+		f.counts.reset()
+		b.StartTimer()
+		op()
+		b.StopTimer()
+		gets += f.counts.ssts.Load()
+		bytes += f.counts.rangeBytes.Load()
+	}
+	iterations := float64(b.N)
+	b.ReportMetric(float64(b.Elapsed().Milliseconds())/iterations, "ms/op")
+	b.ReportMetric(float64(gets)/iterations, "GETs/op")
+	b.ReportMetric(float64(bytes)/iterations/(1<<10), "KiB/op")
 }

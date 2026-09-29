@@ -332,6 +332,7 @@ type ReaderOpenOptions struct {
     CacheDir            string
     SSTCacheSize        int64
     BloomDiskCacheSize  int64
+    RangeRead           bool
     BlockCacheSize      int64
     BloomCacheSize      int64
     MetaCacheSize       int64
@@ -354,11 +355,12 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 |---|---:|---|
 | `SSTCacheSize` | 8 GiB | Maximum bytes of SSTs cached on local disk |
 | `BloomDiskCacheSize` | 512 MiB | Maximum bytes of Bloom filters cached on local disk |
-| `BlockCacheSize` | 0 | In-memory cache for range-read blocks; 0 disables range reads |
+| `RangeRead` | true | Read SSTs of at least `RangeReadMinSSTSize` by byte range |
+| `BlockCacheSize` | 256 MiB | Maximum bytes of range-read blocks kept in memory |
 | `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
 | `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
-| `RangeReadMinSSTSize` | 0 | No minimum SST size for range reads |
-| `RangeReadChunkSize` | 0 | Chunk size scans read ahead in; 0 reads exact blocks |
+| `RangeReadMinSSTSize` | 4 MiB | Smallest SST read by byte range; smaller SSTs are downloaded whole |
+| `RangeReadChunkSize` | 128 KiB | Aligned bytes a scan reads ahead per request (16 KiB to 16 MiB) |
 | `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
@@ -366,13 +368,21 @@ Every SST records a SHA-256 checksum of its contents in the manifest. When
 the reader downloads a whole SST, it verifies that checksum before using or
 caching the file, so a damaged or mismatched object is never read.
 
-With `BlockCacheSize > 0`, the reader instead range-reads SSTs: it fetches
-only the metadata and blocks a read needs. The whole-file checksum cannot be
+With `RangeRead`, the reader instead range-reads SSTs of at least
+`RangeReadMinSSTSize`: it fetches only the metadata and blocks a read needs.
+Smaller SSTs are still downloaded whole, since that costs little more than
+one ranged request and leaves the SST cached on disk. The whole-file checksum cannot be
 checked without the whole file, so range reads rely on each block's own
 checksum, which detects damaged bytes but not a different, internally valid
 object stored under the SST's name. Point lookups fetch exact blocks into the
-block cache; with `RangeReadChunkSize > 0`, scans read ahead in aligned chunks
-of that size, kept by the scan alone so they never displace cached blocks.
+block cache; scans read ahead in aligned chunks of `RangeReadChunkSize`, kept
+by the scan alone so they never displace cached blocks.
+
+`BlockCacheSize`, `RangeReadMinSSTSize` and `RangeReadChunkSize` apply only to
+range reads: zero selects each default, and setting any of them with
+`RangeRead` false is rejected. A `ReaderOpenOptions` built without
+`DefaultReaderOpenOptions` has `RangeRead` false and downloads every SST
+whole.
 
 ### Reader methods
 

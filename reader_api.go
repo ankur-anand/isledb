@@ -60,8 +60,15 @@ type ReaderOpenOptions struct {
 	// Zero selects the default (512 MiB).
 	BloomDiskCacheSize int64
 
-	// BlockCacheSize is the maximum bytes for the in-memory block cache used
-	// when range-reading SSTs. Default 0 disables the block cache.
+	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
+	// instead of downloading them whole: a lookup fetches only the blocks it
+	// needs and a scan reads ahead in aligned chunks. DefaultReaderOpenOptions
+	// enables it. The range-read sizes below may be set only when it is
+	// enabled; zero selects each one's default.
+	RangeRead bool
+
+	// BlockCacheSize is the maximum bytes of range-read blocks kept in memory.
+	// Zero selects the default (256 MiB).
 	BlockCacheSize int64
 
 	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
@@ -73,14 +80,16 @@ type ReaderOpenOptions struct {
 	// data reads cannot evict it. Zero selects the default (128 MiB).
 	MetaCacheSize int64
 
-	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
-	// range-read + block cache. Default 0 means no size threshold.
+	// RangeReadMinSSTSize is the smallest SST read by byte range; smaller SSTs
+	// are downloaded whole, which costs little more than one ranged request
+	// and leaves the whole SST cached on disk. Zero selects the default
+	// (4 MiB).
 	RangeReadMinSSTSize int64
 
-	// RangeReadChunkSize, when positive, makes range reads fetch and cache
-	// aligned chunks of this many bytes of an SST's data instead of each block
-	// Pebble requests: neighbouring blocks, which a scan reads next, then come
-	// from the same request. Zero reads exactly the requested blocks.
+	// RangeReadChunkSize is how many aligned bytes a scan fetches when it reads
+	// past its read-ahead, so the blocks it reads next come from the same
+	// request. It must be between 16 KiB and 16 MiB. Zero selects the default
+	// (128 KiB).
 	RangeReadChunkSize int64
 
 	// Views controls manifest freshness. Read-view lifetime is a store policy
@@ -100,6 +109,7 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 		BloomDiskCacheSize: defaults.BloomDiskCacheSize,
 		BloomCacheSize:     defaults.BloomCacheSize,
 		MetaCacheSize:      defaults.MetaCacheSize,
+		RangeRead:          defaults.RangeRead,
 		Views:              defaults.ViewPolicy,
 	}
 }
@@ -132,9 +142,15 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
-	if opts.RangeReadChunkSize < 0 {
+	if opts.RangeReadChunkSize < 0 || (opts.RangeReadChunkSize > 0 &&
+		(opts.RangeReadChunkSize < minRangeReadChunkSize || opts.RangeReadChunkSize > maxRangeReadChunkSize)) {
 		return readerOptions{}, fmt.Errorf(
-			"%w: range_read_chunk_size=%d", ErrInvalidReaderOptions, opts.RangeReadChunkSize)
+			"%w: range_read_chunk_size=%d, want 16 KiB to 16 MiB", ErrInvalidReaderOptions, opts.RangeReadChunkSize)
+	}
+	if !opts.RangeRead && (opts.BlockCacheSize != 0 || opts.RangeReadMinSSTSize != 0 || opts.RangeReadChunkSize != 0) {
+		return readerOptions{}, fmt.Errorf(
+			"%w: block_cache_size, range_read_min_sst_size and range_read_chunk_size need range_read",
+			ErrInvalidReaderOptions)
 	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
@@ -148,6 +164,7 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		BlockCacheSize:      opts.BlockCacheSize,
 		BloomCacheSize:      opts.BloomCacheSize,
 		MetaCacheSize:       opts.MetaCacheSize,
+		RangeRead:           opts.RangeRead,
 		RangeReadMinSSTSize: opts.RangeReadMinSSTSize,
 		RangeReadChunkSize:  opts.RangeReadChunkSize,
 		ViewPolicy:          views,

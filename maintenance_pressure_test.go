@@ -61,9 +61,11 @@ func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
 	defer func() { _ = writer.Close(context.Background()) }()
 
 	reader, err := db.OpenReader(ctx, ReaderOpenOptions{
-		CacheDir:       t.TempDir(),
-		SSTCacheSize:   64 << 20,
-		BlockCacheSize: 4 << 20,
+		CacheDir:            t.TempDir(),
+		SSTCacheSize:        64 << 20,
+		RangeRead:           true,
+		RangeReadMinSSTSize: 1,
+		BlockCacheSize:      4 << 20,
 	})
 	if err != nil {
 		t.Fatalf("open reader: %v", err)
@@ -201,9 +203,11 @@ func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
 	}
 	defer reopened.Close()
 	reopenedReader, err := reopened.OpenReader(ctx, ReaderOpenOptions{
-		CacheDir:       t.TempDir(),
-		SSTCacheSize:   64 << 20,
-		BlockCacheSize: 4 << 20,
+		CacheDir:            t.TempDir(),
+		SSTCacheSize:        64 << 20,
+		RangeRead:           true,
+		RangeReadMinSSTSize: 1,
+		BlockCacheSize:      4 << 20,
 	})
 	if err != nil {
 		t.Fatalf("open reader after restart: %v", err)

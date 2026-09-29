@@ -829,6 +829,7 @@ func prepareFakeS3KVBenchmarkPointLevels(
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:            b.TempDir(),
+		RangeRead:           true,
 		BlockCacheSize:      64 << 20,
 		RangeReadMinSSTSize: 1,
 		Metrics:             metrics,
@@ -913,6 +914,7 @@ func prepareFakeS3KVBenchmarkLeveled(
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:            b.TempDir(),
+		RangeRead:           true,
 		BlockCacheSize:      readerCacheMax,
 		RangeReadMinSSTSize: 1,
 		Metrics:             metrics,
@@ -1042,6 +1044,7 @@ func prepareFakeS3KVBenchmarkL1(
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:            b.TempDir(),
+		RangeRead:           true,
 		BlockCacheSize:      64 << 20,
 		RangeReadMinSSTSize: 1,
 		Metrics:             metrics,
@@ -1135,6 +1138,7 @@ func openFakeS3KVBenchmarkReader(
 	opts.Metrics = metrics
 	switch mode {
 	case "whole-sst":
+		opts.RangeRead = false
 	case "range-read":
 		opts.BlockCacheSize = 16 << 20
 		opts.RangeReadMinSSTSize = 1

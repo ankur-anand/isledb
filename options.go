@@ -11,6 +11,12 @@ import (
 const (
 	defaultSSTCacheSize       = 8 << 30
 	defaultBloomDiskCacheSize = 512 << 20
+
+	defaultBlockCacheSize      = 256 << 20
+	defaultRangeReadMinSSTSize = 4 << 20
+	defaultRangeReadChunkSize  = 128 << 10
+	minRangeReadChunkSize      = 16 << 10
+	maxRangeReadChunkSize      = 16 << 20
 )
 
 const (
@@ -127,8 +133,13 @@ type readerOptions struct {
 	// (default 512 MiB).
 	BloomDiskCacheSize int64
 
-	// BlockCacheSize is the maximum bytes for the in-memory block cache used
-	// when range-reading SSTs. Default 0 disables the block cache.
+	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
+	// instead of downloading them whole. The sizes below apply only when it is
+	// set; zero selects each one's default.
+	RangeRead bool
+
+	// BlockCacheSize is the maximum bytes of range-read blocks kept in memory
+	// (default 256 MiB).
 	BlockCacheSize int64
 
 	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
@@ -140,14 +151,13 @@ type readerOptions struct {
 	// data reads cannot evict it. Zero selects the default (128 MiB).
 	MetaCacheSize int64
 
-	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
-	// range-read + block cache. Default 0 means no size threshold.
+	// RangeReadMinSSTSize is the smallest SST read by byte range; smaller SSTs
+	// are downloaded whole (default 4 MiB).
 	RangeReadMinSSTSize int64
 
-	// RangeReadChunkSize, when positive, makes range reads fetch and cache
-	// aligned chunks of this many bytes of an SST's data instead of each block
-	// Pebble requests: neighbouring blocks, which a scan reads next, then come
-	// from the same request. Zero reads exactly the requested blocks.
+	// RangeReadChunkSize is how many aligned bytes a scan fetches when it reads
+	// past its read-ahead, so the blocks it reads next come from the same
+	// request (default 128 KiB).
 	RangeReadChunkSize int64
 
 	ManifestStorage manifest.Storage
@@ -167,6 +177,7 @@ func defaultReaderOptions() readerOptions {
 		BloomDiskCacheSize: defaultBloomDiskCacheSize,
 		BloomCacheSize:     defaultBloomCacheSize,
 		MetaCacheSize:      defaultMetaCacheSize,
+		RangeRead:          true,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},
