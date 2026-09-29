@@ -31,6 +31,9 @@ type kvS3ReadCounts struct {
 	// sstDelay models a small amount of object-store latency in the
 	// synchronized cold-miss benchmark. It is configured before readers start.
 	sstDelay time.Duration
+	// sstBytesPerSecond, when positive, adds transfer time to each ranged SST
+	// read in proportion to its length. It is configured before readers start.
+	sstBytesPerSecond float64
 
 	recordRanges atomic.Bool
 	rangesMu     sync.Mutex
@@ -61,6 +64,9 @@ func (c *kvS3ReadCounts) observe(request *http.Request) {
 				c.rangesMu.Lock()
 				c.ranges = append(c.ranges, byteRange)
 				c.rangesMu.Unlock()
+			}
+			if c.sstBytesPerSecond > 0 {
+				time.Sleep(time.Duration(float64(byteRange.length) / c.sstBytesPerSecond * float64(time.Second)))
 			}
 		}
 		if c.sstDelay > 0 {

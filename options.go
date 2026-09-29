@@ -143,6 +143,12 @@ type readerOptions struct {
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
 
+	// RangeReadChunkSize, when positive, makes range reads fetch and cache
+	// aligned chunks of this many bytes of an SST's data instead of each block
+	// Pebble requests: neighbouring blocks, which a scan reads next, then come
+	// from the same request. Zero reads exactly the requested blocks.
+	RangeReadChunkSize int64
+
 	ManifestStorage manifest.Storage
 
 	ManifestPageCache        cachestore.ManifestPageCache

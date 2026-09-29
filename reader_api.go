@@ -76,6 +76,12 @@ type ReaderOpenOptions struct {
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
 
+	// RangeReadChunkSize, when positive, makes range reads fetch and cache
+	// aligned chunks of this many bytes of an SST's data instead of each block
+	// Pebble requests: neighbouring blocks, which a scan reads next, then come
+	// from the same request. Zero reads exactly the requested blocks.
+	RangeReadChunkSize int64
+
 	// ValidateSSTChecksum verifies SST checksums on read paths that can
 	// otherwise skip it. Persistent disk-cache admissions always verify.
 	ValidateSSTChecksum bool
@@ -124,6 +130,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
+	if opts.RangeReadChunkSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: range_read_chunk_size=%d", ErrInvalidReaderOptions, opts.RangeReadChunkSize)
+	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
 		return readerOptions{}, err
@@ -137,6 +147,7 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		BloomCacheSize:           opts.BloomCacheSize,
 		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
+		RangeReadChunkSize:       opts.RangeReadChunkSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
 		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,
