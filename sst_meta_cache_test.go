@@ -140,7 +140,7 @@ func TestReader_MetaCacheSavesRequestsUnderBlockCachePressure(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(), RangeRead: true, BlockCacheSize: 16 << 20,
-		RangeReadMinSSTSize: 1, RangeReadChunkSize: 16 << 10,
+		RangeReadMinSSTSize: 1, RangeReadAheadMin: 16 << 10,
 	})
 	if err != nil {
 		t.Fatalf("open reader: %v", err)

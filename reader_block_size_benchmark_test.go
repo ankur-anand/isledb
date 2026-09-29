@@ -34,7 +34,7 @@ func BenchmarkFakeS3_KVReaderBlockSize(b *testing.B) {
 					BlockSize:       blockKiB << 10,
 					BloomBitsPerKey: 10,
 					Compression:     "snappy",
-				}, 0)
+				}, -1, 0)
 				runKVBlockSizeWorkloads(b, ctx, fixture)
 			})
 		}
@@ -60,12 +60,16 @@ const kvBlockSizeValueBytes = 256
 // size actually produced.
 const kvBlockSizeEntryBytes = 224
 
+// prepareKVBlockSizeFixture writes one SST of about targetBytes and opens a
+// range reader and a whole-SST reader over it. aheadMin and aheadMax set the
+// range reader's scan read-ahead (zero selects the default); a negative
+// aheadMin turns read-ahead off for exact block reads.
 func prepareKVBlockSizeFixture(
 	b *testing.B,
 	ctx context.Context,
 	targetBytes int,
 	opts sstWriterOptions,
-	chunkSize int64,
+	aheadMin, aheadMax int64,
 ) kvBlockSizeFixture {
 	b.Helper()
 
@@ -86,13 +90,18 @@ func prepareKVBlockSizeFixture(
 		RangeRead:           true,
 		BlockCacheSize:      256 << 20,
 		RangeReadMinSSTSize: 1,
-		RangeReadChunkSize:  chunkSize,
+		RangeReadAheadMin:   aheadMin,
+		RangeReadAheadMax:   aheadMax,
 		Metrics:             DefaultReaderMetrics(nil),
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
 	}
 	b.Cleanup(func() { _ = reader.Close() })
+	if aheadMin < 0 {
+		// Exact block reads, which the chunk model replays.
+		reader.rangeReadAheadMin = 0
+	}
 	whole, err := newReader(ctx, store, readerOptions{
 		CacheDir: b.TempDir(),
 		Metrics:  DefaultReaderMetrics(nil),
@@ -411,22 +420,23 @@ func TestSimulateChunkedRangeReads(t *testing.T) {
 	}
 }
 
-// BenchmarkFakeS3_KVReaderChunkedRangeRead compares exact block range reads
-// (chunk=0KiB) with chunked range reads on one 64 MiB SST. Each ranged GET is
-// delayed to model object storage: 20 ms plus transfer at 100 MB/s. Every
-// workload starts with an empty block cache, so ns/op is cold-read latency.
-func BenchmarkFakeS3_KVReaderChunkedRangeRead(b *testing.B) {
+// BenchmarkFakeS3_KVReaderRangeReadAhead compares scan read-ahead settings on
+// one 64 MiB SST: fixed at 128 KiB, and growing from 128 KiB to 1 or 4 MiB.
+// Each ranged GET is delayed to model object storage: 20 ms plus transfer at
+// 100 MB/s. Every workload starts with an empty block cache, so ns/op is
+// cold-read latency.
+func BenchmarkFakeS3_KVReaderRangeReadAhead(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
 	for _, blockKiB := range []int{4, 16} {
-		for _, chunkKiB := range []int64{0, 64, 128, 256} {
-			b.Run(fmt.Sprintf("block=%dKiB/chunk=%dKiB", blockKiB, chunkKiB), func(b *testing.B) {
+		for _, maxKiB := range []int64{128, 1 << 10, 4 << 10} {
+			b.Run(fmt.Sprintf("block=%dKiB/ahead=128-%dKiB", blockKiB, maxKiB), func(b *testing.B) {
 				f := prepareKVBlockSizeFixture(b, ctx, 64<<20, sstWriterOptions{
 					BlockSize:       blockKiB << 10,
 					BloomBitsPerKey: 12,
 					Compression:     "snappy",
-				}, chunkKiB<<10)
+				}, 128<<10, maxKiB<<10)
 				key := kvLeveledBenchmarkKey(f.records / 2)
 				// Load the sidecar Bloom before adding latency; cold Gets
 				// then measure only SST reads.
@@ -473,7 +483,7 @@ func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
 				BlockSize:       size.blockKiB << 10,
 				BloomBitsPerKey: 12,
 				Compression:     "snappy",
-			}, 128<<10)
+			}, 0, 0)
 			f = f.withMetaOffset(f.meta.MetaOffset)
 			for _, reader := range []*Reader{f.reader, f.whole} {
 				assertKVReaderBenchmarkManifestGet(

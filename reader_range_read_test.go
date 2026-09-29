@@ -230,9 +230,10 @@ func TestReader_RangeRead_DefaultsDownloadSmallSSTsWhole(t *testing.T) {
 		t.Fatalf("block cache not created with the default budget")
 	}
 	if reader.rangeReadMinSSTSize != defaultRangeReadMinSSTSize ||
-		reader.rangeReadChunkSize != defaultRangeReadChunkSize {
-		t.Fatalf("range read sizes min=%d chunk=%d, want defaults",
-			reader.rangeReadMinSSTSize, reader.rangeReadChunkSize)
+		reader.rangeReadAheadMin != defaultRangeReadAheadMin ||
+		reader.rangeReadAheadMax != defaultRangeReadAheadMax {
+		t.Fatalf("range read sizes minSST=%d ahead=%d..%d, want defaults",
+			reader.rangeReadMinSSTSize, reader.rangeReadAheadMin, reader.rangeReadAheadMax)
 	}
 
 	for _, test := range []struct {

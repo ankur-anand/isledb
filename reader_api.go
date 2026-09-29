@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"time"
@@ -86,11 +87,22 @@ type ReaderOpenOptions struct {
 	// (4 MiB).
 	RangeReadMinSSTSize int64
 
-	// RangeReadChunkSize is how many aligned bytes a scan fetches when it reads
-	// past its read-ahead, so the blocks it reads next come from the same
-	// request. It must be between 16 KiB and 16 MiB. Zero selects the default
-	// (128 KiB).
-	RangeReadChunkSize int64
+	// RangeReadAheadMin is how many bytes a scan first reads ahead once it
+	// reads blocks in sequence, so the blocks it reads next come from the same
+	// request. Every read-ahead starts and ends on a multiple of it. Zero
+	// selects the default (128 KiB).
+	RangeReadAheadMin int64
+
+	// RangeReadAheadMax caps a scan's read-ahead, which doubles with each
+	// further fetch while the scan continues, so a short scan fetches little
+	// it does not read and a long scan needs few requests. Each open scan
+	// holds up to this much per SST it reads. Zero selects the default
+	// (4 MiB).
+	//
+	// Both read-ahead sizes must be between 16 KiB and 16 MiB, and the
+	// maximum at least the minimum; the maximum is rounded down to a multiple
+	// of the minimum.
+	RangeReadAheadMax int64
 
 	// Views controls manifest freshness. Read-view lifetime is a store policy
 	// loaded from the manifest and cannot be extended by a reader.
@@ -142,15 +154,18 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
-	if opts.RangeReadChunkSize < 0 || (opts.RangeReadChunkSize > 0 &&
-		(opts.RangeReadChunkSize < minRangeReadChunkSize || opts.RangeReadChunkSize > maxRangeReadChunkSize)) {
+	if !opts.RangeRead && (opts.BlockCacheSize != 0 || opts.RangeReadMinSSTSize != 0 ||
+		opts.RangeReadAheadMin != 0 || opts.RangeReadAheadMax != 0) {
 		return readerOptions{}, fmt.Errorf(
-			"%w: range_read_chunk_size=%d, want 16 KiB to 16 MiB", ErrInvalidReaderOptions, opts.RangeReadChunkSize)
-	}
-	if !opts.RangeRead && (opts.BlockCacheSize != 0 || opts.RangeReadMinSSTSize != 0 || opts.RangeReadChunkSize != 0) {
-		return readerOptions{}, fmt.Errorf(
-			"%w: block_cache_size, range_read_min_sst_size and range_read_chunk_size need range_read",
+			"%w: block_cache_size, range_read_min_sst_size and range_read_ahead_min/max need range_read",
 			ErrInvalidReaderOptions)
+	}
+	aheadMin := cmp.Or(opts.RangeReadAheadMin, defaultRangeReadAheadMin)
+	aheadMax := cmp.Or(opts.RangeReadAheadMax, defaultRangeReadAheadMax)
+	if aheadMin < minRangeReadAhead || aheadMax > maxRangeReadAhead || aheadMax < aheadMin {
+		return readerOptions{}, fmt.Errorf(
+			"%w: range_read_ahead_min=%d range_read_ahead_max=%d, want 16 KiB <= min <= max <= 16 MiB",
+			ErrInvalidReaderOptions, aheadMin, aheadMax)
 	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
@@ -166,7 +181,8 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		MetaCacheSize:       opts.MetaCacheSize,
 		RangeRead:           opts.RangeRead,
 		RangeReadMinSSTSize: opts.RangeReadMinSSTSize,
-		RangeReadChunkSize:  opts.RangeReadChunkSize,
+		RangeReadAheadMin:   opts.RangeReadAheadMin,
+		RangeReadAheadMax:   opts.RangeReadAheadMax,
 		ViewPolicy:          views,
 		Metrics:             opts.Metrics,
 	}, nil

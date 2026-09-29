@@ -14,9 +14,10 @@ const (
 
 	defaultBlockCacheSize      = 256 << 20
 	defaultRangeReadMinSSTSize = 4 << 20
-	defaultRangeReadChunkSize  = 128 << 10
-	minRangeReadChunkSize      = 16 << 10
-	maxRangeReadChunkSize      = 16 << 20
+	defaultRangeReadAheadMin   = 128 << 10
+	defaultRangeReadAheadMax   = 4 << 20
+	minRangeReadAhead          = 16 << 10
+	maxRangeReadAhead          = 16 << 20
 )
 
 const (
@@ -155,10 +156,13 @@ type readerOptions struct {
 	// are downloaded whole (default 4 MiB).
 	RangeReadMinSSTSize int64
 
-	// RangeReadChunkSize is how many aligned bytes a scan fetches when it reads
-	// past its read-ahead, so the blocks it reads next come from the same
-	// request (default 128 KiB).
-	RangeReadChunkSize int64
+	// RangeReadAheadMin is a scan's first read-ahead and the alignment of
+	// every read-ahead (default 128 KiB).
+	RangeReadAheadMin int64
+
+	// RangeReadAheadMax caps a scan's read-ahead, which doubles with each
+	// fetch of a continuing scan (default 4 MiB).
+	RangeReadAheadMax int64
 
 	ManifestStorage manifest.Storage
 
