@@ -176,3 +176,20 @@ func TestMixedSSTOutputEncodingsCompactAndRead(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultSSTOutputBlockSizes(t *testing.T) {
+	defaults := DefaultSSTOutputOptions()
+	if defaults.L0.BlockBytes != 4<<10 || defaults.Compacted.BlockBytes != 16<<10 {
+		t.Fatalf("default block bytes L0=%d compacted=%d, want 4096 and 16384",
+			defaults.L0.BlockBytes, defaults.Compacted.BlockBytes)
+	}
+	// The compactor's own fallback must agree with the DB default so a
+	// compactor built without explicit output options writes the same SSTs.
+	compactor := defaultCompactorOptions().Output
+	if compactor.BlockBytes != defaults.Compacted.BlockBytes ||
+		compactor.BloomBitsPerKey != defaults.Compacted.BloomBitsPerKey ||
+		compactor.Compression != defaults.Compacted.Compression {
+		t.Fatalf("compactor output defaults %+v disagree with DB defaults %+v",
+			compactor, defaults.Compacted)
+	}
+}
