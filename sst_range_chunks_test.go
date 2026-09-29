@@ -14,6 +14,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/dgraph-io/ristretto/v2"
 )
 
@@ -97,101 +98,156 @@ func readChunked(t *testing.T, r *sstRangeReadable, off, length int64) []byte {
 	return p
 }
 
-// TestSSTRangeChunks_SequentialBlocksShareOneRequest reads consecutive
-// variable-length blocks, as a scan does, and counts requests.
-func TestSSTRangeChunks_SequentialBlocksShareOneRequest(t *testing.T) {
-	const chunk = 1000
-	s := newChunkTestStore(t, 5000)
-	r := s.readable(t, newChunkTestCache(t), chunk)
-
-	// Blocks of varying length laid end to end, crossing a chunk boundary.
-	off := int64(0)
-	for _, length := range []int64{120, 95, 130, 110, 101, 99, 125, 105, 90, 150} {
-		if got := readChunked(t, r, off, length); !bytes.Equal(got, s.data[off:off+length]) {
-			t.Fatalf("bytes at %d differ", off)
-		}
-		off += length
+// handleRead reads through one iterator's read handle, as Pebble does for
+// data blocks.
+func handleRead(t *testing.T, h objstorage.ReadHandle, s *chunkTestStore, off, length int64) {
+	t.Helper()
+	p := make([]byte, length)
+	if err := h.ReadAt(context.Background(), p, off); err != nil {
+		t.Fatalf("ReadAt(%d, %d): %v", off, length, err)
 	}
-	// 1,125 bytes read span chunks 0 and 1: one request each.
-	if got := s.gets.Load(); got != 2 {
-		t.Fatalf("GETs = %d (%v), want 2", got, s.ranges)
-	}
-	if s.ranges[0] != "bytes=0-999" || s.ranges[1] != "bytes=1000-1999" {
-		t.Fatalf("ranges = %v", s.ranges)
+	if !bytes.Equal(p, s.data[off:off+length]) {
+		t.Fatalf("bytes at %d+%d differ", off, length)
 	}
 }
 
-// TestSSTRangeChunks_BoundaryReadFetchesOnlyMissingChunks reads a block that
-// crosses a chunk boundary, with and without its first chunk cached.
-func TestSSTRangeChunks_BoundaryReadFetchesOnlyMissingChunks(t *testing.T) {
-	const chunk = 1000
-	s := newChunkTestStore(t, 5000)
-
-	t.Run("neither cached", func(t *testing.T) {
-		s.reset()
-		r := s.readable(t, newChunkTestCache(t), chunk)
-		if got := readChunked(t, r, 950, 100); !bytes.Equal(got, s.data[950:1050]) {
-			t.Fatal("bytes differ")
-		}
-		if s.gets.Load() != 1 || s.ranges[0] != "bytes=0-1999" {
-			t.Fatalf("ranges = %v, want one request for both chunks", s.ranges)
-		}
-	})
-	t.Run("first cached", func(t *testing.T) {
-		s.reset()
-		r := s.readable(t, newChunkTestCache(t), chunk)
-		readChunked(t, r, 10, 10)
-		if got := readChunked(t, r, 950, 100); !bytes.Equal(got, s.data[950:1050]) {
-			t.Fatal("bytes differ")
-		}
-		if s.gets.Load() != 2 || s.ranges[1] != "bytes=1000-1999" {
-			t.Fatalf("ranges = %v, want the second chunk only", s.ranges)
-		}
-	})
-}
-
-// TestSSTRangeChunks_LastChunkStopsAtMetaOffset checks that data chunks never
-// reach into the metadata region, which has its own single request.
-func TestSSTRangeChunks_LastChunkStopsAtMetaOffset(t *testing.T) {
-	s := newChunkTestStore(t, 5000)
-	r := s.readable(t, newChunkTestCache(t), 1000)
-	r.useMetaRegion(4500)
-
-	if got := readChunked(t, r, 4400, 100); !bytes.Equal(got, s.data[4400:4500]) {
-		t.Fatal("data bytes differ")
+func (s *chunkTestStore) wantRanges(t *testing.T, want ...string) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ranges) != len(want) {
+		t.Fatalf("ranges = %v, want %v", s.ranges, want)
 	}
-	if got := readChunked(t, r, 4600, 50); !bytes.Equal(got, s.data[4600:4650]) {
-		t.Fatal("metadata bytes differ")
-	}
-	if len(s.ranges) != 2 || s.ranges[0] != "bytes=4000-4499" || s.ranges[1] != "bytes=4500-4999" {
-		t.Fatalf("ranges = %v, want the cut data chunk then the metadata region", s.ranges)
+	for i := range want {
+		if s.ranges[i] != want[i] {
+			t.Fatalf("ranges = %v, want %v", s.ranges, want)
+		}
 	}
 }
 
-// TestSSTRangeChunks_CachedChunksServeOtherReads opens the SST again, as
-// another query would, and reads different offsets and lengths inside the
-// chunks already cached.
-func TestSSTRangeChunks_CachedChunksServeOtherReads(t *testing.T) {
+// TestSSTRangeHandle_PointReadUsesSharedCache checks that a lone read, as a
+// point lookup makes, fetches exactly its block and leaves it in the shared
+// cache for the next lookup.
+func TestSSTRangeHandle_PointReadUsesSharedCache(t *testing.T) {
 	s := newChunkTestStore(t, 5000)
 	cache := newChunkTestCache(t)
-	readChunked(t, s.readable(t, cache, 1000), 0, 1500)
+	handleRead(t, s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore), s, 500, 100)
+	s.wantRanges(t, "bytes=500-599")
+
+	cache.Wait()
+	s.reset()
+	handleRead(t, s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore), s, 500, 100)
+	s.wantRanges(t)
+}
+
+// TestSSTRangeHandle_ScanReadsAheadInChunks reads consecutive blocks of
+// varying length, as a scan does: the first block is fetched exactly, the
+// scan then reads ahead one chunk at a time, and a block crossing into the
+// next chunk fetches only that chunk.
+func TestSSTRangeHandle_ScanReadsAheadInChunks(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	h := s.readable(t, newChunkTestCache(t), 1000).NewReadHandle(objstorage.NoReadBefore)
+	off := int64(0)
+	for _, length := range []int64{120, 95, 130, 110, 101, 99, 125, 105, 90, 150} {
+		handleRead(t, h, s, off, length)
+		off += length
+	}
+	s.wantRanges(t, "bytes=0-119", "bytes=0-999", "bytes=1000-1999")
+}
+
+// TestSSTRangeHandle_ScanChunksStayPrivate checks that chunks a scan read
+// ahead serve neither a point lookup nor another scan.
+func TestSSTRangeHandle_ScanChunksStayPrivate(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	cache := newChunkTestCache(t)
+	scan := s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, scan, s, 0, 100)
+	handleRead(t, scan, s, 100, 100)
 	cache.Wait()
 
 	s.reset()
-	other := s.readable(t, cache, 1000)
-	for _, read := range [][2]int64{{3, 7}, {400, 333}, {999, 2}, {1200, 700}} {
-		if got := readChunked(t, other, read[0], read[1]); !bytes.Equal(got, s.data[read[0]:read[0]+read[1]]) {
-			t.Fatalf("bytes at %d differ", read[0])
-		}
-	}
-	if got := s.gets.Load(); got != 0 {
-		t.Fatalf("GETs = %d (%v), want all reads from cached chunks", got, s.ranges)
-	}
+	handleRead(t, s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore), s, 500, 10)
+	other := s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, other, s, 600, 100)
+	handleRead(t, other, s, 700, 100)
+	s.wantRanges(t, "bytes=500-509", "bytes=600-699", "bytes=0-999")
 }
 
-// TestSSTRangeChunks_ConcurrentMissesShareOneRequest has many callers miss the
-// same chunk at once.
-func TestSSTRangeChunks_ConcurrentMissesShareOneRequest(t *testing.T) {
+// TestSSTRangeHandle_ScanUsesCachedBlockWithoutFillingCache has a scan reach
+// a block a point lookup cached: the scan uses it, and reads ahead after it.
+func TestSSTRangeHandle_ScanUsesCachedBlockWithoutFillingCache(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	cache := newChunkTestCache(t)
+	handleRead(t, s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore), s, 500, 100)
+	cache.Wait()
+
+	s.reset()
+	scan := s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, scan, s, 400, 100)
+	handleRead(t, scan, s, 500, 100) // cached block
+	handleRead(t, scan, s, 600, 100)
+	s.wantRanges(t, "bytes=400-499", "bytes=0-999")
+}
+
+// TestSSTRangeHandle_JumpReturnsToExactReads seeks elsewhere mid-scan.
+func TestSSTRangeHandle_JumpReturnsToExactReads(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	h := s.readable(t, newChunkTestCache(t), 1000).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, h, s, 0, 100)
+	handleRead(t, h, s, 100, 100)
+	handleRead(t, h, s, 3000, 100)
+	handleRead(t, h, s, 3100, 100)
+	s.wantRanges(t, "bytes=0-99", "bytes=0-999", "bytes=3000-3099", "bytes=3000-3999")
+}
+
+// TestSSTRangeHandle_ReadAheadAcrossBoundaryFetchesBothChunks reads a block
+// that crosses a chunk boundary right after the scan starts.
+func TestSSTRangeHandle_ReadAheadAcrossBoundaryFetchesBothChunks(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	h := s.readable(t, newChunkTestCache(t), 1000).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, h, s, 900, 50)
+	handleRead(t, h, s, 950, 100)
+	s.wantRanges(t, "bytes=900-949", "bytes=0-1999")
+}
+
+// TestSSTRangeHandle_ReadAheadStopsAtMetaOffset checks that read-ahead never
+// reaches into the metadata region, which has its own single request, and
+// that metadata reads do not interrupt a scan.
+func TestSSTRangeHandle_ReadAheadStopsAtMetaOffset(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	r := s.readable(t, newChunkTestCache(t), 1000)
+	r.useMetaRegion(4500)
+	h := r.NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, h, s, 4200, 100)
+	handleRead(t, h, s, 4600, 50) // metadata
+	handleRead(t, h, s, 4300, 100)
+	handleRead(t, h, s, 4400, 100)
+	s.wantRanges(t, "bytes=4200-4299", "bytes=4500-4999", "bytes=4000-4499")
+}
+
+// TestSSTRangeHandle_CacheHitAdvancesScan checks that a block Pebble served
+// from its own cache counts toward the scan.
+func TestSSTRangeHandle_CacheHitAdvancesScan(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	h := s.readable(t, newChunkTestCache(t), 1000).NewReadHandle(objstorage.NoReadBefore)
+	h.RecordCacheHit(context.Background(), 0, 100)
+	handleRead(t, h, s, 100, 100)
+	s.wantRanges(t, "bytes=0-999")
+}
+
+// TestSSTRangeHandle_ChunkSizeZeroReadsExactBlocks keeps exact reads for
+// every read when read-ahead is off.
+func TestSSTRangeHandle_ChunkSizeZeroReadsExactBlocks(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	h := s.readable(t, newChunkTestCache(t), 0).NewReadHandle(objstorage.NoReadBefore)
+	handleRead(t, h, s, 0, 100)
+	handleRead(t, h, s, 100, 100)
+	s.wantRanges(t, "bytes=0-99", "bytes=100-199")
+}
+
+// TestSSTRangeHandle_ConcurrentPointMissesShareOneRequest has many point
+// lookups miss the same block at once.
+func TestSSTRangeHandle_ConcurrentPointMissesShareOneRequest(t *testing.T) {
 	s := newChunkTestStore(t, 5000)
 	s.delay = 20 * time.Millisecond
 	cache := newChunkTestCache(t)
@@ -199,18 +255,17 @@ func TestSSTRangeChunks_ConcurrentMissesShareOneRequest(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	errs := make(chan error, 16)
-	for i := range 16 {
+	for range 16 {
 		wg.Go(func() {
-			r := s.readable(t, cache, 1000)
-			p := make([]byte, 50)
+			h := s.readable(t, cache, 1000).NewReadHandle(objstorage.NoReadBefore)
+			p := make([]byte, 100)
 			<-start
-			off := int64(i * 50)
-			if err := r.ReadAt(context.Background(), p, off); err != nil {
+			if err := h.ReadAt(context.Background(), p, 500); err != nil {
 				errs <- err
 				return
 			}
-			if !bytes.Equal(p, s.data[off:off+50]) {
-				errs <- fmt.Errorf("bytes at %d differ", off)
+			if !bytes.Equal(p, s.data[500:600]) {
+				errs <- fmt.Errorf("bytes differ")
 			}
 		})
 	}
@@ -225,20 +280,32 @@ func TestSSTRangeChunks_ConcurrentMissesShareOneRequest(t *testing.T) {
 	}
 }
 
-// TestSSTRangeChunks_RandomReadsMatchData compares many random reads against
-// the object, across chunk sizes that do and do not divide its size.
-func TestSSTRangeChunks_RandomReadsMatchData(t *testing.T) {
+// TestSSTRangeHandle_MixedReadsMatchData runs scans, jumps and metadata reads
+// through handles across chunk sizes that do and do not divide the data
+// region, comparing every read with the object.
+func TestSSTRangeHandle_MixedReadsMatchData(t *testing.T) {
 	s := newChunkTestStore(t, 10_007)
 	rng := rand.New(rand.NewSource(1))
 	for _, chunk := range []int64{1, 97, 1000, 4096, 20_000} {
 		r := s.readable(t, newChunkTestCache(t), chunk)
 		r.useMetaRegion(9000)
-		for range 300 {
-			off := rng.Int63n(int64(len(s.data)))
-			length := 1 + rng.Int63n(min(int64(len(s.data))-off, 3000))
-			if got := readChunked(t, r, off, length); !bytes.Equal(got, s.data[off:off+length]) {
-				t.Fatalf("chunk=%d: bytes at %d+%d differ", chunk, off, length)
+		h := r.NewReadHandle(objstorage.NoReadBefore)
+		off := int64(0)
+		for range 400 {
+			length := 1 + rng.Int63n(700)
+			switch {
+			case rng.Intn(10) == 0: // metadata read
+				metaOff := 9000 + rng.Int63n(900)
+				handleRead(t, h, s, metaOff, min(length, 10_007-metaOff))
+				continue
+			case rng.Intn(5) == 0: // jump
+				off = rng.Int63n(8999)
 			}
+			if off+length > 9000 {
+				off = rng.Int63n(8000)
+			}
+			handleRead(t, h, s, off, length)
+			off += length
 		}
 	}
 }

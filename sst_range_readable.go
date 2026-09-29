@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strconv"
 	"sync"
 	"time"
 
@@ -37,26 +36,11 @@ type sstRangeReadable struct {
 	// own budget, so data reads cannot evict them.
 	metaCache *sstMetaCache
 
-	// chunkSize, when positive, serves reads of the data region
-	// [0, metaOffset) from aligned chunks of this many bytes, cached under
-	// (SST, chunk index); see readChunks.
+	// chunkSize, when positive, is the read-ahead unit for scans: once an
+	// iterator reads data blocks back to back, its read handle fetches the
+	// aligned chunks of this many bytes that hold them, into a buffer of its
+	// own; see sstRangeReadHandle.
 	chunkSize int64
-
-	// recentMu guards recent, the chunks this open SST used last. The block
-	// cache applies sets asynchronously and may decline to admit an entry, so
-	// a scan's next block, usually in the same chunk, is served from here.
-	recentMu   sync.Mutex
-	recent     [recentSSTChunks]recentSSTChunk
-	recentNext int
-}
-
-// recentSSTChunks bounds the chunks one open SST retains: enough for a block
-// that crosses a chunk boundary plus the chunk a scan moves into next.
-const recentSSTChunks = 4
-
-type recentSSTChunk struct {
-	index int64
-	data  []byte
 }
 
 // maxSSTMetaRegionBytes bounds the metadata region fetched in one request. A
@@ -99,15 +83,12 @@ func (r *sstRangeReadable) useMetaCache(cache *sstMetaCache) {
 	r.metaCache = cache
 }
 
-// useChunks makes data reads fetch and cache aligned chunks of size bytes. A
-// size of zero or less keeps exact block reads.
+// useChunks enables read-ahead of aligned chunks of size bytes for iterators
+// that read data blocks sequentially. A size of zero or less keeps exact
+// block reads for every iterator.
 func (r *sstRangeReadable) useChunks(size int64) {
-	if size <= 0 {
-		return
-	}
-	r.chunkSize = size
-	for i := range r.recent {
-		r.recent[i].index = -1
+	if size > 0 {
+		r.chunkSize = size
 	}
 }
 
@@ -119,9 +100,6 @@ func (r *sstRangeReadable) ReadAt(ctx context.Context, p []byte, off int64) erro
 		}
 		copy(p, region[off-r.metaOffset:])
 		return nil
-	}
-	if r.chunkSize > 0 && off >= 0 && off+int64(len(p)) <= r.dataEnd() && len(p) > 0 {
-		return r.readChunks(ctx, p, off)
 	}
 	data, err := r.read(ctx, off, len(p))
 	if err != nil {
@@ -188,41 +166,9 @@ func (r *sstRangeReadable) dataEnd() int64 {
 	return r.size
 }
 
-// readChunks serves p from the aligned chunks covering [off, off+len(p)).
-// Each chunk is looked up by index; each missing contiguous run of chunks is
-// fetched with one request. Because the chunk index depends only on the
-// offset, reads of different blocks and lengths share cached chunks.
-func (r *sstRangeReadable) readChunks(ctx context.Context, p []byte, off int64) error {
-	first := off / r.chunkSize
-	last := (off + int64(len(p)) - 1) / r.chunkSize
-	chunks := make([][]byte, last-first+1)
-	for k := first; k <= last; k++ {
-		chunks[k-first] = r.cachedChunk(k)
-	}
-	for k := first; k <= last; {
-		if chunks[k-first] != nil {
-			k++
-			continue
-		}
-		end := k
-		for end < last && chunks[end+1-first] == nil {
-			end++
-		}
-		run, err := r.loadChunks(ctx, k, end)
-		if err != nil {
-			return err
-		}
-		copy(chunks[k-first:], run)
-		k = end + 1
-	}
-
-	n := 0
-	start := off - first*r.chunkSize
-	for _, chunk := range chunks {
-		n += copy(p[n:], chunk[start:])
-		start = 0
-	}
-	return nil
+// inDataRegion reports whether [off, off+length) lies within the data region.
+func (r *sstRangeReadable) inDataRegion(off int64, length int) bool {
+	return length > 0 && off >= 0 && off+int64(length) <= r.dataEnd()
 }
 
 // chunkBounds returns the byte range of chunk k, cut at the data region's end.
@@ -230,114 +176,15 @@ func (r *sstRangeReadable) chunkBounds(k int64) (int64, int64) {
 	return k * r.chunkSize, min((k+1)*r.chunkSize, r.dataEnd())
 }
 
-// cachedChunk returns chunk k from this SST's recent chunks or the block
-// cache, or nil.
-func (r *sstRangeReadable) cachedChunk(k int64) []byte {
-	r.recentMu.Lock()
-	for _, recent := range r.recent {
-		if recent.index == k {
-			r.recentMu.Unlock()
-			return recent.data
-		}
-	}
-	r.recentMu.Unlock()
-
-	if r.cache == nil {
-		return nil
-	}
-	data, ok := r.cache.Get(chunkCacheKey(r.sstID, k))
-	r.m.ObserveSSTRangeBlockCacheLookup(ok)
-	if !ok {
-		return nil
-	}
-	r.remember(k, data)
-	return data
-}
-
-// loadChunks fetches chunks [first, last] with one request, caches each chunk
-// on its own, and returns them. Concurrent loads of the same run share one
-// request.
-func (r *sstRangeReadable) loadChunks(ctx context.Context, first, last int64) ([][]byte, error) {
-	fetch := func(ctx context.Context) (any, error) {
-		// A concurrent load may have cached the whole run meanwhile.
-		if run, ok := r.cachedRun(first, last); ok {
-			return run, nil
-		}
-		start, _ := r.chunkBounds(first)
-		_, end := r.chunkBounds(last)
-		data, err := r.readRange(ctx, start, int(end-start))
-		if err != nil {
-			return nil, err
-		}
-		run := make([][]byte, 0, last-first+1)
-		for k := first; k <= last; k++ {
-			lo, hi := r.chunkBounds(k)
-			chunk := data[lo-start : hi-start]
-			if first != last {
-				// Give each chunk its own allocation, so one chunk left in
-				// the cache does not keep the whole run's buffer alive.
-				chunk = append([]byte(nil), chunk...)
-			}
-			if r.cache != nil {
-				r.cache.Set(chunkCacheKey(r.sstID, k), chunk, int64(len(chunk)))
-			}
-			run = append(run, chunk)
-		}
-		return run, nil
-	}
-
-	var value any
-	var err error
-	if r.loads != nil {
-		value, err = r.loads.Do(ctx, chunkRunKey(r.sstID, first, last), fetch)
-	} else {
-		value, err = fetch(ctx)
-	}
-	if err != nil {
-		return nil, err
-	}
-	run := value.([][]byte)
-	for i, chunk := range run {
-		r.remember(first+int64(i), chunk)
-	}
-	return run, nil
-}
-
-func (r *sstRangeReadable) cachedRun(first, last int64) ([][]byte, bool) {
+// cachedBlock returns an exact block from the shared block cache without
+// fetching or caching anything.
+func (r *sstRangeReadable) cachedBlock(off int64, length int) ([]byte, bool) {
 	if r.cache == nil {
 		return nil, false
 	}
-	run := make([][]byte, 0, last-first+1)
-	for k := first; k <= last; k++ {
-		chunk, ok := r.cache.Get(chunkCacheKey(r.sstID, k))
-		if !ok {
-			return nil, false
-		}
-		run = append(run, chunk)
-	}
-	return run, true
-}
-
-// remember records chunk k among this SST's recent chunks, replacing the
-// oldest.
-func (r *sstRangeReadable) remember(k int64, data []byte) {
-	r.recentMu.Lock()
-	defer r.recentMu.Unlock()
-	for _, recent := range r.recent {
-		if recent.index == k {
-			return
-		}
-	}
-	r.recent[r.recentNext] = recentSSTChunk{index: k, data: data}
-	r.recentNext = (r.recentNext + 1) % recentSSTChunks
-}
-
-func chunkCacheKey(sstID string, k int64) string {
-	return sstID + ":chunk:" + strconv.FormatInt(k, 10)
-}
-
-func chunkRunKey(sstID string, first, last int64) string {
-	return sstID + ":chunks:" + strconv.FormatInt(first, 10) + "-" + strconv.FormatInt(last, 10)
+	data, ok := r.cache.Get(blockCacheKey(r.sstID, off, length))
+	r.m.ObserveSSTRangeBlockCacheLookup(ok)
+	return data, ok
 }
 
 func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int) ([]byte, error) {
@@ -358,15 +205,12 @@ func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int)
 	return data, nil
 }
 
-// Close releases the retained metadata region and recent chunks; the readable
-// holds no other resources.
+// Close releases the retained metadata region; the readable holds no other
+// resources.
 func (r *sstRangeReadable) Close() error {
 	r.metaMu.Lock()
 	r.metaBytes = nil
 	r.metaMu.Unlock()
-	r.recentMu.Lock()
-	r.recent = [recentSSTChunks]recentSSTChunk{}
-	r.recentMu.Unlock()
 	return nil
 }
 
@@ -439,6 +283,7 @@ func (r *sstRangeReadable) NewReadHandle(requested objstorage.ReadBeforeSize) ob
 	return &sstRangeReadHandle{
 		readable:       r,
 		readBeforeSize: readBeforeSize,
+		nextOff:        -1,
 	}
 }
 
@@ -468,14 +313,31 @@ func rangeReadBeforeSize(sstSize int64, requested objstorage.ReadBeforeSize) int
 	return min(window, int64(requested))
 }
 
-// sstRangeReadHandle retains the extra bytes fetched before its first read so
-// later related Pebble metadata reads can be served without another range GET.
-// Pebble does not call a ReadHandle concurrently.
+// sstRangeReadHandle serves one iterator's reads. Pebble gives each iterator
+// its own handle and does not call a handle concurrently.
+//
+// It retains the extra bytes fetched before its first read, so related
+// metadata reads of SSTs without a MetaOffset need no further request.
+//
+// It also adapts data reads to the iterator's access pattern. Data blocks are
+// stored back to back, so a read that starts where the previous one ended
+// means the iterator is scanning. The first read, and any read elsewhere,
+// fetches the exact block through the shared block cache, as a point lookup
+// needs. Sequential reads instead fetch the aligned chunks holding the block
+// into ahead, a buffer only this iterator uses: a scan takes one request per
+// chunk rather than per block, and its chunks, which it reads once, never
+// displace the blocks point lookups reuse. A scan still uses a block already
+// in the shared cache.
 type sstRangeReadHandle struct {
 	readable       *sstRangeReadable
 	readBeforeSize int64
 	buffer         []byte
 	bufferOffset   int64
+
+	// nextOff is where the previous data read ended, or -1.
+	nextOff     int64
+	ahead       []byte
+	aheadOffset int64
 }
 
 func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) error {
@@ -486,6 +348,22 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 		copy(p, h.buffer[off-h.bufferOffset:])
 		return nil
 	}
+	r := h.readable
+	if r.chunkSize > 0 && r.inDataRegion(off, len(p)) {
+		sequential := off == h.nextOff
+		h.nextOff = off + int64(len(p))
+		if h.aheadContains(off, len(p)) {
+			copy(p, h.ahead[off-h.aheadOffset:])
+			return nil
+		}
+		if sequential {
+			if data, ok := r.cachedBlock(off, len(p)); ok {
+				copy(p, data)
+				return nil
+			}
+			return h.readAhead(ctx, p, off)
+		}
+	}
 
 	readBeforeSize := h.readBeforeSize
 	h.readBeforeSize = 0
@@ -494,7 +372,7 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 		if extra > 0 {
 			h.bufferOffset = off - extra
 			var err error
-			h.buffer, err = h.readable.read(ctx, h.bufferOffset, int(int64(len(p))+extra))
+			h.buffer, err = r.read(ctx, h.bufferOffset, int(int64(len(p))+extra))
 			if err != nil {
 				h.buffer = nil
 				return err
@@ -503,7 +381,39 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 			return nil
 		}
 	}
-	return h.readable.ReadAt(ctx, p, off)
+	return r.ReadAt(ctx, p, off)
+}
+
+// readAhead fetches the aligned chunks holding [off, off+len(p)) into this
+// handle's buffer with one request. When the block starts inside the buffer
+// and runs past it, only the chunks after the buffer are fetched.
+func (h *sstRangeReadHandle) readAhead(ctx context.Context, p []byte, off int64) error {
+	r := h.readable
+	end := off + int64(len(p))
+	_, fetchEnd := r.chunkBounds((end - 1) / r.chunkSize)
+	fetchStart, _ := r.chunkBounds(off / r.chunkSize)
+	keep := []byte(nil)
+	if aheadEnd := h.aheadOffset + int64(len(h.ahead)); len(h.ahead) > 0 &&
+		off >= h.aheadOffset && off < aheadEnd {
+		keep = h.ahead[off-h.aheadOffset:]
+		fetchStart = aheadEnd
+	}
+	data, err := r.readRange(ctx, fetchStart, int(fetchEnd-fetchStart))
+	if err != nil {
+		return err
+	}
+	if keep != nil {
+		data = append(append(make([]byte, 0, len(keep)+len(data)), keep...), data...)
+		fetchStart = off
+	}
+	h.ahead, h.aheadOffset = data, fetchStart
+	copy(p, h.ahead[off-h.aheadOffset:])
+	return nil
+}
+
+func (h *sstRangeReadHandle) aheadContains(off int64, length int) bool {
+	return len(h.ahead) > 0 && off >= h.aheadOffset &&
+		off+int64(length) <= h.aheadOffset+int64(len(h.ahead))
 }
 
 func (h *sstRangeReadHandle) bufferContains(off int64, length int) bool {
@@ -517,13 +427,19 @@ func (h *sstRangeReadHandle) bufferContains(off int64, length int) bool {
 func (h *sstRangeReadHandle) Close() error {
 	h.readable = nil
 	h.buffer = nil
+	h.ahead = nil
 	return nil
 }
 
 func (*sstRangeReadHandle) SetupForCompaction() {}
 
-func (h *sstRangeReadHandle) RecordCacheHit(_ context.Context, _, _ int64) {
+func (h *sstRangeReadHandle) RecordCacheHit(_ context.Context, off, length int64) {
 	// Match Pebble's remote readable: if the first block was already cached,
 	// do not over-read on a later miss from the same handle.
 	h.readBeforeSize = 0
+	// A block Pebble served from its own cache still advances a scan, so the
+	// next miss is recognised as sequential.
+	if h.readable != nil && h.readable.inDataRegion(off, int(length)) {
+		h.nextOff = off + length
+	}
 }
