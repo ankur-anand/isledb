@@ -39,7 +39,8 @@ type Reader struct {
 
 	rangeRead           bool
 	rangeReadMinSSTSize int64
-	rangeReadChunkSize  int64
+	rangeReadAheadMin   int64
+	rangeReadAheadMax   int64
 
 	ownsFileCache bool
 	cacheDir      string
@@ -126,7 +127,8 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		metaCache:           newSSTMetaCache(opts.MetaCacheSize),
 		rangeRead:           opts.RangeRead,
 		rangeReadMinSSTSize: cmp.Or(opts.RangeReadMinSSTSize, defaultRangeReadMinSSTSize),
-		rangeReadChunkSize:  cmp.Or(opts.RangeReadChunkSize, defaultRangeReadChunkSize),
+		rangeReadAheadMin:   cmp.Or(opts.RangeReadAheadMin, defaultRangeReadAheadMin),
+		rangeReadAheadMax:   cmp.Or(opts.RangeReadAheadMax, defaultRangeReadAheadMax),
 		ownsFileCache:       ownsFileCache,
 		cacheDir:            opts.CacheDir,
 		metrics:             opts.Metrics,
@@ -904,7 +906,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 		r.store, path, sstMeta.ID, sstMeta.Size, r.blockCache, &r.sstRangeLoads, r.metrics)
 	readable.useMetaRegion(sstMeta.MetaOffset)
 	readable.useMetaCache(r.metaCache)
-	readable.useChunks(r.rangeReadChunkSize)
+	readable.useReadAhead(r.rangeReadAheadMin, r.rangeReadAheadMax)
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil, nil)
 }
 

@@ -69,11 +69,21 @@ func (s *chunkTestStore) reset() {
 	s.mu.Unlock()
 }
 
+// readable opens the object with a read-ahead fixed at chunk bytes.
 func (s *chunkTestStore) readable(t *testing.T, cache *ristretto.Cache[string, []byte], chunk int64) *sstRangeReadable {
+	t.Helper()
+	return s.growingReadable(t, cache, chunk, chunk)
+}
+
+// growingReadable opens the object with a read-ahead that grows from aheadMin
+// to aheadMax bytes.
+func (s *chunkTestStore) growingReadable(
+	t *testing.T, cache *ristretto.Cache[string, []byte], aheadMin, aheadMax int64,
+) *sstRangeReadable {
 	t.Helper()
 	r := newSSTRangeReadable(s.store, s.path, "chunked-sst", int64(len(s.data)),
 		cache, &s.loads, DefaultReaderMetrics(nil))
-	r.useChunks(chunk)
+	r.useReadAhead(aheadMin, aheadMax)
 	return r
 }
 
@@ -153,6 +163,58 @@ func TestSSTRangeHandle_ScanReadsAheadInChunks(t *testing.T) {
 		off += length
 	}
 	s.wantRanges(t, "bytes=0-119", "bytes=0-999", "bytes=1000-1999")
+}
+
+// TestSSTRangeHandle_ReadAheadDoubles scans 100-byte blocks: after the
+// first exact read, each read-ahead doubles from 1000 bytes up to the 4000
+// byte cap, starting where the previous one ended.
+func TestSSTRangeHandle_ReadAheadDoubles(t *testing.T) {
+	s := newChunkTestStore(t, 20_000)
+	h := s.growingReadable(t, newChunkTestCache(t), 1000, 4000).NewReadHandle(objstorage.NoReadBefore)
+	for off := int64(0); off < 15_000; off += 100 {
+		handleRead(t, h, s, off, 100)
+	}
+	s.wantRanges(t, "bytes=0-99", "bytes=0-999", "bytes=1000-2999",
+		"bytes=3000-6999", "bytes=7000-10999", "bytes=11000-14999")
+}
+
+// TestSSTRangeHandle_JumpResetsReadAhead seeks elsewhere after the read-ahead
+// has grown: the new scan starts again from the smallest read-ahead.
+func TestSSTRangeHandle_JumpResetsReadAhead(t *testing.T) {
+	s := newChunkTestStore(t, 20_000)
+	h := s.growingReadable(t, newChunkTestCache(t), 1000, 4000).NewReadHandle(objstorage.NoReadBefore)
+	for off := int64(0); off < 3000; off += 100 {
+		handleRead(t, h, s, off, 100)
+	}
+	s.reset()
+	handleRead(t, h, s, 17_000, 100)
+	handleRead(t, h, s, 17_100, 100)
+	s.wantRanges(t, "bytes=17000-17099", "bytes=17000-17999")
+}
+
+// TestSSTRangeHandle_ReadAheadStopsAtDataEndWhileGrowing lets a growing read-ahead reach
+// the metadata region: the fetch is cut where the data ends.
+func TestSSTRangeHandle_ReadAheadStopsAtDataEndWhileGrowing(t *testing.T) {
+	s := newChunkTestStore(t, 5000)
+	r := s.growingReadable(t, newChunkTestCache(t), 1000, 4000)
+	r.useMetaRegion(4500)
+	h := r.NewReadHandle(objstorage.NoReadBefore)
+	for off := int64(0); off < 4500; off += 100 {
+		handleRead(t, h, s, off, 100)
+	}
+	s.wantRanges(t, "bytes=0-99", "bytes=0-999", "bytes=1000-2999", "bytes=3000-4499")
+}
+
+// TestSSTRangeHandle_ReadAheadMaxRoundsToMin checks that a cap which is not a
+// multiple of the minimum is rounded down to one, so fetches stay aligned.
+func TestSSTRangeHandle_ReadAheadMaxRoundsToMin(t *testing.T) {
+	s := newChunkTestStore(t, 20_000)
+	h := s.growingReadable(t, newChunkTestCache(t), 1000, 2500).NewReadHandle(objstorage.NoReadBefore)
+	for off := int64(0); off < 7000; off += 100 {
+		handleRead(t, h, s, off, 100)
+	}
+	s.wantRanges(t, "bytes=0-99", "bytes=0-999", "bytes=1000-2999",
+		"bytes=3000-4999", "bytes=5000-6999")
 }
 
 // TestSSTRangeHandle_ScanChunksStayPrivate checks that chunks a scan read
@@ -235,9 +297,9 @@ func TestSSTRangeHandle_CacheHitAdvancesScan(t *testing.T) {
 	s.wantRanges(t, "bytes=0-999")
 }
 
-// TestSSTRangeHandle_ChunkSizeZeroReadsExactBlocks keeps exact reads for
+// TestSSTRangeHandle_ReadAheadOffReadsExactBlocks keeps exact reads for
 // every read when read-ahead is off.
-func TestSSTRangeHandle_ChunkSizeZeroReadsExactBlocks(t *testing.T) {
+func TestSSTRangeHandle_ReadAheadOffReadsExactBlocks(t *testing.T) {
 	s := newChunkTestStore(t, 5000)
 	h := s.readable(t, newChunkTestCache(t), 0).NewReadHandle(objstorage.NoReadBefore)
 	handleRead(t, h, s, 0, 100)
@@ -286,8 +348,11 @@ func TestSSTRangeHandle_ConcurrentPointMissesShareOneRequest(t *testing.T) {
 func TestSSTRangeHandle_MixedReadsMatchData(t *testing.T) {
 	s := newChunkTestStore(t, 10_007)
 	rng := rand.New(rand.NewSource(1))
-	for _, chunk := range []int64{1, 97, 1000, 4096, 20_000} {
-		r := s.readable(t, newChunkTestCache(t), chunk)
+	for _, ahead := range [][2]int64{
+		{1, 1}, {97, 97}, {1000, 1000}, {4096, 4096}, {20_000, 20_000},
+		{1, 64}, {97, 1000}, {1000, 8000}, {1000, 2500},
+	} {
+		r := s.growingReadable(t, newChunkTestCache(t), ahead[0], ahead[1])
 		r.useMetaRegion(9000)
 		h := r.NewReadHandle(objstorage.NoReadBefore)
 		off := int64(0)
@@ -318,7 +383,7 @@ func TestReader_ChunkedRangeReadsServeGetsAndScans(t *testing.T) {
 	defer store.Close()
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(), RangeRead: true, BlockCacheSize: 16 << 20,
-		RangeReadMinSSTSize: 1, RangeReadChunkSize: 8 << 10,
+		RangeReadMinSSTSize: 1, RangeReadAheadMin: 8 << 10, RangeReadAheadMax: 64 << 10,
 	})
 	if err != nil {
 		t.Fatalf("open reader: %v", err)

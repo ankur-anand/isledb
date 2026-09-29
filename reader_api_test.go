@@ -95,15 +95,29 @@ func TestReaderOpenOptionsRangeReadSizes(t *testing.T) {
 			o.RangeRead = false
 			o.RangeReadMinSSTSize = 1
 		}},
-		{name: "chunk_without_range_read", mutate: func(o *ReaderOpenOptions) {
+		{name: "ahead_min_without_range_read", mutate: func(o *ReaderOpenOptions) {
 			o.RangeRead = false
-			o.RangeReadChunkSize = 128 << 10
+			o.RangeReadAheadMin = 128 << 10
 		}},
-		{name: "chunk_min", mutate: func(o *ReaderOpenOptions) { o.RangeReadChunkSize = 16 << 10 }, valid: true},
-		{name: "chunk_max", mutate: func(o *ReaderOpenOptions) { o.RangeReadChunkSize = 16 << 20 }, valid: true},
-		{name: "chunk_too_small", mutate: func(o *ReaderOpenOptions) { o.RangeReadChunkSize = 16<<10 - 1 }},
-		{name: "chunk_too_large", mutate: func(o *ReaderOpenOptions) { o.RangeReadChunkSize = 16<<20 + 1 }},
-		{name: "chunk_negative", mutate: func(o *ReaderOpenOptions) { o.RangeReadChunkSize = -1 }},
+		{name: "ahead_max_without_range_read", mutate: func(o *ReaderOpenOptions) {
+			o.RangeRead = false
+			o.RangeReadAheadMax = 4 << 20
+		}},
+		{name: "ahead_smallest", mutate: func(o *ReaderOpenOptions) {
+			o.RangeReadAheadMin, o.RangeReadAheadMax = 16<<10, 16<<10
+		}, valid: true},
+		{name: "ahead_largest", mutate: func(o *ReaderOpenOptions) {
+			o.RangeReadAheadMin, o.RangeReadAheadMax = 16<<20, 16<<20
+		}, valid: true},
+		{name: "ahead_min_too_small", mutate: func(o *ReaderOpenOptions) { o.RangeReadAheadMin = 16<<10 - 1 }},
+		{name: "ahead_max_too_large", mutate: func(o *ReaderOpenOptions) { o.RangeReadAheadMax = 16<<20 + 1 }},
+		{name: "ahead_min_negative", mutate: func(o *ReaderOpenOptions) { o.RangeReadAheadMin = -1 }},
+		{name: "ahead_max_negative", mutate: func(o *ReaderOpenOptions) { o.RangeReadAheadMax = -1 }},
+		// The default maximum (4 MiB) is below this minimum.
+		{name: "ahead_min_above_default_max", mutate: func(o *ReaderOpenOptions) { o.RangeReadAheadMin = 8 << 20 }},
+		{name: "ahead_max_below_min", mutate: func(o *ReaderOpenOptions) {
+			o.RangeReadAheadMin, o.RangeReadAheadMax = 1<<20, 512<<10
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

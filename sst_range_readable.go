@@ -36,11 +36,13 @@ type sstRangeReadable struct {
 	// own budget, so data reads cannot evict them.
 	metaCache *sstMetaCache
 
-	// chunkSize, when positive, is the read-ahead unit for scans: once an
+	// aheadMin and aheadMax, when positive, bound scan read-ahead: once an
 	// iterator reads data blocks back to back, its read handle fetches the
-	// aligned chunks of this many bytes that hold them, into a buffer of its
-	// own; see sstRangeReadHandle.
-	chunkSize int64
+	// data ahead into a buffer of its own, starting with aheadMin bytes and
+	// doubling on each further fetch up to aheadMax. Every fetch starts and
+	// ends on a multiple of aheadMin; see sstRangeReadHandle.
+	aheadMin int64
+	aheadMax int64
 }
 
 // maxSSTMetaRegionBytes bounds the metadata region fetched in one request. A
@@ -83,12 +85,15 @@ func (r *sstRangeReadable) useMetaCache(cache *sstMetaCache) {
 	r.metaCache = cache
 }
 
-// useChunks enables read-ahead of aligned chunks of size bytes for iterators
-// that read data blocks sequentially. A size of zero or less keeps exact
-// block reads for every iterator.
-func (r *sstRangeReadable) useChunks(size int64) {
-	if size > 0 {
-		r.chunkSize = size
+// useReadAhead enables read-ahead for iterators that read data blocks
+// sequentially, growing from minSize to maxSize bytes. maxSize is rounded down
+// to a multiple of minSize, and at least minSize, so every read-ahead stays
+// aligned. A minSize of zero or less keeps exact block reads for every
+// iterator.
+func (r *sstRangeReadable) useReadAhead(minSize, maxSize int64) {
+	if minSize > 0 {
+		r.aheadMin = minSize
+		r.aheadMax = max(maxSize/minSize*minSize, minSize)
 	}
 }
 
@@ -157,7 +162,7 @@ func (r *sstRangeReadable) read(ctx context.Context, off int64, length int) ([]b
 	return data, nil
 }
 
-// dataEnd is where the chunked data region ends: the start of the metadata
+// dataEnd is where the data region read-ahead covers ends: the start of the metadata
 // region when known, otherwise the end of the SST.
 func (r *sstRangeReadable) dataEnd() int64 {
 	if r.metaOffset > 0 {
@@ -171,9 +176,13 @@ func (r *sstRangeReadable) inDataRegion(off int64, length int) bool {
 	return length > 0 && off >= 0 && off+int64(length) <= r.dataEnd()
 }
 
-// chunkBounds returns the byte range of chunk k, cut at the data region's end.
-func (r *sstRangeReadable) chunkBounds(k int64) (int64, int64) {
-	return k * r.chunkSize, min((k+1)*r.chunkSize, r.dataEnd())
+// alignDown and alignUp round off to a multiple of aheadMin.
+func (r *sstRangeReadable) alignDown(off int64) int64 {
+	return off / r.aheadMin * r.aheadMin
+}
+
+func (r *sstRangeReadable) alignUp(off int64) int64 {
+	return r.alignDown(off + r.aheadMin - 1)
 }
 
 // cachedBlock returns an exact block from the shared block cache without
@@ -323,11 +332,15 @@ func rangeReadBeforeSize(sstSize int64, requested objstorage.ReadBeforeSize) int
 // stored back to back, so a read that starts where the previous one ended
 // means the iterator is scanning. The first read, and any read elsewhere,
 // fetches the exact block through the shared block cache, as a point lookup
-// needs. Sequential reads instead fetch the aligned chunks holding the block
-// into ahead, a buffer only this iterator uses: a scan takes one request per
-// chunk rather than per block, and its chunks, which it reads once, never
+// needs. Sequential reads instead fetch the block and the data after it into
+// ahead, a buffer only this iterator uses: a scan takes one request per
+// read-ahead rather than per block, and the bytes it reads once never
 // displace the blocks point lookups reuse. A scan still uses a block already
 // in the shared cache.
+//
+// The read-ahead starts small, so a short scan fetches little beyond what it
+// reads, and doubles with each fetch of a continuing scan, so a long scan
+// needs few requests. A read elsewhere starts it small again.
 type sstRangeReadHandle struct {
 	readable       *sstRangeReadable
 	readBeforeSize int64
@@ -338,6 +351,9 @@ type sstRangeReadHandle struct {
 	nextOff     int64
 	ahead       []byte
 	aheadOffset int64
+	// aheadSize is the size of the last read-ahead of the current scan, or
+	// zero before its first.
+	aheadSize int64
 }
 
 func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) error {
@@ -349,9 +365,12 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 		return nil
 	}
 	r := h.readable
-	if r.chunkSize > 0 && r.inDataRegion(off, len(p)) {
+	if r.aheadMin > 0 && r.inDataRegion(off, len(p)) {
 		sequential := off == h.nextOff
 		h.nextOff = off + int64(len(p))
+		if !sequential {
+			h.aheadSize = 0
+		}
 		if h.aheadContains(off, len(p)) {
 			copy(p, h.ahead[off-h.aheadOffset:])
 			return nil
@@ -384,20 +403,23 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 	return r.ReadAt(ctx, p, off)
 }
 
-// readAhead fetches the aligned chunks holding [off, off+len(p)) into this
-// handle's buffer with one request. When the block starts inside the buffer
-// and runs past it, only the chunks after the buffer are fetched.
+// readAhead fetches [off, off+len(p)) and the data after it into this
+// handle's buffer with one request: the next read-ahead size from the aligned
+// start, extended to cover the whole block, rounded up to the alignment and
+// cut at the data region's end. When the block starts inside the buffer and
+// runs past it, the fetch starts where the buffer ends.
 func (h *sstRangeReadHandle) readAhead(ctx context.Context, p []byte, off int64) error {
 	r := h.readable
+	h.aheadSize = min(max(2*h.aheadSize, r.aheadMin), r.aheadMax)
 	end := off + int64(len(p))
-	_, fetchEnd := r.chunkBounds((end - 1) / r.chunkSize)
-	fetchStart, _ := r.chunkBounds(off / r.chunkSize)
+	fetchStart := r.alignDown(off)
 	keep := []byte(nil)
 	if aheadEnd := h.aheadOffset + int64(len(h.ahead)); len(h.ahead) > 0 &&
 		off >= h.aheadOffset && off < aheadEnd {
 		keep = h.ahead[off-h.aheadOffset:]
 		fetchStart = aheadEnd
 	}
+	fetchEnd := min(r.alignUp(max(end, fetchStart+h.aheadSize)), r.dataEnd())
 	data, err := r.readRange(ctx, fetchStart, int(fetchEnd-fetchStart))
 	if err != nil {
 		return err

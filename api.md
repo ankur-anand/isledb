@@ -337,7 +337,8 @@ type ReaderOpenOptions struct {
     BloomCacheSize      int64
     MetaCacheSize       int64
     RangeReadMinSSTSize int64
-    RangeReadChunkSize  int64
+    RangeReadAheadMin   int64
+    RangeReadAheadMax   int64
     Views               ReaderViewPolicy
     Metrics             *ReaderMetrics
 }
@@ -360,7 +361,8 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 | `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
 | `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
 | `RangeReadMinSSTSize` | 4 MiB | Smallest SST read by byte range; smaller SSTs are downloaded whole |
-| `RangeReadChunkSize` | 128 KiB | Aligned bytes a scan reads ahead per request (16 KiB to 16 MiB) |
+| `RangeReadAheadMin` | 128 KiB | A scan's first read-ahead, and the alignment of every read-ahead |
+| `RangeReadAheadMax` | 4 MiB | Cap on a scan's read-ahead, which doubles while the scan continues |
 | `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
@@ -375,11 +377,17 @@ one ranged request and leaves the SST cached on disk. The whole-file checksum ca
 checked without the whole file, so range reads rely on each block's own
 checksum, which detects damaged bytes but not a different, internally valid
 object stored under the SST's name. Point lookups fetch exact blocks into the
-block cache; scans read ahead in aligned chunks of `RangeReadChunkSize`, kept
-by the scan alone so they never displace cached blocks.
+block cache. A scan reads ahead into a buffer of its own, so the bytes it
+reads once never displace cached blocks: its first read-ahead is
+`RangeReadAheadMin`, and each further one doubles, up to `RangeReadAheadMax`,
+so a short scan fetches little it does not read and a long scan needs few
+requests. A seek elsewhere starts the read-ahead small again. An open scan
+holds up to `RangeReadAheadMax` for each SST it is reading. Both read-ahead
+sizes must be between 16 KiB and 16 MiB with the maximum at least the
+minimum; the maximum is rounded down to a multiple of the minimum.
 
-`BlockCacheSize`, `RangeReadMinSSTSize` and `RangeReadChunkSize` apply only to
-range reads: zero selects each default, and setting any of them with
+`BlockCacheSize`, `RangeReadMinSSTSize`, `RangeReadAheadMin` and
+`RangeReadAheadMax` apply only to range reads: zero selects each default, and setting any of them with
 `RangeRead` false is rejected. A `ReaderOpenOptions` built without
 `DefaultReaderOpenOptions` has `RangeRead` false and downloads every SST
 whole.
