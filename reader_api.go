@@ -68,6 +68,11 @@ type ReaderOpenOptions struct {
 	// filters. Zero selects the default (64 MiB).
 	BloomCacheSize int64
 
+	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
+	// and footer) that range reads keep in memory, separately from data so
+	// data reads cannot evict it. Zero selects the default (128 MiB).
+	MetaCacheSize int64
+
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
 	// full-file checksums.
 	AllowUnverifiedRangeRead bool
@@ -75,6 +80,12 @@ type ReaderOpenOptions struct {
 	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
+
+	// RangeReadChunkSize, when positive, makes range reads fetch and cache
+	// aligned chunks of this many bytes of an SST's data instead of each block
+	// Pebble requests: neighbouring blocks, which a scan reads next, then come
+	// from the same request. Zero reads exactly the requested blocks.
+	RangeReadChunkSize int64
 
 	// ValidateSSTChecksum verifies SST checksums on read paths that can
 	// otherwise skip it. Persistent disk-cache admissions always verify.
@@ -96,6 +107,7 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions {
 		SSTCacheSize:       defaults.SSTCacheSize,
 		BloomDiskCacheSize: defaults.BloomDiskCacheSize,
 		BloomCacheSize:     defaults.BloomCacheSize,
+		MetaCacheSize:      defaults.MetaCacheSize,
 		Views:              defaults.ViewPolicy,
 	}
 }
@@ -116,6 +128,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_cache_size=%d", ErrInvalidReaderOptions, opts.BloomCacheSize)
 	}
+	if opts.MetaCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: meta_cache_size=%d", ErrInvalidReaderOptions, opts.MetaCacheSize)
+	}
 	if opts.BloomDiskCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_disk_cache_size=%d", ErrInvalidReaderOptions, opts.BloomDiskCacheSize)
@@ -123,6 +139,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	if opts.RangeReadMinSSTSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
+	}
+	if opts.RangeReadChunkSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: range_read_chunk_size=%d", ErrInvalidReaderOptions, opts.RangeReadChunkSize)
 	}
 	views, err := normalizeReaderViewPolicy(opts.Views)
 	if err != nil {
@@ -135,8 +155,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		BloomDiskCacheSize:       opts.BloomDiskCacheSize,
 		BlockCacheSize:           opts.BlockCacheSize,
 		BloomCacheSize:           opts.BloomCacheSize,
+		MetaCacheSize:            opts.MetaCacheSize,
 		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
+		RangeReadChunkSize:       opts.RangeReadChunkSize,
 		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
 		ViewPolicy:               views,
 		Metrics:                  opts.Metrics,

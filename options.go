@@ -135,6 +135,11 @@ type readerOptions struct {
 	// filters. Zero selects the default (64 MiB).
 	BloomCacheSize int64
 
+	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
+	// and footer) that range reads keep in memory, separately from data so
+	// data reads cannot evict it. Zero selects the default (128 MiB).
+	MetaCacheSize int64
+
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
 	// full-file checksums.
 	AllowUnverifiedRangeRead bool
@@ -142,6 +147,12 @@ type readerOptions struct {
 	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
+
+	// RangeReadChunkSize, when positive, makes range reads fetch and cache
+	// aligned chunks of this many bytes of an SST's data instead of each block
+	// Pebble requests: neighbouring blocks, which a scan reads next, then come
+	// from the same request. Zero reads exactly the requested blocks.
+	RangeReadChunkSize int64
 
 	ManifestStorage manifest.Storage
 
@@ -163,6 +174,7 @@ func defaultReaderOptions() readerOptions {
 		SSTCacheSize:       defaultSSTCacheSize,
 		BloomDiskCacheSize: defaultBloomDiskCacheSize,
 		BloomCacheSize:     defaultBloomCacheSize,
+		MetaCacheSize:      defaultMetaCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},
