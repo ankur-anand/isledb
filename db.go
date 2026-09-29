@@ -84,13 +84,20 @@ type SSTEncodingOptions struct {
 // SST is checked on a point lookup, yet L0 holds few keys, so extra bits there
 // remove many false positives for little memory. At 16 and 12 bits per key the
 // filters answer "may contain" for about 0.05% and 0.3% of absent keys.
+//
+// Compacted SSTs use 16 KiB data blocks, L0 SSTs 4 KiB. Compacted SSTs are
+// large and hold most of the data, so larger blocks shrink their index about
+// fourfold, which is most of the metadata a cold range read fetches, and cut
+// the blocks a scan requests. Small, short-lived L0 SSTs keep 4 KiB blocks for
+// the cheapest warm point lookups.
 func DefaultSSTOutputOptions() SSTOutputOptions {
 	l0 := SSTEncodingOptions{
 		Compression:     "snappy",
-		BlockBytes:      4096,
+		BlockBytes:      4 << 10,
 		BloomBitsPerKey: 16,
 	}
 	compacted := l0
+	compacted.BlockBytes = 16 << 10
 	compacted.BloomBitsPerKey = 12
 	return SSTOutputOptions{L0: l0, Compacted: compacted}
 }

@@ -243,7 +243,7 @@ func defaultCompactorOptions() compactorOptions {
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,
 			BloomBitsPerKey: 12,
-			BlockBytes:      4096,
+			BlockBytes:      16 << 10,
 			Compression:     "snappy",
 		},
 	}
