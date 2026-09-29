@@ -140,10 +140,6 @@ type readerOptions struct {
 	// data reads cannot evict it. Zero selects the default (128 MiB).
 	MetaCacheSize int64
 
-	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
-	// full-file checksums.
-	AllowUnverifiedRangeRead bool
-
 	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
@@ -159,10 +155,6 @@ type readerOptions struct {
 	ManifestPageCache        cachestore.ManifestPageCache
 	ManifestPageCacheSize    int
 	DisableManifestPageCache bool
-
-	// ValidateSSTChecksum verifies SST checksums on read paths that can
-	// otherwise skip it. Files entering the local cache are always verified.
-	ValidateSSTChecksum bool
 
 	ViewPolicy ReaderViewPolicy
 

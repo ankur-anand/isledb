@@ -40,11 +40,9 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 	}
 
 	opts := readerOptions{
-		CacheDir:                 t.TempDir(),
-		BlockCacheSize:           1 << 20,
-		RangeReadMinSSTSize:      32 << 10,
-		ValidateSSTChecksum:      false,
-		AllowUnverifiedRangeRead: false,
+		CacheDir:            t.TempDir(),
+		BlockCacheSize:      1 << 20,
+		RangeReadMinSSTSize: 32 << 10,
 	}
 	reader, err := newReader(ctx, store, opts)
 	if err != nil {
@@ -125,12 +123,10 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 
 	metrics := DefaultReaderMetrics(nil)
 	opts := readerOptions{
-		CacheDir:                 t.TempDir(),
-		Metrics:                  metrics,
-		BlockCacheSize:           1 << 20,
-		RangeReadMinSSTSize:      32 << 10,
-		ValidateSSTChecksum:      false,
-		AllowUnverifiedRangeRead: false,
+		CacheDir:            t.TempDir(),
+		Metrics:             metrics,
+		BlockCacheSize:      1 << 20,
+		RangeReadMinSSTSize: 32 << 10,
 	}
 	reader, err := newReader(ctx, store, opts)
 	if err != nil {

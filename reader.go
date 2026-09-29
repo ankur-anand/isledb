@@ -37,10 +37,8 @@ type Reader struct {
 	sstRangeLoads coalescedLoadGroup
 	manifestLoads coalescedLoadGroup
 
-	verifySST                bool
-	allowUnverifiedRangeRead bool
-	rangeReadMinSSTSize      int64
-	rangeReadChunkSize       int64
+	rangeReadMinSSTSize int64
+	rangeReadChunkSize  int64
 
 	ownsFileCache  bool
 	ownsBlockCache bool
@@ -113,27 +111,25 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
-		store:                    store,
-		manifestStore:            ms,
-		manifest:                 m,
-		version:                  versionFromCurrent(current),
-		changeFeed:               changeFeed,
-		changeHead:               changeHead,
-		viewPolicy:               viewPolicy,
-		viewRefreshAt:            viewRefreshAt,
-		viewExpiresAt:            viewExpiresAt,
-		fileCache:                fileCache,
-		blockCache:               blockCache,
-		bloomCache:               newBloomFilterCache(opts.BloomCacheSize),
-		metaCache:                newSSTMetaCache(opts.MetaCacheSize),
-		verifySST:                opts.ValidateSSTChecksum,
-		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
-		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
-		rangeReadChunkSize:       opts.RangeReadChunkSize,
-		ownsFileCache:            ownsFileCache,
-		ownsBlockCache:           ownsBlockCache,
-		cacheDir:                 opts.CacheDir,
-		metrics:                  opts.Metrics,
+		store:               store,
+		manifestStore:       ms,
+		manifest:            m,
+		version:             versionFromCurrent(current),
+		changeFeed:          changeFeed,
+		changeHead:          changeHead,
+		viewPolicy:          viewPolicy,
+		viewRefreshAt:       viewRefreshAt,
+		viewExpiresAt:       viewExpiresAt,
+		fileCache:           fileCache,
+		blockCache:          blockCache,
+		bloomCache:          newBloomFilterCache(opts.BloomCacheSize),
+		metaCache:           newSSTMetaCache(opts.MetaCacheSize),
+		rangeReadMinSSTSize: opts.RangeReadMinSSTSize,
+		rangeReadChunkSize:  opts.RangeReadChunkSize,
+		ownsFileCache:       ownsFileCache,
+		ownsBlockCache:      ownsBlockCache,
+		cacheDir:            opts.CacheDir,
+		metrics:             opts.Metrics,
 	}
 	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
 	cleanupFileCache = false
@@ -891,9 +887,6 @@ func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lo
 
 func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, int64, error) {
 	if r.blockCache == nil {
-		return false, 0, nil
-	}
-	if !r.allowUnverifiedRangeRead && r.verifySST {
 		return false, 0, nil
 	}
 

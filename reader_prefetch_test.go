@@ -155,7 +155,7 @@ func TestReader_PrefetchAllAndSkipCached(t *testing.T) {
 }
 
 func TestReader_PrefetchResidentRaceReportsNoDownloadedBytes(t *testing.T) {
-	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, true)
+	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t)
 	defer cleanup()
 	if err := reader.cacheSST(ctx, &meta, path); err != nil {
 		t.Fatal(err)
@@ -284,9 +284,7 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 		t.Fatalf("Write corrupted SST: %v", err)
 	}
 
-	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{
-		ValidateSSTChecksum: true,
-	})
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{})
 	defer reader.Close()
 
 	stats, err := reader.Prefetch(ctx, PrefetchOptions{All: true})

@@ -23,7 +23,7 @@ func readCachedSST(t *testing.T, file *os.File, size int64) []byte {
 	return data
 }
 
-func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Context, sstMetadata, []byte, string, func()) {
+func setupReaderCacheFixture(t *testing.T) (*Reader, context.Context, sstMetadata, []byte, string, func()) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -37,7 +37,6 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 
 	opts := defaultReaderOptions()
 	opts.CacheDir = t.TempDir()
-	opts.ValidateSSTChecksum = validate
 
 	reader, err := newReader(ctx, store, opts)
 	require.NoError(t, err)
@@ -51,7 +50,7 @@ func setupReaderCacheFixture(t *testing.T, validate bool) (*Reader, context.Cont
 }
 
 func TestReader_cacheSST_StreamedToFileCache(t *testing.T) {
-	reader, ctx, meta, data, path, cleanup := setupReaderCacheFixture(t, true)
+	reader, ctx, meta, data, path, cleanup := setupReaderCacheFixture(t)
 	defer cleanup()
 
 	err := reader.cacheSST(ctx, &meta, path)
@@ -64,7 +63,7 @@ func TestReader_cacheSST_StreamedToFileCache(t *testing.T) {
 }
 
 func TestReader_cacheSSTArtifact_ChecksumMismatch(t *testing.T) {
-	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, true)
+	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t)
 	defer cleanup()
 
 	_, err := reader.store.Write(ctx, path, []byte("corrupt"))
@@ -196,7 +195,7 @@ func TestReader_EvictsSSTInUseAndServesRead(t *testing.T) {
 // succeeds, so the corruption surfaces while reading: that read fails, the SST
 // is dropped from the cache, and the next read downloads it again.
 func TestReader_CorruptBlockInCachedSSTIsDroppedAndRefetched(t *testing.T) {
-	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t, false)
+	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t)
 	defer cleanup()
 	require.NoError(t, reader.cacheSST(ctx, &meta, path))
 

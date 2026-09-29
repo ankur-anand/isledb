@@ -73,10 +73,6 @@ type ReaderOpenOptions struct {
 	// data reads cannot evict it. Zero selects the default (128 MiB).
 	MetaCacheSize int64
 
-	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
-	// full-file checksums.
-	AllowUnverifiedRangeRead bool
-
 	// RangeReadMinSSTSize is the minimum SST size (bytes) required to use
 	// range-read + block cache. Default 0 means no size threshold.
 	RangeReadMinSSTSize int64
@@ -86,10 +82,6 @@ type ReaderOpenOptions struct {
 	// Pebble requests: neighbouring blocks, which a scan reads next, then come
 	// from the same request. Zero reads exactly the requested blocks.
 	RangeReadChunkSize int64
-
-	// ValidateSSTChecksum verifies SST checksums on read paths that can
-	// otherwise skip it. Persistent disk-cache admissions always verify.
-	ValidateSSTChecksum bool
 
 	// Views controls manifest freshness. Read-view lifetime is a store policy
 	// loaded from the manifest and cannot be extended by a reader.
@@ -150,18 +142,16 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	}
 
 	return readerOptions{
-		CacheDir:                 opts.CacheDir,
-		SSTCacheSize:             opts.SSTCacheSize,
-		BloomDiskCacheSize:       opts.BloomDiskCacheSize,
-		BlockCacheSize:           opts.BlockCacheSize,
-		BloomCacheSize:           opts.BloomCacheSize,
-		MetaCacheSize:            opts.MetaCacheSize,
-		AllowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
-		RangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
-		RangeReadChunkSize:       opts.RangeReadChunkSize,
-		ValidateSSTChecksum:      opts.ValidateSSTChecksum,
-		ViewPolicy:               views,
-		Metrics:                  opts.Metrics,
+		CacheDir:            opts.CacheDir,
+		SSTCacheSize:        opts.SSTCacheSize,
+		BloomDiskCacheSize:  opts.BloomDiskCacheSize,
+		BlockCacheSize:      opts.BlockCacheSize,
+		BloomCacheSize:      opts.BloomCacheSize,
+		MetaCacheSize:       opts.MetaCacheSize,
+		RangeReadMinSSTSize: opts.RangeReadMinSSTSize,
+		RangeReadChunkSize:  opts.RangeReadChunkSize,
+		ViewPolicy:          views,
+		Metrics:             opts.Metrics,
 	}, nil
 }
 
