@@ -846,8 +846,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:            cacheDir,
-		ValidateSSTChecksum: true,
+		CacheDir: cacheDir,
 	})
 	if err != nil {
 		_ = store.Close()

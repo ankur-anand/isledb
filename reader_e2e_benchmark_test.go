@@ -828,11 +828,10 @@ func prepareFakeS3KVBenchmarkPointLevels(
 
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:                 b.TempDir(),
-		BlockCacheSize:           64 << 20,
-		AllowUnverifiedRangeRead: true,
-		RangeReadMinSSTSize:      1,
-		Metrics:                  metrics,
+		CacheDir:            b.TempDir(),
+		BlockCacheSize:      64 << 20,
+		RangeReadMinSSTSize: 1,
+		Metrics:             metrics,
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
@@ -913,11 +912,10 @@ func prepareFakeS3KVBenchmarkLeveled(
 
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:                 b.TempDir(),
-		BlockCacheSize:           readerCacheMax,
-		AllowUnverifiedRangeRead: true,
-		RangeReadMinSSTSize:      1,
-		Metrics:                  metrics,
+		CacheDir:            b.TempDir(),
+		BlockCacheSize:      readerCacheMax,
+		RangeReadMinSSTSize: 1,
+		Metrics:             metrics,
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
@@ -1043,11 +1041,10 @@ func prepareFakeS3KVBenchmarkL1(
 
 	metrics := DefaultReaderMetrics(nil)
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:                 b.TempDir(),
-		BlockCacheSize:           64 << 20,
-		AllowUnverifiedRangeRead: true,
-		RangeReadMinSSTSize:      1,
-		Metrics:                  metrics,
+		CacheDir:            b.TempDir(),
+		BlockCacheSize:      64 << 20,
+		RangeReadMinSSTSize: 1,
+		Metrics:             metrics,
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
@@ -1141,7 +1138,6 @@ func openFakeS3KVBenchmarkReader(
 	case "range-read":
 		opts.BlockCacheSize = 16 << 20
 		opts.RangeReadMinSSTSize = 1
-		opts.AllowUnverifiedRangeRead = true
 	default:
 		b.Fatalf("unknown reader benchmark mode %q", mode)
 	}

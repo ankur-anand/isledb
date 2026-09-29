@@ -329,15 +329,16 @@ called once after the background worker stops; later mutations, `Flush`, and
 
 ```go
 type ReaderOpenOptions struct {
-    CacheDir                 string
-    SSTCacheSize             int64
-    BlockCacheSize           int64
-    BloomCacheSize           int64
-    AllowUnverifiedRangeRead bool
-    RangeReadMinSSTSize      int64
-    ValidateSSTChecksum      bool
-    Views                    ReaderViewPolicy
-    Metrics                  *ReaderMetrics
+    CacheDir            string
+    SSTCacheSize        int64
+    BloomDiskCacheSize  int64
+    BlockCacheSize      int64
+    BloomCacheSize      int64
+    MetaCacheSize       int64
+    RangeReadMinSSTSize int64
+    RangeReadChunkSize  int64
+    Views               ReaderViewPolicy
+    Metrics             *ReaderMetrics
 }
 
 type ReaderViewPolicy struct {
@@ -351,20 +352,27 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `SSTCacheSize` | 1 GiB | Maximum on-disk SST cache size |
-| `BlockCacheSize` | 0 | In-memory range-read block cache disabled |
-| `BloomCacheSize` | 64 MiB | Maximum accounted size of decoded SST bloom filters |
-| `RangeReadMinSSTSize` | 0 | No minimum SST size |
-| `ValidateSSTChecksum` | `false` | Do not hash full SST downloads |
-| `AllowUnverifiedRangeRead` | `false` | Do not bypass requested full-file validation |
+| `SSTCacheSize` | 8 GiB | Maximum bytes of SSTs cached on local disk |
+| `BloomDiskCacheSize` | 512 MiB | Maximum bytes of Bloom filters cached on local disk |
+| `BlockCacheSize` | 0 | In-memory cache for range-read blocks; 0 disables range reads |
+| `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
+| `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
+| `RangeReadMinSSTSize` | 0 | No minimum SST size for range reads |
+| `RangeReadChunkSize` | 0 | Chunk size scans read ahead in; 0 reads exact blocks |
 | `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
-Every newly written SST records a SHA-256 checksum. With
-`ValidateSSTChecksum`, the reader validates the full SST on its first download.
-Range reads require `BlockCacheSize > 0`. If checksum validation is enabled,
-the reader uses a full download unless `AllowUnverifiedRangeRead` explicitly
-permits range reads without validating the full-file checksum.
+Every SST records a SHA-256 checksum of its contents in the manifest. When
+the reader downloads a whole SST, it verifies that checksum before using or
+caching the file, so a damaged or mismatched object is never read.
+
+With `BlockCacheSize > 0`, the reader instead range-reads SSTs: it fetches
+only the metadata and blocks a read needs. The whole-file checksum cannot be
+checked without the whole file, so range reads rely on each block's own
+checksum, which detects damaged bytes but not a different, internally valid
+object stored under the SST's name. Point lookups fetch exact blocks into the
+block cache; with `RangeReadChunkSize > 0`, scans read ahead in aligned chunks
+of that size, kept by the scan alone so they never displace cached blocks.
 
 ### Reader methods
 

@@ -79,12 +79,11 @@ func prepareKVBlockSizeFixture(
 	// Open before writing: a reader refuses a prefix that already holds SSTs
 	// but no manifest. The benchmark passes its own manifest to each read.
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:                 b.TempDir(),
-		BlockCacheSize:           256 << 20,
-		AllowUnverifiedRangeRead: true,
-		RangeReadMinSSTSize:      1,
-		RangeReadChunkSize:       chunkSize,
-		Metrics:                  DefaultReaderMetrics(nil),
+		CacheDir:            b.TempDir(),
+		BlockCacheSize:      256 << 20,
+		RangeReadMinSSTSize: 1,
+		RangeReadChunkSize:  chunkSize,
+		Metrics:             DefaultReaderMetrics(nil),
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)

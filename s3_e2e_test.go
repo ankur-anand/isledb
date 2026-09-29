@@ -284,9 +284,8 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	defer db.Close()
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
-		CacheDir:            t.TempDir(),
-		BlockCacheSize:      64 << 10,
-		ValidateSSTChecksum: true,
+		CacheDir:       t.TempDir(),
+		BlockCacheSize: 64 << 10,
 	})
 	defer reader.Close()
 
@@ -403,8 +402,7 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	assertCurrentKVState(t, ctx, reader)
 
 	freshReader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{
-		CacheDir:            t.TempDir(),
-		ValidateSSTChecksum: true,
+		CacheDir: t.TempDir(),
 	})
 	defer freshReader.Close()
 	assertCurrentKVState(t, ctx, freshReader)

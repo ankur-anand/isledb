@@ -145,7 +145,6 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	const blockCacheBytes = int64(1 << 20)
 	options := DefaultReaderOpenOptions(cacheDir)
 	options.BlockCacheSize = blockCacheBytes
-	options.AllowUnverifiedRangeRead = true
 	options.RangeReadMinSSTSize = 1
 	options.BloomCacheSize = 1 << 20
 	firstMetrics := DefaultReaderMetrics(nil)
