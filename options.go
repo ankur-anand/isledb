@@ -135,6 +135,11 @@ type readerOptions struct {
 	// filters. Zero selects the default (64 MiB).
 	BloomCacheSize int64
 
+	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
+	// and footer) that range reads keep in memory, separately from data so
+	// data reads cannot evict it. Zero selects the default (128 MiB).
+	MetaCacheSize int64
+
 	// AllowUnverifiedRangeRead permits range-reading SSTs without verifying
 	// full-file checksums.
 	AllowUnverifiedRangeRead bool
@@ -169,6 +174,7 @@ func defaultReaderOptions() readerOptions {
 		SSTCacheSize:       defaultSSTCacheSize,
 		BloomDiskCacheSize: defaultBloomDiskCacheSize,
 		BloomCacheSize:     defaultBloomCacheSize,
+		MetaCacheSize:      defaultMetaCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},

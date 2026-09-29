@@ -31,6 +31,7 @@ type Reader struct {
 	fileCache     *filecache.Cache
 	blockCache    *ristretto.Cache[string, []byte]
 	bloomCache    *bloomFilterCache
+	metaCache     *sstMetaCache
 	bloomLoads    coalescedLoadGroup
 	sstLoads      coalescedLoadGroup
 	sstRangeLoads coalescedLoadGroup
@@ -124,6 +125,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		fileCache:                fileCache,
 		blockCache:               blockCache,
 		bloomCache:               newBloomFilterCache(opts.BloomCacheSize),
+		metaCache:                newSSTMetaCache(opts.MetaCacheSize),
 		verifySST:                opts.ValidateSSTChecksum,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
@@ -332,6 +334,7 @@ func (r *Reader) Close() error {
 		r.blockCache.Close()
 	}
 	r.bloomCache.clear()
+	r.metaCache.clear()
 
 	return firstErr
 }
@@ -929,6 +932,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 	readable := newSSTRangeReadable(
 		r.store, path, sstMeta.ID, size, r.blockCache, &r.sstRangeLoads, r.metrics)
 	readable.useMetaRegion(sstMeta.MetaOffset)
+	readable.useMetaCache(r.metaCache)
 	readable.useChunks(r.rangeReadChunkSize)
 	return r.openSSTIterWithReadable(ctx, readable, lower, upper, nil, nil)
 }
@@ -1095,6 +1099,12 @@ func (r *Reader) downloadSST(ctx context.Context, meta *sstMetadata, path string
 
 func (r *Reader) SSTCacheStats() CacheStats {
 	return r.fileCacheStats(filecache.KindSST)
+}
+
+// MetaCacheStats reports the in-memory cache of SST metadata regions used by
+// range reads.
+func (r *Reader) MetaCacheStats() CacheStats {
+	return r.metaCache.stats()
 }
 
 // BloomCacheStats reports decoded Bloom-filter L1 occupancy.

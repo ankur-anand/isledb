@@ -33,6 +33,10 @@ type sstRangeReadable struct {
 	metaMu    sync.Mutex
 	metaBytes []byte
 
+	// metaCache, when set, holds metadata regions across opens under their
+	// own budget, so data reads cannot evict them.
+	metaCache *sstMetaCache
+
 	// chunkSize, when positive, serves reads of the data region
 	// [0, metaOffset) from aligned chunks of this many bytes, cached under
 	// (SST, chunk index); see readChunks.
@@ -87,6 +91,12 @@ func (r *sstRangeReadable) useMetaRegion(offset int64) {
 		return
 	}
 	r.metaOffset = offset
+}
+
+// useMetaCache makes metadata regions come from, and go to, cache instead of
+// the block cache.
+func (r *sstRangeReadable) useMetaCache(cache *sstMetaCache) {
+	r.metaCache = cache
 }
 
 // useChunks makes data reads fetch and cache aligned chunks of size bytes. A
@@ -371,14 +381,52 @@ func (r *sstRangeReadable) inMetaRegion(off int64, length int) bool {
 func (r *sstRangeReadable) metaRegion(ctx context.Context) ([]byte, error) {
 	r.metaMu.Lock()
 	defer r.metaMu.Unlock()
-	if r.metaBytes == nil {
-		data, err := r.read(ctx, r.metaOffset, int(r.size-r.metaOffset))
+	if r.metaBytes != nil {
+		return r.metaBytes, nil
+	}
+	var data []byte
+	var err error
+	if r.metaCache != nil {
+		data, err = r.loadMetaRegion(ctx)
+	} else {
+		data, err = r.read(ctx, r.metaOffset, int(r.size-r.metaOffset))
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.metaBytes = data
+	return data, nil
+}
+
+// loadMetaRegion returns the metadata region from the metadata cache, or
+// fetches it with one request shared by concurrent opens and caches it.
+func (r *sstRangeReadable) loadMetaRegion(ctx context.Context) ([]byte, error) {
+	length := r.size - r.metaOffset
+	if region, ok := r.metaCache.get(r.sstID, length); ok {
+		return region, nil
+	}
+	fetch := func(ctx context.Context) (any, error) {
+		if region, ok := r.metaCache.peek(r.sstID, length); ok {
+			return region, nil
+		}
+		data, err := r.readRange(ctx, r.metaOffset, int(length))
 		if err != nil {
 			return nil, err
 		}
-		r.metaBytes = data
+		r.metaCache.put(r.sstID, data)
+		return data, nil
 	}
-	return r.metaBytes, nil
+	var value any
+	var err error
+	if r.loads != nil {
+		value, err = r.loads.Do(ctx, r.sstID+":meta", fetch)
+	} else {
+		value, err = fetch(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return value.([]byte), nil
 }
 
 func (r *sstRangeReadable) NewReadHandle(requested objstorage.ReadBeforeSize) objstorage.ReadHandle {
