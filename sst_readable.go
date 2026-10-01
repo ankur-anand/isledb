@@ -25,6 +25,12 @@ const (
 	// smallSSTBytes is the largest SST fetched and cached whole, together
 	// with its Bloom sidecar, in one request.
 	smallSSTBytes = 4 << 20
+	// maxBridgeChunks is the longest run of cached chunks a request fetches
+	// again to reach a missing chunk after it, rather than end and leave that
+	// chunk to a second request. Crossing 8 chunks (1 MiB) costs about 10 ms
+	// at 100 MB/s, half a typical 20 ms request; a longer run is read from
+	// disk instead.
+	maxBridgeChunks = 8
 )
 
 // sstObject describes where an SST's parts lie in its object and how the
@@ -398,11 +404,15 @@ func (f *sstFetcher) chunksOnDisk(o sstObject, p []byte, off int64) bool {
 }
 
 // fetchChunks returns a run of whole chunks covering chunks first through
-// last, extended toward want (exclusive) but stopping before a chunk that is
-// already cached or being fetched, so no request repeats another's bytes. A
-// reader needing a chunk already in flight waits for that request instead.
-// It returns where the run starts and its bytes. With store, the chunks are
-// on disk when it returns, whoever requested them.
+// last, extended toward want (exclusive) as far as the last chunk not yet
+// cached. Cached chunks between missing ones are fetched again rather than
+// split the run, since a request costs more than a few chunks' bytes, but no
+// more than maxBridgeChunks of them in a row; cached chunks after the last
+// missing one are left to be read from disk. The run stops before a chunk
+// already being fetched, so no request repeats another's; a reader needing a
+// chunk in flight waits for that request instead. It returns
+// where the run starts and its bytes. With store, the chunks are on disk when
+// it returns, whoever requested them.
 func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, want uint32, store bool) (int64, []byte, error) {
 	waited := false
 	for {
@@ -424,14 +434,20 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 			}
 			continue // the request failed or did not cover the run: fetch it here
 		}
-		end := max(want, last+1)
-		for i := last + 1; i < end; i++ {
-			if f.inflight[o.entry(diskcache.KindChunk, i)] != nil ||
-				f.diskHas(o.entry(diskcache.KindChunk, i), chunkLen(o, i)) {
-				end = i
+		lastMissing, cached := last, 0
+		for i := last + 1; i < max(want, last+1); i++ {
+			if f.inflight[o.entry(diskcache.KindChunk, i)] != nil {
 				break
 			}
+			if f.diskHas(o.entry(diskcache.KindChunk, i), chunkLen(o, i)) {
+				if cached++; cached > maxBridgeChunks {
+					break
+				}
+				continue
+			}
+			lastMissing, cached = i, 0
 		}
+		end := lastMissing + 1
 		start, _ := o.chunkSpan(first)
 		_, stop := o.chunkSpan(end - 1)
 		fl := &chunkFetch{done: make(chan struct{}), start: start, end: stop}
@@ -633,9 +649,11 @@ func (h *sstReadHandle) ReadAt(ctx context.Context, p []byte, off int64) error {
 
 // readData fills p, at off in the data region, chunk by chunk: from this
 // iterator's read-ahead buffer, else from a chunk on disk, else by fetching a
-// run of chunks from the first one missing. A run reads ahead as far as the
-// read-ahead allows but stops before a chunk already cached or in flight, so
-// a block crossing into a cached chunk fetches only its missing part.
+// run of chunks from the first one missing. A run covers the rest of this
+// read, so a block crossing chunks, or one larger than a chunk, costs one
+// request; it reads further ahead as far as the read-ahead allows. A run ends
+// at its last missing chunk, fetching cached chunks between missing ones
+// again, and stops before a chunk in flight (see fetchChunks).
 func (h *sstReadHandle) readData(ctx context.Context, p []byte, off int64) error {
 	o, f := h.r.o, h.r.f
 	end := off + int64(len(p))
@@ -658,7 +676,8 @@ func (h *sstReadHandle) readData(ctx context.Context, p []byte, off int64) error
 			if sequential {
 				h.chunks = min(max(2*h.chunks, 1), maxReadAheadChunks)
 			}
-			want := min(i+max(h.chunks, 1), o.numChunks())
+			// end is at most MetaOffset, so its chunk exists.
+			want := max(min(i+max(h.chunks, 1), o.numChunks()), uint32((end-1)/sstChunkSize)+1)
 			start, data, err := f.fetchChunks(ctx, o, i, i, want, store)
 			if err != nil {
 				return err

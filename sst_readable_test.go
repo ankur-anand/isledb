@@ -215,22 +215,53 @@ func TestSSTReadable_SmallSSTIsOneRequest(t *testing.T) {
 	}
 }
 
-// TestSSTReadable_ScanStopsBeforeCachedChunks caches one chunk with a lookup,
-// then scans across it from cold memory: no request covers the cached chunk.
-func TestSSTReadable_ScanStopsBeforeCachedChunks(t *testing.T) {
-	f := newReadableTestFixture(t, 20_000, true)
-	o := f.object()
-	f.get(t, 10_000)
-	cached := f.dataRanges(f.ranges.take())[0]
-	f.forgetMemory()
+// chunkRange returns n chunk numbers from first.
+func chunkRange(first uint32, n int) []uint32 {
+	chunks := make([]uint32, n)
+	for i := range chunks {
+		chunks[i] = first + uint32(i)
+	}
+	return chunks
+}
 
-	f.scan(t, 5_000, 10_000)
-	for _, r := range f.dataRanges(f.ranges.take()) {
-		if r.start < cached.end && cached.start < r.end {
-			t.Fatalf("scan request %v overlaps cached chunk %v", r, cached)
+// TestSSTReadable_ScanCrossesCachedGaps scans, block by block, across chunks
+// that lookups left cached every other chunk: requests fetch the cached
+// chunks between missing ones again rather than split at each, so the scan
+// makes no more requests than one from cold, and no request ends on a cached
+// chunk.
+func TestSSTReadable_ScanCrossesCachedGaps(t *testing.T) {
+	scan := func(cached []uint32) ([]byteRange, map[uint32]bool) {
+		f := newReadableTestFixture(t, 20_000, true)
+		o := f.object()
+		was := make(map[uint32]bool)
+		for _, i := range cached {
+			start, end := o.chunkSpan(i)
+			if err := (&sstReadHandle{r: f.reader.fetcher.readable(o), nextOff: -1}).readData(
+				f.ctx, make([]byte, end-start), start); err != nil {
+				t.Fatalf("cache chunk %d: %v", i, err)
+			}
+			was[i] = true
+		}
+		f.ranges.take()
+		h := &sstReadHandle{r: f.reader.fetcher.readable(o), nextOff: -1}
+		for off := int64(0); off < 12*sstChunkSize; off += 16 << 10 {
+			if err := h.readData(f.ctx, make([]byte, 16<<10), off); err != nil {
+				t.Fatalf("scan at %d: %v", off, err)
+			}
+		}
+		return f.ranges.take(), was
+	}
+	cold, _ := scan(nil)
+	gappy, was := scan([]uint32{1, 3, 5, 7, 9, 11})
+	if len(gappy) > len(cold) {
+		t.Fatalf("scan across cached gaps made %d requests %v, cold scan %d %v; want no more",
+			len(gappy), gappy, len(cold), cold)
+	}
+	for _, r := range gappy {
+		if last := uint32((r.end - 1) / sstChunkSize); was[last] {
+			t.Fatalf("request %v ends on cached chunk %d", r, last)
 		}
 	}
-	_ = o
 }
 
 // TestSSTReadable_LongScanStoresOnlyItsStart scans a whole chunked SST from
@@ -547,6 +578,84 @@ func TestSSTReadable_PrefetchFetchesOnlyMissingBloom(t *testing.T) {
 	}
 	if !f.reader.fetcher.resident(o) {
 		t.Fatal("SST not resident after prefetch")
+	}
+}
+
+// TestSSTReadable_ReadAcrossChunksIsOneRequest reads, as a lookup does, a
+// block crossing a chunk boundary and blocks spanning many chunks, some of
+// them already cached: a request runs from the first to the last missing
+// chunk, fetching cached chunks between them again, unless more than
+// maxBridgeChunks of them lie in a row, which are read from disk instead.
+// Every chunk ends up stored.
+func TestSSTReadable_ReadAcrossChunksIsOneRequest(t *testing.T) {
+	if n := newReadableTestFixture(t, 20_000, true).object().numChunks(); n < 30 {
+		t.Fatalf("fixture has %d chunks, want at least 30", n)
+	}
+	cases := []struct {
+		name   string
+		off    int64
+		length int
+		cached []uint32
+		want   []byteRange
+	}{
+		{"straddling_block", sstChunkSize - 8<<10, 16 << 10, nil,
+			[]byteRange{{0, 2 * sstChunkSize}}},
+		{"one_mib_block", 1000, 1 << 20, nil,
+			[]byteRange{{0, 9 * sstChunkSize}}},
+		{"cached_chunk_inside", 1000, 1 << 20, []uint32{4},
+			[]byteRange{{0, 9 * sstChunkSize}}},
+		{"every_other_cached", 0, 10 * sstChunkSize, []uint32{1, 3, 5, 7, 9},
+			[]byteRange{{0, 9 * sstChunkSize}}},
+		{"leading_cached", 0, 10 * sstChunkSize, []uint32{0, 1, 2, 3, 4},
+			[]byteRange{{5 * sstChunkSize, 10 * sstChunkSize}}},
+		{"trailing_cached", 0, 10 * sstChunkSize, []uint32{5, 6, 7, 8, 9},
+			[]byteRange{{0, 5 * sstChunkSize}}},
+		{"only_ends_missing", 0, 10 * sstChunkSize, []uint32{1, 2, 3, 4, 5, 6, 7, 8},
+			[]byteRange{{0, 10 * sstChunkSize}}},
+		{"all_cached", 0, 10 * sstChunkSize, []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			nil},
+		{"cached_run_at_limit", 0, 10 * sstChunkSize, chunkRange(1, maxBridgeChunks),
+			[]byteRange{{0, 10 * sstChunkSize}}},
+		{"cached_run_over_limit", 0, 11 * sstChunkSize, chunkRange(1, maxBridgeChunks+1),
+			[]byteRange{{0, sstChunkSize}, {10 * sstChunkSize, 11 * sstChunkSize}}},
+		{"long_cached_middle", 0, 30 * sstChunkSize, chunkRange(2, 26),
+			[]byteRange{{0, 2 * sstChunkSize}, {28 * sstChunkSize, 30 * sstChunkSize}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReadableTestFixture(t, 20_000, true)
+			o := f.object()
+			for _, i := range tc.cached {
+				start, end := o.chunkSpan(i)
+				if err := (&sstReadHandle{r: f.reader.fetcher.readable(o), nextOff: -1}).readData(
+					f.ctx, make([]byte, end-start), start); err != nil {
+					t.Fatalf("cache chunk %d: %v", i, err)
+				}
+			}
+			f.ranges.take()
+
+			p := make([]byte, tc.length)
+			h := &sstReadHandle{r: f.reader.fetcher.readable(o), nextOff: -1}
+			if err := h.readData(f.ctx, p, tc.off); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if got := f.ranges.take(); fmt.Sprint(got) != fmt.Sprint(tc.want) && (len(got) > 0 || len(tc.want) > 0) {
+				t.Fatalf("requests=%v, want %v", got, tc.want)
+			}
+			for i := uint32(tc.off / sstChunkSize); i <= uint32((tc.off+int64(tc.length)-1)/sstChunkSize); i++ {
+				if !f.chunkCached(i) {
+					t.Fatalf("chunk %d not stored", i)
+				}
+			}
+			// The bytes match a read served from disk.
+			again := make([]byte, tc.length)
+			if err := (&sstReadHandle{r: f.reader.fetcher.readable(o), nextOff: -1}).readData(f.ctx, again, tc.off); err != nil {
+				t.Fatalf("read from disk: %v", err)
+			}
+			if !bytes.Equal(p, again) || len(f.ranges.take()) != 0 {
+				t.Fatal("read from disk differs or fetched")
+			}
+		})
 	}
 }
 
