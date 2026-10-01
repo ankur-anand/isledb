@@ -135,6 +135,8 @@ func TestReader_MetaCacheSavesRequestsUnderBlockCachePressure(t *testing.T) {
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(), RangeRead: true, BlockCacheSize: 16 << 20,
 		RangeReadMinSSTSize: 1, RangeReadAheadMin: 16 << 10,
+		// Each lookup must open the SST and read its metadata again.
+		OpenSSTCacheSize: -1,
 	})
 	if err != nil {
 		t.Fatalf("open reader: %v", err)

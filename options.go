@@ -147,6 +147,10 @@ type readerOptions struct {
 	// filters. Zero selects the default (64 MiB).
 	BloomCacheSize int64
 
+	// OpenSSTCacheSize is how many SSTs stay open across reads (default
+	// 1,024). Negative disables the cache, for tests that count per-open work.
+	OpenSSTCacheSize int
+
 	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
 	// and footer) that range reads keep in memory, separately from data so
 	// data reads cannot evict it. Zero selects the default (128 MiB).

@@ -27,7 +27,7 @@ func (c *Cache) Create(d Descriptor) (*Writer, error) {
 	}
 	c.mu.Lock()
 	closed := c.closed
-	c.mu.Unlock()
+	c.unlock()
 	if closed {
 		return nil, ErrClosed
 	}
@@ -122,7 +122,7 @@ func (c *Cache) Put(d Descriptor, data []byte) error {
 // it open are unaffected either way.
 func (c *Cache) publish(kind Kind, sum [sha256.Size]byte, size int64, tmp string, synced bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	t := c.tiers[kind]
 	c.dropMismatchedLocked(kind, sum, size)
 	switch {

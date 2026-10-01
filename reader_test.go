@@ -1037,9 +1037,11 @@ func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 	_ = writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
 	metrics := DefaultReaderMetrics(nil)
+	// The second read must look in the disk cache, so SSTs are not kept open.
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir: t.TempDir(),
-		Metrics:  metrics,
+		CacheDir:         t.TempDir(),
+		Metrics:          metrics,
+		OpenSSTCacheSize: -1,
 	})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)

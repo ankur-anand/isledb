@@ -336,6 +336,7 @@ type ReaderOpenOptions struct {
     RangeRead           bool
     BloomCacheSize      int64
     MetaCacheSize       int64
+    OpenSSTCacheSize    int
     RangeReadMinSSTSize int64
     RangeReadAheadMin   int64
     RangeReadAheadMax   int64
@@ -360,6 +361,7 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 | `RangeRead` | true | Read SSTs of at least `RangeReadMinSSTSize` by byte range |
 | `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
 | `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
+| `OpenSSTCacheSize` | 1,024 | SSTs kept open across reads |
 | `RangeReadMinSSTSize` | 4 MiB | Smallest SST read by byte range; smaller SSTs are downloaded whole |
 | `RangeReadAheadMin` | 128 KiB | A scan's first read-ahead, and the alignment of every read-ahead |
 | `RangeReadAheadMax` | 4 MiB | Cap on a scan's read-ahead, which doubles while the scan continues |
@@ -379,6 +381,15 @@ are dropped at the next refresh.
 `BlockCacheStats` reports its bytes and entries, and its hits and misses on
 index and data blocks; the metaindex and properties blocks read on every SST
 open, which are never cached, are not counted.
+
+Up to `OpenSSTCacheSize` SSTs stay open across reads, least recently used
+first out, so a read of an open SST opens no file and parses no metadata: a
+warm lookup takes about 1 µs, local or remote, instead of about 20 µs and
+4 µs. Each local SST held open uses one file descriptor. An SST leaves when it
+leaves the manifest, is reported corrupt, or its local file is evicted from
+the disk cache, and closes once the reads using it finish. Because reads of
+an open SST skip opening it, `SSTCacheStats` and `MetaCacheStats` count only
+the opens; `OpenSSTCacheStats` reports how many reads found their SST open.
 
 The block cache is Pebble's. With cgo it is allocated outside the Go heap: it
 counts toward the process's resident memory but not toward `GOMEMLIMIT` or
@@ -424,6 +435,7 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) SSTCacheStats() CacheStats
 func (r *Reader) BlockCacheStats() CacheStats
+func (r *Reader) OpenSSTCacheStats() CacheStats
 func (r *Reader) MetaCacheStats() CacheStats
 func (r *Reader) BloomCacheStats() CacheStats
 func (r *Reader) ManifestPageCacheStats() CacheStats

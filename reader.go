@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -32,10 +33,14 @@ type Reader struct {
 	blockCache    *blockCache
 	bloomCache    *bloomFilterCache
 	metaCache     *sstMetaCache
-	bloomLoads    coalescedLoadGroup
-	sstLoads      coalescedLoadGroup
-	metaLoads     coalescedLoadGroup
-	manifestLoads coalescedLoadGroup
+	openSSTs      *openSSTCache
+	// stopFileListener unregisters the open-SST cache from disk cache
+	// removals.
+	stopFileListener func()
+	bloomLoads       coalescedLoadGroup
+	sstLoads         coalescedLoadGroup
+	metaLoads        coalescedLoadGroup
+	manifestLoads    coalescedLoadGroup
 
 	rangeRead           bool
 	rangeReadMinSSTSize int64
@@ -114,6 +119,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		blockCache:          newBlockCache(cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)),
 		bloomCache:          newBloomFilterCache(opts.BloomCacheSize),
 		metaCache:           newSSTMetaCache(opts.MetaCacheSize),
+		openSSTs:            newOpenSSTCache(openSSTCacheSize(opts.OpenSSTCacheSize)),
 		rangeRead:           opts.RangeRead,
 		rangeReadMinSSTSize: cmp.Or(opts.RangeReadMinSSTSize, defaultRangeReadMinSSTSize),
 		rangeReadAheadMin:   cmp.Or(opts.RangeReadAheadMin, defaultRangeReadAheadMin),
@@ -122,9 +128,27 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:            opts.CacheDir,
 		metrics:             opts.Metrics,
 	}
+	if fileCache != nil && reader.openSSTs != nil {
+		// A local SST held open keeps its file's disk space after the disk
+		// cache evicts it, so the open SST is dropped with the file.
+		reader.stopFileListener = fileCache.OnRemove(func(kind filecache.Kind, sum [sha256.Size]byte) {
+			if kind == filecache.KindSST {
+				reader.openSSTs.removeLocalFile(sum)
+			}
+		})
+	}
 	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
 	cleanupFileCache = false
 	return reader, nil
+}
+
+// openSSTCacheSize resolves the open-SST cache size: zero selects the default
+// and a negative size, used by tests, disables the cache.
+func openSSTCacheSize(size int) int {
+	if size == 0 {
+		return defaultOpenSSTCacheSize
+	}
+	return size
 }
 
 // initReaderFileCache opens the local SST and Bloom cache under CacheDir,
@@ -233,8 +257,17 @@ func (r *Reader) publishManifestView(
 	r.viewExpiresAt = expiresAt
 	r.mu.Unlock()
 
-	r.blockCache.retain(m)
+	r.retainSSTs(m)
 	r.armManifestExpiry(refreshAt, expiresAt)
+}
+
+// retainSSTs drops the open readers and cached blocks of SSTs not in m. Each
+// open reader reads blocks under the file number it was opened with, so the
+// two are dropped together: a later read opens the SST afresh, under a new
+// number.
+func (r *Reader) retainSSTs(m *manifestState) {
+	r.openSSTs.retain(m)
+	r.blockCache.retain(m)
 }
 
 func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
@@ -312,6 +345,11 @@ func (r *Reader) Close() error {
 
 	var firstErr error
 
+	// Close open SSTs, and their local files, before the disk cache.
+	if r.stopFileListener != nil {
+		r.stopFileListener()
+	}
+	r.openSSTs.clear()
 	if r.fileCache != nil && r.ownsFileCache {
 		if err := r.fileCache.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -838,6 +876,15 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 // private makes it read blocks into buffers of its own rather than adding
 // them to the block cache; see openSSTIterWithReadable.
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
+	if sst := r.openSSTs.acquire(sstMeta.ID); sst != nil {
+		if sst.local || !r.sstResident(sstMeta) {
+			return r.newSSTIter(ctx, sst, lower, upper, private)
+		}
+		// The SST was read by range but has since been downloaded, for
+		// example by Prefetch: reopen it from the local file.
+		r.openSSTs.drop(sst)
+		sst.unref()
+	}
 	path := r.store.SSTPath(sstMeta.ID)
 	var cachedOpenErr error
 
@@ -897,7 +944,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 	readable.useMetaRegion(sstMeta.MetaOffset)
 	readable.useMetaCache(r.metaCache)
 	readable.useReadAhead(r.rangeReadAheadMin, r.rangeReadAheadMax)
-	return r.openSSTIterWithReadable(ctx, sstMeta, readable, lower, upper, private, nil, nil)
+	return r.openSSTIterWithReadable(ctx, sstMeta, readable, false, lower, upper, private, nil, nil)
 }
 
 // openSSTIterFromFile opens an SST from a local cache file. If a read later
@@ -905,7 +952,7 @@ func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path
 // downloads it again instead of failing the same way.
 func (r *Reader) openSSTIterFromFile(ctx context.Context, sstMeta sstMetadata, file *os.File, lower, upper []byte, private bool, release func()) (*sstable.Reader, sstable.Iterator, error) {
 	return r.openSSTIterWithReadable(
-		ctx, sstMeta, newSSTFileReadable(file, sstMeta.Size), lower, upper, private, release,
+		ctx, sstMeta, newSSTFileReadable(file, sstMeta.Size), true, lower, upper, private, release,
 		func() { r.reportCorruptSST(sstMeta) })
 }
 
@@ -916,7 +963,7 @@ func (r *Reader) openSSTIterFromFile(ctx context.Context, sstMeta sstMetadata, f
 // others; the long tail of a scan reads this way (see scanSSTSource). release,
 // if set, runs when the iterator closes; onCorruption, if set, runs when the
 // iterator failed on corrupt data.
-func (r *Reader) openSSTIterWithReadable(ctx context.Context, sstMeta sstMetadata, readable objstorage.Readable, lower, upper []byte, private bool, release, onCorruption func()) (*sstable.Reader, sstable.Iterator, error) {
+func (r *Reader) openSSTIterWithReadable(ctx context.Context, sstMeta sstMetadata, readable objstorage.Readable, local bool, lower, upper []byte, private bool, release, onCorruption func()) (*sstable.Reader, sstable.Iterator, error) {
 	reader, err := sstable.NewReader(ctx, readable, r.blockCache.readerOptions(sstMeta.ID))
 	if err != nil {
 		_ = readable.Close()
@@ -926,13 +973,23 @@ func (r *Reader) openSSTIterWithReadable(ctx context.Context, sstMeta sstMetadat
 		return nil, nil, err
 	}
 	r.blockCache.noteOpen()
+	sst := &openSST{id: sstMeta.ID, reader: reader, local: local, release: release, onCorruption: onCorruption}
+	if local {
+		sst.sum, _ = sstFileDescriptor(sstMeta).Sum()
+	}
+	sst = r.openSSTs.add(sst)
+	return r.newSSTIter(ctx, sst, lower, upper, private)
+}
 
+// newSSTIter opens an iterator over an open SST, taking over the caller's
+// reference, which the iterator drops when it closes.
+func (r *Reader) newSSTIter(ctx context.Context, sst *openSST, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
 	iterOpts := sstable.IterOptions{
 		Lower:                lower,
 		Upper:                upper,
 		Transforms:           sstable.NoTransforms,
 		FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
-		ReaderProvider:       sstable.MakeTrivialReaderProvider(reader),
+		ReaderProvider:       sstable.MakeTrivialReaderProvider(sst.reader),
 		BlobContext:          sstable.AssertNoBlobHandles,
 	}
 	var pool *block.BufferPool
@@ -941,39 +998,25 @@ func (r *Reader) openSSTIterWithReadable(ctx context.Context, sstMeta sstMetadat
 		pool.Init(5)
 		iterOpts.Env.Block.BufferPool = pool
 	}
-	iter, err := reader.NewPointIter(ctx, iterOpts)
+	iter, err := sst.reader.NewPointIter(ctx, iterOpts)
 	if err != nil {
 		if pool != nil {
 			pool.Release()
 		}
-		_ = reader.Close()
-		if release != nil {
-			release()
-		}
+		sst.unref()
 		return nil, nil, err
 	}
-
-	wrapped := &sstIterWithClose{
-		Iterator:     iter,
-		reader:       reader,
-		pool:         pool,
-		release:      release,
-		onCorruption: onCorruption,
-	}
-
-	return reader, wrapped, nil
+	return sst.reader, &sstIterWithClose{Iterator: iter, sst: sst, pool: pool}, nil
 }
 
 type sstIterWithClose struct {
 	sstable.Iterator
-	reader *sstable.Reader
+	// sst is the open SST this iterator holds a reference to.
+	sst *openSST
 	// pool, when set, holds a private iterator's blocks; it is released once
 	// the iterator has returned them.
-	pool    *block.BufferPool
-	release func()
-	closed  bool
-	// onCorruption, when set, runs if the iterator failed on corrupt data.
-	onCorruption func()
+	pool   *block.BufferPool
+	closed bool
 }
 
 func (it *sstIterWithClose) Close() error {
@@ -987,17 +1030,10 @@ func (it *sstIterWithClose) Close() error {
 	if it.pool != nil {
 		it.pool.Release()
 	}
-	if it.onCorruption != nil && (pebble.IsCorruptionError(iterErr) || pebble.IsCorruptionError(err)) {
-		it.onCorruption()
+	if it.sst.onCorruption != nil && (pebble.IsCorruptionError(iterErr) || pebble.IsCorruptionError(err)) {
+		it.sst.onCorruption()
 	}
-	if it.reader != nil {
-		if rerr := it.reader.Close(); err == nil {
-			err = rerr
-		}
-	}
-	if it.release != nil {
-		it.release()
-	}
+	it.sst.unref()
 	return err
 }
 
@@ -1090,6 +1126,12 @@ func (r *Reader) downloadSST(ctx context.Context, meta *sstMetadata, path string
 
 func (r *Reader) SSTCacheStats() CacheStats {
 	return r.fileCacheStats(filecache.KindSST)
+}
+
+// OpenSSTCacheStats reports the SSTs kept open across reads: hits are reads
+// of an SST already open, misses reads that had to open it.
+func (r *Reader) OpenSSTCacheStats() CacheStats {
+	return r.openSSTs.stats()
 }
 
 // BlockCacheStats reports the in-memory cache of decoded SST blocks, shared

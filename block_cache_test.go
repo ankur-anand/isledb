@@ -48,7 +48,8 @@ func TestBlockCache_OpenMakesTwoUncachedLookups(t *testing.T) {
 			ctx := context.Background()
 			store := blobstore.NewMemory(fmt.Sprintf("block-cache-opens-%t", rangeRead))
 			defer store.Close()
-			opts := readerOptions{CacheDir: t.TempDir()}
+			// Every read must open the SST, so the open-SST cache is off.
+			opts := readerOptions{CacheDir: t.TempDir(), OpenSSTCacheSize: -1}
 			if rangeRead {
 				opts.RangeRead, opts.RangeReadMinSSTSize = true, 1
 			}
@@ -312,7 +313,7 @@ func TestReader_BlockCache_EvictsRetiredAndCorruptSSTs(t *testing.T) {
 	if reader.BlockCacheStats().EntryCount == 0 {
 		t.Fatal("lookup cached nothing")
 	}
-	reader.blockCache.retain(&manifestState{})
+	reader.retainSSTs(&manifestState{})
 	if stats := reader.BlockCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
 		t.Fatalf("retired SST still cached: %+v", stats)
 	}
