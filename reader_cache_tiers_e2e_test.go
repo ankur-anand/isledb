@@ -5,13 +5,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
 
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// TestReaderCacheTierBudgetsAndRestart reopens a reader's disk cache with
+// smaller tier budgets: recovery trims each tier to its own budget, and the
+// tiers stay independent, so churn in the data tier never evicts Bloom
+// filters from the meta tier.
 func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -33,98 +39,63 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	if len(metas) != 3 {
 		t.Fatalf("tier-budget SST count=%d, want 3", len(metas))
 	}
-
+	// Each SST is small, so it is cached whole in the data tier, and its
+	// Bloom filter in the meta tier.
 	oneSSTBytes := metas[0].Size
 	oneBloomBytes := metas[0].Bloom.Length
 	oneLoadedBloomBytes := artifactCacheTestLoadedBloomCost(t, ctx, db, metas[0])
 	for _, meta := range metas[1:] {
 		if meta.Size != oneSSTBytes || meta.Bloom.Length != oneBloomBytes {
-			t.Fatalf(
-				"fixture artifacts have unequal sizes: first=(%d,%d) %s=(%d,%d)",
+			t.Fatalf("fixture SSTs have unequal sizes: first=(%d,%d) %s=(%d,%d)",
 				oneSSTBytes, oneBloomBytes, meta.ID, meta.Size, meta.Bloom.Length)
 		}
-		if cost := artifactCacheTestLoadedBloomCost(t, ctx, db, meta); cost != oneLoadedBloomBytes {
-			t.Fatalf("fixture decoded Bloom cost=%d for %s, want=%d",
-				cost, meta.ID, oneLoadedBloomBytes)
-		}
 	}
 
-	largeOptions := DefaultReaderOpenOptions(cacheDir)
-	largeOptions.SSTCacheSize = int64(len(metas)) * oneSSTBytes
-	largeOptions.BloomDiskCacheSize = int64(len(metas)) * oneBloomBytes
-	// The decoded Bloom L1 intentionally holds only one of the three filters.
-	largeOptions.BloomCacheSize = oneLoadedBloomBytes
-	reader := openArtifactCacheTestReaderWithOptions(t, ctx, db, largeOptions)
-	defer func() {
-		if reader != nil {
-			_ = reader.Close()
-		}
-	}()
+	// Room for all three; the parsed Bloom cache holds only one filter.
+	reader, done := openTierTestReader(t, ctx, db, cacheDir, 3*oneBloomBytes, 3*oneSSTBytes, oneLoadedBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	assertArtifactCacheTierBound(
-		t, "large SST L2", reader.SSTCacheStats(), 3, largeOptions.SSTCacheSize)
-	assertArtifactCacheTierBound(
-		t, "large Bloom L2", reader.BloomDiskCacheStats(), 3, largeOptions.BloomDiskCacheSize)
-	assertArtifactCacheTierBound(
-		t, "decoded Bloom L1", reader.BloomCacheStats(), 1, largeOptions.BloomCacheSize)
-	if err := reader.Close(); err != nil {
-		t.Fatalf("close large-budget Reader: %v", err)
-	}
-	reader = nil
+	stats := reader.DiskCacheStats()
+	assertArtifactCacheTierBound(t, "data tier", stats.Data, 3, 3*oneSSTBytes)
+	assertArtifactCacheTierBound(t, "meta tier", stats.Meta, 3, 3*oneBloomBytes)
+	assertArtifactCacheTierBound(t, "parsed Bloom cache", reader.BloomCacheStats(), 1, oneLoadedBloomBytes)
+	done()
 
-	// Shrink only SST L2 on reopen. Recovery trims that tier while retaining
-	// every raw Bloom under its independently configured disk budget.
-	shrunkSSTOptions := largeOptions
-	shrunkSSTOptions.SSTCacheSize = oneSSTBytes
-	reader = openArtifactCacheTestReaderWithOptions(t, ctx, db, shrunkSSTOptions)
-	assertArtifactCacheTierBound(
-		t, "recovered shrunk SST L2", reader.SSTCacheStats(), 1, oneSSTBytes)
-	assertArtifactCacheTierBound(
-		t, "recovered full Bloom L2", reader.BloomDiskCacheStats(), 3,
-		shrunkSSTOptions.BloomDiskCacheSize)
+	// Shrink only the data tier. Recovery trims it, and reading all three
+	// churns it, while every Bloom filter stays on disk and is reused.
+	reader, done = openTierTestReader(t, ctx, db, cacheDir, 3*oneBloomBytes, oneSSTBytes, oneLoadedBloomBytes)
+	stats = reader.DiskCacheStats()
+	assertArtifactCacheTierBound(t, "recovered data tier", stats.Data, 1, oneSSTBytes)
+	assertArtifactCacheTierBound(t, "recovered meta tier", stats.Meta, 3, 3*oneBloomBytes)
 	assertArtifactCacheEmptyL1(t, reader, "first budget restart")
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	assertArtifactCacheTierBound(
-		t, "churning SST L2", reader.SSTCacheStats(), 1, oneSSTBytes)
-	assertArtifactCacheTierBound(
-		t, "retained Bloom L2", reader.BloomDiskCacheStats(), 3,
-		shrunkSSTOptions.BloomDiskCacheSize)
-	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
-		t.Fatalf("SST L2 did not evict cleanly under its reduced budget: %+v", stats)
+	stats = reader.DiskCacheStats()
+	assertArtifactCacheTierBound(t, "churning data tier", stats.Data, 1, oneSSTBytes)
+	if stats.Data.Evictions == 0 || stats.Data.Bypasses != 0 {
+		t.Fatalf("data tier did not evict cleanly under its reduced budget: %+v", stats.Data)
 	}
-	if stats := reader.BloomDiskCacheStats(); stats.Hits == 0 || stats.Evictions != 0 {
-		t.Fatalf("independent Bloom L2 was not reused: %+v", stats)
+	if stats.Meta.Hits == 0 || stats.Meta.Evictions != 0 {
+		t.Fatalf("meta tier was not reused independently: %+v", stats.Meta)
 	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("close shrunk-SST Reader: %v", err)
-	}
-	reader = nil
+	done()
 
-	// Shrink Bloom L2 as well. Recovery and subsequent admission churn must
-	// keep all three independently-accounted tiers within their byte limits.
-	shrunkBothOptions := shrunkSSTOptions
-	shrunkBothOptions.BloomDiskCacheSize = oneBloomBytes
-	reader = openArtifactCacheTestReaderWithOptions(t, ctx, db, shrunkBothOptions)
-	assertArtifactCacheTierBound(
-		t, "recovered one-entry SST L2", reader.SSTCacheStats(), 1, oneSSTBytes)
-	assertArtifactCacheTierBound(
-		t, "recovered one-entry Bloom L2", reader.BloomDiskCacheStats(), 1, oneBloomBytes)
-	assertArtifactCacheEmptyL1(t, reader, "second budget restart")
+	// Shrink the meta tier too. Both tiers stay within their budgets.
+	reader, done = openTierTestReader(t, ctx, db, cacheDir, oneBloomBytes, oneSSTBytes, oneLoadedBloomBytes)
+	defer done()
+	stats = reader.DiskCacheStats()
+	assertArtifactCacheTierBound(t, "recovered one-entry data tier", stats.Data, 1, oneSSTBytes)
+	assertArtifactCacheTierBound(t, "recovered one-entry meta tier", stats.Meta, 1, oneBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	assertArtifactCacheTierBound(
-		t, "bounded SST L2", reader.SSTCacheStats(), 1, oneSSTBytes)
-	assertArtifactCacheTierBound(
-		t, "bounded Bloom L2", reader.BloomDiskCacheStats(), 1, oneBloomBytes)
-	assertArtifactCacheTierBound(
-		t, "bounded decoded Bloom L1", reader.BloomCacheStats(), 1, oneLoadedBloomBytes)
-	if stats := reader.SSTCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
-		t.Fatalf("bounded SST L2 churn stats=%+v", stats)
-	}
-	if stats := reader.BloomDiskCacheStats(); stats.Evictions == 0 || stats.Bypasses != 0 {
-		t.Fatalf("bounded Bloom L2 churn stats=%+v", stats)
+	stats = reader.DiskCacheStats()
+	assertArtifactCacheTierBound(t, "bounded data tier", stats.Data, 1, oneSSTBytes)
+	assertArtifactCacheTierBound(t, "bounded meta tier", stats.Meta, 1, oneBloomBytes)
+	if stats.Meta.Evictions == 0 || stats.Meta.Bypasses != 0 {
+		t.Fatalf("bounded meta tier churn stats=%+v", stats.Meta)
 	}
 }
 
+// TestReaderProcessLocalL1RestartsWithPersistentBloomL2 restarts a reader:
+// its memory caches start empty, and the disk cache alone serves the SST and
+// its Bloom filter, with no read of object storage.
 func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -139,11 +110,9 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	}
 	writeArtifactCacheTestBatches(t, ctx, db, []map[string]string{batch})
 
-	// The bound is asserted before and after a full multi-block scan.
 	const blockCacheBytes = int64(1 << 20)
 	options := DefaultReaderOpenOptions(cacheDir)
 	options.BlockCacheSize = blockCacheBytes
-	options.RangeReadMinSSTSize = 1
 	options.BloomCacheSize = 1 << 20
 	firstMetrics := DefaultReaderMetrics(nil)
 	options.Metrics = firstMetrics
@@ -156,69 +125,80 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	wantValue := artifactCacheTestLargeValue(64, 768)
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
 	assertArtifactCacheBlockBound(t, reader, blockCacheBytes)
-	if stats := reader.SSTCacheStats(); stats.EntryCount != 0 {
-		t.Fatalf("range-read unexpectedly populated SST L2: %+v", stats)
-	}
-	assertArtifactCacheTierBound(
-		t, "range-read raw Bloom L2", reader.BloomDiskCacheStats(), 1,
-		options.BloomDiskCacheSize)
-	assertArtifactCacheTierBound(
-		t, "range-read decoded Bloom L1", reader.BloomCacheStats(), 1,
-		options.BloomCacheSize)
-	firstRangeReads := testutil.ToFloat64(firstMetrics.SSTRangeReadTotal)
-	if firstRangeReads == 0 || reader.BlockCacheStats().Misses == 0 {
-		t.Fatalf("cold range read metrics: reads=%v block cache=%+v",
-			firstRangeReads, reader.BlockCacheStats())
+	if testutil.ToFloat64(firstMetrics.SSTRangeReadTotal) == 0 || reader.BlockCacheStats().Misses == 0 {
+		t.Fatalf("cold read did not reach object storage: reads=%v block cache=%+v",
+			testutil.ToFloat64(firstMetrics.SSTRangeReadTotal), reader.BlockCacheStats())
 	}
 	hitsBefore := reader.BlockCacheStats().Hits
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
 	if reader.BlockCacheStats().Hits == hitsBefore {
-		t.Fatal("warm block L1 lookup recorded no hits")
+		t.Fatal("warm lookup recorded no block cache hits")
 	}
-	// Read the full SST through the range path; the cache must stay within
-	// its configured maximum.
 	rows, err := reader.Scan(ctx, nil, nil)
 	if err != nil || len(rows) != len(batch) {
-		t.Fatalf("range scan rows=%d err=%v, want=%d", len(rows), err, len(batch))
+		t.Fatalf("scan rows=%d err=%v, want=%d", len(rows), err, len(batch))
 	}
 	assertArtifactCacheBlockBound(t, reader, blockCacheBytes)
 	if err := reader.Close(); err != nil {
-		t.Fatalf("close first range Reader: %v", err)
+		t.Fatalf("close first Reader: %v", err)
 	}
 	reader = nil
 
 	secondMetrics := DefaultReaderMetrics(nil)
 	options.Metrics = secondMetrics
 	reader = openArtifactCacheTestReaderWithOptions(t, ctx, db, options)
-	assertArtifactCacheEmptyL1(t, reader, "range Reader restart")
+	assertArtifactCacheEmptyL1(t, reader, "Reader restart")
 	if stats := reader.BlockCacheStats(); stats.MaxBytes != blockCacheBytes ||
 		stats.Bytes != 0 || stats.EntryCount != 0 {
-		t.Fatalf("block L1 was not empty after restart: %+v", stats)
+		t.Fatalf("block cache was not empty after restart: %+v", stats)
 	}
-	assertArtifactCacheTierBound(
-		t, "recovered raw Bloom L2", reader.BloomDiskCacheStats(), 1,
-		options.BloomDiskCacheSize)
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
-	if testutil.ToFloat64(secondMetrics.SSTRangeReadTotal) == 0 ||
-		reader.BlockCacheStats().Misses == 0 {
-		t.Fatalf("restarted block L1 did not take a cold origin path: reads=%v block cache=%+v",
-			testutil.ToFloat64(secondMetrics.SSTRangeReadTotal), reader.BlockCacheStats())
+	if got := testutil.ToFloat64(secondMetrics.SSTRangeReadTotal); got != 0 {
+		t.Fatalf("restarted Reader read object storage %v times, want the disk cache only", got)
 	}
-	if stats := reader.BloomDiskCacheStats(); stats.Hits == 0 {
-		t.Fatalf("restarted Reader did not reuse raw Bloom L2: %+v", stats)
+	if stats := reader.DiskCacheStats(); stats.Data.Hits == 0 || stats.Meta.Hits == 0 {
+		t.Fatalf("restarted Reader did not use the disk cache: %+v", stats)
 	}
 	if stats := reader.BloomCacheStats(); stats.EntryCount != 1 || stats.Misses == 0 {
-		t.Fatalf("restarted Reader did not repopulate decoded Bloom L1: %+v", stats)
+		t.Fatalf("restarted Reader did not repopulate parsed Bloom filters: %+v", stats)
 	}
-	readsBeforeWarm := testutil.ToFloat64(secondMetrics.SSTRangeReadTotal)
 	hitsBefore = reader.BlockCacheStats().Hits
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
 	if reader.BlockCacheStats().Hits == hitsBefore {
-		t.Fatal("restarted warm block L1 lookup recorded no hits")
+		t.Fatal("restarted warm lookup recorded no block cache hits")
 	}
-	if readsAfterWarm := testutil.ToFloat64(secondMetrics.SSTRangeReadTotal); readsAfterWarm != readsBeforeWarm {
-		t.Fatalf("warm block L1 still read origin: before=%v after=%v",
-			readsBeforeWarm, readsAfterWarm)
+}
+
+// openTierTestReader opens a reader on db whose disk cache under cacheDir has
+// the given tier budgets. done closes the reader and then the cache.
+func openTierTestReader(
+	t *testing.T,
+	ctx context.Context,
+	db *DB,
+	cacheDir string,
+	metaBytes, dataBytes, bloomCacheBytes int64,
+) (*Reader, func()) {
+	t.Helper()
+	disk, err := diskcache.Open(diskcache.Options{
+		Dir: filepath.Join(cacheDir, "artifacts"), MetaMaxBytes: metaBytes, DataMaxBytes: dataBytes,
+	})
+	if err != nil {
+		t.Fatalf("open disk cache: %v", err)
+	}
+	reader, err := newReader(ctx, db.store, readerOptions{
+		CacheDir: cacheDir, DiskCache: disk, BloomCacheSize: bloomCacheBytes,
+	})
+	if err != nil {
+		_ = disk.Close()
+		t.Fatalf("open tier test Reader: %v", err)
+	}
+	return reader, func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("close tier test Reader: %v", err)
+		}
+		if err := disk.Close(); err != nil {
+			t.Errorf("close disk cache: %v", err)
+		}
 	}
 }
 
@@ -282,18 +262,22 @@ func assertArtifactCacheBudgetValues(t *testing.T, ctx context.Context, reader *
 	}
 }
 
+// assertArtifactCacheRecoveredTiers checks a reopened reader recovered the
+// expected disk entries: whole small SSTs in the data tier and Bloom filters
+// in the meta tier.
 func assertArtifactCacheRecoveredTiers(
 	t *testing.T,
 	reader *Reader,
-	wantSSTEntries int,
-	wantBloomEntries int,
+	wantDataEntries int,
+	wantMetaEntries int,
 ) {
 	t.Helper()
-	if stats := reader.SSTCacheStats(); stats.EntryCount != wantSSTEntries || stats.Bytes == 0 {
-		t.Fatalf("recovered SST L2 stats=%+v, want entries=%d", stats, wantSSTEntries)
+	stats := reader.DiskCacheStats()
+	if stats.Data.EntryCount != wantDataEntries || stats.Data.Bytes == 0 {
+		t.Fatalf("recovered data tier stats=%+v, want entries=%d", stats.Data, wantDataEntries)
 	}
-	if stats := reader.BloomDiskCacheStats(); stats.EntryCount != wantBloomEntries || stats.Bytes == 0 {
-		t.Fatalf("recovered Bloom L2 stats=%+v, want entries=%d", stats, wantBloomEntries)
+	if stats.Meta.EntryCount != wantMetaEntries || stats.Meta.Bytes == 0 {
+		t.Fatalf("recovered meta tier stats=%+v, want entries=%d", stats.Meta, wantMetaEntries)
 	}
 }
 
@@ -301,7 +285,7 @@ func assertArtifactCacheEmptyL1(t *testing.T, reader *Reader, label string) {
 	t.Helper()
 	if stats := reader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 ||
 		stats.Hits != 0 || stats.Misses != 0 {
-		t.Fatalf("%s decoded Bloom L1 is not empty: %+v", label, stats)
+		t.Fatalf("%s parsed Bloom cache is not empty: %+v", label, stats)
 	}
 }
 
@@ -325,6 +309,6 @@ func assertArtifactCacheBlockBound(t *testing.T, reader *Reader, maxBytes int64)
 	t.Helper()
 	if stats := reader.BlockCacheStats(); stats.MaxBytes != maxBytes ||
 		stats.Bytes <= 0 || stats.Bytes > maxBytes {
-		t.Fatalf("block L1 outside bound: %+v want_max=%d", stats, maxBytes)
+		t.Fatalf("block cache outside bound: %+v want_max=%d", stats, maxBytes)
 	}
 }

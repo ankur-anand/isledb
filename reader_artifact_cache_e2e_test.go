@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ankur-anand/isledb/internal/filecache"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 )
 
 // TestReaderArtifactCacheLifecycle is the in-process end-to-end test for the
-// persistent Reader cache. Focused filecache tests cover failure handling;
+// persistent Reader cache. Focused diskcache tests cover failure handling;
 // this test verifies the user-visible lifecycle through fake S3 and real
 // temporary cache directories without requiring an integration environment.
 func TestReaderArtifactCacheLifecycle(t *testing.T) {
@@ -57,8 +57,8 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		// A second DB using the same local cache directory must fail while the
 		// first Reader owns it, then the directory must be reusable after Close.
 		contender := openArtifactCacheTestDB(t, ctx, bucketURL, "persistent")
-		if _, err := contender.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir)); !errors.Is(err, filecache.ErrLocked) {
-			t.Fatalf("contending Reader error=%v, want %v", err, filecache.ErrLocked)
+		if _, err := contender.OpenReader(ctx, DefaultReaderOpenOptions(cacheDir)); !errors.Is(err, diskcache.ErrLocked) {
+			t.Fatalf("contending Reader error=%v, want %v", err, diskcache.ErrLocked)
 		}
 		if err := contender.Close(); err != nil {
 			t.Fatalf("close contender: %v", err)
@@ -70,9 +70,9 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		// Same-size corruption of both tiers must be removed and healed from
 		// fake S3 rather than poisoning subsequent reads.
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v2", "sst", "*", "*"))
+			t, filepath.Join(cacheDir, "artifacts", "v4", "data", "*", "*.whole.*"))
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v2", "bloom", "*", "*"))
+			t, filepath.Join(cacheDir, "artifacts", "v4", "meta", "*", "*.bloom.*"))
 		healingReader := openArtifactCacheTestReader(t, ctx, db, cacheDir, 0)
 		assertArtifactCacheRecoveredTiers(t, healingReader, 1, 1)
 		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
@@ -85,11 +85,11 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("decoded Bloom L1 did not repopulate: %+v", stats)
 		}
 		assertArtifactCacheTestValue(t, ctx, healingReader, "accounts/001", "Ada")
-		if stats := healingReader.SSTCacheStats(); stats.Corruptions != 1 {
-			t.Fatalf("SST corruption stats=%+v", stats)
+		if stats := healingReader.DiskCacheStats(); stats.SSTDrops != 1 || stats.Data.Corruptions != 0 {
+			t.Fatalf("damaged SST stats=%+v", stats)
 		}
-		if stats := healingReader.BloomDiskCacheStats(); stats.Corruptions != 1 {
-			t.Fatalf("Bloom corruption stats=%+v", stats)
+		if stats := healingReader.DiskCacheStats().Meta; stats.Corruptions != 1 {
+			t.Fatalf("meta tier corruption stats=%+v", stats)
 		}
 		if err := healingReader.Close(); err != nil {
 			t.Fatalf("close healing Reader: %v", err)
@@ -114,18 +114,18 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("cache-only decoded Bloom L1 did not reload from L2: %+v", stats)
 		}
 		assertArtifactCacheTestValue(t, ctx, cacheOnlyReader, "accounts/001", "Ada")
-		if stats := cacheOnlyReader.SSTCacheStats(); stats.Hits == 0 {
-			t.Fatalf("cache-only SST stats=%+v", stats)
+		if stats := cacheOnlyReader.DiskCacheStats().Data; stats.Hits == 0 {
+			t.Fatalf("cache-only data tier stats=%+v", stats)
 		}
-		if stats := cacheOnlyReader.BloomDiskCacheStats(); stats.Hits == 0 {
-			t.Fatalf("cache-only Bloom stats=%+v", stats)
+		if stats := cacheOnlyReader.DiskCacheStats().Meta; stats.Hits == 0 {
+			t.Fatalf("cache-only meta tier stats=%+v", stats)
 		}
 	})
 
 	t.Run("format reset preserves unrelated files", func(t *testing.T) {
 		cacheDir := filepath.Join(cacheRoot, "format-reset")
 		artifactRoot := filepath.Join(cacheDir, "artifacts")
-		legacyPath := filepath.Join(artifactRoot, "v1", "sst", "aa", "legacy.sst")
+		legacyPath := filepath.Join(artifactRoot, "v2", "sst", "aa", "legacy.sst")
 		if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
 			t.Fatalf("create legacy layout: %v", err)
 		}
@@ -157,7 +157,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("oversized SST bypass", func(t *testing.T) {
+	t.Run("SST larger than the data tier is read in chunks", func(t *testing.T) {
 		cacheDir := filepath.Join(cacheRoot, "oversized")
 		db := openArtifactCacheTestDB(t, ctx, bucketURL, "oversized")
 		defer db.Close()
@@ -167,20 +167,22 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("replay oversized manifest: SSTs=%d err=%v", len(manifest.L0SSTs), err)
 		}
 		meta := manifest.L0SSTs[0]
-		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, meta.Size-1)
+		// The data tier, seven eighths of the budget, is smaller than the SST,
+		// so it is never cached whole.
+		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, meta.Size)
 		defer reader.Close()
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
-		stats := reader.SSTCacheStats()
-		if stats.EntryCount != 0 || stats.Bytes != 0 || stats.Bypasses != 1 ||
-			stats.Failures != 0 {
-			t.Fatalf("oversized bypass stats=%+v", stats)
+		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
+		stats := reader.DiskCacheStats().Data
+		if stats.Bytes > stats.MaxBytes || stats.Failures != 0 || stats.Bypasses != 0 {
+			t.Fatalf("oversized SST data tier stats=%+v", stats)
 		}
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
 	})
 
-	t.Run("evicts SST still in use", func(t *testing.T) {
-		cacheDir := filepath.Join(cacheRoot, "evict-in-use")
-		db := openArtifactCacheTestDB(t, ctx, bucketURL, "evict-in-use")
+	t.Run("evicted SST is fetched again", func(t *testing.T) {
+		cacheDir := filepath.Join(cacheRoot, "evict")
+		db := openArtifactCacheTestDB(t, ctx, bucketURL, "evict")
 		defer db.Close()
 		writeArtifactCacheTestBatches(t, ctx, db, []map[string]string{
 			{"a": "first"},
@@ -188,46 +190,27 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		})
 		manifest, err := db.manifestStore.ReplayWithArtifactValidation(ctx)
 		if err != nil {
-			t.Fatalf("replay evict-in-use manifest: %v", err)
+			t.Fatalf("replay evict manifest: %v", err)
 		}
 		first := artifactCacheTestSSTForKey(t, manifest, []byte("a"))
 		second := artifactCacheTestSSTForKey(t, manifest, []byte("b"))
-		reader := openArtifactCacheTestReader(
-			t, ctx, db, cacheDir, max(first.Size, second.Size))
+		// A data tier that holds one SST but not two.
+		one := max(first.Size, second.Size)
+		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, (one*8+6)/7+8)
 		defer reader.Close()
 
-		if err := reader.cacheSST(ctx, &first, db.store.SSTPath(first.ID)); err != nil {
-			t.Fatalf("prime first SST: %v", err)
-		}
-		held, hit := reader.acquireSST(first)
-		if !hit {
-			t.Fatal("first SST not cached")
-		}
-		defer held.Close()
-
-		// Caching the second SST evicts the first while it is still open.
+		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")
 		assertArtifactCacheTestValue(t, ctx, reader, "b", "second")
-		stats := reader.SSTCacheStats()
-		if stats.EntryCount != 1 || stats.Bytes != second.Size ||
-			stats.Evictions != 1 || stats.Bypasses != 0 {
-			t.Fatalf("evict-in-use stats=%+v", stats)
+		stats := reader.DiskCacheStats().Data
+		if stats.EntryCount != 1 || stats.Evictions != 1 || stats.Bypasses != 0 {
+			t.Fatalf("evict stats=%+v", stats)
 		}
-		if reader.sstResident(first) {
-			t.Fatal("first SST still cached")
-		}
+		// The first SST is still open in memory; dropping it forces a reopen,
+		// which fetches it again.
+		reader.openSSTs.clear()
+		reader.blockCache.clear()
+		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
-
-		heldBytes := make([]byte, first.Size)
-		if _, err := held.ReadAt(heldBytes, 0); err != nil {
-			t.Fatalf("read evicted SST still in use: %v", err)
-		}
-		origin, _, err := db.store.Read(ctx, db.store.SSTPath(first.ID))
-		if err != nil {
-			t.Fatalf("read first SST from origin: %v", err)
-		}
-		if !bytes.Equal(heldBytes, origin[:first.Size]) {
-			t.Fatal("evicted SST in use changed")
-		}
 	})
 }
 
@@ -250,12 +233,12 @@ func openArtifactCacheTestReader(
 	ctx context.Context,
 	db *DB,
 	cacheDir string,
-	sstMaxBytes int64,
+	diskBytes int64,
 ) *Reader {
 	t.Helper()
 	opts := DefaultReaderOpenOptions(cacheDir)
-	if sstMaxBytes > 0 {
-		opts.SSTCacheSize = sstMaxBytes
+	if diskBytes > 0 {
+		opts.DiskCacheSize = diskBytes
 	}
 	reader, err := db.OpenReader(ctx, opts)
 	if err != nil {
@@ -328,28 +311,30 @@ func assertArtifactCacheTestValue(
 	}
 }
 
+// assertArtifactCacheHealthyStats checks the disk cache holds the expected
+// entries: for small SSTs, one whole entry each in the data tier and one Bloom
+// entry each in the meta tier.
 func assertArtifactCacheHealthyStats(
 	t *testing.T,
 	reader *Reader,
-	wantSSTEntries int,
-	wantBloomEntries int,
+	wantDataEntries int,
+	wantMetaEntries int,
 ) {
 	t.Helper()
-	sst := reader.SSTCacheStats()
-	if sst.EntryCount != wantSSTEntries || sst.Bypasses != 0 ||
-		sst.Failures != 0 {
-		t.Fatalf("SST cache stats=%+v", sst)
+	stats := reader.DiskCacheStats()
+	if stats.Data.EntryCount != wantDataEntries || stats.Data.Bypasses != 0 ||
+		stats.Data.Failures != 0 {
+		t.Fatalf("data tier stats=%+v", stats.Data)
 	}
-	bloom := reader.BloomDiskCacheStats()
-	if bloom.EntryCount != wantBloomEntries || bloom.Bypasses != 0 ||
-		bloom.Failures != 0 {
-		t.Fatalf("Bloom cache stats=%+v", bloom)
+	if stats.Meta.EntryCount != wantMetaEntries || stats.Meta.Bypasses != 0 ||
+		stats.Meta.Failures != 0 {
+		t.Fatalf("meta tier stats=%+v", stats.Meta)
 	}
 }
 
 func assertArtifactCacheIncomingEmpty(t *testing.T, cacheDir string) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v2", "incoming"))
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v4", "incoming"))
 	if err != nil {
 		t.Fatalf("read incoming cache directory: %v", err)
 	}

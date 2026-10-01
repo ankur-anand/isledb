@@ -9,23 +9,23 @@ import (
 )
 
 // blockCache keeps SST blocks in memory after checksum and decompression, in
-// Pebble's block cache, so a hit costs neither and allocates nothing. It
-// serves every SST read, whether the SST is on local disk or read by range.
+// Pebble's block cache, so a hit costs neither and allocates nothing.
 //
-// Pebble keys blocks by file number and offset. Each SST ID gets a number from
-// a counter that never repeats, the same for every open of that SST, so local
-// and range reads of one SST share its blocks. SSTs never change, so cached
-// blocks never go stale; numbers are dropped, and their blocks evicted, when
-// an SST leaves the manifest or turns out corrupt.
+// Pebble keys blocks by file number and offset. Each SST ID gets a number
+// from a counter that never repeats, kept across opens, so an SST reopened
+// after leaving the open-SST cache still finds its blocks. An SST forgets its
+// number, and its blocks are evicted, when it is reported corrupt, or when it
+// has left the manifest and is not open; a later open takes a new number, so
+// blocks cached under the old one can never be served again.
 type blockCache struct {
 	cache    *pebble.Cache
 	maxBytes int64
 	// opts carries the cache handle, whose type is internal to Pebble; it is
-	// copied per SST with that SST's file number.
+	// copied per open SST with that SST's file number.
 	opts sstable.ReaderOptions
+	next uint64
 
 	mu    sync.Mutex
-	next  uint64
 	files map[string]uint64
 
 	// opens counts SST opens, whose metadata lookups stats leaves out.
@@ -45,29 +45,36 @@ func newBlockCache(size int64) *blockCache {
 	return b
 }
 
-// readerOptions returns sstable reader options that read and fill the cache
-// under sstID's file number. A nil cache returns options without one.
-func (b *blockCache) readerOptions(sstID string) sstable.ReaderOptions {
+// fileNum returns sstID's block cache file number, assigning one on first
+// use.
+func (b *blockCache) fileNum(sstID string) uint64 {
 	if b == nil {
-		return sstable.ReaderOptions{}
+		return 0
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	n, ok := b.files[sstID]
 	if !ok {
 		b.next++
 		n = b.next
 		b.files[sstID] = n
 	}
-	b.mu.Unlock()
+	return n
+}
+
+// readerOptions returns sstable reader options that read and fill the cache
+// under file number n. A nil cache returns options without one.
+func (b *blockCache) readerOptions(n uint64) sstable.ReaderOptions {
+	if b == nil {
+		return sstable.ReaderOptions{}
+	}
 	opts := b.opts
 	setFileNum(&opts.CacheOpts.FileNum, n)
 	return opts
 }
 
-// evict drops sstID's cached blocks. A later open gets a new file number;
-// blocks a racing read adds under the old one are never read again and age
-// out.
-func (b *blockCache) evict(sstID string) {
+// forget evicts sstID's blocks and drops its number.
+func (b *blockCache) forget(sstID string) {
 	if b == nil {
 		return
 	}
@@ -80,10 +87,10 @@ func (b *blockCache) evict(sstID string) {
 	}
 }
 
-// retain evicts the blocks of every SST not in m, as SSTs leave the manifest.
-// A read view still holding an older manifest can read a retired SST; it just
-// misses the cache.
-func (b *blockCache) retain(m *manifestState) {
+// prune forgets every SST that is neither in m nor open, as SSTs leave the
+// manifest, keeping the number map bounded. An SST still open, as one a
+// snapshot is reading, keeps its blocks.
+func (b *blockCache) prune(m *manifestState, open func(sstID string) bool) {
 	if b == nil || m == nil {
 		return
 	}
@@ -96,17 +103,18 @@ func (b *blockCache) retain(m *manifestState) {
 			live[sst.ID] = struct{}{}
 		}
 	}
-	var retired []uint64
 	b.mu.Lock()
-	for id, n := range b.files {
+	var retired []string
+	for id := range b.files {
 		if _, ok := live[id]; !ok {
-			retired = append(retired, n)
-			delete(b.files, id)
+			retired = append(retired, id)
 		}
 	}
 	b.mu.Unlock()
-	for _, n := range retired {
-		evictFile(b.opts.CacheOpts.CacheHandle.EvictFile, n)
+	for _, id := range retired {
+		if !open(id) {
+			b.forget(id)
+		}
 	}
 }
 

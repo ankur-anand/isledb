@@ -4,12 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -18,10 +15,8 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/cachestore"
-	"github.com/ankur-anand/isledb/internal/filecache"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 )
@@ -29,25 +24,17 @@ import (
 type Reader struct {
 	store         *blobstore.Store
 	manifestStore *manifest.Store
-	fileCache     *filecache.Cache
+	diskCache     *diskcache.Cache
+	fetcher       *sstFetcher
 	blockCache    *blockCache
 	bloomCache    *bloomFilterCache
-	metaCache     *sstMetaCache
 	openSSTs      *openSSTCache
-	// stopFileListener unregisters the open-SST cache from disk cache
-	// removals.
-	stopFileListener func()
-	bloomLoads       coalescedLoadGroup
-	sstLoads         coalescedLoadGroup
-	metaLoads        coalescedLoadGroup
-	manifestLoads    coalescedLoadGroup
+	bloomLoads    coalescedLoadGroup
+	// sstDrops counts dropSST calls.
+	sstDrops      atomic.Int64
+	manifestLoads coalescedLoadGroup
 
-	rangeRead           bool
-	rangeReadMinSSTSize int64
-	rangeReadAheadMin   int64
-	rangeReadAheadMax   int64
-
-	ownsFileCache bool
+	ownsDiskCache bool
 	cacheDir      string
 
 	lifecycleMu            sync.RWMutex
@@ -90,14 +77,14 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		return nil, err
 	}
 
-	fileCache, ownsFileCache, err := initReaderFileCache(opts)
+	disk, ownsDiskCache, err := initReaderDiskCache(opts)
 	if err != nil {
 		return nil, err
 	}
-	cleanupFileCache := true
+	cleanupDiskCache := true
 	defer func() {
-		if cleanupFileCache && ownsFileCache {
-			_ = fileCache.Close()
+		if cleanupDiskCache && ownsDiskCache {
+			_ = disk.Close()
 		}
 	}()
 
@@ -106,39 +93,26 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
-		store:               store,
-		manifestStore:       ms,
-		manifest:            m,
-		version:             versionFromCurrent(current),
-		changeFeed:          changeFeed,
-		changeHead:          changeHead,
-		viewPolicy:          viewPolicy,
-		viewRefreshAt:       viewRefreshAt,
-		viewExpiresAt:       viewExpiresAt,
-		fileCache:           fileCache,
-		blockCache:          newBlockCache(cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)),
-		bloomCache:          newBloomFilterCache(opts.BloomCacheSize),
-		metaCache:           newSSTMetaCache(opts.MetaCacheSize),
-		openSSTs:            newOpenSSTCache(openSSTCacheSize(opts.OpenSSTCacheSize)),
-		rangeRead:           opts.RangeRead,
-		rangeReadMinSSTSize: cmp.Or(opts.RangeReadMinSSTSize, defaultRangeReadMinSSTSize),
-		rangeReadAheadMin:   cmp.Or(opts.RangeReadAheadMin, defaultRangeReadAheadMin),
-		rangeReadAheadMax:   cmp.Or(opts.RangeReadAheadMax, defaultRangeReadAheadMax),
-		ownsFileCache:       ownsFileCache,
-		cacheDir:            opts.CacheDir,
-		metrics:             opts.Metrics,
-	}
-	if fileCache != nil && reader.openSSTs != nil {
-		// A local SST held open keeps its file's disk space after the disk
-		// cache evicts it, so the open SST is dropped with the file.
-		reader.stopFileListener = fileCache.OnRemove(func(kind filecache.Kind, sum [sha256.Size]byte) {
-			if kind == filecache.KindSST {
-				reader.openSSTs.removeLocalFile(sum)
-			}
-		})
+		store:         store,
+		manifestStore: ms,
+		manifest:      m,
+		version:       versionFromCurrent(current),
+		changeFeed:    changeFeed,
+		changeHead:    changeHead,
+		viewPolicy:    viewPolicy,
+		viewRefreshAt: viewRefreshAt,
+		viewExpiresAt: viewExpiresAt,
+		diskCache:     disk,
+		fetcher:       newSSTFetcher(store, disk, opts.Metrics),
+		blockCache:    newBlockCache(cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)),
+		bloomCache:    newBloomFilterCache(opts.BloomCacheSize),
+		openSSTs:      newOpenSSTCache(openSSTCacheSize(opts.OpenSSTCacheSize)),
+		ownsDiskCache: ownsDiskCache,
+		cacheDir:      opts.CacheDir,
+		metrics:       opts.Metrics,
 	}
 	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
-	cleanupFileCache = false
+	cleanupDiskCache = false
 	return reader, nil
 }
 
@@ -151,40 +125,41 @@ func openSSTCacheSize(size int) int {
 	return size
 }
 
-// initReaderFileCache opens the local SST and Bloom cache under CacheDir,
-// unless the caller supplied one.
-func initReaderFileCache(opts readerOptions) (*filecache.Cache, bool, error) {
-	if opts.FileCache != nil {
-		return opts.FileCache, false, nil
+// initReaderDiskCache opens the disk cache under CacheDir, unless the caller
+// supplied one. The budget is split between its tiers: an eighth for SST
+// metadata and Bloom filters, the rest for data.
+func initReaderDiskCache(opts readerOptions) (*diskcache.Cache, bool, error) {
+	if opts.DiskCache != nil {
+		return opts.DiskCache, false, nil
 	}
 	if opts.CacheDir == "" {
 		return nil, false, errors.New("cache dir is required")
 	}
-	sstBudget := cmp.Or(opts.SSTCacheSize, defaultSSTCacheSize)
-	bloomBudget := cmp.Or(opts.BloomDiskCacheSize, defaultBloomDiskCacheSize)
+	budget := cmp.Or(opts.DiskCacheSize, defaultDiskCacheSize)
+	metaBudget := max(budget/8, 1)
 	dir := filepath.Join(opts.CacheDir, "artifacts")
-	cache, err := filecache.Open(filecache.Options{
-		Dir:           dir,
-		SSTMaxBytes:   sstBudget,
-		BloomMaxBytes: bloomBudget,
+	cache, err := diskcache.Open(diskcache.Options{
+		Dir:          dir,
+		MetaMaxBytes: metaBudget,
+		DataMaxBytes: max(budget-metaBudget, 1),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("open file cache: %w", err)
+		return nil, false, fmt.Errorf("open disk cache: %w", err)
 	}
-	warnIfCacheDirTooSmall(dir, cache, sstBudget+bloomBudget)
+	warnIfCacheDirTooSmall(dir, cache, budget)
 	return cache, true, nil
 }
 
 // warnIfCacheDirTooSmall logs when the cache's filesystem cannot hold its
-// budgets: the space still free plus what the cache already holds is less
-// than the budgets combined. The cache keeps working; it evicts sooner, and
-// downloads that cannot be cached are served without being kept.
-func warnIfCacheDirTooSmall(dir string, cache *filecache.Cache, budget int64) {
-	free, err := filecache.FreeBytes(dir)
+// budget: the space still free plus what the cache already holds is less than
+// the budget. The cache keeps working; it evicts sooner, and entries it cannot
+// write are served without being kept.
+func warnIfCacheDirTooSmall(dir string, cache *diskcache.Cache, budget int64) {
+	free, err := diskcache.FreeBytes(dir)
 	if err != nil {
 		return
 	}
-	held := cache.Stats(filecache.KindSST).Bytes + cache.Stats(filecache.KindBloom).Bytes
+	held := cache.Stats(diskcache.TierMeta).Bytes + cache.Stats(diskcache.TierData).Bytes
 	if available := free + uint64(held); available < uint64(budget) {
 		slog.Warn("isledb: cache directory has less space than the disk cache budget",
 			"dir", dir, "available_bytes", available, "budget_bytes", budget)
@@ -245,9 +220,9 @@ func (r *Reader) publishManifestView(
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
 	// Manifest states and SST IDs are immutable after publication. Swap the view
-	// and its metadata under one short critical section. Artifact and decoded
-	// Bloom caches remain byte-bounded and age retired entries through their
-	// LRUs; the block cache drops retired SSTs' blocks right after.
+	// and its metadata under one short critical section. Caches age retired
+	// SSTs out through their own LRUs; the block cache only forgets the file
+	// numbers of retired SSTs no longer open, keeping its map bounded.
 	r.mu.Lock()
 	r.manifest = m
 	r.version = versionFromCurrent(current)
@@ -257,17 +232,8 @@ func (r *Reader) publishManifestView(
 	r.viewExpiresAt = expiresAt
 	r.mu.Unlock()
 
-	r.retainSSTs(m)
+	r.blockCache.prune(m, r.openSSTs.isOpen)
 	r.armManifestExpiry(refreshAt, expiresAt)
-}
-
-// retainSSTs drops the open readers and cached blocks of SSTs not in m. Each
-// open reader reads blocks under the file number it was opened with, so the
-// two are dropped together: a later read opens the SST afresh, under a new
-// number.
-func (r *Reader) retainSSTs(m *manifestState) {
-	r.openSSTs.retain(m)
-	r.blockCache.retain(m)
 }
 
 func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
@@ -340,26 +306,17 @@ func (r *Reader) Close() error {
 	r.closeOpenIterators()
 	r.manifestLoads.Close(ErrReaderClosed)
 	r.bloomLoads.Close(ErrReaderClosed)
-	r.sstLoads.Close(ErrReaderClosed)
-	r.metaLoads.Close(ErrReaderClosed)
+	r.fetcher.close()
 
 	var firstErr error
-
-	// Close open SSTs, and their local files, before the disk cache.
-	if r.stopFileListener != nil {
-		r.stopFileListener()
-	}
 	r.openSSTs.clear()
-	if r.fileCache != nil && r.ownsFileCache {
-		if err := r.fileCache.Close(); err != nil && firstErr == nil {
+	r.blockCache.close()
+	r.bloomCache.clear()
+	if r.diskCache != nil && r.ownsDiskCache {
+		if err := r.diskCache.Close(); err != nil {
 			firstErr = err
 		}
 	}
-
-	r.blockCache.close()
-	r.bloomCache.clear()
-	r.metaCache.clear()
-
 	return firstErr
 }
 
@@ -742,17 +699,26 @@ func (r *Reader) getFromSST(
 	key []byte,
 ) (value []byte, found bool, tombstone bool, err error) {
 	if hasUsableBloom(sstMeta) {
-		if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
-			if !filter.mayContain(bloomHashKey(key)) {
-				return nil, false, false, nil
-			}
-		} else if !r.sstResident(sstMeta) {
-			if !r.bloomMayContain(ctx, sstMeta, key) {
-				return nil, false, false, nil
-			}
+		if !r.bloomMayContain(ctx, sstMeta, key) {
+			return nil, false, false, nil
 		}
 	}
+	value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
+	if damaged(err) {
+		// Damage found while reading dropped the SST, so the retry reads it
+		// afresh: damaged cached bytes cost one more fetch, never a failed
+		// lookup. Any other error, as damage at the origin or a value that
+		// does not decode, fails the same way again.
+		value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
+	}
+	return value, found, tombstone, err
+}
 
+func (r *Reader) lookupSST(
+	ctx context.Context,
+	sstMeta sstMetadata,
+	key []byte,
+) (value []byte, found bool, tombstone bool, err error) {
 	_, iter, err := r.openSSTIterBounded(ctx, sstMeta, key, nil, false)
 	if err != nil {
 		return nil, false, false, err
@@ -831,33 +797,20 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 	return filter.mayContain(bloomHashKey(key))
 }
 
-// loadBloomFilter reads an SST's filter from the local cache, or else from
-// object storage, verifying it against the manifest checksum before use; a
-// corrupted filter could otherwise report a present key as absent. Both
-// sources return freshly read bytes, which the filter then owns.
+// loadBloomFilter reads an SST's filter from the disk cache, or else from
+// object storage, verified against the manifest checksum before use; a
+// corrupted filter could otherwise report a present key as absent.
 func (r *Reader) loadBloomFilter(ctx context.Context, sstMeta sstMetadata) (sstBloomFilter, error) {
-	if data, ok := r.readCachedBloom(sstMeta); ok {
-		filter, err := parseSSTBloomFilter(data)
-		if err == nil {
-			return filter, nil
-		}
+	data, err := r.fetcher.bloom(ctx, r.fetcher.object(sstMeta))
+	if err != nil {
+		return sstBloomFilter{}, err
+	}
+	filter, err := parseSSTBloomFilter(data)
+	if err != nil {
 		// The bytes match the manifest checksum, so the SST's filter itself is
 		// unusable; fetching it again would fail the same way.
 		return sstBloomFilter{}, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
 	}
-
-	data, err := r.store.ReadRange(ctx, r.store.SSTPath(sstMeta.ID), sstMeta.Bloom.Offset, sstMeta.Bloom.Length)
-	if err != nil {
-		return sstBloomFilter{}, fmt.Errorf("read bloom %s: %w", sstMeta.ID, err)
-	}
-	if err := validateBloomChecksum(sstMeta.Bloom.Checksum, data); err != nil {
-		return sstBloomFilter{}, fmt.Errorf("validate bloom %s: %w", sstMeta.ID, err)
-	}
-	filter, err := parseSSTBloomFilter(data)
-	if err != nil {
-		return sstBloomFilter{}, fmt.Errorf("decode bloom %s: %w", sstMeta.ID, err)
-	}
-	r.cacheBloom(sstMeta, data)
 	return filter, nil
 }
 
@@ -872,113 +825,50 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 	return 0, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
 }
 
-// openSSTIterBounded opens an iterator over one SST's keys in [lower, upper).
-// private makes it read blocks into buffers of its own rather than adding
-// them to the block cache; see openSSTIterWithReadable.
+// openSSTIterBounded opens an iterator over one SST's keys in [lower, upper),
+// reusing the SST if it is already open. private makes the iterator fill no
+// cache: it reads blocks into buffers of its own and stores no fetched bytes
+// on disk; the long tail of a scan reads this way (see scanSSTSource).
+//
+// An SST whose open or iterator fails on damage is dropped, as is one whose
+// iterator later fails on damage (see sstIterWithClose.Close).
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
-	if sst := r.openSSTs.acquire(sstMeta.ID); sst != nil {
-		if sst.local || !r.sstResident(sstMeta) {
-			return r.newSSTIter(ctx, sst, lower, upper, private)
+	if _, err := r.sstPayloadSize(sstMeta); err != nil {
+		return nil, nil, err
+	}
+	sst := r.openSSTs.acquire(sstMeta.ID)
+	if sst == nil {
+		var err error
+		if sst, err = r.openSST(ctx, sstMeta); err != nil {
+			if damaged(err) {
+				r.dropSST(sstMeta)
+			}
+			return nil, nil, err
 		}
-		// The SST was read by range but has since been downloaded, for
-		// example by Prefetch: reopen it from the local file.
-		r.openSSTs.drop(sst)
-		sst.unref()
 	}
-	path := r.store.SSTPath(sstMeta.ID)
-	var cachedOpenErr error
-
-	if file, ok := r.acquireSST(sstMeta); ok {
-		r.metrics.ObserveSSTCacheLookup(true)
-		reader, iter, err := r.openSSTIterFromFile(ctx, sstMeta, file, lower, upper, private, func() { _ = file.Close() })
-		if err == nil {
-			return reader, iter, nil
-		}
-		// A cached SST that cannot be opened is dropped, and the read makes one
-		// attempt against object storage below.
-		r.reportCorruptSST(sstMeta)
-		cachedOpenErr = err
-	} else {
-		r.metrics.ObserveSSTCacheLookup(false)
-	}
-
-	if ok, err := r.shouldRangeRead(sstMeta); err != nil {
-		return nil, nil, errors.Join(cachedOpenErr, err)
-	} else if ok {
-		reader, iter, err := r.openSSTIterRange(ctx, sstMeta, path, lower, upper, private)
-		if err != nil {
-			err = errors.Join(cachedOpenErr, err)
-		}
-		return reader, iter, err
-	}
-
-	loaded, err := r.loadSSTFile(ctx, &sstMeta, path)
-	if err != nil {
-		return nil, nil, errors.Join(cachedOpenErr, err)
-	}
-	reader, iter, err := r.openSSTIterFromFile(
-		ctx, sstMeta, loaded.file, lower, upper, private, func() { _ = loaded.Close() })
-	if err != nil {
-		r.reportCorruptSST(sstMeta)
-		err = errors.Join(cachedOpenErr, err)
+	reader, iter, err := r.newSSTIter(ctx, sst, lower, upper, private)
+	if damaged(err) {
+		r.dropSST(sstMeta)
 	}
 	return reader, iter, err
 }
 
-// shouldRangeRead reports whether an SST is read by byte range rather than
-// downloaded whole: only when range reads are enabled and the SST is at least
-// the minimum size.
-func (r *Reader) shouldRangeRead(sstMeta sstMetadata) (bool, error) {
-	if !r.rangeRead {
-		return false, nil
-	}
-	size, err := r.sstPayloadSize(sstMeta)
+// openSST opens an SST and caches it open, returning it with a reference for
+// the caller. Its blocks are cached under the SST's block cache file number,
+// so a reopen finds them.
+func (r *Reader) openSST(ctx context.Context, sstMeta sstMetadata) (*openSST, error) {
+	readable := r.fetcher.readable(r.fetcher.object(sstMeta))
+	readable.holdMetadata()
+	reader, err := sstable.NewReader(ctx, readable, r.blockCache.readerOptions(r.blockCache.fileNum(sstMeta.ID)))
+	readable.releaseMetadata()
 	if err != nil {
-		return false, err
-	}
-	return size >= r.rangeReadMinSSTSize, nil
-}
-
-func (r *Reader) openSSTIterRange(ctx context.Context, sstMeta sstMetadata, path string, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
-	readable := newSSTRangeReadable(r.store, path, sstMeta.ID, sstMeta.Size, &r.metaLoads, r.metrics)
-	readable.useMetaRegion(sstMeta.MetaOffset)
-	readable.useMetaCache(r.metaCache)
-	readable.useReadAhead(r.rangeReadAheadMin, r.rangeReadAheadMax)
-	return r.openSSTIterWithReadable(ctx, sstMeta, readable, false, lower, upper, private, nil, nil)
-}
-
-// openSSTIterFromFile opens an SST from a local cache file. If a read later
-// reports corruption, the SST is dropped from the cache so the next read
-// downloads it again instead of failing the same way.
-func (r *Reader) openSSTIterFromFile(ctx context.Context, sstMeta sstMetadata, file *os.File, lower, upper []byte, private bool, release func()) (*sstable.Reader, sstable.Iterator, error) {
-	return r.openSSTIterWithReadable(
-		ctx, sstMeta, newSSTFileReadable(file, sstMeta.Size), true, lower, upper, private, release,
-		func() { r.reportCorruptSST(sstMeta) })
-}
-
-// openSSTIterWithReadable opens an iterator over readable, reading blocks
-// through the block cache. By default the iterator adds the blocks it reads to
-// the cache. A private iterator reads into buffers of its own instead: it
-// still uses blocks already cached, but the blocks it reads never evict
-// others; the long tail of a scan reads this way (see scanSSTSource). release,
-// if set, runs when the iterator closes; onCorruption, if set, runs when the
-// iterator failed on corrupt data.
-func (r *Reader) openSSTIterWithReadable(ctx context.Context, sstMeta sstMetadata, readable objstorage.Readable, local bool, lower, upper []byte, private bool, release, onCorruption func()) (*sstable.Reader, sstable.Iterator, error) {
-	reader, err := sstable.NewReader(ctx, readable, r.blockCache.readerOptions(sstMeta.ID))
-	if err != nil {
-		_ = readable.Close()
-		if release != nil {
-			release()
-		}
-		return nil, nil, err
+		return nil, err
 	}
 	r.blockCache.noteOpen()
-	sst := &openSST{id: sstMeta.ID, reader: reader, local: local, release: release, onCorruption: onCorruption}
-	if local {
-		sst.sum, _ = sstFileDescriptor(sstMeta).Sum()
-	}
-	sst = r.openSSTs.add(sst)
-	return r.newSSTIter(ctx, sst, lower, upper, private)
+	return r.openSSTs.add(&openSST{
+		id: sstMeta.ID, reader: reader,
+		onDamage: func() { r.dropSST(sstMeta) },
+	}), nil
 }
 
 // newSSTIter opens an iterator over an open SST, taking over the caller's
@@ -997,6 +887,9 @@ func (r *Reader) newSSTIter(ctx context.Context, sst *openSST, lower, upper []by
 		pool = new(block.BufferPool)
 		pool.Init(5)
 		iterOpts.Env.Block.BufferPool = pool
+	}
+	if private {
+		ctx = withPrivateReads(ctx)
 	}
 	iter, err := sst.reader.NewPointIter(ctx, iterOpts)
 	if err != nil {
@@ -1030,102 +923,50 @@ func (it *sstIterWithClose) Close() error {
 	if it.pool != nil {
 		it.pool.Release()
 	}
-	if it.sst.onCorruption != nil && (pebble.IsCorruptionError(iterErr) || pebble.IsCorruptionError(err)) {
-		it.sst.onCorruption()
+	if it.sst.onDamage != nil && (damaged(iterErr) || damaged(err)) {
+		it.sst.onDamage()
 	}
 	it.sst.unref()
 	return err
 }
 
-// cacheSST downloads an SST into the local cache.
-func (r *Reader) cacheSST(ctx context.Context, meta *sstMetadata, path string) error {
-	file, err := r.downloadSST(ctx, meta, path)
-	if err != nil {
-		return err
-	}
-	return file.Close()
+// DiskCacheStats reports the disk cache's two tiers.
+type DiskCacheStats struct {
+	// Meta holds SST metadata regions and Bloom filters.
+	Meta CacheStats
+	// Data holds small SSTs whole and chunks of larger SSTs' data.
+	Data CacheStats
+	// SSTDrops counts reads that failed on what looked like damaged bytes,
+	// each dropping the SST from every layer so it is fetched again. It
+	// counts drops, not distinct SSTs: concurrent readers of one damaged SST
+	// each count, and an SST bad at the origin counts on every read.
+	SSTDrops int64
 }
 
-// loadSSTFile returns the SST from the local cache or downloads it. Concurrent
-// loads of one SST share a single download.
-func (r *Reader) loadSSTFile(
-	ctx context.Context,
-	meta *sstMetadata,
-	path string,
-) (*sstFileLease, error) {
-	if meta == nil {
-		return nil, errors.New("load sst: missing metadata")
+// DiskCacheStats reports the persistent disk cache under CacheDir.
+func (r *Reader) DiskCacheStats() DiskCacheStats {
+	if r.diskCache == nil {
+		return DiskCacheStats{}
 	}
-	value, err := r.sstLoads.Do(ctx, path, func(loadCtx context.Context) (any, error) {
-		if r.sstResident(*meta) {
-			if file, ok := r.acquireSST(*meta); ok {
-				return newSharedSSTFile(file), nil
-			}
-		}
-		file, err := r.downloadSST(loadCtx, meta, path)
-		if err != nil {
-			return nil, err
-		}
-		return newSharedSSTFile(file), nil
-	})
-	if err != nil {
-		return nil, err
+	return DiskCacheStats{
+		Meta:     diskTierStats(r.diskCache.Stats(diskcache.TierMeta)),
+		Data:     diskTierStats(r.diskCache.Stats(diskcache.TierData)),
+		SSTDrops: r.sstDrops.Load(),
 	}
-	lease, ok := value.(*sstFileLease)
-	if !ok || lease == nil {
-		return nil, fmt.Errorf("load sst %s: missing file lease", meta.ID)
-	}
-	return lease, nil
 }
 
-// downloadSST streams an SST into the local cache and returns it open for
-// reading. The file is served even when it could not be cached.
-func (r *Reader) downloadSST(ctx context.Context, meta *sstMetadata, path string) (file *os.File, err error) {
-	start := time.Now()
-	var downloadedBytes int64
-	defer func() {
-		r.metrics.ObserveSSTDownload(time.Since(start), downloadedBytes, err)
-	}()
-	if meta == nil {
-		return nil, fmt.Errorf("download sst %s: missing metadata", path)
+func diskTierStats(stats diskcache.Stats) CacheStats {
+	return CacheStats{
+		Hits:        stats.Hits,
+		Misses:      stats.Misses,
+		Bytes:       stats.Bytes,
+		MaxBytes:    stats.MaxBytes,
+		EntryCount:  stats.Entries,
+		Evictions:   stats.Evictions,
+		Corruptions: stats.Corruptions,
+		Bypasses:    stats.Bypasses,
+		Failures:    stats.Failures,
 	}
-	if r.fileCache == nil {
-		return nil, fmt.Errorf("download sst %s: no local cache", meta.ID)
-	}
-
-	w, err := r.fileCache.Create(sstFileDescriptor(*meta))
-	if err != nil {
-		return nil, fmt.Errorf("begin cache fill for sst %s: %w", meta.ID, err)
-	}
-	// The object may hold the Bloom sidecar and trailer after the SST, so read
-	// exactly the manifest's [0, Size) extent.
-	stream, err := r.store.ReadRangeStream(ctx, path, 0, meta.Size)
-	if err != nil {
-		w.Abort()
-		return nil, fmt.Errorf("read sst %s: %w", path, err)
-	}
-	downloadedBytes, err = io.Copy(w, stream)
-	if closeErr := stream.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		w.Abort()
-		return nil, fmt.Errorf("download sst %s: %w", path, err)
-	}
-	file, err = w.Commit()
-	switch {
-	case errors.Is(err, filecache.ErrChecksumMismatch):
-		return nil, fmt.Errorf("validate sst %s: checksum mismatch: %w", meta.ID, err)
-	case errors.Is(err, filecache.ErrSizeMismatch):
-		return nil, fmt.Errorf("validate sst %s: size mismatch: %w", meta.ID, err)
-	case err != nil:
-		return nil, fmt.Errorf("cache sst %s: %w", meta.ID, err)
-	}
-	return file, nil
-}
-
-func (r *Reader) SSTCacheStats() CacheStats {
-	return r.fileCacheStats(filecache.KindSST)
 }
 
 // OpenSSTCacheStats reports the SSTs kept open across reads: hits are reads
@@ -1142,20 +983,9 @@ func (r *Reader) BlockCacheStats() CacheStats {
 	return r.blockCache.stats()
 }
 
-// MetaCacheStats reports the in-memory cache of SST metadata regions used by
-// range reads.
-func (r *Reader) MetaCacheStats() CacheStats {
-	return r.metaCache.stats()
-}
-
-// BloomCacheStats reports decoded Bloom-filter L1 occupancy.
+// BloomCacheStats reports the parsed Bloom filters kept in memory.
 func (r *Reader) BloomCacheStats() CacheStats {
 	return r.bloomCache.stats()
-}
-
-// BloomDiskCacheStats reports verified raw Bloom sidecar occupancy.
-func (r *Reader) BloomDiskCacheStats() CacheStats {
-	return r.fileCacheStats(filecache.KindBloom)
 }
 
 func (r *Reader) ManifestPageCacheStats() CacheStats {

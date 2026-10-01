@@ -12,7 +12,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
-	"github.com/ankur-anand/isledb/internal/filecache"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -56,6 +56,9 @@ func TestReaderDiagnosticLimiterBoundsLogsAndReportsSuppression(t *testing.T) {
 	}
 }
 
+// TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen reads a small SST,
+// which is cached whole with its Bloom filter, then deletes it from object
+// storage: a reopened reader serves both from disk.
 func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-artifact-persistence")
@@ -74,11 +77,9 @@ func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("initial Get value=%q found=%t err=%v", value, found, err)
 	}
-	if got := reader.SSTCacheStats().EntryCount; got != 1 {
-		t.Fatalf("SST disk entries=%d want=1", got)
-	}
-	if got := reader.BloomDiskCacheStats().EntryCount; got != 1 {
-		t.Fatalf("Bloom disk entries=%d want=1", got)
+	if stats := reader.DiskCacheStats(); stats.Data.EntryCount != 1 || stats.Meta.EntryCount != 1 {
+		t.Fatalf("disk entries data=%d meta=%d, want the whole SST and its Bloom filter",
+			stats.Data.EntryCount, stats.Meta.EntryCount)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
@@ -101,11 +102,11 @@ func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("recovered Get value=%q found=%t err=%v", value, found, err)
 	}
-	if stats := reopened.SSTCacheStats(); stats.EntryCount != 1 || stats.Hits == 0 {
-		t.Fatalf("recovered SST stats=%+v", stats)
+	if stats := reopened.DiskCacheStats().Data; stats.EntryCount != 1 || stats.Hits == 0 {
+		t.Fatalf("recovered data tier stats=%+v", stats)
 	}
-	if stats := reopened.BloomDiskCacheStats(); stats.EntryCount != 1 || stats.Hits == 0 {
-		t.Fatalf("recovered Bloom stats=%+v", stats)
+	if stats := reopened.DiskCacheStats().Meta; stats.EntryCount != 1 || stats.Hits == 0 {
+		t.Fatalf("recovered meta tier stats=%+v", stats)
 	}
 }
 
@@ -130,8 +131,8 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v2", "sst", "*", "*"))
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v2", "bloom", "*", "*"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v4", "data", "*", "*.whole.*"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v4", "meta", "*", "*.bloom.*"))
 
 	reopened, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {
@@ -145,11 +146,11 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("self-healed Get value=%q found=%t err=%v", value, found, err)
 	}
-	if stats := reopened.SSTCacheStats(); stats.Corruptions != 1 {
-		t.Fatalf("SST corruption stats=%+v", stats)
+	if stats := reopened.DiskCacheStats(); stats.SSTDrops != 1 || stats.Data.Corruptions != 0 {
+		t.Fatalf("damaged SST stats=%+v", stats)
 	}
-	if stats := reopened.BloomDiskCacheStats(); stats.Corruptions != 1 {
-		t.Fatalf("Bloom corruption stats=%+v", stats)
+	if stats := reopened.DiskCacheStats().Meta; stats.Corruptions != 1 {
+		t.Fatalf("meta tier corruption stats=%+v", stats)
 	}
 }
 
@@ -214,7 +215,7 @@ func TestPinnedSnapshotReadsRetiredArtifactsWithoutOrigin(t *testing.T) {
 	reader.publishManifestView(&manifestState{}, &manifest.Current{
 		MaxPinnedViewAge: time.Hour,
 	}, time.Now())
-	reader.clearBloomDiskCache()
+	reader.diskCache.Purge(diskcache.TierMeta)
 	if err := store.Delete(ctx, store.SSTPath(result.Meta.ID)); err != nil {
 		t.Fatal(err)
 	}
@@ -235,8 +236,8 @@ func TestReaderArtifactCacheExclusivelyLocksCacheDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir}); !errors.Is(err, filecache.ErrLocked) {
-		t.Fatalf("second Reader error=%v want=%v", err, filecache.ErrLocked)
+	if _, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir}); !errors.Is(err, diskcache.ErrLocked) {
+		t.Fatalf("second Reader error=%v want=%v", err, diskcache.ErrLocked)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)

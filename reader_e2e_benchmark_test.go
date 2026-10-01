@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -129,7 +130,7 @@ func BenchmarkFakeS3_KVReaderGet_16384x256B(b *testing.B) {
 
 	for _, cache := range []string{"cold", "warm"} {
 		b.Run(cache, func(b *testing.B) {
-			reader.clearSSTCache()
+			resetReaderCaches(reader)
 			if cache == "warm" {
 				assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
 			}
@@ -140,7 +141,7 @@ func BenchmarkFakeS3_KVReaderGet_16384x256B(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				if cache == "cold" {
 					b.StopTimer()
-					reader.clearSSTCache()
+					resetReaderCaches(reader)
 					b.StartTimer()
 				}
 				assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
@@ -165,7 +166,7 @@ func BenchmarkFakeS3_KVReaderScan_16384x256B(b *testing.B) {
 	reader, counts := prepareFakeS3KVReaderBenchmark(b, ctx, records, valueSize)
 	for _, cache := range []string{"cold", "warm"} {
 		b.Run(cache, func(b *testing.B) {
-			reader.clearSSTCache()
+			resetReaderCaches(reader)
 			if cache == "warm" {
 				assertKVReaderBenchmarkScan(b, ctx, reader, records)
 			}
@@ -176,7 +177,7 @@ func BenchmarkFakeS3_KVReaderScan_16384x256B(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				if cache == "cold" {
 					b.StopTimer()
-					reader.clearSSTCache()
+					resetReaderCaches(reader)
 					b.StartTimer()
 				}
 				assertKVReaderBenchmarkScan(b, ctx, reader, records)
@@ -760,6 +761,18 @@ func prepareFakeS3KVBenchmarkPointLevels(
 	}
 	b.Cleanup(func() { _ = store.Close() })
 
+	// Open the reader before writing SSTs: a prefix holding SSTs but no
+	// CURRENT manifest is refused.
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:       b.TempDir(),
+		BlockCacheSize: 64 << 20,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
+
 	values := benchmarkChangeFeedValues(rowsPerLevel, valueSize, true)
 	hitKeys := make(map[int][]byte, levelCount)
 	for level := 1; level <= levelCount; level++ {
@@ -813,18 +826,6 @@ func prepareFakeS3KVBenchmarkPointLevels(
 		b.Fatalf("validate point-level benchmark manifest: %v", err)
 	}
 
-	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:            b.TempDir(),
-		RangeRead:           true,
-		BlockCacheSize:      64 << 20,
-		RangeReadMinSSTSize: 1,
-		Metrics:             metrics,
-	})
-	if err != nil {
-		b.Fatalf("open reader: %v", err)
-	}
-
 	return kvPointLevelBenchmarkFixture{
 		reader: reader, state: state, counts: counts,
 		hitKeys: hitKeys, missingKey: missingKey, tombstoneKey: tombstoneKey,
@@ -856,6 +857,18 @@ func prepareFakeS3KVBenchmarkLeveled(
 		b.Fatalf("open store: %v", err)
 	}
 	b.Cleanup(func() { _ = store.Close() })
+
+	// Open the reader before writing SSTs: a prefix holding SSTs but no
+	// CURRENT manifest is refused.
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:       b.TempDir(),
+		BlockCacheSize: readerCacheMax,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
 
 	values := benchmarkChangeFeedValues(totalKeys, valueBytes, true)
 	state := &manifestState{}
@@ -896,18 +909,6 @@ func prepareFakeS3KVBenchmarkLeveled(
 
 	if err := state.ValidateLevels(); err != nil {
 		b.Fatalf("validate benchmark manifest: %v", err)
-	}
-
-	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:            b.TempDir(),
-		RangeRead:           true,
-		BlockCacheSize:      readerCacheMax,
-		RangeReadMinSSTSize: 1,
-		Metrics:             metrics,
-	})
-	if err != nil {
-		b.Fatalf("open reader: %v", err)
 	}
 
 	return kvLeveledBenchmarkFixture{
@@ -1006,6 +1007,18 @@ func prepareFakeS3KVBenchmarkL1(
 	}
 	b.Cleanup(func() { _ = store.Close() })
 
+	// Open the reader before writing SSTs: a prefix holding SSTs but no
+	// CURRENT manifest is refused.
+	metrics := DefaultReaderMetrics(nil)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir:       b.TempDir(),
+		BlockCacheSize: 64 << 20,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		b.Fatalf("open reader: %v", err)
+	}
+
 	level := manifest.Level{Number: 1, SSTs: make([]manifest.SSTMeta, 0, sstCount)}
 	value := []byte("value")
 	for i := 0; i < sstCount; i++ {
@@ -1028,17 +1041,6 @@ func prepareFakeS3KVBenchmarkL1(
 		b.Fatalf("validate benchmark manifest: %v", err)
 	}
 
-	metrics := DefaultReaderMetrics(nil)
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:            b.TempDir(),
-		RangeRead:           true,
-		BlockCacheSize:      64 << 20,
-		RangeReadMinSSTSize: 1,
-		Metrics:             metrics,
-	})
-	if err != nil {
-		b.Fatalf("open reader: %v", err)
-	}
 	return reader, state, counts, metrics
 }
 
@@ -1123,44 +1125,47 @@ func openFakeS3KVBenchmarkReader(
 	metrics := DefaultReaderMetrics(nil)
 	opts := DefaultReaderOpenOptions(b.TempDir())
 	opts.Metrics = metrics
-	switch mode {
-	case "whole-sst":
-		opts.RangeRead = false
-	case "range-read":
-		opts.BlockCacheSize = 16 << 20
-		opts.RangeReadMinSSTSize = 1
-	default:
-		b.Fatalf("unknown reader benchmark mode %q", mode)
-	}
 	reader, err := db.OpenReader(ctx, opts)
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
+	}
+	switch mode {
+	case "whole-sst":
+		reader.fetcher.smallLimit = math.MaxInt64
+	case "range-read":
+		reader.fetcher.smallLimit = 0
+	default:
+		b.Fatalf("unknown reader benchmark mode %q", mode)
 	}
 	return reader, metrics
 }
 
 func clearKVReaderBenchmarkCache(b *testing.B, reader *Reader) {
 	b.Helper()
-	reader.blockCache.clear()
-	reader.clearSSTCache()
+	resetReaderCaches(reader)
 }
 
 func clearKVReaderPointBenchmarkCaches(b *testing.B, reader *Reader) {
 	b.Helper()
-	reader.blockCache.clear()
+	resetReaderCaches(reader)
 	if reader.bloomCache != nil {
 		reader.bloomCache.clear()
 	}
-	reader.clearSSTCache()
-	reader.clearBloomDiskCache()
+}
+
+// resetReaderCaches empties a reader's open SSTs, block cache and disk
+// cache, keeping parsed Bloom filters, so the next read starts cold.
+func resetReaderCaches(reader *Reader) {
+	reader.openSSTs.clear()
+	reader.blockCache.clear()
+	reader.clearDiskCache()
 }
 
 func kvReaderRemoteBytes(metrics *ReaderMetrics) float64 {
 	if metrics == nil {
 		return 0
 	}
-	return testutil.ToFloat64(metrics.SSTDownloadBytes) +
-		testutil.ToFloat64(metrics.SSTRangeReadBytes)
+	return testutil.ToFloat64(metrics.SSTRangeReadBytes)
 }
 
 func assertKVReaderBenchmarkGet(b *testing.B, ctx context.Context, reader *Reader, key []byte, valueSize int) {

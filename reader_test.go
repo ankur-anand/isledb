@@ -483,13 +483,13 @@ func TestReader_ScanLimit_LazilyOpensSortedLevel(t *testing.T) {
 	if len(results) != 1 || !bytes.Equal(results[0].Key, []byte("a")) {
 		t.Fatalf("ScanLimit result: %+v", results)
 	}
-	if !reader.sstResidentByID(first.Meta.ID) {
+	if !reader.sstOpenedByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was not opened")
 	}
-	if reader.sstResidentByID(second.Meta.ID) {
+	if reader.sstOpenedByID(second.Meta.ID) {
 		t.Fatal("second L1 SST was opened after the scan reached its limit")
 	}
-	if reader.sstResidentByID(third.Meta.ID) {
+	if reader.sstOpenedByID(third.Meta.ID) {
 		t.Fatal("third L1 SST was opened before the scan reached it")
 	}
 }
@@ -605,16 +605,16 @@ func TestReader_Iterator_SeekGESkipsEarlierSortedLevelSSTs(t *testing.T) {
 
 	// Construction alone must not perform object I/O. Otherwise a subsequent
 	// seek pays for the first SST before jumping to the target SST.
-	if reader.sstResidentByID(first.Meta.ID) {
+	if reader.sstOpenedByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstResidentByID(second.Meta.ID) {
+	if reader.sstOpenedByID(second.Meta.ID) {
 		t.Fatal("middle L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstResidentByID(third.Meta.ID) {
+	if reader.sstOpenedByID(third.Meta.ID) {
 		t.Fatal("target L1 SST was opened before the iterator was positioned")
 	}
-	if reader.sstResidentByID(l0.Meta.ID) {
+	if reader.sstOpenedByID(l0.Meta.ID) {
 		t.Fatal("L0 SST was opened before the iterator was positioned")
 	}
 	if !iter.SeekGE([]byte("z")) {
@@ -623,16 +623,16 @@ func TestReader_Iterator_SeekGESkipsEarlierSortedLevelSSTs(t *testing.T) {
 	if got := iter.Key(); !bytes.Equal(got, []byte("z")) {
 		t.Fatalf("SeekGE key: got %q want z", got)
 	}
-	if reader.sstResidentByID(second.Meta.ID) {
+	if reader.sstOpenedByID(second.Meta.ID) {
 		t.Fatal("middle L1 SST was opened by a seek that skipped over it")
 	}
-	if reader.sstResidentByID(first.Meta.ID) {
+	if reader.sstOpenedByID(first.Meta.ID) {
 		t.Fatal("first L1 SST was opened by a seek that skipped over it")
 	}
-	if !reader.sstResidentByID(third.Meta.ID) {
+	if !reader.sstOpenedByID(third.Meta.ID) {
 		t.Fatal("target L1 SST was not opened")
 	}
-	if reader.sstResidentByID(l0.Meta.ID) {
+	if reader.sstOpenedByID(l0.Meta.ID) {
 		t.Fatal("L0 SST below the seek target was opened")
 	}
 }
@@ -864,7 +864,19 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 	}
 }
 
-func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
+// sstOpenedByID reports whether the reader has opened the SST, which stays in
+// its open-SST cache.
+func (r *Reader) sstOpenedByID(id string) bool {
+	r.openSSTs.mu.Lock()
+	defer r.openSSTs.mu.Unlock()
+	_, ok := r.openSSTs.entries[id]
+	return ok
+}
+
+// TestReader_OpenIteratorSurvivesDiskCacheRemoval empties the disk cache
+// and deletes the object under an open iterator: the iterator keeps reading,
+// because nothing on disk is held open and its blocks were already fetched.
+func TestReader_OpenIteratorSurvivesDiskCacheRemoval(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-cache-release")
 	ms := manifest.NewStore(store)
@@ -886,24 +898,20 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSSTIterBounded: %v", err)
 	}
-
-	if !reader.sstResident(res.Meta) {
-		iter.Close()
-		t.Fatal("expected sst cache entry after iterator open")
-	}
-
-	// Removal takes effect at once; the open iterator keeps reading its file.
-	reader.removeSST(res.Meta)
-	if file, ok := reader.acquireSST(res.Meta); ok {
-		_ = file.Close()
-		iter.Close()
-		t.Fatal("removed SST is still served from the cache")
-	}
-	if got := reader.SSTCacheStats().EntryCount; got != 0 {
-		iter.Close()
-		t.Fatalf("entry count=%d want=0", got)
-	}
 	if kv := iter.First(); kv == nil {
+		iter.Close()
+		t.Fatalf("First: %v", iter.Error())
+	}
+	reader.clearDiskCache()
+	if got := reader.DiskCacheStats().Data.EntryCount; got != 0 {
+		iter.Close()
+		t.Fatalf("data tier entries=%d want=0", got)
+	}
+	if err := store.Delete(ctx, store.SSTPath(res.Meta.ID)); err != nil {
+		iter.Close()
+		t.Fatal(err)
+	}
+	if kv := iter.SeekGE([]byte("a"), 0); kv == nil {
 		iter.Close()
 		t.Fatalf("open iterator stopped working after removal: %v", iter.Error())
 	}
@@ -1025,7 +1033,10 @@ func TestReader_MetricsGetScanRefresh(t *testing.T) {
 	}
 }
 
-func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
+// TestReader_MetricsObjectReadsAndDiskCache reads a small SST twice, opening
+// it again for the second read: the first read fetches the whole object once,
+// and the second is served from the disk cache.
+func TestReader_MetricsObjectReadsAndDiskCache(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-metrics-sst-cache")
 	defer store.Close()
@@ -1037,11 +1048,10 @@ func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 	_ = writeTestSST(t, ctx, store, ms, entries, 0, 1)
 
 	metrics := DefaultReaderMetrics(nil)
-	// The second read must look in the disk cache, so SSTs are not kept open.
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir:         t.TempDir(),
 		Metrics:          metrics,
-		OpenSSTCacheSize: -1,
+		OpenSSTCacheSize: -1, // the second read must open the SST again
 	})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
@@ -1055,24 +1065,21 @@ func TestReader_MetricsSSTCacheAndDownload(t *testing.T) {
 		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
 	}
 
-	if got := testutil.ToFloat64(metrics.SSTCacheMisses); got != 1 {
-		t.Fatalf("sst_cache_misses_total mismatch: got=%v want=1", got)
+	if got := testutil.ToFloat64(metrics.SSTRangeReadTotal); got != 1 {
+		t.Fatalf("sst_range_read_total=%v, want one fetch of the whole object", got)
 	}
-	if got := testutil.ToFloat64(metrics.SSTCacheHits); got != 1 {
-		t.Fatalf("sst_cache_hits_total mismatch: got=%v want=1", got)
+	if got := testutil.ToFloat64(metrics.SSTRangeReadErrors); got != 0 {
+		t.Fatalf("sst_range_read_errors_total=%v, want 0", got)
 	}
-	if got := testutil.ToFloat64(metrics.SSTDownloadTotal); got != 1 {
-		t.Fatalf("sst_download_total mismatch: got=%v want=1", got)
+	if got := testutil.ToFloat64(metrics.SSTRangeReadBytes); got <= 0 {
+		t.Fatalf("sst_range_read_bytes_total must be > 0, got=%v", got)
 	}
-	if got := testutil.ToFloat64(metrics.SSTDownloadErrors); got != 0 {
-		t.Fatalf("sst_download_errors_total mismatch: got=%v want=0", got)
-	}
-	if got := testutil.ToFloat64(metrics.SSTDownloadBytes); got <= 0 {
-		t.Fatalf("sst_download_bytes_total must be > 0, got=%v", got)
+	if stats := reader.DiskCacheStats().Data; stats.Hits == 0 {
+		t.Fatalf("second read did not use the disk cache: %+v", stats)
 	}
 }
 
-func TestReader_MetricsSSTDownloadError(t *testing.T) {
+func TestReader_MetricsObjectReadError(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-metrics-sst-download-error")
 	defer store.Close()
@@ -1099,17 +1106,10 @@ func TestReader_MetricsSSTDownloadError(t *testing.T) {
 	if _, _, err := reader.Get(ctx, []byte("k")); err == nil {
 		t.Fatalf("expected Get error with missing sst object")
 	}
-
-	if got := testutil.ToFloat64(metrics.SSTCacheMisses); got != 1 {
-		t.Fatalf("sst_cache_misses_total mismatch: got=%v want=1", got)
+	if got := testutil.ToFloat64(metrics.SSTRangeReadErrors); got == 0 {
+		t.Fatalf("sst_range_read_errors_total=%v, want > 0", got)
 	}
-	if got := testutil.ToFloat64(metrics.SSTCacheHits); got != 0 {
-		t.Fatalf("sst_cache_hits_total mismatch: got=%v want=0", got)
-	}
-	if got := testutil.ToFloat64(metrics.SSTDownloadTotal); got != 1 {
-		t.Fatalf("sst_download_total mismatch: got=%v want=1", got)
-	}
-	if got := testutil.ToFloat64(metrics.SSTDownloadErrors); got != 1 {
-		t.Fatalf("sst_download_errors_total mismatch: got=%v want=1", got)
+	if stats := reader.DiskCacheStats(); stats.Data.EntryCount != 0 || stats.Meta.EntryCount != 0 {
+		t.Fatalf("failed read left disk entries: %+v", stats)
 	}
 }

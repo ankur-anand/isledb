@@ -4,20 +4,13 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/cachestore"
-	"github.com/ankur-anand/isledb/internal/filecache"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 const (
-	defaultSSTCacheSize       = 8 << 30
-	defaultBloomDiskCacheSize = 512 << 20
-
-	defaultBlockCacheSize      = 256 << 20
-	defaultRangeReadMinSSTSize = 4 << 20
-	defaultRangeReadAheadMin   = 128 << 10
-	defaultRangeReadAheadMax   = 4 << 20
-	minRangeReadAhead          = 16 << 10
-	maxRangeReadAhead          = 16 << 20
+	defaultDiskCacheSize  = 8 << 30
+	defaultBlockCacheSize = 256 << 20
 )
 
 const (
@@ -117,31 +110,21 @@ func defaultWriterValueOptions() ValueOptions {
 }
 
 type readerOptions struct {
-	// CacheDir is required local working storage for SST downloads as well as
-	// the root of the persistent disk caches. It must remain writable while the
-	// Reader is open.
+	// CacheDir is the root of the persistent disk cache. It must remain
+	// writable while the Reader is open.
 	CacheDir string
 
-	// FileCache is an optional pre-opened local SST/Bloom cache. A
-	// caller-supplied cache must stay open until every Reader using it has
-	// closed; afterwards, downloads can no longer be staged locally.
-	FileCache *filecache.Cache
+	// DiskCache is an optional pre-opened disk cache. A caller-supplied cache
+	// must stay open until every Reader using it has closed.
+	DiskCache *diskcache.Cache
 
-	// SSTCacheSize is the maximum bytes of SSTs cached on disk (default 8 GiB).
-	SSTCacheSize int64
-
-	// BloomDiskCacheSize is the maximum bytes of Bloom filters cached on disk
-	// (default 512 MiB).
-	BloomDiskCacheSize int64
+	// DiskCacheSize bounds the disk cache (default 8 GiB), an eighth of it
+	// for SST metadata and Bloom filters.
+	DiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes of decoded SST blocks kept in memory
-	// for every SST read (default 256 MiB).
+	// (default 256 MiB).
 	BlockCacheSize int64
-
-	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
-	// instead of downloading them whole. The range-read sizes apply only when
-	// it is set; zero selects each one's default.
-	RangeRead bool
 
 	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
 	// filters. Zero selects the default (64 MiB).
@@ -150,23 +133,6 @@ type readerOptions struct {
 	// OpenSSTCacheSize is how many SSTs stay open across reads (default
 	// 1,024). Negative disables the cache, for tests that count per-open work.
 	OpenSSTCacheSize int
-
-	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
-	// and footer) that range reads keep in memory, separately from data so
-	// data reads cannot evict it. Zero selects the default (128 MiB).
-	MetaCacheSize int64
-
-	// RangeReadMinSSTSize is the smallest SST read by byte range; smaller SSTs
-	// are downloaded whole (default 4 MiB).
-	RangeReadMinSSTSize int64
-
-	// RangeReadAheadMin is a scan's first read-ahead and the alignment of
-	// every read-ahead (default 128 KiB).
-	RangeReadAheadMin int64
-
-	// RangeReadAheadMax caps a scan's read-ahead, which doubles with each
-	// fetch of a continuing scan (default 4 MiB).
-	RangeReadAheadMax int64
 
 	ManifestStorage manifest.Storage
 
@@ -181,11 +147,9 @@ type readerOptions struct {
 
 func defaultReaderOptions() readerOptions {
 	return readerOptions{
-		SSTCacheSize:       defaultSSTCacheSize,
-		BloomDiskCacheSize: defaultBloomDiskCacheSize,
-		BloomCacheSize:     defaultBloomCacheSize,
-		MetaCacheSize:      defaultMetaCacheSize,
-		RangeRead:          true,
+		DiskCacheSize:  defaultDiskCacheSize,
+		BlockCacheSize: defaultBlockCacheSize,
+		BloomCacheSize: defaultBloomCacheSize,
 		ViewPolicy: ReaderViewPolicy{
 			RefreshAfter: defaultReaderRefreshAfter,
 		},

@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -12,9 +13,8 @@ import (
 )
 
 // BenchmarkReaderWarmGet_BlockCache measures warm point lookups on one 16 MiB
-// SST, read from the local disk cache or by range, through the decoded block
-// cache, with the SST kept open across reads or, in the reopen modes, opened
-// for every read. Every key in the working set is read once before timing, so no
+// SST, fetched whole or in chunks, through the decoded block cache, with the
+// SST kept open across reads or, in the reopen modes, opened for every read. Every key in the working set is read once before timing, so no
 // lookup touches object storage or decodes a block.
 //
 // get is a whole lookup; open is only opening and closing the SST iterator,
@@ -27,13 +27,14 @@ func BenchmarkReaderWarmGet_BlockCache(b *testing.B) {
 		b.Cleanup(func() { _ = store.Close() })
 
 		modes := []struct {
-			name string
-			opts readerOptions
+			name    string
+			opts    readerOptions
+			chunked bool
 		}{
-			{"local", readerOptions{}},
-			{"remote", readerOptions{RangeRead: true, RangeReadMinSSTSize: 1}},
-			{"local-reopen", readerOptions{OpenSSTCacheSize: -1}},
-			{"remote-reopen", readerOptions{RangeRead: true, RangeReadMinSSTSize: 1, OpenSSTCacheSize: -1}},
+			{"whole", readerOptions{}, false},
+			{"chunked", readerOptions{}, true},
+			{"whole-reopen", readerOptions{OpenSSTCacheSize: -1}, false},
+			{"chunked-reopen", readerOptions{OpenSSTCacheSize: -1}, true},
 		}
 		// Open before writing: a reader refuses a prefix that already holds
 		// SSTs but no manifest.
@@ -42,6 +43,13 @@ func BenchmarkReaderWarmGet_BlockCache(b *testing.B) {
 			opts := mode.opts
 			opts.CacheDir = b.TempDir()
 			reader, err := newReader(ctx, store, opts)
+			if err == nil {
+				if mode.chunked {
+					reader.fetcher.smallLimit = 0
+				} else {
+					reader.fetcher.smallLimit = math.MaxInt64
+				}
+			}
 			if err != nil {
 				b.Fatalf("open %s reader: %v", mode.name, err)
 			}

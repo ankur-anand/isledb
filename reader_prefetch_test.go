@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/internal/filecache"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -78,8 +79,8 @@ func TestReader_PrefetchRangeAfterRefresh(t *testing.T) {
 	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 1 || stats.SkippedSSTs != 0 || stats.BytesRead <= 0 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
-	if got := reader.SSTCacheStats().EntryCount; got != 1 {
-		t.Fatalf("cache entries = %d, want 1", got)
+	if got := reader.DiskCacheStats().Data.EntryCount; got != 1 {
+		t.Fatalf("data tier entries = %d, want 1", got)
 	}
 
 	val, found, err := reader.Get(ctx, []byte("user:001"))
@@ -154,25 +155,32 @@ func TestReader_PrefetchAllAndSkipCached(t *testing.T) {
 	}
 }
 
-func TestReader_PrefetchResidentRaceReportsNoDownloadedBytes(t *testing.T) {
-	reader, ctx, meta, _, path, cleanup := setupReaderCacheFixture(t)
-	defer cleanup()
-	if err := reader.cacheSST(ctx, &meta, path); err != nil {
-		t.Fatal(err)
-	}
+// TestReader_PrefetchCachedSSTFetchesNothing prefetches an SST already on
+// disk: nothing is fetched.
+func TestReader_PrefetchCachedSSTFetchesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("prefetch-cached")
+	manifestStore := newManifestStore(store, nil)
+	writer := newPrefetchTestWriter(t, ctx, store, manifestStore)
+	defer writer.close(ctx)
+	writePrefetchBatch(t, ctx, writer, "cached", 0, 3)
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{})
+	defer reader.Close()
+	meta := reader.currentManifest().L0SSTs[0]
 
-	resident, downloaded, err := reader.prefetchSST(ctx, meta)
-	if err != nil {
-		t.Fatal(err)
+	if fetched, err := reader.prefetchSST(ctx, meta); err != nil || fetched == 0 {
+		t.Fatalf("first prefetch fetched=%d err=%v, want the SST", fetched, err)
 	}
-	if !resident || downloaded != 0 {
-		t.Fatalf("resident=%t downloaded=%d want=true,0", resident, downloaded)
+	if fetched, err := reader.prefetchSST(ctx, meta); err != nil || fetched != 0 {
+		t.Fatalf("second prefetch fetched=%d err=%v, want nothing", fetched, err)
 	}
 }
 
-func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
+// TestReader_PrefetchSkipsSSTLargerThanBudget selects nothing that could not
+// stay on disk: an SST larger than the data tier is skipped, not fetched.
+func TestReader_PrefetchSkipsSSTLargerThanBudget(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("prefetch-oversized-bypass")
+	store := blobstore.NewMemory("prefetch-oversized")
 	manifestStore := newManifestStore(store, nil)
 	writer := newPrefetchTestWriter(t, ctx, store, manifestStore)
 	defer writer.close(ctx)
@@ -185,9 +193,9 @@ func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
 	if len(manifest.L0SSTs) != 1 || manifest.L0SSTs[0].Size <= 1 {
 		t.Fatalf("unexpected test manifest: %+v", manifest.L0SSTs)
 	}
-	sstSize := manifest.L0SSTs[0].Size
+	// The data tier is seven eighths of the budget: smaller than the SST.
 	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{
-		SSTCacheSize: sstSize - 1,
+		DiskCacheSize: manifest.L0SSTs[0].Size,
 	})
 	defer reader.Close()
 
@@ -195,12 +203,11 @@ func TestReader_PrefetchOversizedSSTReportsBypass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 || stats.BytesRead != sstSize {
-		t.Fatalf("oversized prefetch stats=%+v", stats)
+	if stats.MatchedSSTs != 1 || stats.SkippedSSTs != 1 || stats.CachedSSTs != 0 || stats.BytesRead != 0 {
+		t.Fatalf("oversized prefetch stats=%+v, want it skipped unfetched", stats)
 	}
-	cacheStats := reader.SSTCacheStats()
-	if cacheStats.EntryCount != 0 || cacheStats.Bytes != 0 || cacheStats.Bypasses != 1 {
-		t.Fatalf("oversized cache stats=%+v", cacheStats)
+	if data := reader.DiskCacheStats().Data; data.EntryCount != 0 || data.Bypasses != 0 {
+		t.Fatalf("oversized data tier stats=%+v", data)
 	}
 }
 
@@ -225,9 +232,102 @@ func TestReader_PrefetchRespectsMaxSSTs(t *testing.T) {
 	if stats.MatchedSSTs != 3 || stats.CachedSSTs != 2 || stats.SkippedSSTs != 1 {
 		t.Fatalf("stats = %+v, want matched=3 cached=2 skipped=1", stats)
 	}
-	if got := reader.SSTCacheStats().EntryCount; got != 2 {
-		t.Fatalf("cache entries = %d, want 2", got)
+	if got := reader.DiskCacheStats().Data.EntryCount; got != 2 {
+		t.Fatalf("data tier entries = %d, want 2", got)
 	}
+}
+
+// TestReader_PrefetchTierBudgetCountsCachedSSTs repeats a prefetch of more
+// than the data tier holds: SSTs the first one cached count against the
+// tier, so the second fetches nothing rather than evicting them.
+func TestReader_PrefetchTierBudgetCountsCachedSSTs(t *testing.T) {
+	ctx := context.Background()
+	store := newPrefetchBudgetTestStore(t, ctx, "prefetch-tier-budget")
+	sizes := prefetchTestSSTSizes(t, ctx, store)
+	// A data tier with room for any two of the three SSTs, not all three.
+	var total, smallest int64 = 0, sizes[0]
+	for _, size := range sizes {
+		total += size
+		smallest = min(smallest, size)
+	}
+	cacheDir := t.TempDir()
+	disk, err := diskcache.Open(diskcache.Options{
+		Dir: filepath.Join(cacheDir, "artifacts"), MetaMaxBytes: 1 << 20, DataMaxBytes: total - smallest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir, DiskCache: disk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	first, err := reader.Prefetch(ctx, PrefetchOptions{All: true})
+	if err != nil {
+		t.Fatalf("Prefetch first: %v", err)
+	}
+	if first.CachedSSTs != 2 {
+		t.Fatalf("first stats = %+v, want two cached", first)
+	}
+	second, err := reader.Prefetch(ctx, PrefetchOptions{All: true})
+	if err != nil {
+		t.Fatalf("Prefetch second: %v", err)
+	}
+	if second.CachedSSTs != 0 || second.BytesRead != 0 || second.SkippedSSTs != 3 {
+		t.Fatalf("second stats = %+v, want nothing fetched", second)
+	}
+}
+
+// TestReader_PrefetchMaxBytesBoundsEachCall warms SSTs in steps with a
+// MaxBytes that fits one SST: SSTs already cached do not count against it, so
+// each call downloads one more.
+func TestReader_PrefetchMaxBytesBoundsEachCall(t *testing.T) {
+	ctx := context.Background()
+	store := newPrefetchBudgetTestStore(t, ctx, "prefetch-max-bytes-steps")
+	sizes := prefetchTestSSTSizes(t, ctx, store)
+	opts := PrefetchOptions{All: true, MaxBytes: max(sizes[0], sizes[1], sizes[2])}
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{})
+	defer reader.Close()
+
+	for call := 1; call <= 3; call++ {
+		stats, err := reader.Prefetch(ctx, opts)
+		if err != nil {
+			t.Fatalf("Prefetch %d: %v", call, err)
+		}
+		if stats.CachedSSTs != 1 {
+			t.Fatalf("call %d stats = %+v, want one more SST cached", call, stats)
+		}
+	}
+}
+
+// newPrefetchBudgetTestStore writes three single-batch L0 SSTs.
+func newPrefetchBudgetTestStore(t *testing.T, ctx context.Context, name string) *blobstore.Store {
+	t.Helper()
+	store := blobstore.NewMemory(name)
+	writer := newPrefetchTestWriter(t, ctx, store, newManifestStore(store, nil))
+	writePrefetchBatch(t, ctx, writer, "a", 0, 2)
+	writePrefetchBatch(t, ctx, writer, "b", 0, 2)
+	writePrefetchBatch(t, ctx, writer, "c", 0, 2)
+	writer.close(ctx)
+	return store
+}
+
+func prefetchTestSSTSizes(t *testing.T, ctx context.Context, store *blobstore.Store) []int64 {
+	t.Helper()
+	m, err := newManifestStore(store, nil).Replay(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.L0SSTs) != 3 {
+		t.Fatalf("L0 SST count = %d, want 3", len(m.L0SSTs))
+	}
+	sizes := make([]int64, len(m.L0SSTs))
+	for i, sst := range m.L0SSTs {
+		sizes[i] = sst.Size
+	}
+	return sizes
 }
 
 func TestReader_PrefetchByteBudgetSkipsUnknownSize(t *testing.T) {
@@ -294,7 +394,7 @@ func TestReader_PrefetchValidatesChecksum(t *testing.T) {
 	if stats.MatchedSSTs != 1 || stats.CachedSSTs != 0 {
 		t.Fatalf("stats after error = %+v, want matched=1 cached=0", stats)
 	}
-	if reader.sstResident(m.L0SSTs[0]) {
+	if reader.fetcher.resident(reader.fetcher.object(m.L0SSTs[0])) {
 		t.Fatal("corrupted SST was cached")
 	}
 }
@@ -344,7 +444,7 @@ func TestReader_TruncatedSSTCacheSelfHealsAfterOriginRecovers(t *testing.T) {
 	if _, _, err := reader.Get(ctx, []byte("key")); err == nil {
 		t.Fatal("first read of truncated SST unexpectedly succeeded")
 	}
-	if got := reader.SSTCacheStats().EntryCount; got != 0 {
+	if got := reader.DiskCacheStats().Data.EntryCount; got != 0 {
 		t.Fatalf("truncated SST was retained in cache; entries=%d", got)
 	}
 	if _, err := store.Write(ctx, path, valid); err != nil {
@@ -396,12 +496,9 @@ func TestReader_EvictsInvalidCachedSSTAndRedownloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	truncated := valid[:len(valid)/2]
-	if err := reader.fileCache.Put(filecache.Descriptor{
-		Kind:     filecache.KindSST,
-		Size:     int64(len(truncated)),
-		Checksum: bloomChecksum(truncated),
-	}, truncated); err != nil {
+	// A cached copy of the wrong size, as a crash mid-write leaves.
+	whole := reader.fetcher.object(m.L0SSTs[0]).entry(diskcache.KindWhole, 0)
+	if err := reader.diskCache.Put(whole, valid[:len(valid)/2]); err != nil {
 		t.Fatal(err)
 	}
 

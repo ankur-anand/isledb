@@ -19,23 +19,47 @@ import (
 func TestBlockCache_FileNumbers(t *testing.T) {
 	b := newBlockCache(1 << 20)
 	defer b.close()
-	fileNum := func(id string) uint64 { return uint64(b.readerOptions(id).CacheOpts.FileNum) }
-
-	a1, a2, c := fileNum("a"), fileNum("a"), fileNum("c")
+	a1, a2, c := b.fileNum("a"), b.fileNum("a"), b.fileNum("c")
 	if a1 == 0 || a1 != a2 || a1 == c {
-		t.Fatalf("file numbers a=%d,%d c=%d: want one nonzero number per SST", a1, a2, c)
+		t.Fatalf("file numbers a=%d,%d c=%d: want one nonzero number per SST, kept across opens", a1, a2, c)
 	}
-	b.evict("a")
-	if again := fileNum("a"); again == a1 || again == c {
-		t.Fatalf("evicted SST reused number %d", again)
+	if got := uint64(b.readerOptions(c).CacheOpts.FileNum); got != c {
+		t.Fatalf("reader options carry file number %d, want %d", got, c)
 	}
-	b.retain(&manifestState{L0SSTs: []manifest.SSTMeta{{ID: "c"}}})
+	b.forget("a")
+	if again := b.fileNum("a"); again == a1 || again == c {
+		t.Fatalf("forgotten SST reused number %d", again)
+	}
+	open := map[string]bool{"d": true}
+	b.fileNum("d")
+	b.prune(&manifestState{L0SSTs: []manifest.SSTMeta{{ID: "c"}}}, func(id string) bool { return open[id] })
 	if _, ok := b.files["a"]; ok {
-		t.Fatal("retain kept an SST missing from the manifest")
+		t.Fatal("prune kept an SST neither in the manifest nor open")
 	}
-	if got := fileNum("c"); got != c {
-		t.Fatalf("retain changed a live SST's number: %d -> %d", c, got)
+	if _, ok := b.files["d"]; !ok {
+		t.Fatal("prune forgot an open SST")
 	}
+	if got := b.fileNum("c"); got != c {
+		t.Fatalf("prune changed a live SST's number: %d -> %d", c, got)
+	}
+}
+
+// newBlockCacheTestReader opens a reader on store. With chunked, SSTs of any
+// size are read in chunks rather than fetched whole.
+func newBlockCacheTestReader(t *testing.T, ctx context.Context, store *blobstore.Store, opts readerOptions, chunked bool) *Reader {
+	t.Helper()
+	if opts.CacheDir == "" {
+		opts.CacheDir = t.TempDir()
+	}
+	reader, err := newReader(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	if chunked {
+		reader.fetcher.smallLimit = 0
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	return reader
 }
 
 // TestBlockCache_OpenMakesTwoUncachedLookups pins the Pebble behaviour
@@ -49,15 +73,7 @@ func TestBlockCache_OpenMakesTwoUncachedLookups(t *testing.T) {
 			store := blobstore.NewMemory(fmt.Sprintf("block-cache-opens-%t", rangeRead))
 			defer store.Close()
 			// Every read must open the SST, so the open-SST cache is off.
-			opts := readerOptions{CacheDir: t.TempDir(), OpenSSTCacheSize: -1}
-			if rangeRead {
-				opts.RangeRead, opts.RangeReadMinSSTSize = true, 1
-			}
-			reader, err := newReader(ctx, store, opts)
-			if err != nil {
-				t.Fatalf("open reader: %v", err)
-			}
-			defer reader.Close()
+			reader := newBlockCacheTestReader(t, ctx, store, readerOptions{CacheDir: t.TempDir(), OpenSSTCacheSize: -1}, rangeRead)
 			entries, state := blockCacheTestSST(t, ctx, store, 2_000)
 			meta := state.Levels[0].SSTs[0]
 			blockCacheTestGet(t, ctx, reader, state, entries, 10)
@@ -65,11 +81,11 @@ func TestBlockCache_OpenMakesTwoUncachedLookups(t *testing.T) {
 			const opens = 5
 			before := reader.blockCache.cache.Metrics()
 			for range opens {
-				_, iter, err := reader.openSSTIterBounded(ctx, meta, nil, nil, false)
+				sst, err := reader.openSST(ctx, meta)
 				if err != nil {
 					t.Fatalf("open SST: %v", err)
 				}
-				_ = iter.Close()
+				sst.unref()
 			}
 			after := reader.blockCache.cache.Metrics()
 			if got := after.Misses - before.Misses; got != metaLookupsPerOpen*opens {
@@ -154,15 +170,7 @@ func TestReader_BlockCache_ScanFillsOnlyItsStart(t *testing.T) {
 				t.Fatalf("open store: %v", err)
 			}
 			defer store.Close()
-			opts := readerOptions{CacheDir: t.TempDir()}
-			if rangeRead {
-				opts.RangeRead, opts.RangeReadMinSSTSize = true, 1
-			}
-			reader, err := newReader(ctx, store, opts)
-			if err != nil {
-				t.Fatalf("open reader: %v", err)
-			}
-			defer reader.Close()
+			reader := newBlockCacheTestReader(t, ctx, store, readerOptions{CacheDir: t.TempDir()}, rangeRead)
 			entries, state := blockCacheTestSST(t, ctx, store, 20_000)
 
 			kvs, err := reader.scanInternalWithManifest(ctx, state, nil, nil, len(entries))
@@ -295,68 +303,44 @@ func TestScanSSTSource_SwitchKeepsEveryEntry(t *testing.T) {
 	}
 }
 
-// TestReader_BlockCache_EvictsRetiredAndCorruptSSTs checks that an SST's
-// blocks leave the cache when it leaves the manifest or is reported corrupt.
-func TestReader_BlockCache_EvictsRetiredAndCorruptSSTs(t *testing.T) {
+// TestReader_BlockCache_KeepsBlocksAcrossReopen checks when an SST's blocks
+// leave the cache: not when it closes, so a reopen finds them; not when it
+// leaves the manifest while still open, as for a snapshot; but when it is
+// reported corrupt, or has left the manifest and is no longer open.
+func TestReader_BlockCache_KeepsBlocksAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("block-cache-evict")
 	defer store.Close()
-	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	defer reader.Close()
+	reader := newBlockCacheTestReader(t, ctx, store, readerOptions{}, false)
 	entries, state := blockCacheTestSST(t, ctx, store, 2_000)
 	meta := state.Levels[0].SSTs[0]
 
 	blockCacheTestGet(t, ctx, reader, state, entries, 10)
-	if reader.BlockCacheStats().EntryCount == 0 {
+	cached := reader.BlockCacheStats().EntryCount
+	if cached == 0 {
 		t.Fatal("lookup cached nothing")
 	}
-	reader.retainSSTs(&manifestState{})
-	if stats := reader.BlockCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
-		t.Fatalf("retired SST still cached: %+v", stats)
+	reader.openSSTs.clear()
+	before := reader.BlockCacheStats()
+	blockCacheTestGet(t, ctx, reader, state, entries, 10)
+	if after := reader.BlockCacheStats(); after.EntryCount != before.EntryCount || after.Misses != before.Misses {
+		t.Fatalf("reopened SST did not find its blocks: before %+v after %+v", before, after)
 	}
 
-	blockCacheTestGet(t, ctx, reader, state, entries, 10)
-	if reader.BlockCacheStats().EntryCount == 0 {
-		t.Fatal("lookup cached nothing")
+	reader.publishManifestView(&manifestState{}, &manifest.Current{}, time.Now())
+	if got := reader.BlockCacheStats().EntryCount; got != cached {
+		t.Fatalf("leaving the manifest while open dropped blocks: %d -> %d", cached, got)
 	}
-	reader.reportCorruptSST(meta)
+	reader.dropSST(meta)
 	if stats := reader.BlockCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
 		t.Fatalf("corrupt SST still cached: %+v", stats)
 	}
-}
 
-// TestReader_BlockCache_LocalAndRangeReadsShareBlocks reads an SST by range,
-// then downloads it: the local read finds the same blocks in the cache.
-func TestReader_BlockCache_LocalAndRangeReadsShareBlocks(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("block-cache-share")
-	defer store.Close()
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir: t.TempDir(), RangeRead: true, RangeReadMinSSTSize: 1,
-	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	defer reader.Close()
-	entries, state := blockCacheTestSST(t, ctx, store, 2_000)
-	meta := state.Levels[0].SSTs[0]
-
-	blockCacheTestGet(t, ctx, reader, state, entries, 700)
-	if err := reader.cacheSST(ctx, &meta, store.SSTPath(meta.ID)); err != nil {
-		t.Fatalf("download SST: %v", err)
-	}
-	if !reader.sstResident(meta) {
-		t.Fatal("SST not on local disk")
-	}
-	before := reader.BlockCacheStats()
-	blockCacheTestGet(t, ctx, reader, state, entries, 700)
-	after := reader.BlockCacheStats()
-	if after.EntryCount != before.EntryCount || after.Misses != before.Misses ||
-		after.Hits < before.Hits+2 {
-		t.Fatalf("local read did not reuse the range read's blocks: before %+v after %+v", before, after)
+	blockCacheTestGet(t, ctx, reader, state, entries, 10)
+	reader.openSSTs.clear()
+	reader.publishManifestView(&manifestState{}, &manifest.Current{}, time.Now())
+	if stats := reader.BlockCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
+		t.Fatalf("retired, closed SST still cached: %+v", stats)
 	}
 }
 
@@ -380,13 +364,7 @@ func TestReader_BlockCache_ConcurrentColdLookupsShareRequests(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir: t.TempDir(), RangeRead: true, RangeReadMinSSTSize: 1,
-	})
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	defer reader.Close()
+	reader := newBlockCacheTestReader(t, ctx, store, readerOptions{}, true)
 	entries, state := blockCacheTestSST(t, ctx, store, 2_000)
 	mu.Lock()
 	clear(ranges)
@@ -428,15 +406,7 @@ func blockCacheTestSource(t *testing.T, rangeRead bool) (*Reader, *scanSSTSource
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	opts := readerOptions{CacheDir: t.TempDir()}
-	if rangeRead {
-		opts.RangeRead, opts.RangeReadMinSSTSize = true, 1
-	}
-	reader, err := newReader(ctx, store, opts)
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	t.Cleanup(func() { _ = reader.Close() })
+	reader := newBlockCacheTestReader(t, ctx, store, readerOptions{CacheDir: t.TempDir()}, rangeRead)
 	entries, state := blockCacheTestSST(t, ctx, store, 20_000)
 	src, err := openScanSSTSource(reader, ctx, state.Levels[0].SSTs[0], nil, nil, scanCacheFillBytes)
 	if err != nil {

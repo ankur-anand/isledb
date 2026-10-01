@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func BenchmarkFakeS3_KVReaderBlockSize(b *testing.B) {
 					BlockSize:       blockKiB << 10,
 					BloomBitsPerKey: 10,
 					Compression:     "snappy",
-				}, -1, 0)
+				})
 				runKVBlockSizeWorkloads(b, ctx, fixture)
 			})
 		}
@@ -60,16 +61,14 @@ const kvBlockSizeValueBytes = 256
 // size actually produced.
 const kvBlockSizeEntryBytes = 224
 
-// prepareKVBlockSizeFixture writes one SST of about targetBytes and opens a
-// range reader and a whole-SST reader over it. aheadMin and aheadMax set the
-// range reader's scan read-ahead (zero selects the default); a negative
-// aheadMin turns read-ahead off for exact block reads.
+// prepareKVBlockSizeFixture writes one SST of about targetBytes and opens two
+// readers over it: reader reads it in chunks whatever its size, and whole
+// fetches it whole, as small SSTs are.
 func prepareKVBlockSizeFixture(
 	b *testing.B,
 	ctx context.Context,
 	targetBytes int,
 	opts sstWriterOptions,
-	aheadMin, aheadMax int64,
 ) kvBlockSizeFixture {
 	b.Helper()
 
@@ -86,22 +85,15 @@ func prepareKVBlockSizeFixture(
 	// Open before writing: a reader refuses a prefix that already holds SSTs
 	// but no manifest. The benchmark passes its own manifest to each read.
 	reader, err := newReader(ctx, store, readerOptions{
-		CacheDir:            b.TempDir(),
-		RangeRead:           true,
-		BlockCacheSize:      256 << 20,
-		RangeReadMinSSTSize: 1,
-		RangeReadAheadMin:   aheadMin,
-		RangeReadAheadMax:   aheadMax,
-		Metrics:             DefaultReaderMetrics(nil),
+		CacheDir:       b.TempDir(),
+		BlockCacheSize: 256 << 20,
+		Metrics:        DefaultReaderMetrics(nil),
 	})
 	if err != nil {
 		b.Fatalf("open reader: %v", err)
 	}
 	b.Cleanup(func() { _ = reader.Close() })
-	if aheadMin < 0 {
-		// Exact block reads, which the chunk model replays.
-		reader.rangeReadAheadMin = 0
-	}
+	reader.fetcher.smallLimit = 0
 	whole, err := newReader(ctx, store, readerOptions{
 		CacheDir: b.TempDir(),
 		Metrics:  DefaultReaderMetrics(nil),
@@ -110,6 +102,7 @@ func prepareKVBlockSizeFixture(
 		b.Fatalf("open whole-SST reader: %v", err)
 	}
 	b.Cleanup(func() { _ = whole.Close() })
+	whole.fetcher.smallLimit = math.MaxInt64
 
 	entries := make([]internal.MemEntry, records)
 	values := kvBlockSizeValues(records)
@@ -418,8 +411,9 @@ func TestSimulateChunkedRangeReads(t *testing.T) {
 	}
 }
 
-// BenchmarkFakeS3_KVReaderRangeReadAhead compares scan read-ahead settings on
-// one 64 MiB SST: fixed at 128 KiB, and growing from 128 KiB to 1 or 4 MiB.
+// BenchmarkFakeS3_KVReaderRangeReadAhead measures cold lookups and scans of
+// one 64 MiB SST read in chunks, with read-ahead growing from 128 KiB to
+// 4 MiB.
 // Each ranged GET is delayed to model object storage: 20 ms plus transfer at
 // 100 MB/s. Every workload starts with an empty block cache, so ns/op is
 // cold-read latency.
@@ -428,13 +422,13 @@ func BenchmarkFakeS3_KVReaderRangeReadAhead(b *testing.B) {
 	defer cancel()
 
 	for _, blockKiB := range []int{4, 16} {
-		for _, maxKiB := range []int64{128, 1 << 10, 4 << 10} {
-			b.Run(fmt.Sprintf("block=%dKiB/ahead=128-%dKiB", blockKiB, maxKiB), func(b *testing.B) {
+		for _, ahead := range []string{"128KiB-4MiB"} {
+			b.Run(fmt.Sprintf("block=%dKiB/ahead=%s", blockKiB, ahead), func(b *testing.B) {
 				f := prepareKVBlockSizeFixture(b, ctx, 64<<20, sstWriterOptions{
 					BlockSize:       blockKiB << 10,
 					BloomBitsPerKey: 12,
 					Compression:     "snappy",
-				}, 128<<10, maxKiB<<10)
+				})
 				key := kvLeveledBenchmarkKey(f.records / 2)
 				// Load the sidecar Bloom before adding latency; cold Gets
 				// then measure only SST reads.
@@ -480,7 +474,7 @@ func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
 				BlockSize:       size.blockKiB << 10,
 				BloomBitsPerKey: 12,
 				Compression:     "snappy",
-			}, 0, 0)
+			})
 			f = f.withMetaOffset(f.meta.MetaOffset)
 			for _, reader := range []*Reader{f.reader, f.whole} {
 				assertKVReaderBenchmarkManifestGet(
@@ -494,11 +488,8 @@ func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
 				reader *Reader
 				reset  func()
 			}{
-				{"range", f.reader, func() {
-					f.reader.blockCache.clear()
-					f.reader.metaCache.clear()
-				}},
-				{"whole", f.whole, f.whole.clearSSTCache},
+				{"range", f.reader, func() { resetReaderCaches(f.reader) }},
+				{"whole", f.whole, func() { resetReaderCaches(f.whole) }},
 			}
 			for _, mode := range modes {
 				for _, gets := range []int{1, 10, 100} {

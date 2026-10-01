@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -31,7 +32,8 @@ type PrefetchOptions struct {
 	Concurrency int
 }
 
-// PrefetchStats reports what Reader.Prefetch matched and cached.
+// PrefetchStats reports what Reader.Prefetch matched and cached. CachedSSTs
+// counts the selected SSTs wholly on disk when Prefetch returns.
 type PrefetchStats struct {
 	MatchedSSTs int
 	CachedSSTs  int
@@ -39,7 +41,10 @@ type PrefetchStats struct {
 	BytesRead   int64
 }
 
-// Prefetch warms the reader's SST cache for a fresh manifest view.
+// Prefetch caches SSTs on disk for a fresh manifest view: their metadata,
+// Bloom filters and data, fetching only what is missing. It stops selecting
+// SSTs once they would exceed the disk cache's data budget, counting the rest
+// as skipped.
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error) {
 	if err := validatePrefetchOptions(opts); err != nil {
 		return PrefetchStats{}, err
@@ -76,35 +81,26 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
 	defer cancel()
 
-	var cached atomic.Int64
 	var bytesRead atomic.Int64
 	g, gctx := errgroup.WithContext(readCtx)
 	g.SetLimit(concurrency)
 	for _, sst := range selected {
-		sst := sst
 		g.Go(func() error {
-			resident, downloaded, err := r.prefetchSST(gctx, sst)
-			if err != nil {
-				return err
-			}
-			if resident {
-				cached.Add(1)
-			}
-			if downloaded > 0 {
-				bytesRead.Add(downloaded)
-			}
-			return nil
+			fetched, err := r.prefetchSST(gctx, sst)
+			bytesRead.Add(fetched)
+			return err
 		})
 	}
-
-	if err := g.Wait(); err != nil {
-		stats.CachedSSTs = int(cached.Load())
-		stats.BytesRead = bytesRead.Load()
+	err = g.Wait()
+	for _, sst := range selected {
+		if r.fetcher.resident(r.fetcher.object(sst)) {
+			stats.CachedSSTs++
+		}
+	}
+	stats.BytesRead = bytesRead.Load()
+	if err != nil {
 		return stats, readViewError(readCtx, err)
 	}
-
-	stats.CachedSSTs = int(cached.Load())
-	stats.BytesRead = bytesRead.Load()
 	return stats, nil
 }
 
@@ -132,7 +128,14 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 	var selected []sstMetadata
 	var stats PrefetchStats
 	seen := make(map[string]struct{})
-	var selectedBytes int64
+	// The disk cache's data tier bounds the SSTs on disk and selected, so a
+	// prefetch neither evicts what it fetches nor, repeated over more than
+	// fits, what the last one cached. MaxBytes bounds only what this one
+	// downloads.
+	var tierMax, tierBytes, downloadBytes int64
+	if r.diskCache != nil {
+		tierMax = r.diskCache.Stats(diskcache.TierData).MaxBytes
+	}
 
 	visit := func(sst sstMetadata) {
 		if _, ok := seen[sst.ID]; ok {
@@ -145,7 +148,10 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		}
 		stats.MatchedSSTs++
 
-		if r.sstResident(sst) {
+		if r.fetcher.resident(r.fetcher.object(sst)) {
+			if sst.Size > 0 && tierBytes+sst.Size <= tierMax {
+				tierBytes += sst.Size
+			}
 			stats.SkippedSSTs++
 			return
 		}
@@ -153,15 +159,15 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 			stats.SkippedSSTs++
 			return
 		}
-		if opts.MaxBytes > 0 {
-			if sst.Size <= 0 || sst.Size > opts.MaxBytes-selectedBytes {
-				stats.SkippedSSTs++
-				return
-			}
+		if sst.Size <= 0 || tierBytes+sst.Size > tierMax ||
+			(opts.MaxBytes > 0 && downloadBytes+sst.Size > opts.MaxBytes) {
+			stats.SkippedSSTs++
+			return
 		}
 
 		selected = append(selected, sst)
-		selectedBytes += sst.Size
+		tierBytes += sst.Size
+		downloadBytes += sst.Size
 	}
 
 	for _, sst := range m.L0SSTs {
@@ -176,13 +182,7 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 	return selected, stats
 }
 
-func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (bool, int64, error) {
-	path := r.store.SSTPath(sst.ID)
-	if r.sstResident(sst) {
-		return true, 0, nil
-	}
-	if err := r.cacheSST(ctx, &sst, path); err != nil {
-		return false, 0, err
-	}
-	return r.sstResident(sst), sst.Size, nil
+// prefetchSST caches one SST's parts on disk and reports the bytes fetched.
+func (r *Reader) prefetchSST(ctx context.Context, sst sstMetadata) (int64, error) {
+	return r.fetcher.prefetch(ctx, r.fetcher.object(sst))
 }

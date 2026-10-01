@@ -154,7 +154,13 @@ func minTime(left, right time.Time) time.Time {
 	return right
 }
 
+// readViewError reports a failed read whose view expired as the expiry. A
+// read that succeeded keeps its result, even if the view expired as it
+// finished.
 func readViewError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
 	if cause := context.Cause(ctx); cause != nil &&
 		(errors.Is(cause, ErrReadViewExpired) || errors.Is(cause, ErrSnapshotExpired) || errors.Is(cause, ErrIteratorExpired)) {
 		return cause
