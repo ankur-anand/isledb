@@ -755,3 +755,61 @@ func TestCache_FailedPublishEvictsNothing(t *testing.T) {
 		t.Fatal("temporary file left behind")
 	}
 }
+
+// TestOnRemoveReportsEveryRemoval checks that listeners hear about files
+// removed by eviction, Remove, ReportCorrupt and Purge, from outside the
+// cache's lock (the listener calls back into the cache), and stop once
+// cancelled.
+func TestOnRemoveReportsEveryRemoval(t *testing.T) {
+	c := openCache(t, t.TempDir(), 300, 1<<20)
+	var removed []Descriptor
+	byName := map[[sha256.Size]byte]Descriptor{}
+	cancel := c.OnRemove(func(kind Kind, sum [sha256.Size]byte) {
+		_ = c.Contains(byName[sum]) // would deadlock if called with the lock held
+		removed = append(removed, byName[sum])
+	})
+	put := func(seed string) Descriptor {
+		t.Helper()
+		data := content(seed, 100)
+		d := descriptor(KindSST, data)
+		sum, err := d.Sum()
+		if err != nil {
+			t.Fatalf("Sum: %v", err)
+		}
+		byName[sum] = d
+		if err := c.Put(d, data); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		return d
+	}
+	want := func(step string, ds ...Descriptor) {
+		t.Helper()
+		if len(removed) != len(ds) {
+			t.Fatalf("%s: removed %v, want %v", step, removed, ds)
+		}
+		for i := range ds {
+			if removed[i] != ds[i] {
+				t.Fatalf("%s: removed %v, want %v", step, removed, ds)
+			}
+		}
+		removed = nil
+	}
+
+	a, b, d3 := put("a"), put("b"), put("c")
+	want("fill to budget")
+	d4 := put("d") // the budget holds three: a, least recently used, goes
+	want("eviction", a)
+	c.Remove(b)
+	want("Remove", b)
+	c.ReportCorrupt(d3)
+	want("ReportCorrupt", d3)
+	c.Remove(a) // already gone
+	want("removing a missing file")
+	c.Purge(KindSST)
+	want("Purge", d4)
+
+	cancel()
+	put("e")
+	c.Purge(KindSST)
+	want("after cancel")
+}

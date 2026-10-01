@@ -29,9 +29,14 @@ type sstRangeReadable struct {
 	// region, fetched once.
 	metaOffset int64
 
-	// metaMu guards metaBytes, the region retained for this open SST.
-	metaMu    sync.Mutex
-	metaBytes []byte
+	// metaMu guards metaBytes and metaLooked. metaBytes is the region retained
+	// for this open SST when the metadata cache cannot hold it; otherwise
+	// every read takes it from that cache, so an SST kept open does not pin
+	// its region outside the cache's budget. metaLooked records that this
+	// readable has looked the region up, so later reads do not count again.
+	metaMu     sync.Mutex
+	metaBytes  []byte
+	metaLooked bool
 
 	// metaCache, when set, holds metadata regions across opens under their
 	// own budget.
@@ -180,13 +185,13 @@ func (r *sstRangeReadable) metaRegion(ctx context.Context) ([]byte, error) {
 	if r.metaBytes != nil {
 		return r.metaBytes, nil
 	}
-	var data []byte
-	var err error
-	if r.metaCache != nil {
-		data, err = r.loadMetaRegion(ctx)
-	} else {
-		data, err = r.readRange(ctx, r.metaOffset, int(r.size-r.metaOffset))
+	length := r.size - r.metaOffset
+	if r.metaCache.fits(r.sstID, length) {
+		record := !r.metaLooked
+		r.metaLooked = true
+		return r.loadMetaRegion(ctx, record)
 	}
+	data, err := r.readRange(ctx, r.metaOffset, int(length))
 	if err != nil {
 		return nil, err
 	}
@@ -196,9 +201,10 @@ func (r *sstRangeReadable) metaRegion(ctx context.Context) ([]byte, error) {
 
 // loadMetaRegion returns the metadata region from the metadata cache, or
 // fetches it with one request shared by concurrent opens and caches it.
-func (r *sstRangeReadable) loadMetaRegion(ctx context.Context) ([]byte, error) {
+// record counts the lookup in the cache's stats.
+func (r *sstRangeReadable) loadMetaRegion(ctx context.Context, record bool) ([]byte, error) {
 	length := r.size - r.metaOffset
-	if region, ok := r.metaCache.get(r.sstID, length); ok {
+	if region, ok := r.metaCache.lookup(r.sstID, length, record); ok {
 		return region, nil
 	}
 	fetch := func(ctx context.Context) (any, error) {

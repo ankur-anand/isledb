@@ -184,6 +184,7 @@ func (r *Reader) reportCorruptSST(meta sstMetadata) {
 	if r.fileCache != nil {
 		r.fileCache.ReportCorrupt(sstFileDescriptor(meta))
 	}
+	r.openSSTs.remove(meta.ID)
 	r.blockCache.evict(meta.ID)
 }
 

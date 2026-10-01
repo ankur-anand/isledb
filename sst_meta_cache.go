@@ -73,6 +73,12 @@ func (c *sstMetaCache) lookup(sstID string, length int64, record bool) ([]byte, 
 	return element.Value.(*sstMetaCacheEntry).region, true
 }
 
+// fits reports whether a region of length bytes for sstID can be cached at
+// all, that is, it is within the whole budget.
+func (c *sstMetaCache) fits(sstID string, length int64) bool {
+	return c != nil && length+int64(len(sstID))+metaCacheEntryOverhead <= c.maxBytes
+}
+
 // put caches region for sstID, evicting the least recently used regions to
 // stay within budget. A region larger than the whole budget is not cached.
 func (c *sstMetaCache) put(sstID string, region []byte) {

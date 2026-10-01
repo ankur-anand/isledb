@@ -80,6 +80,11 @@ type ReaderOpenOptions struct {
 	// filters. Zero selects the default (64 MiB).
 	BloomCacheSize int64
 
+	// OpenSSTCacheSize is how many SSTs stay open across reads, so a read of
+	// an open SST opens no file and parses no metadata. Each local SST held
+	// open uses one file descriptor. Zero selects the default (1,024).
+	OpenSSTCacheSize int
+
 	// MetaCacheSize is the maximum bytes of SST metadata (index, properties
 	// and footer) that range reads keep in memory, separately from data so
 	// data reads cannot evict it. Zero selects the default (128 MiB).
@@ -142,6 +147,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: block_cache_size=%d", ErrInvalidReaderOptions, opts.BlockCacheSize)
 	}
+	if opts.OpenSSTCacheSize < 0 {
+		return readerOptions{}, fmt.Errorf(
+			"%w: open_sst_cache_size=%d", ErrInvalidReaderOptions, opts.OpenSSTCacheSize)
+	}
 	if opts.BloomCacheSize < 0 {
 		return readerOptions{}, fmt.Errorf(
 			"%w: bloom_cache_size=%d", ErrInvalidReaderOptions, opts.BloomCacheSize)
@@ -182,6 +191,7 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		BloomDiskCacheSize:  opts.BloomDiskCacheSize,
 		BlockCacheSize:      opts.BlockCacheSize,
 		BloomCacheSize:      opts.BloomCacheSize,
+		OpenSSTCacheSize:    opts.OpenSSTCacheSize,
 		MetaCacheSize:       opts.MetaCacheSize,
 		RangeRead:           opts.RangeRead,
 		RangeReadMinSSTSize: opts.RangeReadMinSSTSize,

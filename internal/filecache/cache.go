@@ -65,6 +65,10 @@ type Descriptor struct {
 	Checksum string
 }
 
+// Sum returns the descriptor's SHA-256, the identity removal listeners
+// receive.
+func (d Descriptor) Sum() ([sha256.Size]byte, error) { return d.sum() }
+
 func (d Descriptor) sum() ([sha256.Size]byte, error) {
 	if d.Kind >= kindCount {
 		return [sha256.Size]byte{}, fmt.Errorf("%w: kind %d", ErrInvalidDescriptor, d.Kind)
@@ -121,6 +125,17 @@ type Cache struct {
 	lock     *flock.Flock
 	tiers    [kindCount]*tier
 	closed   bool
+	// removed collects files removed while mu is held, for unlock to report.
+	removed []removal
+
+	listenersMu sync.Mutex
+	listeners   map[int]func(Kind, [sha256.Size]byte)
+	nextID      int
+}
+
+type removal struct {
+	kind Kind
+	sum  [sha256.Size]byte
 }
 
 type tier struct {
@@ -171,7 +186,51 @@ func Open(opts Options) (*Cache, error) {
 		_ = lock.Close()
 		return nil, err
 	}
+	// Nothing can be listening yet to the files loading dropped.
+	c.removed = nil
 	return c, nil
+}
+
+// OnRemove registers fn to be called for every file the cache removes from
+// then on, by eviction, corruption, Remove or Purge, so a caller holding the
+// file open can close it and let its space be freed. fn runs after the
+// cache's lock is released, on the goroutine that removed the file, and must
+// not block. The returned function unregisters fn.
+func (c *Cache) OnRemove(fn func(kind Kind, sum [sha256.Size]byte)) (cancel func()) {
+	c.listenersMu.Lock()
+	defer c.listenersMu.Unlock()
+	if c.listeners == nil {
+		c.listeners = make(map[int]func(Kind, [sha256.Size]byte))
+	}
+	id := c.nextID
+	c.nextID++
+	c.listeners[id] = fn
+	return func() {
+		c.listenersMu.Lock()
+		defer c.listenersMu.Unlock()
+		delete(c.listeners, id)
+	}
+}
+
+// unlock releases mu, then reports the files removed while it was held.
+func (c *Cache) unlock() {
+	removed := c.removed
+	c.removed = nil
+	c.mu.Unlock()
+	if len(removed) == 0 {
+		return
+	}
+	c.listenersMu.Lock()
+	listeners := make([]func(Kind, [sha256.Size]byte), 0, len(c.listeners))
+	for _, fn := range c.listeners {
+		listeners = append(listeners, fn)
+	}
+	c.listenersMu.Unlock()
+	for _, r := range removed {
+		for _, fn := range listeners {
+			fn(r.kind, r.sum)
+		}
+	}
 }
 
 // Close releases the directory lock. Files already returned stay usable.
@@ -180,7 +239,7 @@ func Open(opts Options) (*Cache, error) {
 // served without being cached, and removals do nothing.
 func (c *Cache) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	if c.closed {
 		return nil
 	}
@@ -196,7 +255,7 @@ func (c *Cache) Contains(d Descriptor) bool {
 		return false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	_, ok := c.entryLocked(d.Kind, sum, d.Size)
 	return ok
 }
@@ -245,7 +304,7 @@ func (c *Cache) Remove(d Descriptor) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	if c.closed {
 		return
 	}
@@ -275,7 +334,7 @@ func (c *Cache) Purge(kind Kind) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	if c.closed {
 		return
 	}
@@ -291,7 +350,7 @@ func (c *Cache) Stats(kind Kind) Stats {
 		return Stats{}
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	t := c.tiers[kind]
 	stats := t.stats
 	stats.Entries = t.lru.Len()
@@ -308,7 +367,7 @@ func (c *Cache) touch(d Descriptor) ([sha256.Size]byte, string, bool) {
 		return sum, "", false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	t := c.tiers[d.Kind]
 	c.dropMismatchedLocked(d.Kind, sum, d.Size)
 	element, ok := c.entryLocked(d.Kind, sum, d.Size)
@@ -350,7 +409,7 @@ func (c *Cache) entryLocked(kind Kind, sum [sha256.Size]byte, size int64) (*list
 
 func (c *Cache) record(kind Kind, hit bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	if hit {
 		c.tiers[kind].stats.Hits++
 	} else {
@@ -390,7 +449,7 @@ func corrupt(err error) bool {
 // vanished or could not be opened is simply dropped.
 func (c *Cache) invalidate(kind Kind, sum [sha256.Size]byte, cause error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer c.unlock()
 	if c.closed {
 		return
 	}
@@ -417,6 +476,7 @@ func (c *Cache) removeLocked(kind Kind, element *list.Element) {
 	delete(t.index, e.sum)
 	t.bytes -= e.size
 	_ = os.Remove(c.path(kind, e.sum))
+	c.removed = append(c.removed, removal{kind: kind, sum: e.sum})
 }
 
 func (c *Cache) path(kind Kind, sum [sha256.Size]byte) string {
