@@ -128,7 +128,6 @@ func (f *readableTestFixture) scan(t *testing.T, from, limit int) {
 // forgetMemory drops the reader's open SSTs and blocks, so the next read
 // starts from the disk cache.
 func (f *readableTestFixture) forgetMemory() {
-	f.reader.diskCache.Sync()
 	f.reader.openSSTs.clear()
 	f.reader.blockCache.clear()
 }
@@ -252,7 +251,6 @@ func TestSSTReadable_LongScanStoresOnlyItsStart(t *testing.T) {
 	if limit := 12; len(data) > limit {
 		t.Fatalf("scan of %d chunks made %d data requests, want at most %d", o.numChunks(), len(data), limit)
 	}
-	f.reader.diskCache.Sync()
 	if got := f.reader.DiskCacheStats().Data.EntryCount; got == 0 || got > 2 {
 		t.Fatalf("long scan stored %d chunks, want its first one or two", got)
 	}
@@ -524,9 +522,37 @@ func TestSSTReadable_BloomMissFetchesOnlyBloom(t *testing.T) {
 	}
 }
 
+// TestSSTReadable_PrefetchFetchesOnlyMissingBloom prefetches a small SST
+// cached whole whose Bloom filter was evicted: only the Bloom range is
+// fetched, and the SST is resident again.
+func TestSSTReadable_PrefetchFetchesOnlyMissingBloom(t *testing.T) {
+	f := newReadableTestFixture(t, 2_000, false)
+	o := f.object()
+	if !o.small() || f.meta.Bloom.Length == 0 {
+		t.Fatal("fixture SST is not small with a Bloom filter")
+	}
+	if _, err := f.reader.fetcher.prefetch(f.ctx, o); err != nil {
+		t.Fatalf("first prefetch: %v", err)
+	}
+	f.reader.diskCache.Remove(o.entry(diskcache.KindBloom, 0))
+	f.ranges.take()
+
+	fetched, err := f.reader.fetcher.prefetch(f.ctx, o)
+	if err != nil {
+		t.Fatalf("second prefetch: %v", err)
+	}
+	bloom := byteRange{f.meta.Bloom.Offset, f.meta.Bloom.Offset + f.meta.Bloom.Length}
+	if got := f.ranges.take(); len(got) != 1 || got[0] != bloom || fetched != f.meta.Bloom.Length {
+		t.Fatalf("prefetch ranges=%v fetched=%d, want only the Bloom range %v", got, fetched, bloom)
+	}
+	if !f.reader.fetcher.resident(o) {
+		t.Fatal("SST not resident after prefetch")
+	}
+}
+
 // TestSSTReadable_WaiterStoresSharedChunks has a caller that caches wait on
-// a chunk request made by one that does not, as a prefetch or lookup waiting
-// on a scan's private read: the waiter stores the chunks it receives.
+// a chunk request whose requester stored nothing, as a prefetch or lookup
+// waiting on a scan's private read: the waiter stores the chunks it receives.
 func TestSSTReadable_WaiterStoresSharedChunks(t *testing.T) {
 	f := newReadableTestFixture(t, 20_000, true)
 	fetcher, o := f.reader.fetcher, f.object()
@@ -535,7 +561,6 @@ func TestSSTReadable_WaiterStoresSharedChunks(t *testing.T) {
 	if err := (&sstReadHandle{r: fetcher.readable(o), nextOff: -1}).readData(f.ctx, data, start); err != nil {
 		t.Fatalf("read chunk: %v", err)
 	}
-	f.reader.diskCache.Sync()
 	f.reader.diskCache.Purge(diskcache.TierData)
 	if f.chunkCached(3) {
 		t.Fatal("chunk still cached after purge")
@@ -548,7 +573,7 @@ func TestSSTReadable_WaiterStoresSharedChunks(t *testing.T) {
 	fetcher.mu.Lock()
 	fetcher.inflight[k] = fl
 	fetcher.mu.Unlock()
-	got, gotData, err := fetcher.fetchChunks(f.ctx, o, 3, 3, 4, storeSync)
+	got, gotData, err := fetcher.fetchChunks(f.ctx, o, 3, 3, 4, true)
 	fetcher.mu.Lock()
 	delete(fetcher.inflight, k)
 	fetcher.mu.Unlock()

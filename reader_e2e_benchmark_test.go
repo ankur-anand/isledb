@@ -1156,9 +1156,6 @@ func clearKVReaderPointBenchmarkCaches(b *testing.B, reader *Reader) {
 // resetReaderCaches empties a reader's open SSTs, block cache and disk
 // cache, keeping parsed Bloom filters, so the next read starts cold.
 func resetReaderCaches(reader *Reader) {
-	if reader.diskCache != nil {
-		reader.diskCache.Sync()
-	}
 	reader.openSSTs.clear()
 	reader.blockCache.clear()
 	reader.clearDiskCache()

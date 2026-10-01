@@ -393,17 +393,17 @@ that meets damaged cache bytes retries once from object storage, so it does
 not fail.
 
 The disk cache persists across restarts and needs no file held open: a read
-opens, reads and closes, so the budget is exact. Entries are written in the
-background, renamed into place without `fsync`. Each file's name carries its
-entry's size, so startup only lists directories: about 0.1 s for a 10 GiB
-cache and a few seconds at 100 GiB. After a crash, startup drops unfinished
-writes, and a file shorter than its name says fails the read that reaches
-past its end and is dropped then; checksums catch damaged bytes. Until
-written, an entry is served from the write queue, which holds at most 1,024
-entries and 64 MiB; a write beyond either is dropped (`Dropped`), and a later
-read fetches the part again. Nothing else holds fetched bytes in memory. Only
-one live Reader process may own a `CacheDir`; opening logs a warning when its
-filesystem cannot hold `DiskCacheSize`.
+opens, reads and closes, so the budget is exact. A fetched part is written
+before the read returns, to a temporary file renamed into place without
+`fsync`; on a local SSD this adds about 2–4% to a cold read and nothing to a
+warm one. Each file's name carries its entry's size, so startup only lists
+directories: about 0.1 s for a 10 GiB cache and a few seconds at 100 GiB.
+After a crash, startup drops unfinished writes, and a file shorter than its
+name says fails the read that reaches past its end and is dropped then;
+checksums catch damaged bytes. Fetched bytes are never held in memory waiting
+to be written; if the disk cannot store a part, a later read fetches it
+again. Only one live Reader process may own a `CacheDir`; opening logs a
+warning when its filesystem cannot hold `DiskCacheSize`.
 
 The block cache is Pebble's. With cgo it is allocated outside the Go heap: it
 counts toward the process's resident memory but not toward `GOMEMLIMIT` or
@@ -615,12 +615,13 @@ Use `All: true` to opt into prefetching the complete keyspace. A zero
 
 `Prefetch` stores each selected SST's metadata, Bloom filter and data in the
 disk cache, fetching only what is missing and sharing requests with
-concurrent reads. It skips SSTs already on disk but counts them against the
-budget, so repeating a prefetch of more than fits keeps what the last one
-cached; it stops selecting once the SSTs on disk and selected would exceed
-the disk cache's data budget or `MaxBytes`, counting the rest in
-`SkippedSSTs`. `CachedSSTs` counts the selected SSTs
-wholly on disk when it returns; `BytesRead` counts the bytes it fetched.
+concurrent reads. It skips SSTs already on disk, and selects SSTs while those
+on disk and selected fit the disk cache's data budget, so repeating a
+prefetch of more than fits keeps what the last one cached, and while the
+selected ones fit `MaxBytes`, which bounds only what this call downloads, so
+repeated calls warm a range in steps. The rest count in `SkippedSSTs`.
+`CachedSSTs` counts the selected SSTs wholly on disk when it returns;
+`BytesRead` counts the bytes it fetched.
 
 ```go
 stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{
@@ -648,7 +649,6 @@ type CacheStats struct {
     Corruptions int64
     Bypasses    int64
     Failures    int64
-    Dropped     int64
 }
 
 type DiskCacheStats struct {
@@ -661,18 +661,18 @@ type DiskCacheStats struct {
 Byte-bounded caches report `MaxEntries == 0`; the open-SST cache, bounded by
 count, reports `MaxBytes == 0`. For the disk cache, `Corruptions` counts
 entries the cache found damaged on its own (a wrong size, or a Bloom filter
-failing its checksum), `Bypasses` entries larger than their whole tier,
-`Failures` entries that could not be written, and `Dropped` entries not
-written because the background write queue was full. Entries in all three
-cases are still served; they are just not kept. `SSTDrops` counts reads
-that failed on what looked like damaged bytes: each drops the SST from every
-layer, so the next read fetches it again. It counts drops, not distinct SSTs.
+failing its checksum), `Bypasses` entries larger than their whole tier, and
+`Failures` entries that could not be written. Entries in both cases are still
+served; they are just not kept, and a disk that keeps failing to store them
+means each later read fetches them again. `SSTDrops` counts reads that failed
+on what looked like damaged bytes: each drops the SST from every layer, so
+the next read fetches it again. It counts drops, not distinct SSTs.
 Concurrent readers of one damaged SST each count, a lookup whose retry fails
 too counts twice, and an SST read in chunks that is bad in object storage, or
 an SST that fails to open the same way every time, counts on every read. A
 small SST bad in object storage fails its whole-object checksum when fetched,
-so it fails reads without counting. A steadily rising count points at an
-SST in one of those states.
+so it fails reads without counting. A steadily rising count points at an SST
+in one of those states.
 
 ## Enable and consume the change feed
 

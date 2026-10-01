@@ -192,7 +192,6 @@ func TestSSTReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 		t.Fatalf("cold open + seek issued %d GETs, want 2", got)
 	}
 
-	disk.Sync()
 	gets.Store(0)
 	reader, err = open()
 	if err != nil {

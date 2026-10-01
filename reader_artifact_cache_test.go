@@ -77,7 +77,6 @@ func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("initial Get value=%q found=%t err=%v", value, found, err)
 	}
-	reader.diskCache.Sync()
 	if stats := reader.DiskCacheStats(); stats.Data.EntryCount != 1 || stats.Meta.EntryCount != 1 {
 		t.Fatalf("disk entries data=%d meta=%d, want the whole SST and its Bloom filter",
 			stats.Data.EntryCount, stats.Meta.EntryCount)

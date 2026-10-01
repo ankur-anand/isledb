@@ -128,15 +128,13 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 	var selected []sstMetadata
 	var stats PrefetchStats
 	seen := make(map[string]struct{})
-	var selectedBytes int64
-	// Prefetching more than the disk cache holds would only evict what it
-	// fetched first.
-	var maxBytes int64
+	// The disk cache's data tier bounds the SSTs on disk and selected, so a
+	// prefetch neither evicts what it fetches nor, repeated over more than
+	// fits, what the last one cached. MaxBytes bounds only what this one
+	// downloads.
+	var tierMax, tierBytes, downloadBytes int64
 	if r.diskCache != nil {
-		maxBytes = r.diskCache.Stats(diskcache.TierData).MaxBytes
-	}
-	if opts.MaxBytes > 0 {
-		maxBytes = min(maxBytes, opts.MaxBytes)
+		tierMax = r.diskCache.Stats(diskcache.TierData).MaxBytes
 	}
 
 	visit := func(sst sstMetadata) {
@@ -151,10 +149,8 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		stats.MatchedSSTs++
 
 		if r.fetcher.resident(r.fetcher.object(sst)) {
-			// Cached SSTs count against the budget, so repeating a prefetch
-			// of more than fits keeps what the last one cached.
-			if sst.Size > 0 && sst.Size <= maxBytes-selectedBytes {
-				selectedBytes += sst.Size
+			if sst.Size > 0 && tierBytes+sst.Size <= tierMax {
+				tierBytes += sst.Size
 			}
 			stats.SkippedSSTs++
 			return
@@ -163,13 +159,15 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 			stats.SkippedSSTs++
 			return
 		}
-		if sst.Size <= 0 || sst.Size > maxBytes-selectedBytes {
+		if sst.Size <= 0 || tierBytes+sst.Size > tierMax ||
+			(opts.MaxBytes > 0 && downloadBytes+sst.Size > opts.MaxBytes) {
 			stats.SkippedSSTs++
 			return
 		}
 
 		selected = append(selected, sst)
-		selectedBytes += sst.Size
+		tierBytes += sst.Size
+		downloadBytes += sst.Size
 	}
 
 	for _, sst := range m.L0SSTs {

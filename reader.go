@@ -801,7 +801,7 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 // object storage, verified against the manifest checksum before use; a
 // corrupted filter could otherwise report a present key as absent.
 func (r *Reader) loadBloomFilter(ctx context.Context, sstMeta sstMetadata) (sstBloomFilter, error) {
-	data, err := r.fetcher.bloom(ctx, r.fetcher.object(sstMeta), storeAsync)
+	data, err := r.fetcher.bloom(ctx, r.fetcher.object(sstMeta))
 	if err != nil {
 		return sstBloomFilter{}, err
 	}
@@ -966,7 +966,6 @@ func diskTierStats(stats diskcache.Stats) CacheStats {
 		Corruptions: stats.Corruptions,
 		Bypasses:    stats.Bypasses,
 		Failures:    stats.Failures,
-		Dropped:     stats.Dropped,
 	}
 }
 

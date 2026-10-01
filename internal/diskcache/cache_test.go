@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func object(seed byte) [32]byte {
@@ -84,89 +86,6 @@ func TestWrongSizeIsCorrupt(t *testing.T) {
 	}
 }
 
-func TestWriteIsReadableBeforeAndAfterStoring(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
-	data := content("pending", 4096)
-	k := Key{Object: object(3), Kind: KindChunk, Index: 1}
-	if !c.Write(k, data) {
-		t.Fatal("Write dropped")
-	}
-	if got, ok := read(c, k, 4096, 0, 4096); !ok || !bytes.Equal(got, data) {
-		t.Fatal("queued write not readable")
-	}
-	c.Sync()
-	if c.Stats(TierData).Entries != 1 {
-		t.Fatal("queued write not stored after Sync")
-	}
-	if got, ok := read(c, k, 4096, 1000, 10); !ok || !bytes.Equal(got, data[1000:1010]) {
-		t.Fatal("stored write not readable")
-	}
-}
-
-func TestWriteDropsWhenQueueFull(t *testing.T) {
-	c, err := Open(Options{Dir: t.TempDir(), MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20, QueueSize: 2})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	// Swap in a queue no writer reads, so it fills; restore it to close.
-	running := c.queue
-	c.queue = make(chan write, 2)
-	defer func() {
-		c.queue = running
-		_ = c.Close()
-	}()
-
-	for i := range 2 {
-		if !c.Write(Key{Object: object(4), Kind: KindChunk, Index: uint32(i)}, content("x", 10)) {
-			t.Fatalf("write %d dropped with room in the queue", i)
-		}
-	}
-	if c.Write(Key{Object: object(4), Kind: KindChunk, Index: 9}, content("x", 10)) {
-		t.Fatal("write queued past the queue's size")
-	}
-	if got := c.Stats(TierData).Dropped; got != 1 {
-		t.Fatalf("Dropped = %d, want 1", got)
-	}
-}
-
-func TestWriteDropsBeyondQueueBytes(t *testing.T) {
-	c, err := Open(Options{Dir: t.TempDir(), MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20, QueueBytes: 10_000})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	// Hold the writers so queued writes stay pending.
-	resume := make(chan struct{})
-	var once sync.Once
-	c.testHook = func(point string, _ Key) {
-		if point == "picked" {
-			<-resume
-		}
-	}
-	t.Cleanup(func() { once.Do(func() { close(resume) }) })
-
-	first := Key{Object: object(20), Kind: KindChunk, Index: 0}
-	second := Key{Object: object(20), Kind: KindChunk, Index: 1}
-	if !c.Write(first, content("a", 6_000)) {
-		t.Fatal("write within the byte budget dropped")
-	}
-	if c.Write(second, content("b", 6_000)) {
-		t.Fatal("write beyond the byte budget queued")
-	}
-	if stats := c.Stats(TierData); stats.Dropped != 1 {
-		t.Fatalf("dropped=%d, want 1", stats.Dropped)
-	}
-	once.Do(func() { close(resume) })
-	c.Sync()
-	if !c.Write(second, content("b", 6_000)) {
-		t.Fatal("write after the queue drained dropped")
-	}
-	c.Sync()
-	if !c.Contains(first, 6_000) || !c.Contains(second, 6_000) {
-		t.Fatal("queued writes not stored")
-	}
-}
-
 func TestTierLRUEviction(t *testing.T) {
 	c := openCache(t, t.TempDir(), 1<<20, 300)
 	chunk := func(i uint32) Key { return Key{Object: object(5), Kind: KindChunk, Index: i} }
@@ -229,59 +148,86 @@ func TestRemovePurgeAndVanishedFiles(t *testing.T) {
 	}
 }
 
-// TestDropDuringStoreIsNotUndone drops an entry while a write of it is in
-// progress: just after the writer took it from the queue, or between the
-// store's rename and its commit, through Write and through Put. The write is
-// not kept, so the entry stays gone across a restart, and a later write of it
-// is kept.
+// TestDropDuringStoreIsNotUndone drops an entry while a Put of it is between
+// its rename and its commit: the Put is not kept, so the entry stays gone
+// across a restart, and a later Put of it is kept.
 func TestDropDuringStoreIsNotUndone(t *testing.T) {
-	cases := []struct{ mode, point string }{
-		{"write", "picked"}, {"write", "renamed"}, {"put", "renamed"},
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	k := Key{Object: object(9), Kind: KindChunk, Index: 2}
+	renamed, resume := make(chan struct{}), make(chan struct{})
+	c.testHook = func(point string, _ Key) {
+		if point == "renamed" {
+			close(renamed)
+			<-resume
+		}
+	}
+	stored := make(chan struct{})
+	go func() {
+		defer close(stored)
+		if err := c.Put(k, content("bad", 4096)); err != nil {
+			t.Errorf("Put: %v", err)
+		}
+	}()
+	<-renamed
+	c.Remove(k)
+	close(resume)
+	<-stored
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	c = openCache(t, dir, 1<<20, 1<<20)
+	if c.Contains(k, 4096) {
+		t.Fatal("dropped entry came back from a write in progress")
+	}
+	good := content("good", 4096)
+	put(t, c, k, good)
+	if got, ok := read(c, k, 4096, 0, 4096); !ok || !bytes.Equal(got, good) {
+		t.Fatal("write after the drop not kept")
+	}
+}
+
+// TestOtherDropsKeepPut drops other entries while a Put is between its
+// rename and its commit: a Remove of another key and a Purge of the other
+// tier leave it alone, while a Purge of its own tier discards it.
+func TestOtherDropsKeepPut(t *testing.T) {
+	cases := []struct {
+		name string
+		drop func(c *Cache)
+		kept bool
+	}{
+		{"remove_other_key", func(c *Cache) { c.Remove(Key{Object: object(31), Kind: KindChunk}) }, true},
+		{"purge_other_tier", func(c *Cache) { c.Purge(TierMeta) }, true},
+		{"purge_own_tier", func(c *Cache) { c.Purge(TierData) }, false},
 	}
 	for _, tc := range cases {
-		mode := tc.mode
-		t.Run(tc.mode+"/"+tc.point, func(t *testing.T) {
-			dir := t.TempDir()
-			c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
-			if err != nil {
-				t.Fatalf("Open: %v", err)
-			}
-			k := Key{Object: object(9), Kind: KindChunk, Index: 2}
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+			k := Key{Object: object(30), Kind: KindChunk}
 			renamed, resume := make(chan struct{}), make(chan struct{})
 			c.testHook = func(point string, _ Key) {
-				if point == tc.point {
+				if point == "renamed" {
 					close(renamed)
 					<-resume
 				}
 			}
-			stored := make(chan struct{})
-			go func() {
-				defer close(stored)
-				if mode == "write" {
-					if !c.Write(k, content("bad", 4096)) {
-						t.Error("Write dropped")
-					}
-				} else if err := c.Put(k, content("bad", 4096)); err != nil {
-					t.Errorf("Put: %v", err)
-				}
-			}()
+			stored := make(chan error, 1)
+			go func() { stored <- c.Put(k, content("kept", 100)) }()
 			<-renamed
-			c.Remove(k)
+			tc.drop(c)
 			close(resume)
-			<-stored
-			// Close waits for the background writer to finish.
-			if err := c.Close(); err != nil {
-				t.Fatalf("Close: %v", err)
+			if err := <-stored; err != nil {
+				t.Fatalf("Put: %v", err)
 			}
-
-			c = openCache(t, dir, 1<<20, 1<<20)
-			if c.Contains(k, 4096) {
-				t.Fatal("dropped entry came back from a write in progress")
+			if got := c.Contains(k, 100); got != tc.kept {
+				t.Fatalf("entry cached=%t after %s, want %t", got, tc.name, tc.kept)
 			}
-			good := content("good", 4096)
-			put(t, c, k, good)
-			if got, ok := read(c, k, 4096, 0, 4096); !ok || !bytes.Equal(got, good) {
-				t.Fatal("write after the drop not kept")
+			if len(c.stores) != 0 {
+				t.Fatalf("%d keys still tracked after the Put finished", len(c.stores))
 			}
 		})
 	}
@@ -444,23 +390,56 @@ func TestReplacingWithAnotherSizeDeletesOldFile(t *testing.T) {
 	}
 }
 
-// TestCloseStoresQueuedWrites closes right after queueing writes: they are
-// stored, so a reopened cache has them.
-func TestCloseStoresQueuedWrites(t *testing.T) {
+// TestCloseWaitsForPut closes while a Put is in progress: Close refuses new
+// Puts at once but returns only after the one in progress is stored, so a
+// reopened cache has it.
+func TestCloseWaitsForPut(t *testing.T) {
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	for i := range uint32(20) {
-		c.Write(Key{Object: object(13), Kind: KindChunk, Index: i}, content("q", 100))
+	k := Key{Object: object(13), Kind: KindChunk, Index: 0}
+	renamed, resume := make(chan struct{}), make(chan struct{})
+	c.testHook = func(point string, _ Key) {
+		if point == "renamed" {
+			close(renamed)
+			<-resume
+		}
 	}
-	if err := c.Close(); err != nil {
+	go func() {
+		if err := c.Put(k, content("q", 100)); err != nil {
+			t.Errorf("Put: %v", err)
+		}
+	}()
+	<-renamed
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	for {
+		c.mu.Lock()
+		closing := c.closed
+		c.mu.Unlock()
+		if closing {
+			break
+		}
+		runtime.Gosched()
+	}
+	if err := c.Put(Key{Object: object(13), Kind: KindChunk, Index: 1}, content("q", 100)); err == nil {
+		t.Fatal("Put accepted after Close began")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before the Put in progress finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(resume)
+	if err := <-closed; err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+
 	c = openCache(t, dir, 1<<20, 1<<20)
-	if got := c.Stats(TierData).Entries; got != 20 {
-		t.Fatalf("reopened cache has %d entries, want 20", got)
+	if !c.Contains(k, 100) {
+		t.Fatal("Put in progress at Close was not kept")
 	}
 }
 
@@ -506,11 +485,7 @@ func TestConcurrentUse(t *testing.T) {
 			for i := range 200 {
 				k := Key{Object: object(byte(g)), Kind: KindChunk, Index: uint32(i % 20)}
 				data := content(fmt.Sprintf("g%d-%d", g, i%20), 512)
-				if i%2 == 0 {
-					c.Write(k, data)
-				} else {
-					_ = c.Put(k, data)
-				}
+				_ = c.Put(k, data)
 				if got, ok := read(c, k, 512, 0, 512); ok && !bytes.Equal(got, data) {
 					t.Errorf("goroutine %d read wrong bytes for %v", g, k)
 					return

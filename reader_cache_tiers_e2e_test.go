@@ -54,7 +54,6 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	// Room for all three; the parsed Bloom cache holds only one filter.
 	reader, done := openTierTestReader(t, ctx, db, cacheDir, 3*oneBloomBytes, 3*oneSSTBytes, oneLoadedBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	reader.diskCache.Sync()
 	stats := reader.DiskCacheStats()
 	assertArtifactCacheTierBound(t, "data tier", stats.Data, 3, 3*oneSSTBytes)
 	assertArtifactCacheTierBound(t, "meta tier", stats.Meta, 3, 3*oneBloomBytes)
@@ -69,7 +68,6 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	assertArtifactCacheTierBound(t, "recovered meta tier", stats.Meta, 3, 3*oneBloomBytes)
 	assertArtifactCacheEmptyL1(t, reader, "first budget restart")
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	reader.diskCache.Sync()
 	stats = reader.DiskCacheStats()
 	assertArtifactCacheTierBound(t, "churning data tier", stats.Data, 1, oneSSTBytes)
 	if stats.Data.Evictions == 0 || stats.Data.Bypasses != 0 {
@@ -87,7 +85,6 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	assertArtifactCacheTierBound(t, "recovered one-entry data tier", stats.Data, 1, oneSSTBytes)
 	assertArtifactCacheTierBound(t, "recovered one-entry meta tier", stats.Meta, 1, oneBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
-	reader.diskCache.Sync()
 	stats = reader.DiskCacheStats()
 	assertArtifactCacheTierBound(t, "bounded data tier", stats.Data, 1, oneSSTBytes)
 	assertArtifactCacheTierBound(t, "bounded meta tier", stats.Meta, 1, oneBloomBytes)

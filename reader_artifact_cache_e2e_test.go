@@ -49,7 +49,6 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		); err != nil || len(rows) != 3 {
 			t.Fatalf("initial scan rows=%v err=%v", rows, err)
 		}
-		reader.diskCache.Sync()
 		assertArtifactCacheHealthyStats(t, reader, 1, 1)
 		if stats := reader.BloomCacheStats(); stats.EntryCount != 1 || stats.Bytes > stats.MaxBytes {
 			t.Fatalf("primed decoded Bloom L1 stats=%+v", stats)
@@ -174,7 +173,6 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		defer reader.Close()
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
-		reader.diskCache.Sync()
 		stats := reader.DiskCacheStats().Data
 		if stats.Bytes > stats.MaxBytes || stats.Failures != 0 || stats.Bypasses != 0 {
 			t.Fatalf("oversized SST data tier stats=%+v", stats)
@@ -202,9 +200,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		defer reader.Close()
 
 		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")
-		reader.diskCache.Sync()
 		assertArtifactCacheTestValue(t, ctx, reader, "b", "second")
-		reader.diskCache.Sync()
 		stats := reader.DiskCacheStats().Data
 		if stats.EntryCount != 1 || stats.Evictions != 1 || stats.Bypasses != 0 {
 			t.Fatalf("evict stats=%+v", stats)
@@ -214,7 +210,6 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		reader.openSSTs.clear()
 		reader.blockCache.clear()
 		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")
-		reader.diskCache.Sync()
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
 	})
 }

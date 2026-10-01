@@ -38,9 +38,6 @@ type CacheStats struct {
 	// Failures counts entries that could not be written into the cache; they
 	// are served without being cached.
 	Failures int64
-	// Dropped counts entries not written because the cache's write queue was
-	// full; they are served without being cached.
-	Dropped int64
 }
 
 // ReaderOpenOptions configures a read-only handle.

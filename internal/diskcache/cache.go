@@ -4,10 +4,13 @@
 //
 // The cache is advisory. Entries are written to a temporary file and renamed
 // into place without fsync, so a crash can leave an entry empty, short or
-// damaged. Startup drops empty entries and unfinished writes; a read checks
-// each entry's size against the size its caller expects, and callers check
-// contents with their own checksums and report damage with ReportCorrupt.
-// Every failure surfaces as a miss.
+// damaged. Startup drops unfinished writes; a read checks each entry's size
+// against the size its caller expects and drops a file shorter than its name
+// says, and callers check contents with their own checksums and report damage
+// with ReportCorrupt. Every failure surfaces as a miss.
+//
+// Writes are synchronous: Put returns once the entry is stored, so there is
+// no queue to bound and nothing held in memory for a write.
 //
 // No file is held open between calls: a read opens, reads and closes, so an
 // evicted entry's space is freed at once and the budgets are exact.
@@ -97,11 +100,6 @@ type Options struct {
 	Dir          string
 	MetaMaxBytes int64
 	DataMaxBytes int64
-	// QueueSize and QueueBytes bound writes waiting to be stored by Write, by
-	// count and by bytes; zero selects 1024 writes and 64 MiB. A Write that
-	// would exceed either is dropped.
-	QueueSize  int
-	QueueBytes int64
 }
 
 // Stats reports one tier's activity and occupancy.
@@ -115,9 +113,6 @@ type Stats struct {
 	Bypasses int64
 	// Failures counts entries that could not be written or renamed.
 	Failures int64
-	// Dropped counts writes discarded because the write queue was full, by
-	// count or by bytes.
-	Dropped int64
 
 	Entries  int
 	Bytes    int64
@@ -127,12 +122,9 @@ type Stats struct {
 var ErrLocked = errors.New("diskcache: directory is locked by another process")
 
 const (
-	lockName          = "LOCK"
-	versionDir        = "v4"
-	incomingName      = "incoming"
-	defaultQueueSize  = 1024
-	defaultQueueBytes = 64 << 20
-	writers           = 2
+	lockName     = "LOCK"
+	versionDir   = "v4"
+	incomingName = "incoming"
 )
 
 // Cache is safe for concurrent use.
@@ -142,33 +134,24 @@ type Cache struct {
 	incoming string
 	lock     *flock.Flock
 	tiers    [tierCount]*tier
-	// closed refuses new reads and writes; released marks the directory lock
-	// given up, after which nothing more is stored.
-	closed   bool
-	released bool
-	// pending holds entries queued by Write until they are stored, so reads
-	// see them meanwhile; idle is signalled whenever one is stored or dropped.
-	// pendingBytes is their total size, at most maxPendingBytes.
-	pending         map[Key][]byte
-	pendingBytes    int64
-	maxPendingBytes int64
-	idle            *sync.Cond
-	// drops counts Remove, ReportCorrupt and Purge calls. A store that a drop
-	// overlapped is not kept (see store), so a dropped entry never comes
-	// back from a write already in progress.
-	drops uint64
-	// testHook, set only by tests, runs at named points: "picked" after the
-	// writer takes a queued write, "renamed" between a store's rename and its
-	// commit, "read" after ReadAt reads a file.
+	// closed refuses new reads and writes; storing tracks the Puts still in
+	// progress, which Close waits for before releasing the directory lock.
+	closed  bool
+	storing sync.WaitGroup
+	// stores holds the keys with a Put in progress. A drop of such a key
+	// bumps its generation, and a Put that sees the generation change is not
+	// kept (see store), so a dropped entry never comes back from a write
+	// already in progress. Drops of other keys leave Puts alone.
+	stores map[Key]*storeState
+	// testHook, set only by tests, runs at named points: "renamed" between a
+	// store's rename and its commit, "read" after ReadAt reads a file.
 	testHook func(point string, k Key)
-
-	queue   chan write
-	writing sync.WaitGroup
 }
 
-type write struct {
-	key  Key
-	data []byte
+// storeState is one key's Puts in progress: how many, and its generation.
+type storeState struct {
+	n   int
+	gen uint64
 }
 
 type tier struct {
@@ -212,9 +195,8 @@ func Open(opts Options) (*Cache, error) {
 		root:     root,
 		incoming: filepath.Join(root, incomingName),
 		lock:     lock,
-		pending:  make(map[Key][]byte),
+		stores:   make(map[Key]*storeState),
 	}
-	c.idle = sync.NewCond(&c.mu)
 	for t, budget := range [tierCount]int64{TierMeta: opts.MetaMaxBytes, TierData: opts.DataMaxBytes} {
 		c.tiers[t] = &tier{max: budget, index: make(map[Key]*list.Element)}
 	}
@@ -222,24 +204,11 @@ func Open(opts Options) (*Cache, error) {
 		_ = lock.Close()
 		return nil, err
 	}
-	queueSize := opts.QueueSize
-	if queueSize <= 0 {
-		queueSize = defaultQueueSize
-	}
-	c.maxPendingBytes = opts.QueueBytes
-	if c.maxPendingBytes <= 0 {
-		c.maxPendingBytes = defaultQueueBytes
-	}
-	c.queue = make(chan write, queueSize)
-	for range writers {
-		c.writing.Add(1)
-		go c.writer(c.queue)
-	}
 	return c, nil
 }
 
-// Close stores the writes already queued, then releases the directory lock.
-// Reads and new writes are refused from the start of Close.
+// Close waits for Puts in progress, then releases the directory lock. Reads
+// and new Puts are refused from the start of Close.
 func (c *Cache) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -248,24 +217,8 @@ func (c *Cache) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
-	close(c.queue)
-	c.writing.Wait()
-	c.mu.Lock()
-	c.released = true
-	clear(c.pending)
-	c.pendingBytes = 0
-	c.idle.Broadcast()
-	c.mu.Unlock()
+	c.storing.Wait()
 	return c.lock.Close()
-}
-
-// Sync waits until every write queued so far has been stored or dropped.
-func (c *Cache) Sync() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for len(c.pending) > 0 && !c.released {
-		c.idle.Wait()
-	}
 }
 
 // ReadAt reads len(p) bytes at off from the entry k, whose full size the
@@ -277,12 +230,6 @@ func (c *Cache) ReadAt(k Key, size int64, p []byte, off int64) bool {
 	}
 	c.mu.Lock()
 	t := c.tiers[k.Kind.Tier()]
-	if data, ok := c.pending[k]; ok && int64(len(data)) == size {
-		copy(p, data[off:])
-		t.stats.Hits++
-		c.mu.Unlock()
-		return true
-	}
 	element, ok := c.lookupLocked(k, size)
 	if !ok {
 		t.stats.Misses++
@@ -315,17 +262,14 @@ func (c *Cache) ReadAt(k Key, size int64, p []byte, off int64) bool {
 	return true
 }
 
-// Contains reports whether k is cached, or queued to be, with the expected
-// size, without counting a hit or a miss or changing eviction order.
+// Contains reports whether k is cached with the expected size, without
+// counting a hit or a miss or changing eviction order.
 func (c *Cache) Contains(k Key, size int64) bool {
 	if !k.valid() {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if data, ok := c.pending[k]; ok && int64(len(data)) == size {
-		return true
-	}
 	if c.closed {
 		return false
 	}
@@ -333,64 +277,35 @@ func (c *Cache) Contains(k Key, size int64) bool {
 	return ok && element.Value.(*entry).size == size
 }
 
-// Write queues data to be stored as k by a background writer, and reports
-// whether it was queued. Until it is stored, reads of k see it. data must not
-// be modified afterwards. A full queue drops the write.
-func (c *Cache) Write(k Key, data []byte) bool {
-	if !k.valid() || len(data) == 0 {
-		return false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return false
-	}
-	if _, ok := c.pending[k]; ok {
-		return true
-	}
-	if element, ok := c.tiers[k.Kind.Tier()].index[k]; ok && element.Value.(*entry).size == int64(len(data)) {
-		return true
-	}
-	if c.pendingBytes+int64(len(data)) > c.maxPendingBytes {
-		c.tiers[k.Kind.Tier()].stats.Dropped++
-		return false
-	}
-	select {
-	case c.queue <- write{key: k, data: data}:
-		c.pending[k] = data
-		c.pendingBytes += int64(len(data))
-		return true
-	default:
-		c.tiers[k.Kind.Tier()].stats.Dropped++
-		return false
-	}
-}
-
-// unpendLocked forgets k's queued write, if any, and reports whether there
-// was one.
-func (c *Cache) unpendLocked(k Key) bool {
-	data, ok := c.pending[k]
-	if ok {
-		delete(c.pending, k)
-		c.pendingBytes -= int64(len(data))
-		c.idle.Broadcast()
-	}
-	return ok
-}
-
-// Put stores data as k before returning, for callers such as prefetch that
-// must not lose writes to a full queue.
+// Put stores data as k before returning. An entry of the same size already
+// stored is left as it is.
 func (c *Cache) Put(k Key, data []byte) error {
 	if !k.valid() || len(data) == 0 {
 		return fmt.Errorf("diskcache: invalid entry %v", k)
 	}
 	c.mu.Lock()
-	closed, drops := c.closed, c.drops
-	c.mu.Unlock()
-	if closed {
+	if c.closed {
+		c.mu.Unlock()
 		return errors.New("diskcache: closed")
 	}
-	return c.store(k, data, drops)
+	c.storing.Add(1)
+	st := c.stores[k]
+	if st == nil {
+		st = &storeState{}
+		c.stores[k] = st
+	}
+	st.n++
+	gen := st.gen
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if st.n--; st.n == 0 {
+			delete(c.stores, k)
+		}
+		c.mu.Unlock()
+		c.storing.Done()
+	}()
+	return c.store(k, data, st, gen)
 }
 
 // Remove drops k and deletes its file.
@@ -410,11 +325,12 @@ func (c *Cache) drop(k Key, corrupt bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.drops++
+	if st := c.stores[k]; st != nil {
+		st.gen++
+	}
 	t := c.tiers[k.Kind.Tier()]
-	queued := c.unpendLocked(k)
 	element, ok := t.index[k]
-	if corrupt && (ok || queued) {
+	if corrupt && ok {
 		t.stats.Corruptions++
 	}
 	if ok {
@@ -429,10 +345,9 @@ func (c *Cache) Purge(tr Tier) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.drops++
-	for k := range c.pending {
+	for k, st := range c.stores {
 		if k.Kind.Tier() == tr {
-			c.unpendLocked(k)
+			st.gen++
 		}
 	}
 	t := c.tiers[tr]
@@ -456,48 +371,18 @@ func (c *Cache) Stats(tr Tier) Stats {
 	return stats
 }
 
-func (c *Cache) writer(queue <-chan write) {
-	defer c.writing.Done()
-	for w := range queue {
-		// The drop count is taken with the pending check, so a drop after
-		// the check is seen by store.
-		c.mu.Lock()
-		data, ok := c.pending[w.key]
-		drops := c.drops
-		c.mu.Unlock()
-		if c.testHook != nil {
-			c.testHook("picked", w.key)
-		}
-		// A write removed or purged while queued is not stored.
-		if ok && &data[0] == &w.data[0] {
-			_ = c.store(w.key, w.data, drops)
-		}
-		c.mu.Lock()
-		if data, ok := c.pending[w.key]; ok && &data[0] == &w.data[0] {
-			c.unpendLocked(w.key)
-		}
-		c.idle.Broadcast()
-		c.mu.Unlock()
-	}
-}
-
 // store writes data to a temporary file and renames it into place, then
 // evicts the tier's least recently used entries to get back within budget.
 //
-// drops is the drop count when the caller decided to store. The file is
-// written without the lock held. If any drop happened since, the store is not
-// kept and k is removed: the drop may have been of k, and the bytes being
-// stored may be the ones it meant to discard. A drop of another entry costs
-// this one a later fetch; drops are rare.
-func (c *Cache) store(k Key, data []byte, drops uint64) error {
+// st and gen are k's Puts in progress and its generation when this Put
+// began. The file is written without the lock held. If k was dropped since,
+// the store is not kept and k is removed: the bytes being stored may be the
+// ones the drop meant to discard.
+func (c *Cache) store(k Key, data []byte, st *storeState, gen uint64) error {
 	t := c.tiers[k.Kind.Tier()]
 	size := int64(len(data))
 	c.mu.Lock()
-	switch {
-	case c.released:
-		c.mu.Unlock()
-		return errors.New("diskcache: closed")
-	case size > t.max:
+	if size > t.max {
 		t.stats.Bypasses++
 		c.mu.Unlock()
 		return nil
@@ -527,11 +412,7 @@ func (c *Cache) store(k Key, data []byte, drops uint64) error {
 		}
 		return fmt.Errorf("diskcache: store %s: %w", k.name(), err)
 	}
-	if c.released {
-		_ = os.Remove(final)
-		return nil
-	}
-	if c.drops != drops {
+	if st.gen != gen {
 		// The renamed file may also have replaced one another store
 		// committed meanwhile, so k goes entirely.
 		if element, ok := t.index[k]; ok {

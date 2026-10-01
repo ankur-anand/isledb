@@ -902,7 +902,6 @@ func TestReader_OpenIteratorSurvivesDiskCacheRemoval(t *testing.T) {
 		iter.Close()
 		t.Fatalf("First: %v", iter.Error())
 	}
-	reader.diskCache.Sync()
 	reader.clearDiskCache()
 	if got := reader.DiskCacheStats().Data.EntryCount; got != 0 {
 		iter.Close()
@@ -1062,7 +1061,6 @@ func TestReader_MetricsObjectReadsAndDiskCache(t *testing.T) {
 	if _, found, err := reader.Get(ctx, []byte("k")); err != nil || !found {
 		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
 	}
-	reader.diskCache.Sync()
 	if _, found, err := reader.Get(ctx, []byte("k")); err != nil || !found {
 		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
 	}
