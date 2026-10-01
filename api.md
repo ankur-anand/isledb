@@ -394,10 +394,16 @@ not fail.
 
 The disk cache persists across restarts and needs no file held open: a read
 opens, reads and closes, so the budget is exact. Entries are written in the
-background, renamed into place without `fsync`; after a crash, startup drops
-unfinished and empty entries, and reads check each entry's size and
-checksums. Only one live Reader process may own a `CacheDir`; opening logs a
-warning when its filesystem cannot hold `DiskCacheSize`.
+background, renamed into place without `fsync`. Each file's name carries its
+entry's size, so startup only lists directories: about 0.1 s for a 10 GiB
+cache and a few seconds at 100 GiB. After a crash, startup drops unfinished
+writes, and a file shorter than its name says fails the read that reaches
+past its end and is dropped then; checksums catch damaged bytes. Until
+written, an entry is served from the write queue, which holds at most 1,024
+entries and 64 MiB; a write beyond either is dropped (`Dropped`), and a later
+read fetches the part again. Nothing else holds fetched bytes in memory. Only
+one live Reader process may own a `CacheDir`; opening logs a warning when its
+filesystem cannot hold `DiskCacheSize`.
 
 The block cache is Pebble's. With cgo it is allocated outside the Go heap: it
 counts toward the process's resident memory but not toward `GOMEMLIMIT` or
@@ -609,9 +615,11 @@ Use `All: true` to opt into prefetching the complete keyspace. A zero
 
 `Prefetch` stores each selected SST's metadata, Bloom filter and data in the
 disk cache, fetching only what is missing and sharing requests with
-concurrent reads. It skips SSTs already on disk, and stops selecting once the
-selected SSTs would exceed the disk cache's data budget or `MaxBytes`,
-counting the rest in `SkippedSSTs`. `CachedSSTs` counts the selected SSTs
+concurrent reads. It skips SSTs already on disk but counts them against the
+budget, so repeating a prefetch of more than fits keeps what the last one
+cached; it stops selecting once the SSTs on disk and selected would exceed
+the disk cache's data budget or `MaxBytes`, counting the rest in
+`SkippedSSTs`. `CachedSSTs` counts the selected SSTs
 wholly on disk when it returns; `BytesRead` counts the bytes it fetched.
 
 ```go
@@ -660,9 +668,11 @@ cases are still served; they are just not kept. `SSTDrops` counts reads
 that failed on what looked like damaged bytes: each drops the SST from every
 layer, so the next read fetches it again. It counts drops, not distinct SSTs.
 Concurrent readers of one damaged SST each count, a lookup whose retry fails
-too counts twice, and an SST that is bad in object storage, or that fails to
-open the same way every time, counts on every read. A steadily rising count
-points at such an SST.
+too counts twice, and an SST read in chunks that is bad in object storage, or
+an SST that fails to open the same way every time, counts on every read. A
+small SST bad in object storage fails its whole-object checksum when fetched,
+so it fails reads without counting. A steadily rising count points at an
+SST in one of those states.
 
 ## Enable and consume the change feed
 

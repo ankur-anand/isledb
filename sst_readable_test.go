@@ -349,8 +349,8 @@ func TestSSTReadable_DamagedMetadataHealsWithinLookup(t *testing.T) {
 			f.forgetMemory()
 			f.ranges.take()
 
-			paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "meta", "*",
-				fmt.Sprintf("%x.meta", f.object().key)))
+			paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v4", "meta", "*",
+				fmt.Sprintf("%x.meta.*", f.object().key)))
 			if err != nil || len(paths) != 1 {
 				t.Fatalf("metadata file matches=%v err=%v", paths, err)
 			}
@@ -465,8 +465,8 @@ func TestSSTReadable_CorruptChunkHealsWithinLookup(t *testing.T) {
 	f.forgetMemory()
 
 	name := (f.object().entry(diskcache.KindChunk, uint32(cached.start/sstChunkSize))).Object
-	paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "data", "*",
-		fmt.Sprintf("%x.c%d", name, cached.start/sstChunkSize)))
+	paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v4", "data", "*",
+		fmt.Sprintf("%x.c%d.*", name, cached.start/sstChunkSize)))
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("chunk file matches=%v err=%v", paths, err)
 	}
@@ -503,46 +503,62 @@ func TestSSTReadable_ReadAheadDoublesPerRequest(t *testing.T) {
 	}
 }
 
-// TestSSTReadable_UncachedEntryFetchedOncePerOpen opens SSTs through a
-// fetcher with no disk cache, where every disk read misses, as when the cache
-// cannot store an entry: each open still fetches its metadata region, or a
-// small SST's whole object, once.
-func TestSSTReadable_UncachedEntryFetchedOncePerOpen(t *testing.T) {
-	for _, chunked := range []bool{false, true} {
-		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
-			f := newReadableTestFixture(t, 2_000, chunked)
-			fetcher := newSSTFetcher(f.reader.store, nil, nil)
-			if chunked {
-				fetcher.smallLimit = 0
-			}
-			t.Cleanup(fetcher.close)
-			reader, err := sstable.NewReader(f.ctx, fetcher.readable(fetcher.object(f.meta)), sstable.ReaderOptions{})
-			if err != nil {
-				t.Fatalf("open SST: %v", err)
-			}
-			iter, err := reader.NewIter(sstable.NoTransforms, f.entries[1_000].Key, nil, sstable.AssertNoBlobHandles)
-			if err != nil {
-				t.Fatalf("new iter: %v", err)
-			}
-			if kv := iter.First(); kv == nil {
-				t.Fatalf("First: %v", iter.Error())
-			}
-			_ = iter.Close()
-			_ = reader.Close()
+// TestSSTReadable_BloomMissFetchesOnlyBloom evicts a small SST's Bloom
+// filter while the SST stays cached whole: the next lookup fetches the Bloom
+// range alone, not the whole object again.
+func TestSSTReadable_BloomMissFetchesOnlyBloom(t *testing.T) {
+	f := newReadableTestFixture(t, 2_000, false)
+	if !f.object().small() || f.meta.Bloom.Length == 0 {
+		t.Fatal("fixture SST is not small with a Bloom filter")
+	}
+	f.get(t, 1_000)
+	f.forgetMemory()
+	f.reader.bloomCache.clear()
+	f.reader.diskCache.Remove(f.object().entry(diskcache.KindBloom, 0))
+	f.ranges.take()
 
-			var whole, meta int
-			for _, r := range f.ranges.take() {
-				switch {
-				case r.start == 0 && r.end >= f.meta.Size:
-					whole++
-				case r == byteRange{f.meta.MetaOffset, f.meta.Size}:
-					meta++
-				}
-			}
-			if chunked && meta != 1 || !chunked && whole != 1 {
-				t.Fatalf("open fetched the metadata region %d times and the whole SST %d times, want once",
-					meta, whole)
-			}
-		})
+	f.get(t, 1_000)
+	bloom := byteRange{f.meta.Bloom.Offset, f.meta.Bloom.Offset + f.meta.Bloom.Length}
+	if got := f.ranges.take(); len(got) != 1 || got[0] != bloom {
+		t.Fatalf("lookup after Bloom eviction ranges=%v, want only the Bloom range %v", got, bloom)
+	}
+}
+
+// TestSSTReadable_WaiterStoresSharedChunks has a caller that caches wait on
+// a chunk request made by one that does not, as a prefetch or lookup waiting
+// on a scan's private read: the waiter stores the chunks it receives.
+func TestSSTReadable_WaiterStoresSharedChunks(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	fetcher, o := f.reader.fetcher, f.object()
+	start, end := o.chunkSpan(3)
+	data := make([]byte, end-start)
+	if err := (&sstReadHandle{r: fetcher.readable(o), nextOff: -1}).readData(f.ctx, data, start); err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	f.reader.diskCache.Sync()
+	f.reader.diskCache.Purge(diskcache.TierData)
+	if f.chunkCached(3) {
+		t.Fatal("chunk still cached after purge")
+	}
+
+	// A finished private request for chunk 3, still registered in flight.
+	k := o.entry(diskcache.KindChunk, 3)
+	fl := &chunkFetch{done: make(chan struct{}), start: start, end: end, data: data}
+	close(fl.done)
+	fetcher.mu.Lock()
+	fetcher.inflight[k] = fl
+	fetcher.mu.Unlock()
+	got, gotData, err := fetcher.fetchChunks(f.ctx, o, 3, 3, 4, storeSync)
+	fetcher.mu.Lock()
+	delete(fetcher.inflight, k)
+	fetcher.mu.Unlock()
+	if err != nil || got != start || !bytes.Equal(gotData, data) {
+		t.Fatalf("fetchChunks start=%d err=%v, want the shared request's bytes", got, err)
+	}
+	if len(f.ranges.take()) != 1 {
+		t.Fatal("waiter made a request of its own")
+	}
+	if !f.chunkCached(3) {
+		t.Fatal("waiter did not store the chunks it received")
 	}
 }

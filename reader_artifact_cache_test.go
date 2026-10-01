@@ -132,8 +132,8 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v3", "data", "*", "*.whole"))
-	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v3", "meta", "*", "*.bloom"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v4", "data", "*", "*.whole.*"))
+	corruptSingleArtifactFile(t, filepath.Join(cacheDir, "artifacts", "v4", "meta", "*", "*.bloom.*"))
 
 	reopened, err := newReader(ctx, store, readerOptions{CacheDir: cacheDir})
 	if err != nil {

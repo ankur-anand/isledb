@@ -236,6 +236,49 @@ func TestReader_PrefetchRespectsMaxSSTs(t *testing.T) {
 	}
 }
 
+// TestReader_PrefetchBudgetCountsCachedSSTs repeats a prefetch of more than
+// its byte budget holds: SSTs the first one cached count against the second's
+// budget, so the second fetches nothing rather than evicting them.
+func TestReader_PrefetchBudgetCountsCachedSSTs(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("prefetch-budget-cached")
+	manifestStore := newManifestStore(store, nil)
+	writer := newPrefetchTestWriter(t, ctx, store, manifestStore)
+	defer writer.close(ctx)
+	writePrefetchBatch(t, ctx, writer, "a", 0, 2)
+	writePrefetchBatch(t, ctx, writer, "b", 0, 2)
+	writePrefetchBatch(t, ctx, writer, "c", 0, 2)
+
+	reader := newPrefetchTestReader(t, ctx, store, ReaderOpenOptions{})
+	defer reader.Close()
+	ssts := reader.currentManifest().L0SSTs
+	if len(ssts) != 3 {
+		t.Fatalf("L0 SST count = %d, want 3", len(ssts))
+	}
+	// Room for any two of the three SSTs, not all three.
+	var total, smallest int64 = 0, ssts[0].Size
+	for _, sst := range ssts {
+		total += sst.Size
+		smallest = min(smallest, sst.Size)
+	}
+	opts := PrefetchOptions{All: true, MaxBytes: total - smallest}
+
+	first, err := reader.Prefetch(ctx, opts)
+	if err != nil {
+		t.Fatalf("Prefetch first: %v", err)
+	}
+	if first.CachedSSTs != 2 {
+		t.Fatalf("first stats = %+v, want two cached", first)
+	}
+	second, err := reader.Prefetch(ctx, opts)
+	if err != nil {
+		t.Fatalf("Prefetch second: %v", err)
+	}
+	if second.CachedSSTs != 0 || second.BytesRead != 0 || second.SkippedSSTs != 3 {
+		t.Fatalf("second stats = %+v, want nothing fetched", second)
+	}
+}
+
 func TestReader_PrefetchByteBudgetSkipsUnknownSize(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("")

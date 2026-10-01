@@ -151,6 +151,11 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		stats.MatchedSSTs++
 
 		if r.fetcher.resident(r.fetcher.object(sst)) {
+			// Cached SSTs count against the budget, so repeating a prefetch
+			// of more than fits keeps what the last one cached.
+			if sst.Size > 0 && sst.Size <= maxBytes-selectedBytes {
+				selectedBytes += sst.Size
+			}
 			stats.SkippedSSTs++
 			return
 		}

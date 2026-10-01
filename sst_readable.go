@@ -42,6 +42,9 @@ type sstObject struct {
 	key           [32]byte
 	// whole reports that the SST is fetched and cached whole: it is no larger
 	// than the fetcher's small-SST limit, or its metadata offset is unknown.
+	// Every writer records the offset, so it is unknown only through a writer
+	// bug or for an SST written before offsets were recorded; such an SST is
+	// read whole whatever its size.
 	whole bool
 }
 
@@ -196,8 +199,13 @@ func (e *fetchError) Unwrap() error { return e.err }
 // bad. Every error is, except a failed fetch or an ended context: those leave
 // the cache as it was, and the next read tries again.
 func damaged(err error) bool {
+	// Checked first: fetchErr escapes, so declaring it allocates, and nearly
+	// every call is on a successful read.
+	if err == nil {
+		return false
+	}
 	var fetchErr *fetchError
-	return err != nil && !errors.As(err, &fetchErr) &&
+	return !errors.As(err, &fetchErr) &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -229,10 +237,10 @@ func (f *sstFetcher) load(ctx context.Context, k diskcache.Key, fetch func(conte
 }
 
 // whole returns a small SST's object from its start through the end of its
-// Bloom sidecar, fetched in one request. It verifies both parts and caches
-// each as its own entry.
+// Bloom sidecar, fetched in one request shared by concurrent callers. It
+// verifies the SST, and each caller caches both parts as its mode says.
 func (f *sstFetcher) whole(ctx context.Context, o sstObject, mode storeMode) ([]byte, error) {
-	return f.load(ctx, o.entry(diskcache.KindWhole, 0), func(ctx context.Context) ([]byte, error) {
+	data, err := f.load(ctx, o.entry(diskcache.KindWhole, 0), func(ctx context.Context) ([]byte, error) {
 		end := o.size
 		if o.bloomLength > 0 && o.bloomOffset >= o.size {
 			end = o.bloomOffset + o.bloomLength
@@ -248,31 +256,41 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject, mode storeMode) ([]
 				return nil, &fetchError{fmt.Errorf("validate sst %s: checksum mismatch", o.id)}
 			}
 		}
-		f.diskStore(o.entry(diskcache.KindWhole, 0), data[:o.size], mode)
-		if end > o.size {
-			if bloom := data[o.bloomOffset:end]; validateBloomChecksum(o.bloomChecksum, bloom) == nil {
-				f.diskStore(o.entry(diskcache.KindBloom, 0), bloom, mode)
-			}
-		}
 		return data, nil
 	})
+	if err != nil || mode == storeNone {
+		return data, err
+	}
+	f.diskStore(o.entry(diskcache.KindWhole, 0), data[:o.size], mode)
+	if end := o.bloomOffset + o.bloomLength; o.bloomLength > 0 && o.bloomOffset >= o.size && int64(len(data)) >= end {
+		if bloom := data[o.bloomOffset:end]; validateBloomChecksum(o.bloomChecksum, bloom) == nil {
+			f.diskStore(o.entry(diskcache.KindBloom, 0), bloom, mode)
+		}
+	}
+	return data, nil
 }
 
 // meta returns a large SST's metadata region, [MetaOffset, Size), fetched in
-// one request and cached as one entry.
+// one request shared by concurrent callers, each of which caches it as one
+// entry as its mode says.
 func (f *sstFetcher) meta(ctx context.Context, o sstObject, mode storeMode) ([]byte, error) {
-	return f.load(ctx, o.entry(diskcache.KindMeta, 0), func(ctx context.Context) ([]byte, error) {
+	data, err := f.load(ctx, o.entry(diskcache.KindMeta, 0), func(ctx context.Context) ([]byte, error) {
 		data, err := f.readRange(ctx, o.path, o.metaOffset, o.size-o.metaOffset)
 		if err != nil {
 			return nil, fmt.Errorf("read sst %s metadata: %w", o.id, err)
 		}
-		f.diskStore(o.entry(diskcache.KindMeta, 0), data, mode)
 		return data, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	f.diskStore(o.entry(diskcache.KindMeta, 0), data, mode)
+	return data, nil
 }
 
 // bloom returns an SST's verified Bloom sidecar: from disk, else with the
-// whole object for a small SST, else with one request of its own.
+// whole object for a small SST that is not cached either, else with one
+// request of its own.
 func (f *sstFetcher) bloom(ctx context.Context, o sstObject, mode storeMode) ([]byte, error) {
 	k := o.entry(diskcache.KindBloom, 0)
 	data := make([]byte, o.bloomLength)
@@ -282,7 +300,7 @@ func (f *sstFetcher) bloom(ctx context.Context, o sstObject, mode storeMode) ([]
 		}
 		f.disk.ReportCorrupt(k)
 	}
-	if o.small() {
+	if o.small() && !f.diskHas(o.entry(diskcache.KindWhole, 0), o.size) {
 		object, err := f.whole(ctx, o, mode)
 		if err != nil {
 			return nil, err
@@ -404,6 +422,8 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 			waited = true
 			lastEnd := min(int64(last+1)*sstChunkSize, o.metaOffset)
 			if fl.err == nil && fl.start <= int64(first)*sstChunkSize && fl.end >= lastEnd {
+				// The request was another caller's, made for its own mode.
+				f.storeChunks(o, fl.start, fl.data, mode)
 				return fl.start, fl.data, nil
 			}
 			continue // the request failed or did not cover the run: fetch it here
@@ -428,10 +448,9 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 
 		fl.data, fl.err = f.readRange(ctx, o.path, start, stop-start)
 		if fl.err == nil {
-			for i := first; i < end; i++ {
-				s, e := o.chunkSpan(i)
-				f.diskStore(o.entry(diskcache.KindChunk, i), fl.data[s-start:e-start], mode)
-			}
+			// Stored before the request leaves inflight, so a reader that
+			// no longer finds it in flight finds it queued on disk.
+			f.storeChunks(o, start, fl.data, mode)
 		}
 		f.mu.Lock()
 		for i := first; i < end; i++ {
@@ -448,6 +467,20 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 	}
 }
 
+// storeChunks caches, as mode says, the chunks in data, which holds whole
+// chunks from start.
+func (f *sstFetcher) storeChunks(o sstObject, start int64, data []byte, mode storeMode) {
+	if mode == storeNone {
+		return
+	}
+	for off := start; off < start+int64(len(data)); {
+		i := uint32(off / sstChunkSize)
+		s, e := o.chunkSpan(i)
+		f.diskStore(o.entry(diskcache.KindChunk, i), data[s-start:e-start], mode)
+		off = e
+	}
+}
+
 func chunkLen(o sstObject, i uint32) int64 {
 	start, end := o.chunkSpan(i)
 	return end - start
@@ -455,18 +488,13 @@ func chunkLen(o sstObject, i uint32) int64 {
 
 // sstReadable serves Pebble's reads of one SST, through the disk cache, from
 // object storage. Decoded blocks are cached above it by Pebble's block cache,
-// so a read here is a block cache miss.
-//
-// It keeps the metadata region, or a small SST's whole object, that it
-// fetched until the disk cache serves it, so an entry the cache could not
-// store, or dropped from a full write queue, is not fetched again by every
-// read of this open SST.
+// so a read here is a block cache miss. It holds no fetched bytes of its own:
+// a write the disk cache dropped costs a later read a fetch, never memory.
 type sstReadable struct {
 	f *sstFetcher
 	o sstObject
 
-	mu     sync.Mutex
-	pinned []byte
+	mu sync.Mutex
 	// holding, while the SST is being opened, makes metadata reads come from
 	// held, the whole metadata region read once, so the open's several
 	// metadata reads cost one disk read rather than one each. Both are
@@ -520,30 +548,17 @@ func (r *sstReadable) heldMetadata(ctx context.Context) ([]byte, error) {
 }
 
 // readEntry fills p from the whole-object or metadata entry k of the given
-// size, at off within it: from disk, else from what this readable fetched,
-// else by fetching it.
+// size, at off within it: from disk, else by fetching it.
 func (r *sstReadable) readEntry(ctx context.Context, k diskcache.Key, size int64, p []byte, off int64,
 	fetch func(context.Context) ([]byte, error)) error {
 	if r.f.diskRead(k, size, p, off) {
-		r.mu.Lock()
-		r.pinned = nil
-		r.mu.Unlock()
 		return nil
 	}
-	r.mu.Lock()
-	pinned := r.pinned
-	r.mu.Unlock()
-	if pinned == nil {
-		data, err := fetch(ctx)
-		if err != nil {
-			return err
-		}
-		pinned = data
-		r.mu.Lock()
-		r.pinned = data
-		r.mu.Unlock()
+	data, err := fetch(ctx)
+	if err != nil {
+		return err
 	}
-	copy(p, pinned[off:])
+	copy(p, data[off:])
 	return nil
 }
 

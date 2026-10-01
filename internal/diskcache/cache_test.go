@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 )
 
 func object(seed byte) [32]byte {
@@ -130,6 +129,44 @@ func TestWriteDropsWhenQueueFull(t *testing.T) {
 	}
 }
 
+func TestWriteDropsBeyondQueueBytes(t *testing.T) {
+	c, err := Open(Options{Dir: t.TempDir(), MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20, QueueBytes: 10_000})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	// Hold the writers so queued writes stay pending.
+	resume := make(chan struct{})
+	var once sync.Once
+	c.testHook = func(point string, _ Key) {
+		if point == "picked" {
+			<-resume
+		}
+	}
+	t.Cleanup(func() { once.Do(func() { close(resume) }) })
+
+	first := Key{Object: object(20), Kind: KindChunk, Index: 0}
+	second := Key{Object: object(20), Kind: KindChunk, Index: 1}
+	if !c.Write(first, content("a", 6_000)) {
+		t.Fatal("write within the byte budget dropped")
+	}
+	if c.Write(second, content("b", 6_000)) {
+		t.Fatal("write beyond the byte budget queued")
+	}
+	if stats := c.Stats(TierData); stats.Dropped != 1 {
+		t.Fatalf("dropped=%d, want 1", stats.Dropped)
+	}
+	once.Do(func() { close(resume) })
+	c.Sync()
+	if !c.Write(second, content("b", 6_000)) {
+		t.Fatal("write after the queue drained dropped")
+	}
+	c.Sync()
+	if !c.Contains(first, 6_000) || !c.Contains(second, 6_000) {
+		t.Fatal("queued writes not stored")
+	}
+}
+
 func TestTierLRUEviction(t *testing.T) {
 	c := openCache(t, t.TempDir(), 1<<20, 300)
 	chunk := func(i uint32) Key { return Key{Object: object(5), Kind: KindChunk, Index: i} }
@@ -179,7 +216,7 @@ func TestRemovePurgeAndVanishedFiles(t *testing.T) {
 	}
 
 	// A file deleted behind the cache's back reads as a miss and is dropped.
-	if err := os.Remove(c.path(b)); err != nil {
+	if err := os.Remove(c.path(b, 100)); err != nil {
 		t.Fatalf("remove file: %v", err)
 	}
 	if _, ok := read(c, b, 100, 0, 10); ok || c.Contains(b, 100) {
@@ -189,6 +226,89 @@ func TestRemovePurgeAndVanishedFiles(t *testing.T) {
 	c.Purge(TierMeta)
 	if c.Contains(bloom, 100) {
 		t.Fatal("Purge left a meta-tier entry")
+	}
+}
+
+// TestDropDuringStoreIsNotUndone drops an entry while a write of it is in
+// progress: just after the writer took it from the queue, or between the
+// store's rename and its commit, through Write and through Put. The write is
+// not kept, so the entry stays gone across a restart, and a later write of it
+// is kept.
+func TestDropDuringStoreIsNotUndone(t *testing.T) {
+	cases := []struct{ mode, point string }{
+		{"write", "picked"}, {"write", "renamed"}, {"put", "renamed"},
+	}
+	for _, tc := range cases {
+		mode := tc.mode
+		t.Run(tc.mode+"/"+tc.point, func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			k := Key{Object: object(9), Kind: KindChunk, Index: 2}
+			renamed, resume := make(chan struct{}), make(chan struct{})
+			c.testHook = func(point string, _ Key) {
+				if point == tc.point {
+					close(renamed)
+					<-resume
+				}
+			}
+			stored := make(chan struct{})
+			go func() {
+				defer close(stored)
+				if mode == "write" {
+					if !c.Write(k, content("bad", 4096)) {
+						t.Error("Write dropped")
+					}
+				} else if err := c.Put(k, content("bad", 4096)); err != nil {
+					t.Errorf("Put: %v", err)
+				}
+			}()
+			<-renamed
+			c.Remove(k)
+			close(resume)
+			<-stored
+			// Close waits for the background writer to finish.
+			if err := c.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			c = openCache(t, dir, 1<<20, 1<<20)
+			if c.Contains(k, 4096) {
+				t.Fatal("dropped entry came back from a write in progress")
+			}
+			good := content("good", 4096)
+			put(t, c, k, good)
+			if got, ok := read(c, k, 4096, 0, 4096); !ok || !bytes.Equal(got, good) {
+				t.Fatal("write after the drop not kept")
+			}
+		})
+	}
+}
+
+// TestFailedReadKeepsReplacedEntry fails a read of an entry whose file
+// vanished, while the entry is stored again before the read takes the lock:
+// the new entry stays.
+func TestFailedReadKeepsReplacedEntry(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	k := Key{Object: object(21), Kind: KindChunk, Index: 0}
+	put(t, c, k, content("old", 100))
+	if err := os.Remove(c.path(k, 100)); err != nil {
+		t.Fatal(err)
+	}
+	c.testHook = func(point string, _ Key) {
+		if point == "read" {
+			c.testHook = nil
+			c.Remove(k)
+			put(t, c, k, content("new", 100))
+		}
+	}
+	if _, ok := read(c, k, 100, 0, 10); ok {
+		t.Fatal("read of a vanished file succeeded")
+	}
+	if got, ok := read(c, k, 100, 0, 100); !ok || !bytes.Equal(got, content("new", 100)) {
+		t.Fatal("failed read removed the entry stored meanwhile")
 	}
 }
 
@@ -208,7 +328,7 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	}
 
 	// Debris a crash or an older version could leave behind.
-	empty := Key{Object: object(9), Kind: KindChunk, Index: 1}
+	unnamed := Key{Object: object(9), Kind: KindChunk, Index: 1}
 	mustWrite := func(path string, data []byte) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -218,10 +338,14 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	emptyPath := filepath.Join(root, "data", empty.name()[:2], empty.name())
-	mustWrite(emptyPath, nil)
-	wrongTier := filepath.Join(root, "meta", keep.name()[:2], (Key{Object: object(10), Kind: KindChunk}).name())
+	// A name without a size, as the previous layout used.
+	sizeless := filepath.Join(root, "data", unnamed.name()[:2], unnamed.name())
+	mustWrite(sizeless, []byte("x"))
+	wrongTier := filepath.Join(root, "meta", keep.name()[:2], (Key{Object: object(10), Kind: KindChunk}).name()+".1")
 	mustWrite(wrongTier, []byte("x"))
+	// A second size for an entry already found.
+	duplicate := filepath.Join(root, "data", keep.name()[:2], keep.name()+".301")
+	mustWrite(duplicate, content("keep", 301))
 	unfinished := filepath.Join(root, incomingName, "entry-123")
 	mustWrite(unfinished, []byte("partial"))
 	oldLayout := filepath.Join(dir, "v2", "sst", "aa", "file")
@@ -236,7 +360,10 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	if !c.Contains(meta, 200) {
 		t.Fatal("meta entry lost across restart")
 	}
-	for _, gone := range []string{emptyPath, wrongTier, unfinished, filepath.Join(dir, "v2")} {
+	if stats := c.Stats(TierData); stats.Entries != 1 {
+		t.Fatalf("data tier entries=%d after recovery, want 1", stats.Entries)
+	}
+	for _, gone := range []string{sizeless, wrongTier, unfinished, filepath.Join(dir, "v2")} {
 		if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s survived recovery", gone)
 		}
@@ -246,26 +373,74 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	}
 }
 
-func TestRestartTrimsToBudgetOldestFirst(t *testing.T) {
+func TestRestartTrimsToBudget(t *testing.T) {
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	for i := range uint32(3) {
-		k := Key{Object: object(11), Kind: KindChunk, Index: i}
-		put(t, c, k, content("z", 100))
-		old := time.Now().Add(time.Duration(i-3) * time.Hour)
-		if err := os.Chtimes(c.path(k), old, old); err != nil {
-			t.Fatal(err)
-		}
+		put(t, c, Key{Object: object(11), Kind: KindChunk, Index: i}, content("z", 100))
 	}
 	_ = c.Close()
 
 	c = openCache(t, dir, 1<<20, 200)
-	if c.Contains(Key{Object: object(11), Kind: KindChunk, Index: 0}, 100) ||
-		!c.Contains(Key{Object: object(11), Kind: KindChunk, Index: 2}, 100) {
-		t.Fatal("restart did not drop the oldest entry beyond budget")
+	if stats := c.Stats(TierData); stats.Entries != 2 || stats.Bytes != 200 {
+		t.Fatalf("restart kept %d entries of %d bytes, want 2 of 200", stats.Entries, stats.Bytes)
+	}
+	files, err := filepath.Glob(filepath.Join(dir, versionDir, "data", "*", "*"))
+	if err != nil || len(files) != 2 {
+		t.Fatalf("files after trim=%v err=%v, want 2", files, err)
+	}
+}
+
+// TestShortFileDroppedOnRead stores an entry, then truncates its file, as a
+// crash before its data reached the disk can: the read past the end fails,
+// counts a corruption and drops the entry.
+func TestShortFileDroppedOnRead(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	k := Key{Object: object(22), Kind: KindChunk, Index: 0}
+	put(t, c, k, content("short", 100))
+	path := c.path(k, 100)
+	_ = c.Close()
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	c = openCache(t, dir, 1<<20, 1<<20)
+	if !c.Contains(k, 100) {
+		t.Fatal("recovery did not index the entry from its name")
+	}
+	if _, ok := read(c, k, 100, 90, 10); ok {
+		t.Fatal("read past a short file succeeded")
+	}
+	if stats := c.Stats(TierData); stats.Corruptions != 1 || stats.Entries != 0 {
+		t.Fatalf("short file stats=%+v, want one corruption and no entries", stats)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("short file not deleted")
+	}
+}
+
+// TestReplacingWithAnotherSizeDeletesOldFile stores an entry under one size
+// and then another: the first file, whose name differs, is deleted.
+func TestReplacingWithAnotherSizeDeletesOldFile(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	k := Key{Object: object(23), Kind: KindChunk, Index: 0}
+	put(t, c, k, content("a", 100))
+	put(t, c, k, content("b", 200))
+	if _, err := os.Stat(c.path(k, 100)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("file of the replaced size survived")
+	}
+	if got, ok := read(c, k, 200, 0, 200); !ok || !bytes.Equal(got, content("b", 200)) {
+		t.Fatal("replacement not readable")
+	}
+	if stats := c.Stats(TierData); stats.Entries != 1 || stats.Bytes != 200 {
+		t.Fatalf("stats=%+v, want one entry of 200 bytes", stats)
 	}
 }
 
@@ -305,13 +480,18 @@ func TestParseNameRoundTrip(t *testing.T) {
 		{Object: object(12), Kind: KindChunk, Index: 0},
 		{Object: object(12), Kind: KindChunk, Index: 4_294_967_295},
 	} {
-		got, ok := parseName(k.name())
-		if !ok || got != k {
-			t.Fatalf("parseName(%q) = %v, %t; want %v", k.name(), got, ok, k)
+		name := k.name() + ".131072"
+		got, size, ok := parseName(name)
+		if !ok || got != k || size != 131072 {
+			t.Fatalf("parseName(%q) = %v, %d, %t; want %v, 131072", name, got, size, ok, k)
 		}
 	}
-	for _, bad := range []string{"", "abc.meta", fmt.Sprintf("%064x.c01", 0), fmt.Sprintf("%064x.c", 0), fmt.Sprintf("%064x.other", 0), fmt.Sprintf("%064X.meta", 0xabc)} {
-		if _, ok := parseName(bad); ok {
+	zero := fmt.Sprintf("%064x", 0)
+	for _, bad := range []string{
+		"", "abc.meta.1", zero + ".c01.1", zero + ".c.1", zero + ".other.1", fmt.Sprintf("%064X.meta.1", 0xabc),
+		zero + ".meta", zero + ".meta.0", zero + ".meta.01", zero + ".meta.-1", zero + ".meta.x", zero + ".c1",
+	} {
+		if _, _, ok := parseName(bad); ok {
 			t.Fatalf("parseName(%q) accepted", bad)
 		}
 	}

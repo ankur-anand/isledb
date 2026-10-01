@@ -71,9 +71,9 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		// Same-size corruption of both tiers must be removed and healed from
 		// fake S3 rather than poisoning subsequent reads.
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v3", "data", "*", "*.whole"))
+			t, filepath.Join(cacheDir, "artifacts", "v4", "data", "*", "*.whole.*"))
 		corruptSingleArtifactFile(
-			t, filepath.Join(cacheDir, "artifacts", "v3", "meta", "*", "*.bloom"))
+			t, filepath.Join(cacheDir, "artifacts", "v4", "meta", "*", "*.bloom.*"))
 		healingReader := openArtifactCacheTestReader(t, ctx, db, cacheDir, 0)
 		assertArtifactCacheRecoveredTiers(t, healingReader, 1, 1)
 		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
@@ -339,7 +339,7 @@ func assertArtifactCacheHealthyStats(
 
 func assertArtifactCacheIncomingEmpty(t *testing.T, cacheDir string) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v3", "incoming"))
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v4", "incoming"))
 	if err != nil {
 		t.Fatalf("read incoming cache directory: %v", err)
 	}

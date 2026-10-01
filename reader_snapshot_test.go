@@ -817,3 +817,16 @@ func sameStrings(left, right []string) bool {
 	}
 	return true
 }
+
+// TestReadViewErrorKeepsSuccess checks that a read finishing as its view
+// expires keeps its result, while a failed read reports the expiry.
+func TestReadViewErrorKeepsSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(ErrReadViewExpired)
+	if err := readViewError(ctx, nil); err != nil {
+		t.Fatalf("successful read err=%v, want nil", err)
+	}
+	if err := readViewError(ctx, context.Canceled); !errors.Is(err, ErrReadViewExpired) {
+		t.Fatalf("failed read err=%v, want %v", err, ErrReadViewExpired)
+	}
+}
