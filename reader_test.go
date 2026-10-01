@@ -882,7 +882,7 @@ func TestReader_SSTCacheReleaseOnIteratorClose(t *testing.T) {
 	defer reader.Close()
 	defer store.Close()
 
-	_, iter, err := reader.openSSTIterBounded(ctx, res.Meta, nil, nil)
+	_, iter, err := reader.openSSTIterBounded(ctx, res.Meta, nil, nil, false)
 	if err != nil {
 		t.Fatalf("openSSTIterBounded: %v", err)
 	}

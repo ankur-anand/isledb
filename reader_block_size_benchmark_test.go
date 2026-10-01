@@ -219,14 +219,12 @@ func runKVBlockSizeReads(b *testing.B, ctx context.Context, f kvBlockSizeFixture
 	// Load the sidecar Bloom once so cold Gets measure only Pebble navigation
 	// and data reads.
 	assertKVBlockSizeGet(b, ctx, f, key)
-	waitKVReaderBenchmarkCache(f.reader)
 
 	b.Run("get/cold", func(b *testing.B) {
 		runKVBlockSizeCold(b, f, func() { assertKVBlockSizeGet(b, ctx, f, key) })
 	})
 	b.Run("get/warm", func(b *testing.B) {
 		assertKVBlockSizeGet(b, ctx, f, key)
-		waitKVReaderBenchmarkCache(f.reader)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -441,7 +439,6 @@ func BenchmarkFakeS3_KVReaderRangeReadAhead(b *testing.B) {
 				// Load the sidecar Bloom before adding latency; cold Gets
 				// then measure only SST reads.
 				assertKVBlockSizeGet(b, ctx, f, key)
-				waitKVReaderBenchmarkCache(f.reader)
 				f.counts.sstDelay = 20 * time.Millisecond
 				f.counts.sstBytesPerSecond = 100e6
 
@@ -488,7 +485,6 @@ func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
 			for _, reader := range []*Reader{f.reader, f.whole} {
 				assertKVReaderBenchmarkManifestGet(
 					b, ctx, reader, f.state, kvLeveledBenchmarkKey(0), true, kvBlockSizeValueBytes)
-				waitKVReaderBenchmarkCache(reader)
 			}
 			f.counts.sstDelay = 20 * time.Millisecond
 			f.counts.sstBytesPerSecond = 100e6
@@ -499,8 +495,7 @@ func BenchmarkFakeS3_KVReaderRangeVsWholeBySSTSize(b *testing.B) {
 				reset  func()
 			}{
 				{"range", f.reader, func() {
-					waitKVReaderBenchmarkCache(f.reader)
-					f.reader.blockCache.Clear()
+					f.reader.blockCache.clear()
 					f.reader.metaCache.clear()
 				}},
 				{"whole", f.whole, f.whole.clearSSTCache},

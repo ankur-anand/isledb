@@ -216,7 +216,6 @@ func BenchmarkFakeS3_KVReaderGet_WholeSSTVsRange(b *testing.B) {
 				// the whole-SST and range-read data paths. Cold cases then clear
 				// only the corresponding SST-data cache.
 				assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
-				waitKVReaderBenchmarkCache(reader)
 				if temperature == "cold" {
 					clearKVReaderBenchmarkCache(b, reader)
 				}
@@ -271,7 +270,6 @@ func BenchmarkFakeS3_KVReaderGet_ConcurrentColdMiss(b *testing.B) {
 			// independent miss coalescing and is not the cache path this
 			// benchmark compares.
 			assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
-			waitKVReaderBenchmarkCache(reader)
 			clearKVReaderBenchmarkCache(b, reader)
 			counts.reset()
 			bytesBefore := kvReaderRemoteBytes(metrics)
@@ -359,7 +357,6 @@ func BenchmarkFakeS3_KVReaderGet_SortedLevelDepth(b *testing.B) {
 						assertKVReaderBenchmarkManifestGet(
 							b, ctx, fixture.reader, state, benchmarkCase.key,
 							benchmarkCase.wantFound, valueSize)
-						waitKVReaderBenchmarkCache(fixture.reader)
 					}
 
 					fixture.counts.reset()
@@ -399,7 +396,6 @@ func BenchmarkFakeS3_KVReaderGet_SortedLevelDepth(b *testing.B) {
 			if temperature == "warm" {
 				assertKVReaderBenchmarkManifestGet(
 					b, ctx, fixture.reader, state, fixture.tombstoneKey, false, valueSize)
-				waitKVReaderBenchmarkCache(fixture.reader)
 			}
 
 			fixture.counts.reset()
@@ -448,7 +444,6 @@ func BenchmarkFakeS3_KVReaderGet_SortedLevelDepth(b *testing.B) {
 						assertKVReaderBenchmarkWindowedGet(
 							b, ctx, fixture.reader, windowState, benchmarkCase.key,
 							benchmarkCase.wantFound, valueSize, window)
-						waitKVReaderBenchmarkCache(fixture.reader)
 					}
 
 					fixture.counts.reset()
@@ -488,7 +483,6 @@ func BenchmarkFakeS3_KVReaderGet_SortedLevelDepth(b *testing.B) {
 			if temperature == "warm" {
 				assertKVReaderBenchmarkManifestGet(
 					b, ctx, fixture.reader, state, fixture.hitKeys[maxLevels], true, valueSize)
-				waitKVReaderBenchmarkCache(fixture.reader)
 			}
 
 			fixture.counts.reset()
@@ -570,7 +564,6 @@ func BenchmarkFakeS3_KVReaderGet_RangeReadRequestShape(b *testing.B) {
 			// Keep the container Bloom warm so the trace contains only Pebble SST
 			// navigation. Each measured iteration starts with an empty range cache.
 			assertKVReaderBenchmarkGet(b, ctx, reader, key, valueSize)
-			waitKVReaderBenchmarkCache(reader)
 			clearKVReaderBenchmarkCache(b, reader)
 			counts.recordRanges.Store(true)
 
@@ -630,10 +623,8 @@ func BenchmarkFakeS3_KVReaderScanLimit_ManyL1SSTs(b *testing.B) {
 				b.Run(temperature, func(b *testing.B) {
 					if temperature == "warm" {
 						assertKVReaderBenchmarkScanLimit(b, ctx, reader, state, 1)
-						waitKVReaderBenchmarkCache(reader)
 					} else {
-						waitKVReaderBenchmarkCache(reader)
-						reader.blockCache.Clear()
+						reader.blockCache.clear()
 					}
 
 					counts.reset()
@@ -643,8 +634,7 @@ func BenchmarkFakeS3_KVReaderScanLimit_ManyL1SSTs(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						if temperature == "cold" {
 							b.StopTimer()
-							waitKVReaderBenchmarkCache(reader)
-							reader.blockCache.Clear()
+							reader.blockCache.clear()
 							b.StartTimer()
 						}
 						assertKVReaderBenchmarkScanLimit(b, ctx, reader, state, 1)
@@ -700,10 +690,8 @@ func BenchmarkFakeS3_KVReaderScanLimit_LeveledDataset(b *testing.B) {
 						assertKVReaderBenchmarkScanLimitRange(
 							b, ctx, fixture.reader, fixture.state,
 							benchmarkCase.minKey, benchmarkCase.maxKey, benchmarkCase.limit)
-						waitKVReaderBenchmarkCache(fixture.reader)
 					} else {
-						waitKVReaderBenchmarkCache(fixture.reader)
-						fixture.reader.blockCache.Clear()
+						fixture.reader.blockCache.clear()
 					}
 
 					fixture.counts.reset()
@@ -713,8 +701,7 @@ func BenchmarkFakeS3_KVReaderScanLimit_LeveledDataset(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						if temperature == "cold" {
 							b.StopTimer()
-							waitKVReaderBenchmarkCache(fixture.reader)
-							fixture.reader.blockCache.Clear()
+							fixture.reader.blockCache.clear()
 							b.StartTimer()
 						}
 						assertKVReaderBenchmarkScanLimitRange(
@@ -1154,30 +1141,18 @@ func openFakeS3KVBenchmarkReader(
 
 func clearKVReaderBenchmarkCache(b *testing.B, reader *Reader) {
 	b.Helper()
-	if reader.blockCache != nil {
-		reader.blockCache.Clear()
-		return
-	}
+	reader.blockCache.clear()
 	reader.clearSSTCache()
 }
 
 func clearKVReaderPointBenchmarkCaches(b *testing.B, reader *Reader) {
 	b.Helper()
-	waitKVReaderBenchmarkCache(reader)
-	if reader.blockCache != nil {
-		reader.blockCache.Clear()
-	}
+	reader.blockCache.clear()
 	if reader.bloomCache != nil {
 		reader.bloomCache.clear()
 	}
 	reader.clearSSTCache()
 	reader.clearBloomDiskCache()
-}
-
-func waitKVReaderBenchmarkCache(reader *Reader) {
-	if reader != nil && reader.blockCache != nil {
-		reader.blockCache.Wait()
-	}
 }
 
 func kvReaderRemoteBytes(metrics *ReaderMetrics) float64 {

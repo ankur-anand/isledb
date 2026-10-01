@@ -110,9 +110,9 @@ func TestReaderCachedOpenFailurePreservesCauseWhenOriginRetryFails(t *testing.T)
 
 	file, ok := reader.acquireSST(meta)
 	require.True(t, ok)
-	_, _, parseErr := reader.openSSTIterFromFile(ctx, meta, file, nil, nil, func() { _ = file.Close() })
+	_, _, parseErr := reader.openSSTIterFromFile(ctx, meta, file, nil, nil, false, func() { _ = file.Close() })
 	require.Error(t, parseErr)
-	_, _, err = reader.openSSTIterBounded(ctx, meta, nil, nil)
+	_, _, err = reader.openSSTIterBounded(ctx, meta, nil, nil, false)
 	require.Error(t, err)
 	require.ErrorContains(t, err, parseErr.Error())
 	// An SST that cannot be opened is dropped from the cache.

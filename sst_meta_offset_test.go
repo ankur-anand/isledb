@@ -12,7 +12,6 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/dgraph-io/ristretto/v2"
 )
 
 func metaOffsetTestEntries(n int) []internal.MemEntry {
@@ -135,7 +134,7 @@ func TestWriteMultipleSSTsStreaming_RecordsMetaOffset(t *testing.T) {
 
 // TestSSTRangeReadable_MetaRegionServesPebbleOpen opens an SST the way the
 // reader does and checks that every metadata read comes from one fetch of
-// [MetaOffset, Size), which later opens find in the block cache.
+// [MetaOffset, Size), which later opens find in the metadata cache.
 func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 	ctx := context.Background()
 	result, err := writeSST(ctx, &sliceSSTIter{entries: metaOffsetTestEntries(5_000)},
@@ -162,18 +161,12 @@ func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 		t.Fatalf("write SST: %v", err)
 	}
 
-	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
-		NumCounters: 1 << 12, MaxCost: 16 << 20, BufferItems: 64, IgnoreInternalCost: true,
-	})
-	if err != nil {
-		t.Fatalf("new cache: %v", err)
-	}
-	t.Cleanup(cache.Close)
-
+	metaCache := newSSTMetaCache(16 << 20)
 	open := func() (*sstable.Reader, error) {
 		readable := newSSTRangeReadable(store, path, result.Meta.ID, result.Meta.Size,
-			cache, &coalescedLoadGroup{}, DefaultReaderMetrics(nil))
+			&coalescedLoadGroup{}, DefaultReaderMetrics(nil))
 		readable.useMetaRegion(result.Meta.MetaOffset)
+		readable.useMetaCache(metaCache)
 		return sstable.NewReader(ctx, readable, sstable.ReaderOptions{})
 	}
 
@@ -197,7 +190,6 @@ func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 		t.Fatalf("cold open + seek issued %d GETs, want 2", got)
 	}
 
-	cache.Wait()
 	gets.Store(0)
 	reader, err = open()
 	if err != nil {
@@ -221,12 +213,12 @@ func TestSSTRangeReadable_UseMetaRegionIgnoresUnusableOffsets(t *testing.T) {
 		{name: "negative", size: 1000, offset: -1, want: 0},
 		{name: "at end", size: 1000, offset: 1000, want: 0},
 		{name: "past end", size: 1000, offset: 2000, want: 0},
-		{name: "region too large", size: maxSSTMetaRegionBytes + 2, offset: 1, want: 0},
+		{name: "large region", size: 64 << 20, offset: 1, want: 1},
 		{name: "usable", size: 1000, offset: 900, want: 900},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newSSTRangeReadable(nil, "", "sst", tc.size, nil, nil, nil)
+			r := newSSTRangeReadable(nil, "", "sst", tc.size, nil, nil)
 			r.useMetaRegion(tc.offset)
 			if r.metaOffset != tc.want {
 				t.Fatalf("metaOffset=%d, want %d", r.metaOffset, tc.want)

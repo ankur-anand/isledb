@@ -61,16 +61,20 @@ type ReaderOpenOptions struct {
 	// Zero selects the default (512 MiB).
 	BloomDiskCacheSize int64
 
+	// BlockCacheSize is the maximum bytes of SST blocks kept in memory,
+	// decoded (checksummed and decompressed), for every SST read, local or by
+	// range. A lookup adds the blocks it reads; a scan, and each seek, adds
+	// only the blocks holding the first 64 KiB it reads in each SST and reads
+	// the rest into buffers of its own. Zero selects the default (256 MiB).
+	// With cgo, it is allocated outside the Go heap.
+	BlockCacheSize int64
+
 	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
 	// instead of downloading them whole: a lookup fetches only the blocks it
 	// needs and a scan reads ahead in aligned chunks. DefaultReaderOpenOptions
 	// enables it. The range-read sizes below may be set only when it is
 	// enabled; zero selects each one's default.
 	RangeRead bool
-
-	// BlockCacheSize is the maximum bytes of range-read blocks kept in memory.
-	// Zero selects the default (256 MiB).
-	BlockCacheSize int64
 
 	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
 	// filters. Zero selects the default (64 MiB).
@@ -154,10 +158,10 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, fmt.Errorf(
 			"%w: range_read_min_sst_size=%d", ErrInvalidReaderOptions, opts.RangeReadMinSSTSize)
 	}
-	if !opts.RangeRead && (opts.BlockCacheSize != 0 || opts.RangeReadMinSSTSize != 0 ||
+	if !opts.RangeRead && (opts.RangeReadMinSSTSize != 0 ||
 		opts.RangeReadAheadMin != 0 || opts.RangeReadAheadMax != 0) {
 		return readerOptions{}, fmt.Errorf(
-			"%w: block_cache_size, range_read_min_sst_size and range_read_ahead_min/max need range_read",
+			"%w: range_read_min_sst_size and range_read_ahead_min/max need range_read",
 			ErrInvalidReaderOptions)
 	}
 	aheadMin := cmp.Or(opts.RangeReadAheadMin, defaultRangeReadAheadMin)
