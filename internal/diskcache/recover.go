@@ -10,7 +10,7 @@ import (
 )
 
 // prepare readies dir: it removes earlier cache layouts, clears unfinished
-// writes, and loads each tier's entries oldest first, dropping the oldest
+// writes, and loads each tier's entries in directory order, dropping any
 // beyond budget. Files it does not recognise as its own are left alone.
 func (c *Cache) prepare(dir string) error {
 	entries, err := os.ReadDir(dir)

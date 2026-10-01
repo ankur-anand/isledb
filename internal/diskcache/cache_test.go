@@ -443,6 +443,28 @@ func TestCloseWaitsForPut(t *testing.T) {
 	}
 }
 
+// TestDropsAfterCloseLeaveFiles removes and purges after Close: the files
+// stay, since the directory may belong to another process by then.
+func TestDropsAfterCloseLeaveFiles(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	k := Key{Object: object(32), Kind: KindChunk}
+	put(t, c, k, content("stay", 100))
+	path := c.path(k, 100)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	c.Remove(k)
+	c.ReportCorrupt(k)
+	c.Purge(TierData)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("file removed after Close: %v", err)
+	}
+}
+
 func TestLockedDirectory(t *testing.T) {
 	dir := t.TempDir()
 	openCache(t, dir, 1<<20, 1<<20)

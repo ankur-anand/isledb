@@ -19,7 +19,8 @@ type openSST struct {
 	// onDamage, if set, runs when an iterator fails on damage (see damaged).
 	onDamage func()
 	refs     atomic.Int32
-	closed   atomic.Bool
+	// closed records that the reader was closed; tests check it.
+	closed atomic.Bool
 }
 
 func (s *openSST) unref() {

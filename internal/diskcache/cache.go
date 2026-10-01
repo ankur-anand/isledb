@@ -308,7 +308,8 @@ func (c *Cache) Put(k Key, data []byte) error {
 	return c.store(k, data, st, gen)
 }
 
-// Remove drops k and deletes its file.
+// Remove drops k and deletes its file. After Close it does nothing: the
+// directory may belong to another process by then.
 func (c *Cache) Remove(k Key) {
 	c.drop(k, false)
 }
@@ -325,6 +326,9 @@ func (c *Cache) drop(k Key, corrupt bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 	if st := c.stores[k]; st != nil {
 		st.gen++
 	}
@@ -338,13 +342,16 @@ func (c *Cache) drop(k Key, corrupt bool) {
 	}
 }
 
-// Purge drops every entry of one tier.
+// Purge drops every entry of one tier. After Close it does nothing.
 func (c *Cache) Purge(tr Tier) {
 	if tr >= tierCount {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 	for k, st := range c.stores {
 		if k.Kind.Tier() == tr {
 			st.gen++
