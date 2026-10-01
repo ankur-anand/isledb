@@ -332,8 +332,8 @@ type ReaderOpenOptions struct {
     CacheDir            string
     SSTCacheSize        int64
     BloomDiskCacheSize  int64
-    RangeRead           bool
     BlockCacheSize      int64
+    RangeRead           bool
     BloomCacheSize      int64
     MetaCacheSize       int64
     RangeReadMinSSTSize int64
@@ -356,8 +356,8 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 |---|---:|---|
 | `SSTCacheSize` | 8 GiB | Maximum bytes of SSTs cached on local disk |
 | `BloomDiskCacheSize` | 512 MiB | Maximum bytes of Bloom filters cached on local disk |
+| `BlockCacheSize` | 256 MiB | Maximum bytes of decoded SST blocks kept in memory, for every SST read |
 | `RangeRead` | true | Read SSTs of at least `RangeReadMinSSTSize` by byte range |
-| `BlockCacheSize` | 256 MiB | Maximum bytes of range-read blocks kept in memory |
 | `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
 | `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
 | `RangeReadMinSSTSize` | 4 MiB | Smallest SST read by byte range; smaller SSTs are downloaded whole |
@@ -366,6 +366,26 @@ func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 | `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
+The block cache holds SST blocks after checksum and decompression, so a hit
+needs neither and allocates nothing. It serves every SST read, whether the
+SST is on local disk or read by range. A point lookup adds the blocks it
+reads. A scan, and each seek of an iterator, adds the blocks holding the
+first 64 KiB of keys and values it reads in each SST, so a short read, such
+as a page, a prefix read or a seek, is warm when repeated, as a lookup is.
+Reading on past that uses buffers of its own, still using blocks already
+cached, so a long scan adds at most about 64 KiB per SST and never evicts
+the blocks lookups reuse. Blocks of an SST that leaves the manifest
+are dropped at the next refresh.
+`BlockCacheStats` reports its bytes and entries, and its hits and misses on
+index and data blocks; the metaindex and properties blocks read on every SST
+open, which are never cached, are not counted.
+
+The block cache is Pebble's. With cgo it is allocated outside the Go heap: it
+counts toward the process's resident memory but not toward `GOMEMLIMIT` or
+Go heap profiles. Without cgo (`CGO_ENABLED=0`) it is ordinary Go heap, which
+the garbage collector lets grow to about twice the live heap under the
+default `GOGC`; set `GOMEMLIMIT` to bound the process.
+
 Every SST records a SHA-256 checksum of its contents in the manifest. When
 the reader downloads a whole SST, it verifies that checksum before using or
 caching the file, so a damaged or mismatched object is never read.
@@ -373,12 +393,11 @@ caching the file, so a damaged or mismatched object is never read.
 With `RangeRead`, the reader instead range-reads SSTs of at least
 `RangeReadMinSSTSize`: it fetches only the metadata and blocks a read needs.
 Smaller SSTs are still downloaded whole, since that costs little more than
-one ranged request and leaves the SST cached on disk. The whole-file checksum cannot be
-checked without the whole file, so range reads rely on each block's own
-checksum, which detects damaged bytes but not a different, internally valid
-object stored under the SST's name. Point lookups fetch exact blocks into the
-block cache. A scan reads ahead into a buffer of its own, so the bytes it
-reads once never displace cached blocks: its first read-ahead is
+one ranged request and leaves the SST cached on disk. The whole-file checksum
+cannot be checked without the whole file, so range reads rely on each block's
+own checksum, which detects damaged bytes but not a different, internally
+valid object stored under the SST's name. Point lookups fetch exact blocks.
+A scan reads ahead into a buffer of its own: its first read-ahead is
 `RangeReadAheadMin`, and each further one doubles, up to `RangeReadAheadMax`,
 so a short scan fetches little it does not read and a long scan needs few
 requests. A seek elsewhere starts the read-ahead small again. An open scan
@@ -386,8 +405,8 @@ holds up to `RangeReadAheadMax` for each SST it is reading. Both read-ahead
 sizes must be between 16 KiB and 16 MiB with the maximum at least the
 minimum; the maximum is rounded down to a multiple of the minimum.
 
-`BlockCacheSize`, `RangeReadMinSSTSize`, `RangeReadAheadMin` and
-`RangeReadAheadMax` apply only to range reads: zero selects each default, and setting any of them with
+`RangeReadMinSSTSize`, `RangeReadAheadMin` and `RangeReadAheadMax` apply
+only to range reads: zero selects each default, and setting any of them with
 `RangeRead` false is rejected. A `ReaderOpenOptions` built without
 `DefaultReaderOpenOptions` has `RangeRead` false and downloads every SST
 whole.
@@ -404,6 +423,8 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) SSTCacheStats() CacheStats
+func (r *Reader) BlockCacheStats() CacheStats
+func (r *Reader) MetaCacheStats() CacheStats
 func (r *Reader) BloomCacheStats() CacheStats
 func (r *Reader) ManifestPageCacheStats() CacheStats
 func (r *Reader) Close() error

@@ -9,31 +9,32 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/cockroachdb/pebble/v2/objstorage"
-	"github.com/dgraph-io/ristretto/v2"
 )
 
+// sstRangeReadable serves Pebble's reads of one SST from object storage by
+// byte range. Decoded blocks are cached above it, by Pebble's block cache, so
+// a read here is always a request: exact for a lookup's block, or ahead of a
+// scan; see sstRangeReadHandle.
 type sstRangeReadable struct {
 	store *blobstore.Store
 	path  string
 	sstID string
 	size  int64
-	cache *ristretto.Cache[string, []byte]
-	loads *coalescedLoadGroup
-	m     *ReaderMetrics
+	// metaLoads coalesces concurrent fetches of the metadata region.
+	metaLoads *coalescedLoadGroup
+	m         *ReaderMetrics
 
 	// metaOffset, when positive, marks where the SST's trailing metadata
 	// begins. Reads inside [metaOffset, size) are served from that whole
-	// region, fetched once and cached under one key.
+	// region, fetched once.
 	metaOffset int64
 
-	// metaMu guards metaBytes, the region retained for this open SST. The
-	// block cache applies sets asynchronously, so relying on it alone lets
-	// Pebble's next metadata read miss and fetch the region again.
+	// metaMu guards metaBytes, the region retained for this open SST.
 	metaMu    sync.Mutex
 	metaBytes []byte
 
 	// metaCache, when set, holds metadata regions across opens under their
-	// own budget, so data reads cannot evict them.
+	// own budget.
 	metaCache *sstMetaCache
 
 	// aheadMin and aheadMax, when positive, bound scan read-ahead: once an
@@ -45,42 +46,35 @@ type sstRangeReadable struct {
 	aheadMax int64
 }
 
-// maxSSTMetaRegionBytes bounds the metadata region fetched in one request. A
-// larger region falls back to Pebble's read-before hints.
-const maxSSTMetaRegionBytes = 4 << 20
-
 func newSSTRangeReadable(
 	store *blobstore.Store,
 	path, sstID string,
 	size int64,
-	cache *ristretto.Cache[string, []byte],
-	loads *coalescedLoadGroup,
+	metaLoads *coalescedLoadGroup,
 	metrics *ReaderMetrics,
 ) *sstRangeReadable {
-	r := &sstRangeReadable{
-		store: store,
-		path:  path,
-		sstID: sstID,
-		size:  size,
-		cache: cache,
-		loads: loads,
-		m:     metrics,
+	return &sstRangeReadable{
+		store:     store,
+		path:      path,
+		sstID:     sstID,
+		size:      size,
+		metaLoads: metaLoads,
+		m:         metrics,
 	}
-	return r
 }
 
 // useMetaRegion enables whole-region metadata reads for an SST whose writer
-// recorded where its metadata begins. Offsets outside the SST, or regions too
-// large to fetch at once, leave the readable unchanged.
+// recorded where its metadata begins. Offsets outside the SST leave the
+// readable unchanged. The region is fetched in one request whatever its size;
+// a region larger than the whole metadata cache is fetched on every open.
 func (r *sstRangeReadable) useMetaRegion(offset int64) {
-	if offset <= 0 || offset >= r.size || r.size-offset > maxSSTMetaRegionBytes {
+	if offset <= 0 || offset >= r.size {
 		return
 	}
 	r.metaOffset = offset
 }
 
-// useMetaCache makes metadata regions come from, and go to, cache instead of
-// the block cache.
+// useMetaCache makes metadata regions come from, and go to, cache.
 func (r *sstRangeReadable) useMetaCache(cache *sstMetaCache) {
 	r.metaCache = cache
 }
@@ -114,52 +108,12 @@ func (r *sstRangeReadable) ReadAt(ctx context.Context, p []byte, off int64) erro
 	return nil
 }
 
-// read returns immutable bytes for one exact range. Returning the cached slice
-// lets a ReadHandle retain an expanded read-before window without allocating
-// and copying it again on every warm lookup.
+// read fetches one exact range. It returns a fresh slice the caller may keep.
 func (r *sstRangeReadable) read(ctx context.Context, off int64, length int) ([]byte, error) {
 	if off < 0 || off > r.size || int64(length) > r.size-off {
 		return nil, io.ErrUnexpectedEOF
 	}
-
-	var key string
-	if r.cache != nil {
-		key = blockCacheKey(r.sstID, off, length)
-		if cached, ok := r.cache.Get(key); ok {
-			r.m.ObserveSSTRangeBlockCacheLookup(true)
-			return cached, nil
-		}
-		r.m.ObserveSSTRangeBlockCacheLookup(false)
-	}
-
-	if r.cache != nil && r.loads != nil {
-		value, err := r.loads.Do(ctx, key, func(loadCtx context.Context) (any, error) {
-			// A preceding load may have filled the cache after this caller's
-			// first lookup but before it joined the coalesced load.
-			if cached, ok := r.cache.Get(key); ok {
-				return cached, nil
-			}
-			data, err := r.readRange(loadCtx, off, length)
-			if err != nil {
-				return nil, err
-			}
-			r.cache.Set(key, data, int64(len(data)))
-			return data, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return value.([]byte), nil
-	}
-
-	data, err := r.readRange(ctx, off, length)
-	if err != nil {
-		return nil, err
-	}
-	if r.cache != nil {
-		r.cache.Set(key, data, int64(len(data)))
-	}
-	return data, nil
+	return r.readRange(ctx, off, length)
 }
 
 // dataEnd is where the data region read-ahead covers ends: the start of the metadata
@@ -183,17 +137,6 @@ func (r *sstRangeReadable) alignDown(off int64) int64 {
 
 func (r *sstRangeReadable) alignUp(off int64) int64 {
 	return r.alignDown(off + r.aheadMin - 1)
-}
-
-// cachedBlock returns an exact block from the shared block cache without
-// fetching or caching anything.
-func (r *sstRangeReadable) cachedBlock(off int64, length int) ([]byte, bool) {
-	if r.cache == nil {
-		return nil, false
-	}
-	data, ok := r.cache.Get(blockCacheKey(r.sstID, off, length))
-	r.m.ObserveSSTRangeBlockCacheLookup(ok)
-	return data, ok
 }
 
 func (r *sstRangeReadable) readRange(ctx context.Context, off int64, length int) ([]byte, error) {
@@ -242,7 +185,7 @@ func (r *sstRangeReadable) metaRegion(ctx context.Context) ([]byte, error) {
 	if r.metaCache != nil {
 		data, err = r.loadMetaRegion(ctx)
 	} else {
-		data, err = r.read(ctx, r.metaOffset, int(r.size-r.metaOffset))
+		data, err = r.readRange(ctx, r.metaOffset, int(r.size-r.metaOffset))
 	}
 	if err != nil {
 		return nil, err
@@ -271,8 +214,8 @@ func (r *sstRangeReadable) loadMetaRegion(ctx context.Context) ([]byte, error) {
 	}
 	var value any
 	var err error
-	if r.loads != nil {
-		value, err = r.loads.Do(ctx, r.sstID+":meta", fetch)
+	if r.metaLoads != nil {
+		value, err = r.metaLoads.Do(ctx, r.sstID, fetch)
 	} else {
 		value, err = fetch(ctx)
 	}
@@ -331,12 +274,12 @@ func rangeReadBeforeSize(sstSize int64, requested objstorage.ReadBeforeSize) int
 // It also adapts data reads to the iterator's access pattern. Data blocks are
 // stored back to back, so a read that starts where the previous one ended
 // means the iterator is scanning. The first read, and any read elsewhere,
-// fetches the exact block through the shared block cache, as a point lookup
-// needs. Sequential reads instead fetch the block and the data after it into
-// ahead, a buffer only this iterator uses: a scan takes one request per
-// read-ahead rather than per block, and the bytes it reads once never
-// displace the blocks point lookups reuse. A scan still uses a block already
-// in the shared cache.
+// fetches the exact block, as a point lookup needs. Sequential reads instead
+// fetch the block and the data after it into ahead, a buffer only this
+// iterator uses, so a scan takes one request per read-ahead rather than per
+// block. Pebble reaches the handle only for blocks missing from its block
+// cache, and reports the cached ones through RecordCacheHit, which keeps the
+// scan's position.
 //
 // The read-ahead starts small, so a short scan fetches little beyond what it
 // reads, and doubles with each fetch of a continuing scan, so a long scan
@@ -376,10 +319,6 @@ func (h *sstRangeReadHandle) ReadAt(ctx context.Context, p []byte, off int64) er
 			return nil
 		}
 		if sequential {
-			if data, ok := r.cachedBlock(off, len(p)); ok {
-				copy(p, data)
-				return nil
-			}
 			return h.readAhead(ctx, p, off)
 		}
 	}

@@ -9,8 +9,6 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -51,10 +49,6 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 
-	if reader.blockCache == nil {
-		t.Fatalf("expected block cache to be initialized")
-	}
-
 	beforeSSTEntries := reader.SSTCacheStats().EntryCount
 
 	got, found, err := reader.Get(ctx, []byte("key-000100"))
@@ -65,23 +59,13 @@ func TestReader_RangeRead_UsesBlockCacheForLargeSST(t *testing.T) {
 		t.Fatalf("expected value for key")
 	}
 
-	reader.blockCache.Wait()
 	afterSSTEntries := reader.SSTCacheStats().EntryCount
 
 	if afterSSTEntries != beforeSSTEntries {
 		t.Fatalf("expected no SST cache entries, got %d -> %d", beforeSSTEntries, afterSSTEntries)
 	}
-
-	cached := cachedDataBlocks(t, reader, store, res.Meta.ID)
-	for i, h := range cached {
-		if i >= 5 {
-			t.Logf("cached data block offsets: (showing first 5 of %d)", len(cached))
-			break
-		}
-		t.Logf("cached data block offset=%d length=%d", h.Offset, h.Length)
-	}
-	if len(cached) == 0 {
-		t.Fatalf("expected at least one data block cached")
+	if got := reader.BlockCacheStats().EntryCount; got == 0 {
+		t.Fatalf("expected the lookup's blocks in the block cache")
 	}
 
 	if err := store.Delete(ctx, store.SSTPath(res.Meta.ID)); err != nil {
@@ -139,7 +123,6 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	if _, found, err := reader.Get(ctx, []byte("key-000100")); err != nil || !found {
 		t.Fatalf("Get #1 failed: found=%v err=%v", found, err)
 	}
-	reader.blockCache.Wait()
 	if _, found, err := reader.Get(ctx, []byte("key-000100")); err != nil || !found {
 		t.Fatalf("Get #2 failed: found=%v err=%v", found, err)
 	}
@@ -159,43 +142,9 @@ func TestReader_RangeRead_MetricsSeparateFromDownload(t *testing.T) {
 	if got := testutil.ToFloat64(metrics.SSTRangeReadBytes); got <= 0 {
 		t.Fatalf("sst_range_read_bytes_total must be > 0, got=%v", got)
 	}
-	if got := testutil.ToFloat64(metrics.SSTRangeBlockCacheMisses); got <= 0 {
-		t.Fatalf("sst_range_block_cache_misses_total must be > 0, got=%v", got)
+	if stats := reader.BlockCacheStats(); stats.Misses <= 0 || stats.Hits <= 0 {
+		t.Fatalf("block cache stats = %+v, want misses and hits", stats)
 	}
-	if got := testutil.ToFloat64(metrics.SSTRangeBlockCacheHits); got <= 0 {
-		t.Fatalf("sst_range_block_cache_hits_total must be > 0, got=%v", got)
-	}
-}
-
-func cachedDataBlocks(t *testing.T, reader *Reader, store *blobstore.Store, sstID string) []block.Handle {
-	t.Helper()
-
-	data, _, err := store.Read(context.Background(), store.SSTPath(sstID))
-	if err != nil {
-		t.Fatalf("read sst: %v", err)
-	}
-
-	r, err := sstable.NewReader(context.Background(), newMemReadable(data), sstable.ReaderOptions{})
-	if err != nil {
-		t.Fatalf("new reader: %v", err)
-	}
-	defer func() {
-		_ = r.Close()
-	}()
-
-	layout, err := r.Layout()
-	if err != nil {
-		t.Fatalf("layout: %v", err)
-	}
-
-	var cached []block.Handle
-	for _, h := range layout.Data {
-		key := blockCacheKey(sstID, int64(h.Offset), int(h.Length)+block.TrailerLen)
-		if _, ok := reader.blockCache.Get(key); ok {
-			cached = append(cached, h.Handle)
-		}
-	}
-	return cached
 }
 
 func TestReader_RangeRead_DefaultsDownloadSmallSSTsWhole(t *testing.T) {
@@ -226,7 +175,7 @@ func TestReader_RangeRead_DefaultsDownloadSmallSSTsWhole(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 
-	if reader.blockCache == nil || reader.blockCache.MaxCost() != defaultBlockCacheSize {
+	if reader.blockCache.maxBytes != defaultBlockCacheSize {
 		t.Fatalf("block cache not created with the default budget")
 	}
 	if reader.rangeReadMinSSTSize != defaultRangeReadMinSSTSize ||
@@ -277,9 +226,6 @@ func TestReader_RangeRead_DisabledDownloadsWhole(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 
-	if reader.blockCache != nil {
-		t.Fatal("block cache created with range reads disabled")
-	}
 	got, err := reader.shouldRangeRead(sstMetadata{ID: "large", Size: 1 << 30})
 	if err != nil || got {
 		t.Fatalf("shouldRangeRead=%v, %v; want false", got, err)

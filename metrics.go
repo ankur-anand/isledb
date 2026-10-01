@@ -172,12 +172,10 @@ type ReaderMetrics struct {
 	SSTDownloadLatency prometheus.Histogram
 	SSTDownloadBytes   prometheus.Counter
 
-	SSTRangeBlockCacheHits   prometheus.Counter
-	SSTRangeBlockCacheMisses prometheus.Counter
-	SSTRangeReadTotal        prometheus.Counter
-	SSTRangeReadErrors       prometheus.Counter
-	SSTRangeReadLatency      prometheus.Histogram
-	SSTRangeReadBytes        prometheus.Counter
+	SSTRangeReadTotal   prometheus.Counter
+	SSTRangeReadErrors  prometheus.Counter
+	SSTRangeReadLatency prometheus.Histogram
+	SSTRangeReadBytes   prometheus.Counter
 }
 
 func (m *ReaderMetrics) incCounter(counter prometheus.Counter) {
@@ -290,17 +288,6 @@ func (m *ReaderMetrics) ObserveSSTDownload(d time.Duration, sizeBytes int64, err
 	if sizeBytes > 0 {
 		m.addCounter(m.SSTDownloadBytes, float64(sizeBytes))
 	}
-}
-
-func (m *ReaderMetrics) ObserveSSTRangeBlockCacheLookup(hit bool) {
-	if m == nil {
-		return
-	}
-	if hit {
-		m.incCounter(m.SSTRangeBlockCacheHits)
-		return
-	}
-	m.incCounter(m.SSTRangeBlockCacheMisses)
 }
 
 func (m *ReaderMetrics) ObserveSSTRangeRead(d time.Duration, sizeBytes int64, err error) {
@@ -479,20 +466,6 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "sst_download_bytes_total",
 			Help:        "Total number of SST bytes downloaded.",
-			ConstLabels: constLabels,
-		}),
-		SSTRangeBlockCacheHits: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_range_block_cache_hits_total",
-			Help:        "Total number of SST range-read block cache hits.",
-			ConstLabels: constLabels,
-		}),
-		SSTRangeBlockCacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_range_block_cache_misses_total",
-			Help:        "Total number of SST range-read block cache misses.",
 			ConstLabels: constLabels,
 		}),
 		SSTRangeReadTotal: prometheus.NewCounter(prometheus.CounterOpts{

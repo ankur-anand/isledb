@@ -56,15 +56,14 @@ func TestSSTMetaCache_RejectsOversizedAndMismatchedRegions(t *testing.T) {
 	}
 }
 
-// TestSSTRangeReadable_MetaRegionSurvivesBlockCacheEviction reads an SST's
-// metadata, empties the block cache, and opens the SST again: its metadata
-// must come from the metadata cache without a request.
-func TestSSTRangeReadable_MetaRegionSurvivesBlockCacheEviction(t *testing.T) {
+// TestSSTRangeReadable_MetaRegionComesFromMetaCache reads an SST's metadata
+// and opens the SST again: its metadata must come from the metadata cache
+// without a request.
+func TestSSTRangeReadable_MetaRegionComesFromMetaCache(t *testing.T) {
 	s := newChunkTestStore(t, 5000)
-	cache := newChunkTestCache(t)
 	meta := newSSTMetaCache(1 << 20)
 	open := func() *sstRangeReadable {
-		r := s.readable(t, cache, 1000)
+		r := s.readable(t, 1000)
 		r.useMetaRegion(4500)
 		r.useMetaCache(meta)
 		return r
@@ -73,15 +72,10 @@ func TestSSTRangeReadable_MetaRegionSurvivesBlockCacheEviction(t *testing.T) {
 	if got := readChunked(t, open(), 4600, 100); !bytes.Equal(got, s.data[4600:4700]) {
 		t.Fatal("metadata bytes differ")
 	}
-	cache.Wait()
 	if s.gets.Load() != 1 || s.ranges[0] != "bytes=4500-4999" {
 		t.Fatalf("ranges = %v, want one metadata request", s.ranges)
 	}
-	if _, ok := cache.Get(blockCacheKey("chunked-sst", 4500, 500)); ok {
-		t.Fatal("metadata region was also stored in the block cache")
-	}
 
-	cache.Clear()
 	s.reset()
 	if got := readChunked(t, open(), 4510, 300); !bytes.Equal(got, s.data[4510:4810]) {
 		t.Fatal("metadata bytes differ after reopen")
@@ -101,7 +95,7 @@ func TestSSTRangeReadable_ConcurrentMetaMissesShareOneRequest(t *testing.T) {
 	errs := make(chan error, 16)
 	for range 16 {
 		wg.Go(func() {
-			r := s.readable(t, nil, 1000)
+			r := s.readable(t, 1000)
 			r.useMetaRegion(4500)
 			r.useMetaCache(meta)
 			p := make([]byte, 100)
@@ -168,8 +162,7 @@ func TestReader_MetaCacheSavesRequestsUnderBlockCachePressure(t *testing.T) {
 
 	get := func(i int) int64 {
 		t.Helper()
-		waitKVReaderBenchmarkCache(reader)
-		reader.blockCache.Clear()
+		reader.blockCache.clear()
 		counts.reset()
 		value, found, err := reader.getWithManifest(ctx, state, kvLeveledBenchmarkKey(i))
 		if err != nil || !found || !bytes.Equal(value, entries[i].Value) {

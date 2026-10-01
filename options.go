@@ -134,14 +134,14 @@ type readerOptions struct {
 	// (default 512 MiB).
 	BloomDiskCacheSize int64
 
-	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
-	// instead of downloading them whole. The sizes below apply only when it is
-	// set; zero selects each one's default.
-	RangeRead bool
-
-	// BlockCacheSize is the maximum bytes of range-read blocks kept in memory
-	// (default 256 MiB).
+	// BlockCacheSize is the maximum bytes of decoded SST blocks kept in memory
+	// for every SST read (default 256 MiB).
 	BlockCacheSize int64
+
+	// RangeRead reads SSTs of at least RangeReadMinSSTSize by byte range
+	// instead of downloading them whole. The range-read sizes apply only when
+	// it is set; zero selects each one's default.
+	RangeRead bool
 
 	// BloomCacheSize is the maximum accounted bytes for decoded SST bloom
 	// filters. Zero selects the default (64 MiB).

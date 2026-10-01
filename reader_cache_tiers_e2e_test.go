@@ -139,9 +139,7 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	}
 	writeArtifactCacheTestBatches(t, ctx, db, []map[string]string{batch})
 
-	// Leave enough room for deterministic Ristretto admission of the point
-	// lookup's metadata and data blocks. The bound itself is still asserted
-	// before and after a full multi-block scan.
+	// The bound is asserted before and after a full multi-block scan.
 	const blockCacheBytes = int64(1 << 20)
 	options := DefaultReaderOpenOptions(cacheDir)
 	options.BlockCacheSize = blockCacheBytes
@@ -157,7 +155,6 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	}()
 	wantValue := artifactCacheTestLargeValue(64, 768)
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
-	reader.blockCache.Wait()
 	assertArtifactCacheBlockBound(t, reader, blockCacheBytes)
 	if stats := reader.SSTCacheStats(); stats.EntryCount != 0 {
 		t.Fatalf("range-read unexpectedly populated SST L2: %+v", stats)
@@ -169,23 +166,21 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 		t, "range-read decoded Bloom L1", reader.BloomCacheStats(), 1,
 		options.BloomCacheSize)
 	firstRangeReads := testutil.ToFloat64(firstMetrics.SSTRangeReadTotal)
-	if firstRangeReads == 0 || testutil.ToFloat64(firstMetrics.SSTRangeBlockCacheMisses) == 0 {
-		t.Fatalf("cold range read metrics: reads=%v misses=%v",
-			firstRangeReads, testutil.ToFloat64(firstMetrics.SSTRangeBlockCacheMisses))
+	if firstRangeReads == 0 || reader.BlockCacheStats().Misses == 0 {
+		t.Fatalf("cold range read metrics: reads=%v block cache=%+v",
+			firstRangeReads, reader.BlockCacheStats())
 	}
+	hitsBefore := reader.BlockCacheStats().Hits
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
-	reader.blockCache.Wait()
-	if testutil.ToFloat64(firstMetrics.SSTRangeBlockCacheHits) == 0 {
+	if reader.BlockCacheStats().Hits == hitsBefore {
 		t.Fatal("warm block L1 lookup recorded no hits")
 	}
-	// Read the full SST through the range path to exercise multiple block-cache
-	// entries. Ristretto may choose its admissions, but its accounted cost must
-	// remain within the configured maximum.
+	// Read the full SST through the range path; the cache must stay within
+	// its configured maximum.
 	rows, err := reader.Scan(ctx, nil, nil)
 	if err != nil || len(rows) != len(batch) {
 		t.Fatalf("range scan rows=%d err=%v, want=%d", len(rows), err, len(batch))
 	}
-	reader.blockCache.Wait()
 	assertArtifactCacheBlockBound(t, reader, blockCacheBytes)
 	if err := reader.Close(); err != nil {
 		t.Fatalf("close first range Reader: %v", err)
@@ -196,21 +191,18 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 	options.Metrics = secondMetrics
 	reader = openArtifactCacheTestReaderWithOptions(t, ctx, db, options)
 	assertArtifactCacheEmptyL1(t, reader, "range Reader restart")
-	if reader.blockCache.MaxCost() != blockCacheBytes ||
-		reader.blockCache.RemainingCost() != blockCacheBytes {
-		t.Fatalf("block L1 was not empty after restart: max=%d remaining=%d",
-			reader.blockCache.MaxCost(), reader.blockCache.RemainingCost())
+	if stats := reader.BlockCacheStats(); stats.MaxBytes != blockCacheBytes ||
+		stats.Bytes != 0 || stats.EntryCount != 0 {
+		t.Fatalf("block L1 was not empty after restart: %+v", stats)
 	}
 	assertArtifactCacheTierBound(
 		t, "recovered raw Bloom L2", reader.BloomDiskCacheStats(), 1,
 		options.BloomDiskCacheSize)
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
-	reader.blockCache.Wait()
 	if testutil.ToFloat64(secondMetrics.SSTRangeReadTotal) == 0 ||
-		testutil.ToFloat64(secondMetrics.SSTRangeBlockCacheMisses) == 0 {
-		t.Fatalf("restarted block L1 did not take a cold origin path: reads=%v misses=%v",
-			testutil.ToFloat64(secondMetrics.SSTRangeReadTotal),
-			testutil.ToFloat64(secondMetrics.SSTRangeBlockCacheMisses))
+		reader.BlockCacheStats().Misses == 0 {
+		t.Fatalf("restarted block L1 did not take a cold origin path: reads=%v block cache=%+v",
+			testutil.ToFloat64(secondMetrics.SSTRangeReadTotal), reader.BlockCacheStats())
 	}
 	if stats := reader.BloomDiskCacheStats(); stats.Hits == 0 {
 		t.Fatalf("restarted Reader did not reuse raw Bloom L2: %+v", stats)
@@ -219,9 +211,9 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 		t.Fatalf("restarted Reader did not repopulate decoded Bloom L1: %+v", stats)
 	}
 	readsBeforeWarm := testutil.ToFloat64(secondMetrics.SSTRangeReadTotal)
+	hitsBefore = reader.BlockCacheStats().Hits
 	assertArtifactCacheTestValue(t, ctx, reader, "range/064", wantValue)
-	reader.blockCache.Wait()
-	if testutil.ToFloat64(secondMetrics.SSTRangeBlockCacheHits) == 0 {
+	if reader.BlockCacheStats().Hits == hitsBefore {
 		t.Fatal("restarted warm block L1 lookup recorded no hits")
 	}
 	if readsAfterWarm := testutil.ToFloat64(secondMetrics.SSTRangeReadTotal); readsAfterWarm != readsBeforeWarm {
@@ -331,15 +323,8 @@ func assertArtifactCacheTierBound(
 
 func assertArtifactCacheBlockBound(t *testing.T, reader *Reader, maxBytes int64) {
 	t.Helper()
-	if reader.blockCache == nil || reader.blockCache.MaxCost() != maxBytes ||
-		reader.blockCache.RemainingCost() < 0 ||
-		reader.blockCache.RemainingCost() > maxBytes {
-		var maxCost, remaining int64
-		if reader.blockCache != nil {
-			maxCost = reader.blockCache.MaxCost()
-			remaining = reader.blockCache.RemainingCost()
-		}
-		t.Fatalf("block L1 outside bound: max=%d remaining=%d want_max=%d",
-			maxCost, remaining, maxBytes)
+	if stats := reader.BlockCacheStats(); stats.MaxBytes != maxBytes ||
+		stats.Bytes <= 0 || stats.Bytes > maxBytes {
+		t.Fatalf("block L1 outside bound: %+v want_max=%d", stats, maxBytes)
 	}
 }

@@ -23,7 +23,7 @@ type levelMergeIteratorSource struct {
 	upper []byte
 
 	index    int
-	current  *sstableMergeIteratorSource
+	current  *scanSSTSource
 	errValue error
 	closed   bool
 }
@@ -176,13 +176,13 @@ func (s *levelMergeIteratorSource) openCurrent() bool {
 	if s.closed || s.errValue != nil || s.index < 0 || s.index >= len(s.ssts) {
 		return false
 	}
-	_, iter, err := s.reader.openSSTIterBounded(
-		s.ctx, s.ssts[s.index], s.lower, s.upper)
+	current, err := openScanSSTSource(
+		s.reader, s.ctx, s.ssts[s.index], s.lower, s.upper, scanCacheFillBytes)
 	if err != nil {
 		s.errValue = err
 		return false
 	}
-	s.current = &sstableMergeIteratorSource{iter: iter}
+	s.current = current
 	return true
 }
 
@@ -234,5 +234,170 @@ func (s *levelMergeIteratorSource) close() error {
 		s.errValue = err
 	}
 	s.ssts = nil
+	return err
+}
+
+// scanCacheFillBytes is how much of each SST a scan, or each seek, reads
+// through the block cache, adding the blocks it reads, before it switches to
+// reading into buffers of its own. About four 16 KiB blocks: a short read,
+// such as a page, a prefix read or a seek, is cached like a lookup and is
+// warm when repeated, while a long scan adds at most this much per SST and
+// never evicts the blocks lookups reuse.
+const scanCacheFillBytes = 64 << 10
+
+// scanSSTSource reads one SST for a scan. Each read, from the start or from
+// a seek, begins with an iterator that fills the block cache, so a seek and
+// the short read after it are cached as a lookup would be. Once the keys and
+// values a read has returned exceed its budget, the source reopens the SST
+// with an iterator that reads into its own buffers, positioned just after the
+// last entry returned; the next seek starts a new read, filling again. Scans
+// only move forward, so a switch is invisible to the merge, which, as with
+// any Pebble iterator, does not keep an entry past the next call.
+type scanSSTSource struct {
+	reader       *Reader
+	ctx          context.Context
+	meta         sstMetadata
+	lower, upper []byte
+
+	// iter is nil once a reopen has failed, with the failure in errValue.
+	iter     sstable.Iterator
+	errValue error
+	private  bool
+	// budget is how many more bytes the filling iterator may return before
+	// the source switches to its own buffers; each seek resets it to
+	// fillBudget. A fillBudget of zero or less keeps the source private.
+	budget     int64
+	fillBudget int64
+	// last is the entry most recently returned, valid until the iterator
+	// moves.
+	last *sstable.InternalKey
+}
+
+func openScanSSTSource(
+	reader *Reader, ctx context.Context, meta sstMetadata, lower, upper []byte, budget int64,
+) (*scanSSTSource, error) {
+	s := &scanSSTSource{
+		reader: reader, ctx: ctx, meta: meta, lower: lower, upper: upper,
+		budget: budget, fillBudget: budget,
+	}
+	private := budget <= 0
+	_, iter, err := reader.openSSTIterBounded(ctx, meta, lower, upper, private)
+	if err != nil {
+		return nil, err
+	}
+	s.iter, s.private = iter, private
+	return s, nil
+}
+
+func (s *scanSSTSource) first() (*sstable.InternalKey, []byte) {
+	if !s.restart() {
+		return nil, nil
+	}
+	if kv := s.iter.First(); kv != nil {
+		return s.track(&kv.K, kv.InPlaceValue())
+	}
+	return s.track(nil, nil)
+}
+
+func (s *scanSSTSource) seekGE(target []byte) (*sstable.InternalKey, []byte) {
+	if !s.restart() {
+		return nil, nil
+	}
+	// 0 is base.SeekGEFlagNone.
+	if kv := s.iter.SeekGE(target, 0); kv != nil {
+		return s.track(&kv.K, kv.InPlaceValue())
+	}
+	return s.track(nil, nil)
+}
+
+func (s *scanSSTSource) next() (*sstable.InternalKey, []byte) {
+	if s.iter == nil {
+		return nil, nil
+	}
+	if !s.private && s.budget <= 0 && s.last != nil {
+		return s.track(s.switchToPrivate())
+	}
+	if kv := s.iter.Next(); kv != nil {
+		return s.track(&kv.K, kv.InPlaceValue())
+	}
+	return s.track(nil, nil)
+}
+
+// restart begins a new read from a seek: the read gets a fresh budget,
+// so a seek caches what it reads as a lookup does, and a source that had
+// switched to its own buffers reopens filling the cache. It reports false
+// once the source has failed.
+func (s *scanSSTSource) restart() bool {
+	if s.iter == nil {
+		return false
+	}
+	if s.private && s.fillBudget > 0 && !s.reopen(false) {
+		return false
+	}
+	s.budget = s.fillBudget
+	return true
+}
+
+// switchToPrivate replaces the filling iterator with one reading into its own
+// buffers and returns the entry after the last one returned. Internal keys
+// order by user key, then newest version first, so it seeks to the last user
+// key and skips that key's versions up to and including the last returned.
+func (s *scanSSTSource) switchToPrivate() (*sstable.InternalKey, []byte) {
+	lastKey := append([]byte(nil), s.last.UserKey...)
+	lastTrailer := s.last.Trailer
+	if !s.reopen(true) {
+		return nil, nil
+	}
+	kv := s.iter.SeekGE(lastKey, 0)
+	for kv != nil && bytes.Equal(kv.K.UserKey, lastKey) && kv.K.Trailer >= lastTrailer {
+		kv = s.iter.Next()
+	}
+	if kv == nil {
+		return nil, nil
+	}
+	return &kv.K, kv.InPlaceValue()
+}
+
+// reopen replaces the iterator with an unpositioned one that fills the cache,
+// or, if private, reads into its own buffers. On failure the source keeps the
+// error and has no iterator.
+func (s *scanSSTSource) reopen(private bool) bool {
+	s.last = nil
+	err := s.iter.Close()
+	s.iter = nil
+	if err == nil {
+		_, s.iter, err = s.reader.openSSTIterBounded(s.ctx, s.meta, s.lower, s.upper, private)
+	}
+	if err != nil {
+		s.errValue = err
+		return false
+	}
+	s.private = private
+	return true
+}
+
+// track records the entry about to be returned, charging it to the budget
+// while the filling iterator is in use.
+func (s *scanSSTSource) track(key *sstable.InternalKey, value []byte) (*sstable.InternalKey, []byte) {
+	s.last = key
+	if key != nil && !s.private {
+		s.budget -= int64(len(key.UserKey) + len(value))
+	}
+	return key, value
+}
+
+func (s *scanSSTSource) err() error {
+	if s.iter == nil {
+		return s.errValue
+	}
+	return s.iter.Error()
+}
+
+func (s *scanSSTSource) close() error {
+	if s.iter == nil {
+		return nil
+	}
+	err := s.iter.Close()
+	s.iter = nil
 	return err
 }

@@ -87,10 +87,11 @@ func TestReaderOpenOptionsRangeReadSizes(t *testing.T) {
 		valid  bool
 	}{
 		{name: "disabled", mutate: func(o *ReaderOpenOptions) { o.RangeRead = false }, valid: true},
+		// The block cache serves every SST read, not only range reads.
 		{name: "block_cache_without_range_read", mutate: func(o *ReaderOpenOptions) {
 			o.RangeRead = false
 			o.BlockCacheSize = 1 << 20
-		}},
+		}, valid: true},
 		{name: "min_sst_without_range_read", mutate: func(o *ReaderOpenOptions) {
 			o.RangeRead = false
 			o.RangeReadMinSSTSize = 1
