@@ -108,6 +108,7 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	metrics := DefaultReaderMetrics(nil)
 	reader := &Reader{
 		store:      store,
+		fetcher:    newSSTFetcher(store, nil, metrics),
 		bloomCache: newBloomFilterCache(bloomFilterCacheCost(metaA.ID, filterA)),
 		metrics:    metrics,
 	}
@@ -169,7 +170,8 @@ func TestReaderRejectsBloomChecksumMismatchBeforeCaching(t *testing.T) {
 
 	metrics := DefaultReaderMetrics(nil)
 	reader := &Reader{
-		store: store, bloomCache: newBloomFilterCache(1 << 20), metrics: metrics,
+		store: store, fetcher: newSSTFetcher(store, nil, metrics),
+		bloomCache: newBloomFilterCache(1 << 20), metrics: metrics,
 	}
 	if contains := reader.bloomMayContain(ctx, meta, key); !contains {
 		t.Fatal("corrupt bloom did not fail open")
@@ -197,7 +199,7 @@ func TestReaderBloomWithoutChecksumFailsOpen(t *testing.T) {
 		t.Fatalf("write legacy bloom: %v", err)
 	}
 
-	reader := &Reader{store: store, bloomCache: newBloomFilterCache(1 << 20)}
+	reader := &Reader{store: store, fetcher: newSSTFetcher(store, nil, nil), bloomCache: newBloomFilterCache(1 << 20)}
 	contains := reader.bloomMayContain(ctx, meta, []byte("definitely-absent"))
 	if !contains {
 		t.Fatal("checksum-less bloom did not fail open")

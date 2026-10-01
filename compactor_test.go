@@ -440,6 +440,7 @@ func TestCompactor_DataIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	for key, expectedValue := range testData {
 		value, found, err := reader.Get(ctx, []byte(key))
@@ -514,6 +515,7 @@ func TestCompactor_TombstoneHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
+	defer reader.Close()
 
 	for batch := 0; batch < 4; batch++ {
 

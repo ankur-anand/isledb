@@ -164,13 +164,7 @@ type ReaderMetrics struct {
 	ScanLimitLatency prometheus.Histogram
 	ScanLimitResults prometheus.Counter
 
-	SSTCacheHits       prometheus.Counter
-	SSTCacheMisses     prometheus.Counter
-	BloomFilterErrors  prometheus.Counter
-	SSTDownloadTotal   prometheus.Counter
-	SSTDownloadErrors  prometheus.Counter
-	SSTDownloadLatency prometheus.Histogram
-	SSTDownloadBytes   prometheus.Counter
+	BloomFilterErrors prometheus.Counter
 
 	SSTRangeReadTotal   prometheus.Counter
 	SSTRangeReadErrors  prometheus.Counter
@@ -257,37 +251,11 @@ func (m *ReaderMetrics) ObserveScanLimit(d time.Duration, resultCount int, err e
 	}
 }
 
-func (m *ReaderMetrics) ObserveSSTCacheLookup(hit bool) {
-	if m == nil {
-		return
-	}
-	if hit {
-		m.incCounter(m.SSTCacheHits)
-		return
-	}
-	m.incCounter(m.SSTCacheMisses)
-}
-
 func (m *ReaderMetrics) ObserveBloomFilterError() {
 	if m == nil {
 		return
 	}
 	m.incCounter(m.BloomFilterErrors)
-}
-
-func (m *ReaderMetrics) ObserveSSTDownload(d time.Duration, sizeBytes int64, err error) {
-	if m == nil {
-		return
-	}
-	m.incCounter(m.SSTDownloadTotal)
-	m.observeHistogram(m.SSTDownloadLatency, d.Seconds())
-	if err != nil {
-		m.incCounter(m.SSTDownloadErrors)
-		return
-	}
-	if sizeBytes > 0 {
-		m.addCounter(m.SSTDownloadBytes, float64(sizeBytes))
-	}
 }
 
 func (m *ReaderMetrics) ObserveSSTRangeRead(d time.Duration, sizeBytes int64, err error) {
@@ -419,53 +387,11 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Help:        "Total number of key/value results returned by ScanLimit.",
 			ConstLabels: constLabels,
 		}),
-		SSTCacheHits: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_cache_hits_total",
-			Help:        "Total number of SST cache hits.",
-			ConstLabels: constLabels,
-		}),
-		SSTCacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_cache_misses_total",
-			Help:        "Total number of SST cache misses.",
-			ConstLabels: constLabels,
-		}),
 		BloomFilterErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace:   "isledb",
 			Subsystem:   "reader",
 			Name:        "bloom_filter_errors_total",
 			Help:        "Total Bloom-filter loading, verification, or decoding errors; operations either recover from origin or continue to the SST.",
-			ConstLabels: constLabels,
-		}),
-		SSTDownloadTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_download_total",
-			Help:        "Total number of SST download attempts.",
-			ConstLabels: constLabels,
-		}),
-		SSTDownloadErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_download_errors_total",
-			Help:        "Total number of SST download errors.",
-			ConstLabels: constLabels,
-		}),
-		SSTDownloadLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_download_latency_seconds",
-			Help:        "Histogram of SST download latency in seconds.",
-			ConstLabels: constLabels,
-		}),
-		SSTDownloadBytes: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace:   "isledb",
-			Subsystem:   "reader",
-			Name:        "sst_download_bytes_total",
-			Help:        "Total number of SST bytes downloaded.",
 			ConstLabels: constLabels,
 		}),
 		SSTRangeReadTotal: prometheus.NewCounter(prometheus.CounterOpts{

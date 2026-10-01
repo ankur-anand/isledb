@@ -11,6 +11,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -132,10 +133,10 @@ func TestWriteMultipleSSTsStreaming_RecordsMetaOffset(t *testing.T) {
 	}
 }
 
-// TestSSTRangeReadable_MetaRegionServesPebbleOpen opens an SST the way the
-// reader does and checks that every metadata read comes from one fetch of
-// [MetaOffset, Size), which later opens find in the metadata cache.
-func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
+// TestSSTReadable_MetaRegionServesPebbleOpen opens an SST the way the reader
+// does and checks that every metadata read comes from one fetch of
+// [MetaOffset, Size), which a later open finds in the disk cache.
+func TestSSTReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 	ctx := context.Background()
 	result, err := writeSST(ctx, &sliceSSTIter{entries: metaOffsetTestEntries(5_000)},
 		sstWriterOptions{BlockSize: 4096, BloomBitsPerKey: 10, Compression: "snappy"}, 1)
@@ -156,18 +157,19 @@ func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	path := store.SSTPath(result.Meta.ID)
-	if _, err := store.Write(ctx, path, result.SSTData); err != nil {
+	if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), result.SSTData); err != nil {
 		t.Fatalf("write SST: %v", err)
 	}
-
-	metaCache := newSSTMetaCache(16 << 20)
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MetaMaxBytes: 16 << 20, DataMaxBytes: 16 << 20})
+	if err != nil {
+		t.Fatalf("open disk cache: %v", err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	fetcher := newSSTFetcher(store, disk, DefaultReaderMetrics(nil))
+	fetcher.smallLimit = 0 // read the small fixture in chunks
+	t.Cleanup(fetcher.close)
 	open := func() (*sstable.Reader, error) {
-		readable := newSSTRangeReadable(store, path, result.Meta.ID, result.Meta.Size,
-			&coalescedLoadGroup{}, DefaultReaderMetrics(nil))
-		readable.useMetaRegion(result.Meta.MetaOffset)
-		readable.useMetaCache(metaCache)
-		return sstable.NewReader(ctx, readable, sstable.ReaderOptions{})
+		return sstable.NewReader(ctx, fetcher.readable(fetcher.object(result.Meta)), sstable.ReaderOptions{})
 	}
 
 	reader, err := open()
@@ -185,11 +187,12 @@ func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 	_ = iter.Close()
 	_ = reader.Close()
 
-	// One GET for the metadata region, one for the data block.
+	// One GET for the metadata region, one for the data chunk.
 	if got := gets.Load(); got != 2 {
 		t.Fatalf("cold open + seek issued %d GETs, want 2", got)
 	}
 
+	disk.Sync()
 	gets.Store(0)
 	reader, err = open()
 	if err != nil {
@@ -197,31 +200,35 @@ func TestSSTRangeReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 	}
 	_ = reader.Close()
 	if got := gets.Load(); got != 0 {
-		t.Fatalf("reopen issued %d GETs (last %v), want 0 from cached metadata region",
+		t.Fatalf("reopen issued %d GETs (last %v), want 0 from the cached metadata region",
 			got, lastRange.Load())
 	}
 }
 
-func TestSSTRangeReadable_UseMetaRegionIgnoresUnusableOffsets(t *testing.T) {
+// TestSSTObject_UnusableMetaOffsetReadsWhole checks that an SST whose
+// metadata offset is unknown or out of range is fetched whole, whatever its
+// size.
+func TestSSTObject_UnusableMetaOffsetReadsWhole(t *testing.T) {
 	cases := []struct {
-		name   string
-		size   int64
-		offset int64
-		want   int64
+		name      string
+		size      int64
+		offset    int64
+		wantWhole bool
 	}{
-		{name: "unknown", size: 1000, offset: 0, want: 0},
-		{name: "negative", size: 1000, offset: -1, want: 0},
-		{name: "at end", size: 1000, offset: 1000, want: 0},
-		{name: "past end", size: 1000, offset: 2000, want: 0},
-		{name: "large region", size: 64 << 20, offset: 1, want: 1},
-		{name: "usable", size: 1000, offset: 900, want: 900},
+		{name: "unknown", size: 64 << 20, offset: 0, wantWhole: true},
+		{name: "negative", size: 64 << 20, offset: -1, wantWhole: true},
+		{name: "at end", size: 64 << 20, offset: 64 << 20, wantWhole: true},
+		{name: "past end", size: 64 << 20, offset: 65 << 20, wantWhole: true},
+		{name: "small", size: 1000, offset: 900, wantWhole: true},
+		{name: "large", size: 64 << 20, offset: 60 << 20, wantWhole: false},
 	}
+	store := blobstore.NewMemory("meta-offset-object")
+	defer store.Close()
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newSSTRangeReadable(nil, "", "sst", tc.size, nil, nil)
-			r.useMetaRegion(tc.offset)
-			if r.metaOffset != tc.want {
-				t.Fatalf("metaOffset=%d, want %d", r.metaOffset, tc.want)
+			o := newSSTObject(store, sstMetadata{ID: "sst", Size: tc.size, MetaOffset: tc.offset}, smallSSTBytes)
+			if o.small() != tc.wantWhole {
+				t.Fatalf("whole=%t, want %t", o.small(), tc.wantWhole)
 			}
 		})
 	}

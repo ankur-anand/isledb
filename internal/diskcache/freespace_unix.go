@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package filecache
+package diskcache
 
 import "golang.org/x/sys/unix"
 

@@ -329,19 +329,12 @@ called once after the background worker stops; later mutations, `Flush`, and
 
 ```go
 type ReaderOpenOptions struct {
-    CacheDir            string
-    SSTCacheSize        int64
-    BloomDiskCacheSize  int64
-    BlockCacheSize      int64
-    RangeRead           bool
-    BloomCacheSize      int64
-    MetaCacheSize       int64
-    OpenSSTCacheSize    int
-    RangeReadMinSSTSize int64
-    RangeReadAheadMin   int64
-    RangeReadAheadMax   int64
-    Views               ReaderViewPolicy
-    Metrics             *ReaderMetrics
+    CacheDir       string
+    DiskCacheSize  int64
+    BlockCacheSize int64
+    BloomCacheSize int64
+    Views          ReaderViewPolicy
+    Metrics        *ReaderMetrics
 }
 
 type ReaderViewPolicy struct {
@@ -351,45 +344,60 @@ type ReaderViewPolicy struct {
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
 ```
 
-`CacheDir` is required. `DefaultReaderOpenOptions` returns:
+`CacheDir` is required. Zero sizes select the defaults, and negative sizes
+are rejected. `DefaultReaderOpenOptions` returns:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `SSTCacheSize` | 8 GiB | Maximum bytes of SSTs cached on local disk |
-| `BloomDiskCacheSize` | 512 MiB | Maximum bytes of Bloom filters cached on local disk |
-| `BlockCacheSize` | 256 MiB | Maximum bytes of decoded SST blocks kept in memory, for every SST read |
-| `RangeRead` | true | Read SSTs of at least `RangeReadMinSSTSize` by byte range |
-| `BloomCacheSize` | 64 MiB | Maximum accounted size of loaded Bloom filters in memory |
-| `MetaCacheSize` | 128 MiB | Maximum bytes of SST metadata kept in memory for range reads |
-| `OpenSSTCacheSize` | 1,024 | SSTs kept open across reads |
-| `RangeReadMinSSTSize` | 4 MiB | Smallest SST read by byte range; smaller SSTs are downloaded whole |
-| `RangeReadAheadMin` | 128 KiB | A scan's first read-ahead, and the alignment of every read-ahead |
-| `RangeReadAheadMax` | 4 MiB | Cap on a scan's read-ahead, which doubles while the scan continues |
+| `DiskCacheSize` | 8 GiB | Bytes kept on disk: SST metadata, Bloom filters and SST data |
+| `BlockCacheSize` | 256 MiB | Bytes of decoded SST blocks kept in memory |
+| `BloomCacheSize` | 64 MiB | Accounted bytes of parsed Bloom filters kept in memory |
 | `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
-The block cache holds SST blocks after checksum and decompression, so a hit
-needs neither and allocates nothing. It serves every SST read, whether the
-SST is on local disk or read by range. A point lookup adds the blocks it
-reads. A scan, and each seek of an iterator, adds the blocks holding the
-first 64 KiB of keys and values it reads in each SST, so a short read, such
-as a page, a prefix read or a seek, is warm when repeated, as a lookup is.
-Reading on past that uses buffers of its own, still using blocks already
-cached, so a long scan adds at most about 64 KiB per SST and never evicts
-the blocks lookups reuse. Blocks of an SST that leaves the manifest
-are dropped at the next refresh.
-`BlockCacheStats` reports its bytes and entries, and its hits and misses on
-index and data blocks; the metaindex and properties blocks read on every SST
-open, which are never cached, are not counted.
+#### How a reader reads SSTs
 
-Up to `OpenSSTCacheSize` SSTs stay open across reads, least recently used
-first out, so a read of an open SST opens no file and parses no metadata: a
-warm lookup takes about 1 µs, local or remote, instead of about 20 µs and
-4 µs. Each local SST held open uses one file descriptor. An SST leaves when it
-leaves the manifest, is reported corrupt, or its local file is evicted from
-the disk cache, and closes once the reads using it finish. Because reads of
-an open SST skip opening it, `SSTCacheStats` and `MetaCacheStats` count only
-the opens; `OpenSSTCacheStats` reports how many reads found their SST open.
+Every SST is read by byte range from object storage, through four caches:
+
+| Cache | Holds | Bounded by |
+|---|---|---|
+| Open SSTs | Parsed SST readers, up to 1,024, least recently used first out | Count |
+| Block cache | Decoded index and data blocks | `BlockCacheSize` |
+| Bloom cache | Parsed Bloom filters | `BloomCacheSize` |
+| Disk cache, under `CacheDir` | SST metadata regions and Bloom filters (an eighth of `DiskCacheSize`); whole small SSTs and 128 KiB chunks of larger SSTs' data (the rest) | `DiskCacheSize` |
+
+An SST of at most 4 MiB is fetched whole, together with its Bloom filter, in
+one request, and its SHA-256 is checked against the manifest. A larger SST's
+metadata region and Bloom filter are each fetched in one request; its data is
+fetched in aligned 128 KiB chunks. A lookup fetches the chunk holding its
+block. A scan reads ahead: each request fetches twice as many chunks as the
+last, up to 4 MiB, into a buffer of its own, and a seek elsewhere starts it
+small again. A request never repeats bytes already on disk or being fetched,
+and concurrent reads of the same part share one request. Data blocks of
+large SSTs are checked by their own checksums, which detect damaged bytes
+but not a different, internally valid object stored under the SST's name.
+
+A point lookup caches the blocks it reads, in memory and on disk. A scan,
+and each seek of an iterator, caches only what it reads in its first 64 KiB
+of keys and values in each SST, so a short read, such as a page, a prefix
+read or a seek, is warm when repeated, as a lookup is. Reading on past that
+uses buffers of its own, still using whatever is already cached, so a long
+scan adds at most about 64 KiB per SST to memory and two chunks to disk, and
+never evicts what lookups reuse.
+
+A read of an open SST parses no metadata: a warm lookup takes about 1 µs.
+Each cache evicts by its own least-recently-used order; nothing is dropped
+when an SST leaves the manifest, so a snapshot still reading it stays warm.
+A cached part that proves damaged is dropped and fetched again; a lookup
+that meets damaged cache bytes retries once from object storage, so it does
+not fail.
+
+The disk cache persists across restarts and needs no file held open: a read
+opens, reads and closes, so the budget is exact. Entries are written in the
+background, renamed into place without `fsync`; after a crash, startup drops
+unfinished and empty entries, and reads check each entry's size and
+checksums. Only one live Reader process may own a `CacheDir`; opening logs a
+warning when its filesystem cannot hold `DiskCacheSize`.
 
 The block cache is Pebble's. With cgo it is allocated outside the Go heap: it
 counts toward the process's resident memory but not toward `GOMEMLIMIT` or
@@ -397,30 +405,10 @@ Go heap profiles. Without cgo (`CGO_ENABLED=0`) it is ordinary Go heap, which
 the garbage collector lets grow to about twice the live heap under the
 default `GOGC`; set `GOMEMLIMIT` to bound the process.
 
-Every SST records a SHA-256 checksum of its contents in the manifest. When
-the reader downloads a whole SST, it verifies that checksum before using or
-caching the file, so a damaged or mismatched object is never read.
-
-With `RangeRead`, the reader instead range-reads SSTs of at least
-`RangeReadMinSSTSize`: it fetches only the metadata and blocks a read needs.
-Smaller SSTs are still downloaded whole, since that costs little more than
-one ranged request and leaves the SST cached on disk. The whole-file checksum
-cannot be checked without the whole file, so range reads rely on each block's
-own checksum, which detects damaged bytes but not a different, internally
-valid object stored under the SST's name. Point lookups fetch exact blocks.
-A scan reads ahead into a buffer of its own: its first read-ahead is
-`RangeReadAheadMin`, and each further one doubles, up to `RangeReadAheadMax`,
-so a short scan fetches little it does not read and a long scan needs few
-requests. A seek elsewhere starts the read-ahead small again. An open scan
-holds up to `RangeReadAheadMax` for each SST it is reading. Both read-ahead
-sizes must be between 16 KiB and 16 MiB with the maximum at least the
-minimum; the maximum is rounded down to a multiple of the minimum.
-
-`RangeReadMinSSTSize`, `RangeReadAheadMin` and `RangeReadAheadMax` apply
-only to range reads: zero selects each default, and setting any of them with
-`RangeRead` false is rejected. A `ReaderOpenOptions` built without
-`DefaultReaderOpenOptions` has `RangeRead` false and downloads every SST
-whole.
+`BlockCacheStats` counts hits and misses on index and data blocks; the
+metaindex and properties blocks read on every SST open, which are never
+cached, are not counted. `DiskCacheStats` reports the disk cache's two tiers.
+`OpenSSTCacheStats` reports how many reads found their SST open.
 
 ### Reader methods
 
@@ -433,10 +421,9 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
-func (r *Reader) SSTCacheStats() CacheStats
+func (r *Reader) DiskCacheStats() DiskCacheStats
 func (r *Reader) BlockCacheStats() CacheStats
 func (r *Reader) OpenSSTCacheStats() CacheStats
-func (r *Reader) MetaCacheStats() CacheStats
 func (r *Reader) BloomCacheStats() CacheStats
 func (r *Reader) ManifestPageCacheStats() CacheStats
 func (r *Reader) Close() error
@@ -618,7 +605,14 @@ type PrefetchStats struct {
 ```
 
 Use `All: true` to opt into prefetching the complete keyspace. A zero
-`MaxSSTs` or `MaxBytes` means no limit.
+`MaxSSTs` or `MaxBytes` means no limit beyond the disk cache itself.
+
+`Prefetch` stores each selected SST's metadata, Bloom filter and data in the
+disk cache, fetching only what is missing and sharing requests with
+concurrent reads. It skips SSTs already on disk, and stops selecting once the
+selected SSTs would exceed the disk cache's data budget or `MaxBytes`,
+counting the rest in `SkippedSSTs`. `CachedSSTs` counts the selected SSTs
+wholly on disk when it returns; `BytesRead` counts the bytes it fetched.
 
 ```go
 stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{
@@ -636,26 +630,31 @@ immediate visibility check is required.
 
 ```go
 type CacheStats struct {
-	Hits                int64
-	Misses              int64
-	Bytes               int64
-	MaxBytes            int64
-	EntryCount          int
-	MaxEntries          int
-	PinnedBytes         int64
-	PinnedEntries       int
-	Evictions           int64
-	Corruptions         int64
-	AdmissionBypasses   int64
-	SyncFailures        int64
-	PublicationFailures int64
+    Hits        int64
+    Misses      int64
+    Bytes       int64
+    MaxBytes    int64
+    EntryCount  int
+    MaxEntries  int
+    Evictions   int64
+    Corruptions int64
+    Bypasses    int64
+    Failures    int64
+    Dropped     int64
+}
+
+type DiskCacheStats struct {
+    Meta CacheStats // SST metadata regions and Bloom filters
+    Data CacheStats // whole small SSTs and chunks of larger SSTs' data
 }
 ```
 
-Byte-bounded caches report `MaxEntries == 0`. Entry-bounded caches report
-`MaxBytes == 0`. `SyncFailures` counts verified fills served transiently after
-their file sync failed. `PublicationFailures` counts failures while cleaning
-capacity victims or publishing an artifact at its final cache path.
+Byte-bounded caches report `MaxEntries == 0`; the open-SST cache, bounded by
+count, reports `MaxBytes == 0`. For the disk cache, `Corruptions` counts
+entries dropped as damaged, `Bypasses` entries larger than their whole tier,
+`Failures` entries that could not be written, and `Dropped` entries not
+written because the background write queue was full. Entries in all three
+cases are still served; they are just not kept.
 
 ## Enable and consume the change feed
 

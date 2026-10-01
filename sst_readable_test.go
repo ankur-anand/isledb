@@ -1,0 +1,428 @@
+package isledb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2/sstable"
+)
+
+// byteRange is one ranged GET of an SST object.
+type byteRange struct{ start, end int64 } // [start, end)
+
+// rangeRecorder records the ranged GETs fake S3 serves for SST objects.
+type rangeRecorder struct {
+	mu     sync.Mutex
+	ranges []byteRange
+}
+
+func (r *rangeRecorder) observe(request *http.Request) {
+	header := request.Header.Get("Range")
+	if request.Method != http.MethodGet || header == "" || !strings.Contains(request.URL.Path, ".sst") {
+		return
+	}
+	var first, last int64
+	if _, err := fmt.Sscanf(header, "bytes=%d-%d", &first, &last); err != nil {
+		return
+	}
+	r.mu.Lock()
+	r.ranges = append(r.ranges, byteRange{first, last + 1})
+	r.mu.Unlock()
+}
+
+func (r *rangeRecorder) take() []byteRange {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	taken := r.ranges
+	r.ranges = nil
+	return taken
+}
+
+// readableTestFixture is one SST in fake S3, its manifest, and a reader whose
+// ranged GETs are recorded. Values are incompressible, so the data region
+// spans many chunks.
+type readableTestFixture struct {
+	ctx     context.Context
+	reader  *Reader
+	entries []internal.MemEntry
+	state   *manifestState
+	meta    sstMetadata
+	ranges  *rangeRecorder
+}
+
+func newReadableTestFixture(t *testing.T, n int, chunked bool) *readableTestFixture {
+	t.Helper()
+	ctx := context.Background()
+	ranges := &rangeRecorder{}
+	bucketURL := setupFakeS3BucketURLWithObserver(t, ranges.observe)
+	store, err := blobstore.Open(ctx, bucketURL, fmt.Sprintf("readable-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	reader := newBlockCacheTestReader(t, ctx, store, readerOptions{}, chunked)
+
+	rng := rand.New(rand.NewSource(1))
+	entries := make([]internal.MemEntry, n)
+	for i := range entries {
+		value := make([]byte, 200)
+		rng.Read(value)
+		entries[i] = internal.MemEntry{Key: kvLeveledBenchmarkKey(i), Seq: uint64(i + 1), Kind: internal.OpPut, Value: value}
+	}
+	result, err := writeSST(ctx, &sliceSSTIter{entries: entries},
+		sstWriterOptions{BlockSize: 4096, BloomBitsPerKey: 12, Compression: "snappy"}, 1)
+	if err != nil {
+		t.Fatalf("writeSST: %v", err)
+	}
+	if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), result.SSTData); err != nil {
+		t.Fatalf("store SST: %v", err)
+	}
+	meta := result.Meta
+	meta.Level = 1
+	ranges.take()
+	return &readableTestFixture{
+		ctx: ctx, reader: reader, entries: entries, meta: meta, ranges: ranges,
+		state: &manifestState{Levels: []manifest.Level{{Number: 1, SSTs: []manifest.SSTMeta{meta}}}},
+	}
+}
+
+func (f *readableTestFixture) get(t *testing.T, i int) {
+	t.Helper()
+	value, found, err := f.reader.getWithManifest(f.ctx, f.state, f.entries[i].Key)
+	if err != nil || !found {
+		t.Fatalf("Get(%d) found=%t err=%v", i, found, err)
+	}
+	_ = value
+}
+
+func (f *readableTestFixture) scan(t *testing.T, from, limit int) {
+	t.Helper()
+	kvs, err := f.reader.scanInternalWithManifest(f.ctx, f.state, f.entries[from].Key, nil, limit)
+	if err != nil || len(kvs) != min(limit, len(f.entries)-from) {
+		t.Fatalf("scan from %d rows=%d err=%v", from, len(kvs), err)
+	}
+	for j, kv := range kvs {
+		if !bytes.Equal(kv.Key, f.entries[from+j].Key) {
+			t.Fatalf("scan row %d = %q, want %q", j, kv.Key, f.entries[from+j].Key)
+		}
+	}
+}
+
+// forgetMemory drops the reader's open SSTs and blocks, so the next read
+// starts from the disk cache.
+func (f *readableTestFixture) forgetMemory() {
+	f.reader.diskCache.Sync()
+	f.reader.openSSTs.clear()
+	f.reader.blockCache.clear()
+}
+
+func (f *readableTestFixture) object() sstObject { return f.reader.fetcher.object(f.meta) }
+
+// dataRanges keeps the GETs that read the data region.
+func (f *readableTestFixture) dataRanges(ranges []byteRange) []byteRange {
+	var data []byteRange
+	for _, r := range ranges {
+		if r.start < f.meta.MetaOffset {
+			data = append(data, r)
+		}
+	}
+	return data
+}
+
+// TestSSTReadable_LookupFetchesAlignedChunk checks a cold lookup's requests:
+// the metadata region and Bloom sidecar exactly, and one aligned chunk of
+// data; a lookup of another key in that chunk then needs no request.
+func TestSSTReadable_LookupFetchesAlignedChunk(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	o := f.object()
+	if o.numChunks() < 8 {
+		t.Fatalf("fixture data region spans %d chunks, want several", o.numChunks())
+	}
+
+	f.get(t, 10_000)
+	ranges := f.ranges.take()
+	var meta, bloom int
+	for _, r := range ranges {
+		switch {
+		case r == byteRange{f.meta.MetaOffset, f.meta.Size}:
+			meta++
+		case r == byteRange{f.meta.Bloom.Offset, f.meta.Bloom.Offset + f.meta.Bloom.Length}:
+			bloom++
+		}
+	}
+	data := f.dataRanges(ranges)
+	if meta != 1 || bloom != 1 || len(data) != 1 || len(ranges) != 3 {
+		t.Fatalf("cold lookup ranges=%v, want metadata, Bloom and one data chunk", ranges)
+	}
+	chunk := data[0]
+	if chunk.start%sstChunkSize != 0 || (chunk.end%sstChunkSize != 0 && chunk.end != f.meta.MetaOffset) ||
+		chunk.end-chunk.start > 2*sstChunkSize {
+		t.Fatalf("data request %v is not an aligned chunk", chunk)
+	}
+
+	// A neighbour in the same chunk, after memory forgets the SST: served
+	// from disk.
+	f.forgetMemory()
+	for i := 10_001; i < 10_400; i++ {
+		start, _ := o.chunkSpan(uint32(chunk.start / sstChunkSize))
+		_ = start
+	}
+	f.get(t, 10_001)
+	if got := f.dataRanges(f.ranges.take()); len(got) != 0 {
+		t.Fatalf("lookup in a cached chunk made data requests %v", got)
+	}
+	if stats := f.reader.DiskCacheStats(); stats.Data.Hits == 0 || stats.Meta.Hits == 0 {
+		t.Fatalf("lookup did not read the disk cache: %+v", stats)
+	}
+}
+
+// TestSSTReadable_SmallSSTIsOneRequest reads a small SST: one request fetches
+// the SST and its Bloom sidecar, cached as two entries; nothing else is
+// fetched afterwards.
+func TestSSTReadable_SmallSSTIsOneRequest(t *testing.T) {
+	f := newReadableTestFixture(t, 2_000, false)
+	f.get(t, 100)
+	ranges := f.ranges.take()
+	want := byteRange{0, f.meta.Bloom.Offset + f.meta.Bloom.Length}
+	if len(ranges) != 1 || ranges[0] != want {
+		t.Fatalf("small SST ranges=%v, want one request %v", ranges, want)
+	}
+	f.forgetMemory()
+	f.reader.bloomCache.clear()
+	f.get(t, 1_500)
+	f.scan(t, 0, 500)
+	if got := f.ranges.take(); len(got) != 0 {
+		t.Fatalf("reads of a cached small SST made requests %v", got)
+	}
+	if stats := f.reader.DiskCacheStats(); stats.Data.EntryCount != 1 || stats.Meta.EntryCount != 1 {
+		t.Fatalf("disk entries %+v, want the whole SST and its Bloom filter", stats)
+	}
+}
+
+// TestSSTReadable_ScanStopsBeforeCachedChunks caches one chunk with a lookup,
+// then scans across it from cold memory: no request covers the cached chunk.
+func TestSSTReadable_ScanStopsBeforeCachedChunks(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	o := f.object()
+	f.get(t, 10_000)
+	cached := f.dataRanges(f.ranges.take())[0]
+	f.forgetMemory()
+
+	f.scan(t, 5_000, 10_000)
+	for _, r := range f.dataRanges(f.ranges.take()) {
+		if r.start < cached.end && cached.start < r.end {
+			t.Fatalf("scan request %v overlaps cached chunk %v", r, cached)
+		}
+	}
+	_ = o
+}
+
+// TestSSTReadable_LongScanStoresOnlyItsStart scans a whole chunked SST from
+// cold: its requests grow, so they are few, and only the chunks read while
+// filling, at most two, are stored on disk.
+func TestSSTReadable_LongScanStoresOnlyItsStart(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	o := f.object()
+	f.scan(t, 0, len(f.entries))
+	data := f.dataRanges(f.ranges.take())
+	var covered int64
+	for _, r := range data {
+		covered += r.end - r.start
+	}
+	if covered < f.meta.MetaOffset {
+		t.Fatalf("scan requests covered %d bytes, want the data region %d", covered, f.meta.MetaOffset)
+	}
+	if limit := 12; len(data) > limit {
+		t.Fatalf("scan of %d chunks made %d data requests, want at most %d", o.numChunks(), len(data), limit)
+	}
+	f.reader.diskCache.Sync()
+	if got := f.reader.DiskCacheStats().Data.EntryCount; got == 0 || got > 2 {
+		t.Fatalf("long scan stored %d chunks, want its first one or two", got)
+	}
+}
+
+// chunkCached reports whether the disk cache holds data chunk i of f's SST.
+func (f *readableTestFixture) chunkCached(i uint32) bool {
+	o := f.object()
+	start, end := o.chunkSpan(i)
+	return f.reader.diskCache.Contains(o.entry(diskcache.KindChunk, i), end-start)
+}
+
+// TestSSTReadable_FailedOpenKeepsCache fails an SST open for a reason other
+// than corruption, a canceled metadata fetch: what the disk cache holds of the
+// SST stays, and nothing counts as a corruption.
+func TestSSTReadable_FailedOpenKeepsCache(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	f.get(t, 10_000)
+	chunk := uint32(f.dataRanges(f.ranges.take())[0].start / sstChunkSize)
+	f.forgetMemory()
+	// Evicted metadata makes the next open fetch it.
+	f.reader.diskCache.Remove(f.object().entry(diskcache.KindMeta, 0))
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, _, err := f.reader.openSSTIterBounded(ctx, f.meta, nil, nil, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("open with canceled context err=%v, want context.Canceled", err)
+	}
+	if !f.chunkCached(chunk) {
+		t.Fatal("failed open dropped a cached chunk")
+	}
+	meta, data := f.reader.DiskCacheStats().Meta, f.reader.DiskCacheStats().Data
+	if meta.Corruptions != 0 || data.Corruptions != 0 {
+		t.Fatalf("failed open counted corruptions: meta=%+v data=%+v", meta, data)
+	}
+
+	f.ranges.take()
+	f.get(t, 10_000)
+	if got := f.ranges.take(); len(got) != 1 || got[0] != (byteRange{f.meta.MetaOffset, f.meta.Size}) {
+		t.Fatalf("lookup after failed open ranges=%v, want only the metadata region", got)
+	}
+}
+
+// TestSSTReadable_CorruptMetadataHealsWithinLookup damages a cached metadata
+// entry on disk: the next lookup succeeds, fetching the metadata again and
+// keeping the cached data chunks.
+func TestSSTReadable_CorruptMetadataHealsWithinLookup(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	f.get(t, 10_000)
+	chunk := uint32(f.dataRanges(f.ranges.take())[0].start / sstChunkSize)
+	f.forgetMemory()
+
+	paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "meta", "*",
+		fmt.Sprintf("%x.meta", f.object().key)))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("metadata file matches=%v err=%v", paths, err)
+	}
+	flipFile(t, paths[0])
+
+	f.get(t, 10_000)
+	if stats := f.reader.DiskCacheStats().Meta; stats.Corruptions == 0 {
+		t.Fatalf("damaged metadata not counted: %+v", stats)
+	}
+	if got := f.ranges.take(); len(got) != 1 || got[0] != (byteRange{f.meta.MetaOffset, f.meta.Size}) {
+		t.Fatalf("lookup over damaged metadata ranges=%v, want only the metadata region", got)
+	}
+	if !f.chunkCached(chunk) {
+		t.Fatal("damaged metadata dropped a cached chunk")
+	}
+}
+
+// flipFile inverts every byte of the file at path.
+func flipFile(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range data {
+		data[i] ^= 0xff
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSSTReadable_CorruptChunkHealsWithinLookup damages a cached chunk on
+// disk: the next lookup through it still succeeds, fetching it again.
+func TestSSTReadable_CorruptChunkHealsWithinLookup(t *testing.T) {
+	f := newReadableTestFixture(t, 20_000, true)
+	f.get(t, 10_000)
+	cached := f.dataRanges(f.ranges.take())[0]
+	f.forgetMemory()
+
+	name := (f.object().entry(diskcache.KindChunk, uint32(cached.start/sstChunkSize))).Object
+	paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "data", "*",
+		fmt.Sprintf("%x.c%d", name, cached.start/sstChunkSize)))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("chunk file matches=%v err=%v", paths, err)
+	}
+	flipFile(t, paths[0])
+
+	f.get(t, 10_000)
+	if stats := f.reader.DiskCacheStats().Data; stats.Corruptions == 0 {
+		t.Fatalf("damaged chunk not counted: %+v", stats)
+	}
+	if got := f.dataRanges(f.ranges.take()); len(got) == 0 {
+		t.Fatal("damaged chunk was not fetched again")
+	}
+}
+
+// TestSSTReadable_ReadAheadDoublesPerRequest scans a chunked SST from cold:
+// once the scan's tail reads privately, each request fetches twice as many
+// chunks as the one before, up to the maximum.
+func TestSSTReadable_ReadAheadDoublesPerRequest(t *testing.T) {
+	f := newReadableTestFixture(t, 40_000, true)
+	f.scan(t, 0, len(f.entries))
+	data := f.dataRanges(f.ranges.take())
+	var sizes []int64
+	for _, r := range data {
+		sizes = append(sizes, (r.end-r.start+sstChunkSize-1)/sstChunkSize)
+	}
+	// The last request is cut at the end of the data region.
+	for i := 1; i < len(sizes)-1; i++ {
+		if sizes[i] != 1 && sizes[i] != min(2*sizes[i-1], maxReadAheadChunks) {
+			t.Fatalf("request sizes in chunks %v: %d does not double %d", sizes, sizes[i], sizes[i-1])
+		}
+	}
+	if largest := sizes[len(sizes)-2]; largest < 8 {
+		t.Fatalf("request sizes in chunks %v never grew", sizes)
+	}
+}
+
+// TestSSTReadable_UncachedEntryFetchedOncePerOpen opens SSTs through a
+// fetcher with no disk cache, where every disk read misses, as when the cache
+// cannot store an entry: each open still fetches its metadata region, or a
+// small SST's whole object, once.
+func TestSSTReadable_UncachedEntryFetchedOncePerOpen(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			f := newReadableTestFixture(t, 2_000, chunked)
+			fetcher := newSSTFetcher(f.reader.store, nil, nil)
+			if chunked {
+				fetcher.smallLimit = 0
+			}
+			t.Cleanup(fetcher.close)
+			reader, err := sstable.NewReader(f.ctx, fetcher.readable(fetcher.object(f.meta)), sstable.ReaderOptions{})
+			if err != nil {
+				t.Fatalf("open SST: %v", err)
+			}
+			iter, err := reader.NewIter(sstable.NoTransforms, f.entries[1_000].Key, nil, sstable.AssertNoBlobHandles)
+			if err != nil {
+				t.Fatalf("new iter: %v", err)
+			}
+			if kv := iter.First(); kv == nil {
+				t.Fatalf("First: %v", iter.Error())
+			}
+			_ = iter.Close()
+			_ = reader.Close()
+
+			var whole, meta int
+			for _, r := range f.ranges.take() {
+				switch {
+				case r.start == 0 && r.end >= f.meta.Size:
+					whole++
+				case r == byteRange{f.meta.MetaOffset, f.meta.Size}:
+					meta++
+				}
+			}
+			if chunked && meta != 1 || !chunked && whole != 1 {
+				t.Fatalf("open fetched the metadata region %d times and the whole SST %d times, want once",
+					meta, whole)
+			}
+		})
+	}
+}
