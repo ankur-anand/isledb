@@ -17,7 +17,6 @@ import (
 	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 )
@@ -31,6 +30,8 @@ type Reader struct {
 	bloomCache    *bloomFilterCache
 	openSSTs      *openSSTCache
 	bloomLoads    coalescedLoadGroup
+	// sstDrops counts dropSST calls.
+	sstDrops      atomic.Int64
 	manifestLoads coalescedLoadGroup
 
 	ownsDiskCache bool
@@ -703,10 +704,11 @@ func (r *Reader) getFromSST(
 		}
 	}
 	value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
-	if pebble.IsCorruptionError(err) {
-		// The SST and what the disk cache held of it were dropped when the
-		// corruption was found; a damaged cache entry costs one more fetch,
-		// never a failed lookup. Damage at the origin fails again.
+	if damaged(err) {
+		// Damage found while reading dropped the SST, so the retry reads it
+		// afresh: damaged cached bytes cost one more fetch, never a failed
+		// lookup. Any other error, as damage at the origin or a value that
+		// does not decode, fails the same way again.
 		value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
 	}
 	return value, found, tombstone, err
@@ -827,27 +829,28 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 // reusing the SST if it is already open. private makes the iterator fill no
 // cache: it reads blocks into buffers of its own and stores no fetched bytes
 // on disk; the long tail of a scan reads this way (see scanSSTSource).
+//
+// An SST whose open or iterator fails on damage is dropped, as is one whose
+// iterator later fails on damage (see sstIterWithClose.Close).
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
-	if sst := r.openSSTs.acquire(sstMeta.ID); sst != nil {
-		return r.newSSTIter(ctx, sst, lower, upper, private)
-	}
 	if _, err := r.sstPayloadSize(sstMeta); err != nil {
 		return nil, nil, err
 	}
-	sst, err := r.openSST(ctx, sstMeta)
-	if pebble.IsCorruptionError(err) {
-		// The metadata the disk cache held may be damaged: drop it and make
-		// one attempt against object storage. Other failures, as a timeout or
-		// a network error, say nothing about the cache and keep it.
-		r.fetcher.dropMetadata(r.fetcher.object(sstMeta))
-		var retryErr error
-		if sst, retryErr = r.openSST(ctx, sstMeta); retryErr != nil {
-			return nil, nil, errors.Join(err, retryErr)
+	sst := r.openSSTs.acquire(sstMeta.ID)
+	if sst == nil {
+		var err error
+		if sst, err = r.openSST(ctx, sstMeta); err != nil {
+			if damaged(err) {
+				r.dropSST(sstMeta)
+			}
+			return nil, nil, err
 		}
-	} else if err != nil {
-		return nil, nil, err
 	}
-	return r.newSSTIter(ctx, sst, lower, upper, private)
+	reader, iter, err := r.newSSTIter(ctx, sst, lower, upper, private)
+	if damaged(err) {
+		r.dropSST(sstMeta)
+	}
+	return reader, iter, err
 }
 
 // openSST opens an SST and caches it open, returning it with a reference for
@@ -864,7 +867,7 @@ func (r *Reader) openSST(ctx context.Context, sstMeta sstMetadata) (*openSST, er
 	r.blockCache.noteOpen()
 	return r.openSSTs.add(&openSST{
 		id: sstMeta.ID, reader: reader,
-		onCorruption: func() { r.reportCorruptSST(sstMeta) },
+		onDamage: func() { r.dropSST(sstMeta) },
 	}), nil
 }
 
@@ -920,8 +923,8 @@ func (it *sstIterWithClose) Close() error {
 	if it.pool != nil {
 		it.pool.Release()
 	}
-	if it.sst.onCorruption != nil && (pebble.IsCorruptionError(iterErr) || pebble.IsCorruptionError(err)) {
-		it.sst.onCorruption()
+	if it.sst.onDamage != nil && (damaged(iterErr) || damaged(err)) {
+		it.sst.onDamage()
 	}
 	it.sst.unref()
 	return err
@@ -933,6 +936,11 @@ type DiskCacheStats struct {
 	Meta CacheStats
 	// Data holds small SSTs whole and chunks of larger SSTs' data.
 	Data CacheStats
+	// SSTDrops counts reads that failed on what looked like damaged bytes,
+	// each dropping the SST from every layer so it is fetched again. It
+	// counts drops, not distinct SSTs: concurrent readers of one damaged SST
+	// each count, and an SST bad at the origin counts on every read.
+	SSTDrops int64
 }
 
 // DiskCacheStats reports the persistent disk cache under CacheDir.
@@ -941,8 +949,9 @@ func (r *Reader) DiskCacheStats() DiskCacheStats {
 		return DiskCacheStats{}
 	}
 	return DiskCacheStats{
-		Meta: diskTierStats(r.diskCache.Stats(diskcache.TierMeta)),
-		Data: diskTierStats(r.diskCache.Stats(diskcache.TierData)),
+		Meta:     diskTierStats(r.diskCache.Stats(diskcache.TierMeta)),
+		Data:     diskTierStats(r.diskCache.Stats(diskcache.TierData)),
+		SSTDrops: r.sstDrops.Load(),
 	}
 }
 

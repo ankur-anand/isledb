@@ -3,8 +3,10 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -281,9 +284,8 @@ func TestSSTReadable_FailedOpenKeepsCache(t *testing.T) {
 	if !f.chunkCached(chunk) {
 		t.Fatal("failed open dropped a cached chunk")
 	}
-	meta, data := f.reader.DiskCacheStats().Meta, f.reader.DiskCacheStats().Data
-	if meta.Corruptions != 0 || data.Corruptions != 0 {
-		t.Fatalf("failed open counted corruptions: meta=%+v data=%+v", meta, data)
+	if stats := f.reader.DiskCacheStats(); stats.SSTDrops != 0 || stats.Meta.Corruptions != 0 || stats.Data.Corruptions != 0 {
+		t.Fatalf("failed open counted damage: %+v", stats)
 	}
 
 	f.ranges.take()
@@ -293,31 +295,149 @@ func TestSSTReadable_FailedOpenKeepsCache(t *testing.T) {
 	}
 }
 
-// TestSSTReadable_CorruptMetadataHealsWithinLookup damages a cached metadata
-// entry on disk: the next lookup succeeds, fetching the metadata again and
-// keeping the cached data chunks.
-func TestSSTReadable_CorruptMetadataHealsWithinLookup(t *testing.T) {
-	f := newReadableTestFixture(t, 20_000, true)
-	f.get(t, 10_000)
-	chunk := uint32(f.dataRanges(f.ranges.take())[0].start / sstChunkSize)
-	f.forgetMemory()
+// TestSSTReadable_DamagedMetadataHealsWithinLookup damages the cached
+// metadata entry in ways Pebble finds at different points: the whole entry
+// (the open fails on the footer), only the index block (the open succeeds and
+// the iterator fails), and only the footer's metaindex handle, made to point
+// past the end of the SST (the read fails without a corruption error). Each
+// time the lookup still succeeds, dropping the SST and fetching it again.
+func TestSSTReadable_DamagedMetadataHealsWithinLookup(t *testing.T) {
+	cases := []struct {
+		name   string
+		damage func(t *testing.T, meta []byte, layout *sstable.Layout, metaOffset int64)
+	}{
+		{"whole_entry", func(t *testing.T, meta []byte, _ *sstable.Layout, _ int64) {
+			for i := range meta {
+				meta[i] ^= 0xff
+			}
+		}},
+		{"index_block", func(t *testing.T, meta []byte, layout *sstable.Layout, metaOffset int64) {
+			index := layout.TopIndex
+			if index.Length == 0 {
+				index = layout.Index[0]
+			}
+			at := int64(index.Offset) - metaOffset + int64(index.Length)/2
+			meta[at] ^= 0xff
+		}},
+		{"footer_handle_out_of_range", func(t *testing.T, meta []byte, layout *sstable.Layout, metaOffset int64) {
+			// The footer starts with a checksum type byte, then the metaindex
+			// handle: varint offset, varint length.
+			footer := meta[int64(layout.Footer.Offset)-metaOffset:]
+			_, n1 := binary.Uvarint(footer[1:])
+			_, n2 := binary.Uvarint(footer[1+n1:])
+			handle := binary.AppendUvarint(nil, uint64(metaOffset)+uint64(len(meta))+1<<20)
+			handle = binary.AppendUvarint(handle, 64)
+			if len(handle) > n1+n2 {
+				t.Fatalf("new handle is %d bytes, room for %d", len(handle), n1+n2)
+			}
+			// Shift the index handle back to follow the new metaindex handle.
+			rest := append([]byte(nil), footer[1+n1+n2:]...)
+			copy(footer[1:], handle)
+			copy(footer[1+len(handle):], rest)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReadableTestFixture(t, 20_000, true)
+			f.get(t, 10_000)
+			sst := f.reader.openSSTs.acquire(f.meta.ID)
+			layout, err := sst.reader.Layout()
+			sst.unref()
+			if err != nil {
+				t.Fatalf("layout: %v", err)
+			}
+			f.forgetMemory()
+			f.ranges.take()
 
-	paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "meta", "*",
-		fmt.Sprintf("%x.meta", f.object().key)))
-	if err != nil || len(paths) != 1 {
-		t.Fatalf("metadata file matches=%v err=%v", paths, err)
-	}
-	flipFile(t, paths[0])
+			paths, err := filepath.Glob(filepath.Join(f.reader.cacheDir, "artifacts", "v3", "meta", "*",
+				fmt.Sprintf("%x.meta", f.object().key)))
+			if err != nil || len(paths) != 1 {
+				t.Fatalf("metadata file matches=%v err=%v", paths, err)
+			}
+			meta, err := os.ReadFile(paths[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.damage(t, meta, layout, f.meta.MetaOffset)
+			if err := os.WriteFile(paths[0], meta, 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	f.get(t, 10_000)
-	if stats := f.reader.DiskCacheStats().Meta; stats.Corruptions == 0 {
-		t.Fatalf("damaged metadata not counted: %+v", stats)
+			f.get(t, 10_000)
+			if stats := f.reader.DiskCacheStats(); stats.SSTDrops != 1 {
+				t.Fatalf("damaged metadata not counted once: %+v", stats)
+			}
+			var refetched bool
+			for _, r := range f.ranges.take() {
+				refetched = refetched || r == (byteRange{f.meta.MetaOffset, f.meta.Size})
+			}
+			if !refetched {
+				t.Fatal("damaged metadata was not fetched again")
+			}
+			// The SST is healthy again: a lookup in memory needs nothing.
+			f.get(t, 10_000)
+			if got := f.ranges.take(); len(got) != 0 {
+				t.Fatalf("lookup after healing ranges=%v, want none", got)
+			}
+		})
 	}
-	if got := f.ranges.take(); len(got) != 1 || got[0] != (byteRange{f.meta.MetaOffset, f.meta.Size}) {
-		t.Fatalf("lookup over damaged metadata ranges=%v, want only the metadata region", got)
+}
+
+// TestSSTReadable_OriginChecksumMismatchIsNotDamage reads a small SST whose
+// object does not match its manifest checksum: the read fails without
+// dropping anything or retrying, so each lookup fetches the object once for
+// its Bloom filter and once for its open.
+func TestSSTReadable_OriginChecksumMismatchIsNotDamage(t *testing.T) {
+	f := newReadableTestFixture(t, 2_000, false)
+	sum := []byte(f.meta.Checksum)
+	last := len(sum) - 1
+	if sum[last] == '0' {
+		sum[last] = '1'
+	} else {
+		sum[last] = '0'
 	}
-	if !f.chunkCached(chunk) {
-		t.Fatal("damaged metadata dropped a cached chunk")
+	f.meta.Checksum = string(sum)
+	f.state.Levels[0].SSTs[0].Checksum = f.meta.Checksum
+	if !f.object().small() {
+		t.Fatal("fixture SST is not read whole")
+	}
+
+	for range 2 {
+		if _, _, err := f.reader.getWithManifest(f.ctx, f.state, f.entries[1_000].Key); err == nil ||
+			!strings.Contains(err.Error(), "checksum mismatch") {
+			t.Fatalf("Get err=%v, want a checksum mismatch", err)
+		}
+		if got := f.ranges.take(); len(got) != 2 {
+			t.Fatalf("lookup ranges=%v, want the object fetched for the Bloom filter and the open", got)
+		}
+	}
+	if stats := f.reader.DiskCacheStats(); stats.SSTDrops != 0 || stats.Data.EntryCount != 0 {
+		t.Fatalf("origin mismatch counted as damage or cached: %+v", stats)
+	}
+}
+
+// TestDamaged classifies read errors: failed fetches and ended contexts leave
+// the cache alone; every other error means damaged bytes.
+func TestDamaged(t *testing.T) {
+	fetch := &fetchError{errors.New("connection reset")}
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{fetch, false},
+		{fmt.Errorf("read block: %w", fetch), false},
+		{errors.Join(errors.New("open"), fetch), false},
+		{context.Canceled, false},
+		{fmt.Errorf("read: %w", context.DeadlineExceeded), false},
+		{pebble.ErrCorruption, true},
+		{io.ErrUnexpectedEOF, true},
+		{errors.New("anything else"), true},
+	}
+	for _, tc := range cases {
+		if got := damaged(tc.err); got != tc.want {
+			t.Errorf("damaged(%v) = %t, want %t", tc.err, got, tc.want)
+		}
 	}
 }
 
@@ -353,8 +473,8 @@ func TestSSTReadable_CorruptChunkHealsWithinLookup(t *testing.T) {
 	flipFile(t, paths[0])
 
 	f.get(t, 10_000)
-	if stats := f.reader.DiskCacheStats().Data; stats.Corruptions == 0 {
-		t.Fatalf("damaged chunk not counted: %+v", stats)
+	if stats := f.reader.DiskCacheStats(); stats.SSTDrops != 1 || stats.Data.Corruptions != 0 {
+		t.Fatalf("damaged chunk not counted once as a damaged SST: %+v", stats)
 	}
 	if got := f.dataRanges(f.ranges.take()); len(got) == 0 {
 		t.Fatal("damaged chunk was not fetched again")

@@ -16,10 +16,10 @@ const defaultOpenSSTCacheSize = 1024
 type openSST struct {
 	id     string
 	reader *sstable.Reader
-	// onCorruption, if set, runs when an iterator fails on corrupt data.
-	onCorruption func()
-	refs         atomic.Int32
-	closed       atomic.Bool
+	// onDamage, if set, runs when an iterator fails on damage (see damaged).
+	onDamage func()
+	refs     atomic.Int32
+	closed   atomic.Bool
 }
 
 func (s *openSST) unref() {

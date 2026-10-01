@@ -147,8 +147,8 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("self-healed Get value=%q found=%t err=%v", value, found, err)
 	}
-	if stats := reopened.DiskCacheStats().Data; stats.Corruptions != 1 {
-		t.Fatalf("data tier corruption stats=%+v", stats)
+	if stats := reopened.DiskCacheStats(); stats.SSTDrops != 1 || stats.Data.Corruptions != 0 {
+		t.Fatalf("damaged SST stats=%+v", stats)
 	}
 	if stats := reopened.DiskCacheStats().Meta; stats.Corruptions != 1 {
 		t.Fatalf("meta tier corruption stats=%+v", stats)

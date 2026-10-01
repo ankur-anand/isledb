@@ -32,10 +32,11 @@ func (limiter *readerDiagnosticLimiter) allow(now time.Time) (bool, uint64) {
 	return true, suppressed
 }
 
-// reportCorruptSST drops an SST whose blocks failed their checksums: its open
-// reader, its cached blocks and what the disk cache holds of it, so the next
-// read fetches it again.
-func (r *Reader) reportCorruptSST(meta sstMetadata) {
+// dropSST forgets everything held of an SST whose read failed on damage (see
+// damaged): its open reader, its cached blocks and what the disk cache holds
+// of it, so the next read fetches it again.
+func (r *Reader) dropSST(meta sstMetadata) {
+	r.sstDrops.Add(1)
 	r.openSSTs.remove(meta.ID)
 	r.blockCache.forget(meta.ID)
 	r.fetcher.dropObject(r.fetcher.object(meta))

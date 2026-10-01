@@ -169,31 +169,36 @@ func (f *sstFetcher) diskStore(k diskcache.Key, data []byte, mode storeMode) {
 	}
 }
 
-// dropObject removes every cached part of an SST whose contents proved
-// damaged, so the next read fetches them again; which part was damaged is not
-// known, so each counts as a corruption. Its Bloom sidecar has its own
-// checksum and is left alone.
+// dropObject removes every cached part of an SST that proved damaged, so the
+// next read fetches it again. Which part was damaged is not known, so none is
+// counted as a corruption; the reader counts the drop once. The Bloom sidecar
+// stays: it is verified against its checksum whenever it is loaded, so it is
+// never the damage.
 func (f *sstFetcher) dropObject(o sstObject) {
 	if f.disk == nil {
 		return
 	}
-	f.disk.ReportCorrupt(o.entry(diskcache.KindWhole, 0))
-	f.disk.ReportCorrupt(o.entry(diskcache.KindMeta, 0))
+	f.disk.Remove(o.entry(diskcache.KindWhole, 0))
+	f.disk.Remove(o.entry(diskcache.KindMeta, 0))
 	for i := range o.numChunks() {
-		f.disk.ReportCorrupt(o.entry(diskcache.KindChunk, i))
+		f.disk.Remove(o.entry(diskcache.KindChunk, i))
 	}
 }
 
-// dropMetadata removes the cached parts an SST open reads, after the open
-// found them damaged: the metadata entry, and the whole-object entry a small
-// SST is read from. Data chunks are left alone; a damaged block fails its own
-// checksum when read.
-func (f *sstFetcher) dropMetadata(o sstObject) {
-	if f.disk == nil {
-		return
-	}
-	f.disk.ReportCorrupt(o.entry(diskcache.KindWhole, 0))
-	f.disk.ReportCorrupt(o.entry(diskcache.KindMeta, 0))
+// fetchError is a failed or invalid fetch from object storage. It says nothing
+// about the SST's cached bytes; see damaged.
+type fetchError struct{ err error }
+
+func (e *fetchError) Error() string { return e.err.Error() }
+func (e *fetchError) Unwrap() error { return e.err }
+
+// damaged reports whether err from reading an SST means its cached bytes are
+// bad. Every error is, except a failed fetch or an ended context: those leave
+// the cache as it was, and the next read tries again.
+func damaged(err error) bool {
+	var fetchErr *fetchError
+	return err != nil && !errors.As(err, &fetchErr) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func (f *sstFetcher) readRange(ctx context.Context, path string, off, length int64) ([]byte, error) {
@@ -201,14 +206,14 @@ func (f *sstFetcher) readRange(ctx context.Context, path string, off, length int
 	reader, err := f.store.ReadRangeStream(ctx, path, off, length)
 	if err != nil {
 		f.m.ObserveSSTRangeRead(time.Since(start), 0, err)
-		return nil, err
+		return nil, &fetchError{err}
 	}
 	data := make([]byte, length)
 	n, readErr := io.ReadFull(reader, data)
 	err = errors.Join(readErr, reader.Close())
 	f.m.ObserveSSTRangeRead(time.Since(start), int64(n), err)
 	if err != nil {
-		return nil, err
+		return nil, &fetchError{err}
 	}
 	return data, nil
 }
@@ -239,7 +244,8 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject, mode storeMode) ([]
 		if o.checksum != "" {
 			want, err := checksum.ParseSHA256(o.checksum)
 			if err != nil || sha256.Sum256(data[:o.size]) != want {
-				return nil, fmt.Errorf("validate sst %s: checksum mismatch", o.id)
+				// Checked before anything is stored: the object itself is bad.
+				return nil, &fetchError{fmt.Errorf("validate sst %s: checksum mismatch", o.id)}
 			}
 		}
 		f.diskStore(o.entry(diskcache.KindWhole, 0), data[:o.size], mode)

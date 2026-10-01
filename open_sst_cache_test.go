@@ -177,7 +177,7 @@ func TestReader_OpenSSTCache_DropsCorruptSSTs(t *testing.T) {
 	if reader.OpenSSTCacheStats().EntryCount != 1 {
 		t.Fatal("SST leaving the manifest was closed")
 	}
-	reader.reportCorruptSST(meta)
+	reader.dropSST(meta)
 	if reader.OpenSSTCacheStats().EntryCount != 0 {
 		t.Fatal("corrupt SST still cached")
 	}

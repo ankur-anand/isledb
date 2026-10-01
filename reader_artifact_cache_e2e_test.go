@@ -86,8 +86,8 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("decoded Bloom L1 did not repopulate: %+v", stats)
 		}
 		assertArtifactCacheTestValue(t, ctx, healingReader, "accounts/001", "Ada")
-		if stats := healingReader.DiskCacheStats().Data; stats.Corruptions != 1 {
-			t.Fatalf("data tier corruption stats=%+v", stats)
+		if stats := healingReader.DiskCacheStats(); stats.SSTDrops != 1 || stats.Data.Corruptions != 0 {
+			t.Fatalf("damaged SST stats=%+v", stats)
 		}
 		if stats := healingReader.DiskCacheStats().Meta; stats.Corruptions != 1 {
 			t.Fatalf("meta tier corruption stats=%+v", stats)

@@ -644,17 +644,25 @@ type CacheStats struct {
 }
 
 type DiskCacheStats struct {
-    Meta CacheStats // SST metadata regions and Bloom filters
-    Data CacheStats // whole small SSTs and chunks of larger SSTs' data
+    Meta     CacheStats // SST metadata regions and Bloom filters
+    Data     CacheStats // whole small SSTs and chunks of larger SSTs' data
+    SSTDrops int64      // reads that failed on damaged bytes and dropped the SST
 }
 ```
 
 Byte-bounded caches report `MaxEntries == 0`; the open-SST cache, bounded by
 count, reports `MaxBytes == 0`. For the disk cache, `Corruptions` counts
-entries dropped as damaged, `Bypasses` entries larger than their whole tier,
+entries the cache found damaged on its own (a wrong size, or a Bloom filter
+failing its checksum), `Bypasses` entries larger than their whole tier,
 `Failures` entries that could not be written, and `Dropped` entries not
 written because the background write queue was full. Entries in all three
-cases are still served; they are just not kept.
+cases are still served; they are just not kept. `SSTDrops` counts reads
+that failed on what looked like damaged bytes: each drops the SST from every
+layer, so the next read fetches it again. It counts drops, not distinct SSTs.
+Concurrent readers of one damaged SST each count, a lookup whose retry fails
+too counts twice, and an SST that is bad in object storage, or that fails to
+open the same way every time, counts on every read. A steadily rising count
+points at such an SST.
 
 ## Enable and consume the change feed
 

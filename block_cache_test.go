@@ -331,7 +331,7 @@ func TestReader_BlockCache_KeepsBlocksAcrossReopen(t *testing.T) {
 	if got := reader.BlockCacheStats().EntryCount; got != cached {
 		t.Fatalf("leaving the manifest while open dropped blocks: %d -> %d", cached, got)
 	}
-	reader.reportCorruptSST(meta)
+	reader.dropSST(meta)
 	if stats := reader.BlockCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
 		t.Fatalf("corrupt SST still cached: %+v", stats)
 	}
