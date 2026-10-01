@@ -706,7 +706,10 @@ func TestOpenReaderRequiresExplicitCacheDir(t *testing.T) {
 	}
 }
 
-func TestReaderRefreshesExpiredManifestBeforeRead(t *testing.T) {
+// TestReaderRefreshesDueManifestInBackground lets the view's timer fire: it
+// refreshes the view in the background, with no read involved, after which
+// reads see the newer commit.
+func TestReaderRefreshesDueManifestInBackground(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("reader-auto-refresh")
 	defer store.Close()
@@ -724,18 +727,28 @@ func TestReaderRefreshesExpiredManifestBeforeRead(t *testing.T) {
 	}, 0, 1)
 
 	if _, found, err := reader.Get(ctx, []byte("b")); err != nil {
-		t.Fatalf("Get before expiry: %v", err)
+		t.Fatalf("Get before the refresh: %v", err)
 	} else if found {
-		t.Fatal("Get before expiry observed unrefreshed key")
+		t.Fatal("Get before the refresh observed the new key")
 	}
 
-	reader.viewExpired.Store(true)
-	value, found, err := reader.Get(ctx, []byte("b"))
-	if err != nil {
-		t.Fatalf("Get after expiry: %v", err)
-	}
-	if !found || !bytes.Equal(value, []byte("vb")) {
-		t.Fatalf("Get after expiry = %q, %v; want vb, true", value, found)
+	reader.mu.RLock()
+	expiresAt := reader.viewExpiresAt
+	reader.mu.RUnlock()
+	reader.armViewTimer(time.Now(), expiresAt) // the refresh time arrives now
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		value, found, err := reader.Get(ctx, []byte("b"))
+		if err != nil {
+			t.Fatalf("Get after the timer: %v", err)
+		}
+		if found && bytes.Equal(value, []byte("vb")) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the view's timer never refreshed it")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

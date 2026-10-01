@@ -1115,6 +1115,22 @@ func (s *Store) ReplayWithArtifactValidation(ctx context.Context) (*Manifest, er
 	return s.replayCurrent(ctx, current, true)
 }
 
+// ReplayWithCurrentValidated is ReplayWithArtifactValidation that also
+// returns the exact CURRENT value the manifest was built from. A reader
+// publishes the two together; reading CURRENT again afterwards could observe
+// another replay's generation.
+func (s *Store) ReplayWithCurrentValidated(ctx context.Context) (*Manifest, *Current, error) {
+	current, err := s.readCurrent(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	m, err := s.replayCurrent(ctx, current, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, current, nil
+}
+
 // ReplayWithCurrent returns a manifest and the exact CURRENT value used to
 // build it. Maintenance uses this to calculate scheduling pressure without a
 // second object-store read that could observe a different generation.

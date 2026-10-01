@@ -352,8 +352,34 @@ are rejected. `DefaultReaderOpenOptions` returns:
 | `DiskCacheSize` | 8 GiB | Bytes kept on disk: SST metadata, Bloom filters and SST data |
 | `BlockCacheSize` | 256 MiB | Bytes of decoded SST blocks kept in memory |
 | `BloomCacheSize` | 64 MiB | Accounted bytes of parsed Bloom filters kept in memory |
-| `Views.RefreshAfter` | 1 minute | Refresh a loaded manifest before a later read |
+| `Views.RefreshAfter` | 1 minute | How often the manifest view is refreshed in the background; at least 1 second |
 | `Metrics` | `nil` | Optional Prometheus observations |
+
+#### Freshness and outages
+
+A loaded manifest view has two deadlines. Every `Views.RefreshAfter`, the
+reader refreshes it in the background, on a timer: reads never start a
+refresh or wait for one, and those after it see the new view. An idle reader
+therefore still reads the database's CURRENT object once per interval. Until
+the view expires, after the database's `MaxPinnedViewAge`, every SST it names
+is kept, so reading from it stays correct; with refreshes succeeding, a view
+never gets that old. A read waits for a refresh only if the view has expired,
+and fails if that refresh fails; background refreshes keep being retried
+after expiry, so reads work again as soon as object storage answers.
+
+A background refresh that fails, or does not finish within 30 seconds, for
+example while object storage is unavailable or hangs, leaves the loaded view
+in place. Reads keep being answered from it and count in the
+`stale_reads_total` metric. The next refresh is tried after 30 seconds, or
+after `Views.RefreshAfter` if that is shorter; reads in between do not reach
+object storage. A warning is logged at most once a minute while this lasts,
+and an info message once a refresh succeeds again. During an outage, reads
+can therefore be up to `MaxPinnedViewAge` old.
+
+`Refresh` always reloads, waits, and returns any failure, so a caller that
+needs the latest commits learns when it cannot have them. It reflects every
+commit made before it was called, even when it joins a refresh already under
+way.
 
 #### How a reader reads SSTs
 
@@ -1241,8 +1267,11 @@ histograms but do not register them. Register the exported collectors with the
 application's `prometheus.Registerer`.
 
 Writer metrics cover puts, deletes, backpressure, flush count, errors, latency,
-and bytes. Reader metrics cover refreshes, point reads, scans, SST cache use,
-downloads, and range reads.
+and bytes. Reader metrics cover refreshes, point reads, scans and SST range
+reads, plus `stale_reads_total`, reads answered from a view whose refresh
+failed (see [Freshness and outages](#freshness-and-outages)), and
+`view_loaded_timestamp_seconds`, the Unix time the published view was loaded:
+`time() - isledb_reader_view_loaded_timestamp_seconds` is its age.
 
 ## Error reference
 
