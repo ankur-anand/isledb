@@ -33,30 +33,53 @@ type Reader struct {
 	// sstDrops counts dropSST calls.
 	sstDrops      atomic.Int64
 	manifestLoads coalescedLoadGroup
+	// reloads counts manifest reloads started, so a forced refresh can tell
+	// whether a reload began after it was called.
+	reloads atomic.Uint64
+	// refreshing is set while a background refresh runs; background tracks
+	// it so Close can wait for it. refreshTimeout bounds it. refreshRequested
+	// records a timer that fired while one ran, so it runs again.
+	refreshing       atomic.Bool
+	refreshRequested atomic.Bool
+	background       sync.WaitGroup
+	refreshTimeout   time.Duration
 
 	ownsDiskCache bool
 	cacheDir      string
 
-	lifecycleMu            sync.RWMutex
-	iteratorsMu            sync.Mutex
-	iterators              map[*Iterator]struct{}
-	mu                     sync.RWMutex
-	manifest               *manifestState
+	lifecycleMu sync.RWMutex
+	iteratorsMu sync.Mutex
+	iterators   map[*Iterator]struct{}
+	mu          sync.RWMutex
+	manifest    *manifestState
+	// viewSeq is the published CURRENT's NextSeq: the manifest log position
+	// the view reflects. A view is only ever replaced by one at least as new.
+	viewSeq uint64
+	// viewLoadedAt is when the published view was loaded.
+	viewLoadedAt time.Time
+	// refreshFailures counts refreshes failed since the view was loaded, and
+	// staleSince is when the first of them failed; see refreshFailed.
+	refreshFailures        int
+	staleSince             time.Time
 	version                Version
 	changeFeed             bool
 	changeHead             ChangeCursor
 	viewPolicy             ReaderViewPolicy
 	viewRefreshAt          time.Time
 	viewExpiresAt          time.Time
-	viewExpired            atomic.Bool
+	viewDue                atomic.Bool
 	viewTimerMu            sync.Mutex
 	viewTimer              *time.Timer
 	viewTimerID            atomic.Uint64
 	metrics                *ReaderMetrics
 	bloomDiagnosticLimiter readerDiagnosticLimiter
-	closed                 atomic.Bool
-	releaseOnce            sync.Once
-	release                func()
+	// stale reports that a refresh failed and reads are answered from an
+	// older, still valid view; it is cleared when a refresh succeeds.
+	stale                    atomic.Bool
+	refreshDiagnosticLimiter readerDiagnosticLimiter
+	closed                   atomic.Bool
+	releaseOnce              sync.Once
+	release                  func()
 }
 
 type KV struct {
@@ -93,25 +116,29 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
-		store:         store,
-		manifestStore: ms,
-		manifest:      m,
-		version:       versionFromCurrent(current),
-		changeFeed:    changeFeed,
-		changeHead:    changeHead,
-		viewPolicy:    viewPolicy,
-		viewRefreshAt: viewRefreshAt,
-		viewExpiresAt: viewExpiresAt,
-		diskCache:     disk,
-		fetcher:       newSSTFetcher(store, disk, opts.Metrics),
-		blockCache:    newBlockCache(cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)),
-		bloomCache:    newBloomFilterCache(opts.BloomCacheSize),
-		openSSTs:      newOpenSSTCache(openSSTCacheSize(opts.OpenSSTCacheSize)),
-		ownsDiskCache: ownsDiskCache,
-		cacheDir:      opts.CacheDir,
-		metrics:       opts.Metrics,
+		store:          store,
+		manifestStore:  ms,
+		manifest:       m,
+		version:        versionFromCurrent(current),
+		changeFeed:     changeFeed,
+		changeHead:     changeHead,
+		viewSeq:        currentNextSeq(current),
+		viewLoadedAt:   viewLoadedAt,
+		refreshTimeout: backgroundRefreshTimeout,
+		viewPolicy:     viewPolicy,
+		viewRefreshAt:  viewRefreshAt,
+		viewExpiresAt:  viewExpiresAt,
+		diskCache:      disk,
+		fetcher:        newSSTFetcher(store, disk, opts.Metrics),
+		blockCache:     newBlockCache(cmp.Or(opts.BlockCacheSize, defaultBlockCacheSize)),
+		bloomCache:     newBloomFilterCache(opts.BloomCacheSize),
+		openSSTs:       newOpenSSTCache(openSSTCacheSize(opts.OpenSSTCacheSize)),
+		ownsDiskCache:  ownsDiskCache,
+		cacheDir:       opts.CacheDir,
+		metrics:        opts.Metrics,
 	}
-	reader.armManifestExpiry(viewRefreshAt, viewExpiresAt)
+	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
+	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
 	cleanupDiskCache = false
 	return reader, nil
 }
@@ -176,21 +203,92 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 	return r.refreshManifest(ctx, true)
 }
 
-func (r *Reader) ensureFreshManifest(ctx context.Context) error {
-	if !r.manifestViewExpired() {
-		return nil
+// checkManifestView is what every read does first. The view is refreshed in
+// the background when its timer fires (see armViewTimer), never by a read, so
+// a read only checks that the view has not expired: until then every SST it
+// names is kept. An expired view is refreshed before the read, which fails if
+// that refresh does. A read answered from a view whose refresh failed counts
+// as stale.
+func (r *Reader) checkManifestView(ctx context.Context) error {
+	r.mu.RLock()
+	expired := !time.Now().Before(r.viewExpiresAt)
+	r.mu.RUnlock()
+	if expired {
+		return r.refreshManifest(ctx, false)
 	}
-	return r.refreshManifest(ctx, false)
+	if r.stale.Load() {
+		r.metrics.ObserveStaleRead()
+	}
+	return nil
 }
 
-func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
-	_, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
-		if !force && !r.manifestViewExpired() {
-			return nil, nil
+// backgroundRefreshTimeout bounds a background refresh, so a store that
+// hangs counts as failing.
+const backgroundRefreshTimeout = 30 * time.Second
+
+// refreshInBackground refreshes the view detached from any read, unless the
+// reader is closed. A request while a refresh runs is not dropped: the running
+// one refreshes again when it finishes, so the timer chain, which each refresh
+// re-arms, never stops however soon the next timer fires.
+func (r *Reader) refreshInBackground() {
+	// Holding the read lifecycle orders the start before Close's wait.
+	done, err := r.beginRead()
+	if err != nil {
+		return
+	}
+	defer done()
+	r.refreshRequested.Store(true)
+	if !r.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	r.background.Add(1)
+	go func() {
+		defer r.background.Done()
+		for {
+			r.refreshRequested.Store(false)
+			r.refreshOnce()
+			r.refreshing.Store(false)
+			// A request made meanwhile runs here, unless a new start took it.
+			if r.closed.Load() || !r.refreshRequested.Load() || !r.refreshing.CompareAndSwap(false, true) {
+				return
+			}
 		}
-		return nil, r.reloadManifest(loadCtx)
-	})
-	return err
+	}()
+}
+
+// refreshOnce runs one background refresh, bounded by refreshTimeout; a
+// timeout is recorded as a failure, as an error is by reloadManifest.
+func (r *Reader) refreshOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), r.refreshTimeout)
+	defer cancel()
+	if err := r.refreshManifest(ctx, false); err != nil && ctx.Err() != nil {
+		r.refreshFailed(fmt.Errorf("manifest refresh timed out after %s: %w", r.refreshTimeout, err))
+	}
+}
+
+// refreshManifest reloads the manifest view, sharing a reload already in
+// progress. A forced refresh must reflect every commit made before it was
+// called, so it accepts only a reload that started after the call: joining
+// one that started earlier, or a check that found the view fresh and
+// reloaded nothing, it waits for the next. Callers arriving together share
+// that next reload.
+func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
+	called := r.reloads.Load()
+	for {
+		value, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
+			if !force && !r.manifestViewDue() {
+				return uint64(0), nil
+			}
+			started := r.reloads.Add(1)
+			return started, r.reloadManifest(loadCtx)
+		})
+		if err != nil || !force {
+			return err
+		}
+		if started, _ := value.(uint64); started > called {
+			return nil
+		}
+	}
 }
 
 func (r *Reader) reloadManifest(ctx context.Context) (err error) {
@@ -200,21 +298,107 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	var m *manifestState
-	m, err = r.manifestStore.ReplayWithArtifactValidation(ctx)
+	// The manifest and the CURRENT it was built from are published together:
+	// reading CURRENT again could observe an overlapping reload's generation.
+	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
+	// Every caller waiting for this reload gave up: publish nothing.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	if err != nil {
+		r.refreshFailed(err)
 		return err
 	}
-	current := r.manifestStore.CurrentData()
-	r.publishManifestView(m, current, viewLoadedAt)
+	if published, viewSeq := r.publishManifestView(m, current, viewLoadedAt); !published {
+		// CURRENT is older than the view: either an overlapping reload
+		// published a newer one, which leaves the view not due and so is
+		// ignored, or the store went back, which is retried like a failure.
+		r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
+			currentNextSeq(current), viewSeq))
+		return nil
+	}
+	r.refreshSucceeded()
 	return nil
 }
 
+// refreshRetryAfter is how long after a failed refresh the next is tried,
+// or RefreshAfter if that is shorter: reads meanwhile are answered from the
+// still valid view without reaching object storage.
+const refreshRetryAfter = 30 * time.Second
+
+// refreshFailed reschedules the next refresh, refreshRetryAfter later, and
+// logs the failure, at most once a minute. Reads of a view that has not expired
+// are answered from it meanwhile; reads of an expired view fail until a
+// refresh succeeds, which the retries keep trying in the background. A view
+// not yet due, whose forced refresh failed, keeps its schedule.
+func (r *Reader) refreshFailed(err error) {
+	if r.closed.Load() {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	expiresAt := r.viewExpiresAt
+	expired := !now.Before(expiresAt)
+	if !expired && now.Before(r.viewRefreshAt) {
+		r.mu.Unlock()
+		return
+	}
+	r.stale.Store(true)
+	retryAt := now.Add(min(refreshRetryAfter, r.viewPolicy.RefreshAfter))
+	// The timer wakes at the earlier of the two times; once expired, only
+	// the retry is ahead.
+	wakeExpiry := expiresAt
+	if expired {
+		wakeExpiry = retryAt
+	} else {
+		retryAt = minTime(retryAt, expiresAt)
+	}
+	if r.refreshFailures == 0 {
+		r.staleSince = now
+	}
+	r.refreshFailures++
+	r.viewRefreshAt = retryAt
+	age := now.Sub(r.viewLoadedAt)
+	r.mu.Unlock()
+
+	r.armViewTimer(retryAt, wakeExpiry)
+	if allowed, suppressed := r.refreshDiagnosticLimiter.allow(now); allowed {
+		message := "isledb: manifest refresh failed; reads use the loaded view until it expires"
+		if expired {
+			message = "isledb: manifest refresh failed and the loaded view has expired; reads fail until a refresh succeeds"
+		}
+		slog.Warn(message,
+			"error", err,
+			"view_age", age.Round(time.Second),
+			"expires_in", max(expiresAt.Sub(now), 0).Round(time.Second),
+			"retry_in", retryAt.Sub(now).Round(time.Second),
+			"suppressed_since_last_log", suppressed,
+		)
+	}
+}
+
+// refreshSucceeded logs the end of a stale period, if one was under way.
+func (r *Reader) refreshSucceeded() {
+	r.mu.Lock()
+	failures, since := r.refreshFailures, r.staleSince
+	r.refreshFailures, r.staleSince = 0, time.Time{}
+	r.stale.Store(false)
+	r.mu.Unlock()
+	if failures > 0 {
+		slog.Info("isledb: manifest refresh recovered",
+			"failed_refreshes", failures,
+			"stale_for", time.Since(since).Round(time.Second),
+		)
+	}
+}
+
+// publishManifestView publishes a view unless it is older than the one
+// published, and reports whether it did, with the published log position.
 func (r *Reader) publishManifestView(
 	m *manifestState,
 	current *manifest.Current,
 	viewLoadedAt time.Time,
-) {
+) (bool, uint64) {
 	changeFeed, changeHead := readerChangeFeedState(current)
 	refreshAt := viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
@@ -223,8 +407,18 @@ func (r *Reader) publishManifestView(
 	// and its metadata under one short critical section. Caches age retired
 	// SSTs out through their own LRUs; the block cache only forgets the file
 	// numbers of retired SSTs no longer open, keeping its map bounded.
+	// Reloads can overlap and finish in any order; a view older than the one
+	// published is dropped, so reads never go back in time.
+	seq := currentNextSeq(current)
 	r.mu.Lock()
+	if seq < r.viewSeq {
+		published := r.viewSeq
+		r.mu.Unlock()
+		return false, published
+	}
 	r.manifest = m
+	r.viewSeq = seq
+	r.viewLoadedAt = viewLoadedAt
 	r.version = versionFromCurrent(current)
 	r.changeFeed = changeFeed
 	r.changeHead = changeHead
@@ -233,7 +427,18 @@ func (r *Reader) publishManifestView(
 	r.mu.Unlock()
 
 	r.blockCache.prune(m, r.openSSTs.isOpen)
-	r.armManifestExpiry(refreshAt, expiresAt)
+	r.armViewTimer(refreshAt, expiresAt)
+	r.metrics.ObserveViewLoaded(viewLoadedAt)
+	return true, seq
+}
+
+// currentNextSeq is the manifest log position a CURRENT reflects, zero for
+// none.
+func currentNextSeq(current *manifest.Current) uint64 {
+	if current == nil {
+		return 0
+	}
+	return current.NextSeq
 }
 
 func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
@@ -243,9 +448,13 @@ func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
 	return current.ChangeFeedEnabled, changeCursorAt(current.NextSeq, 0)
 }
 
-func (r *Reader) armManifestExpiry(refreshAt, expiresAt time.Time) {
+// armViewTimer schedules the view's next refresh at refreshAt, or at
+// expiresAt if sooner: the timer marks the view due and refreshes it in the
+// background. This, not reads, keeps a reader's view fresh, so an idle
+// reader's view does not expire while object storage answers.
+func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	timerID := r.viewTimerID.Add(1)
-	r.viewExpired.Store(false)
+	r.viewDue.Store(false)
 	wakeAt := minTime(refreshAt, expiresAt)
 	delay := time.Until(wakeAt)
 	if delay < 0 {
@@ -253,7 +462,8 @@ func (r *Reader) armManifestExpiry(refreshAt, expiresAt time.Time) {
 	}
 	timer := time.AfterFunc(delay, func() {
 		if r.viewTimerID.Load() == timerID && !r.closed.Load() {
-			r.viewExpired.Store(true)
+			r.viewDue.Store(true)
+			r.refreshInBackground()
 		}
 	})
 
@@ -266,21 +476,21 @@ func (r *Reader) armManifestExpiry(refreshAt, expiresAt time.Time) {
 	}
 }
 
-func (r *Reader) manifestViewExpired() bool {
-	if r.viewExpired.Load() {
+func (r *Reader) manifestViewDue() bool {
+	if r.viewDue.Load() {
 		return true
 	}
 	r.mu.RLock()
 	wakeAt := minTime(r.viewRefreshAt, r.viewExpiresAt)
 	r.mu.RUnlock()
 	if !wakeAt.IsZero() && !time.Now().Before(wakeAt) {
-		r.viewExpired.Store(true)
+		r.viewDue.Store(true)
 		return true
 	}
 	return false
 }
 
-func (r *Reader) stopManifestExpiry() {
+func (r *Reader) stopViewTimer() {
 	r.viewTimerID.Add(1)
 	r.viewTimerMu.Lock()
 	timer := r.viewTimer
@@ -302,9 +512,10 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	defer r.releaseReader()
-	r.stopManifestExpiry()
+	r.stopViewTimer()
 	r.closeOpenIterators()
 	r.manifestLoads.Close(ErrReaderClosed)
+	r.background.Wait()
 	r.bloomLoads.Close(ErrReaderClosed)
 	r.fetcher.close()
 
@@ -405,7 +616,7 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 	}
 	defer done()
 
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
 	m, version, expiresAt := r.currentManifestState()
@@ -434,7 +645,7 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error) {
 	}
 	defer done()
 
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
 	m, version, cursor, changeFeed, expiresAt := r.currentBootstrapState()
@@ -471,7 +682,7 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 	if len(key) == 0 {
 		return nil, false, errors.New("empty key")
 	}
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, false, err
 	}
 
@@ -537,7 +748,7 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 		return nil, err
 	}
 	defer done()
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
 
@@ -562,7 +773,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 		return nil, err
 	}
 	defer done()
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1029,7 +1240,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 		return nil, err
 	}
 	defer done()
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
 

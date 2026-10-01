@@ -15,7 +15,7 @@ func TestPublishManifestViewDoesNotConsultBloomCache(t *testing.T) {
 		bloomCache: newBloomFilterCache(1 << 20),
 		viewPolicy: ReaderViewPolicy{RefreshAfter: time.Hour},
 	}
-	defer reader.stopManifestExpiry()
+	defer reader.stopViewTimer()
 
 	// Manifest publication must not scan or invalidate the independently bounded
 	// decoded-Bloom cache.
@@ -53,7 +53,7 @@ func TestPublishManifestViewRetainsRetiredDecodedBloom(t *testing.T) {
 		bloomCache: cache,
 		viewPolicy: ReaderViewPolicy{RefreshAfter: time.Hour},
 	}
-	defer reader.stopManifestExpiry()
+	defer reader.stopViewTimer()
 
 	reader.publishManifestView(&manifestState{}, &manifest.Current{
 		MaxPinnedViewAge: time.Hour,

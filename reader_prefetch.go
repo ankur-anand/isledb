@@ -55,7 +55,7 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		return PrefetchStats{}, err
 	}
 	defer done()
-	if err := r.ensureFreshManifest(ctx); err != nil {
+	if err := r.checkManifestView(ctx); err != nil {
 		return PrefetchStats{}, err
 	}
 

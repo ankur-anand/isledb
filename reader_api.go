@@ -10,13 +10,18 @@ var ErrInvalidReaderOptions = errors.New("invalid reader options")
 
 const (
 	defaultReaderRefreshAfter = time.Minute
+	// minReaderRefreshAfter is the shortest RefreshAfter accepted: each
+	// refresh reads CURRENT from object storage.
+	minReaderRefreshAfter = time.Second
 )
 
 // ReaderViewPolicy controls when a Reader refreshes its manifest view.
 type ReaderViewPolicy struct {
-	// RefreshAfter is the maximum age of the Reader's loaded manifest before a
-	// read refreshes it. Concurrent refreshes are coalesced. Zero selects the
-	// default.
+	// RefreshAfter is how often the Reader refreshes its manifest view in the
+	// background. Reads never wait for a refresh; they use the last view
+	// published. A failed refresh is retried after 30 seconds, or RefreshAfter
+	// if shorter. Zero selects one minute; values under one second are
+	// rejected.
 	RefreshAfter time.Duration
 }
 
@@ -117,8 +122,9 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 }
 
 func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error) {
-	if policy.RefreshAfter < 0 {
-		return ReaderViewPolicy{}, fmt.Errorf("%w: refresh_after=%s", ErrInvalidReaderOptions, policy.RefreshAfter)
+	if policy.RefreshAfter < 0 || (policy.RefreshAfter > 0 && policy.RefreshAfter < minReaderRefreshAfter) {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: refresh_after=%s, want zero or at least %s",
+			ErrInvalidReaderOptions, policy.RefreshAfter, minReaderRefreshAfter)
 	}
 	if policy.RefreshAfter == 0 {
 		policy.RefreshAfter = defaultReaderRefreshAfter

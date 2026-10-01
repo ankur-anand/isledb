@@ -3,6 +3,7 @@ package isledb
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestReaderOpenOptionsMapsCacheOptions(t *testing.T) {
@@ -60,5 +61,20 @@ func TestReaderOpenOptionsRejectsNegativeCacheSizes(t *testing.T) {
 				t.Fatalf("readerOptionsFromPublic error=%v want=%v", err, ErrInvalidReaderOptions)
 			}
 		})
+	}
+}
+
+func TestReaderViewPolicyRefreshAfterBounds(t *testing.T) {
+	for _, tc := range []struct {
+		refreshAfter time.Duration
+		valid        bool
+	}{
+		{0, true}, {time.Second, true}, {time.Minute, true},
+		{time.Second - 1, false}, {time.Millisecond, false}, {-time.Second, false},
+	} {
+		_, err := normalizeReaderViewPolicy(ReaderViewPolicy{RefreshAfter: tc.refreshAfter})
+		if got := err == nil; got != tc.valid {
+			t.Errorf("RefreshAfter=%s valid=%t err=%v, want valid=%t", tc.refreshAfter, got, err, tc.valid)
+		}
 	}
 }

@@ -147,6 +147,12 @@ type ReaderMetrics struct {
 	RefreshTotal   prometheus.Counter
 	RefreshErrors  prometheus.Counter
 	RefreshLatency prometheus.Histogram
+	// StaleReads counts reads answered from a view past its refresh time
+	// because refreshing it failed.
+	StaleReads prometheus.Counter
+	// ViewLoaded is the Unix time the published manifest view was loaded;
+	// time() minus it is the view's age.
+	ViewLoaded prometheus.Gauge
 
 	GetTotal   prometheus.Counter
 	GetErrors  prometheus.Counter
@@ -202,6 +208,20 @@ func (m *ReaderMetrics) ObserveRefresh(d time.Duration, err error) {
 	if err != nil {
 		m.incCounter(m.RefreshErrors)
 	}
+}
+
+func (m *ReaderMetrics) ObserveStaleRead() {
+	if m == nil {
+		return
+	}
+	m.incCounter(m.StaleReads)
+}
+
+func (m *ReaderMetrics) ObserveViewLoaded(at time.Time) {
+	if m == nil || m.ViewLoaded == nil {
+		return
+	}
+	m.ViewLoaded.Set(float64(at.UnixNano()) / 1e9)
 }
 
 func (m *ReaderMetrics) ObserveGet(d time.Duration, found bool, err error) {
@@ -294,6 +314,20 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "refresh_latency_seconds",
 			Help:        "Histogram of reader manifest refresh latency in seconds.",
+			ConstLabels: constLabels,
+		}),
+		StaleReads: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "stale_reads_total",
+			Help:        "Reads answered from a manifest view past its refresh time because refreshing it failed.",
+			ConstLabels: constLabels,
+		}),
+		ViewLoaded: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "view_loaded_timestamp_seconds",
+			Help:        "Unix time the published manifest view was loaded.",
 			ConstLabels: constLabels,
 		}),
 		GetTotal: prometheus.NewCounter(prometheus.CounterOpts{
