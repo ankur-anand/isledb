@@ -41,9 +41,13 @@ type WriterOptions struct {
 	// Values controls key/value limits. Values are stored inline in SSTs.
 	Values ValueOptions
 
-	// OnFlushError is called once after the background flush worker stops. The
-	// callback may call Writer.Close. The failure makes the writer terminal and
-	// is returned by later operations.
+	// OnFlushError is called when a background commit, or applying a
+	// maintenance command, fails: on the first failure of a run and at most
+	// once a minute while failures continue. Commits and maintenance are
+	// separate runs, each ended by its next success. Failures are retried,
+	// never final, even ones that cannot succeed until an operator acts, such
+	// as missing permissions; nil logs a warning instead. It runs on its own
+	// goroutine, may call Writer.Close, and may run after Close returns.
 	OnFlushError func(error)
 
 	// Metrics receives optional writer observations. Nil disables metrics.
@@ -64,7 +68,8 @@ type WriterMemtableOptions struct {
 
 type WriterFlushOptions struct {
 	// Interval is the background flush cadence. Zero disables background flush.
-	// A background error makes the writer terminal.
+	// A failed background commit is retried, with a delay that doubles from
+	// Interval up to 30 seconds.
 	Interval time.Duration
 }
 

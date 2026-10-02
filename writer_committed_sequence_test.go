@@ -310,11 +310,9 @@ func (s *failingMaintenanceStorage) ReadMaintenanceHead(context.Context) ([]byte
 	return nil, "", s.err
 }
 
-// TestWriterMaintenancePollFailureIsFinal fails the background flush's poll
-// of maintenance/HEAD: the flush loop stops, so the writer becomes failed
-// rather than looking open with nothing flushing, and a waiter returns the
-// failure instead of waiting.
-func TestWriterMaintenancePollFailureIsFinal(t *testing.T) {
+// TestWriterMaintenancePollFailureDoesNotStopCommits fails every poll of
+// maintenance/HEAD: the failure is reported, and data still commits.
+func TestWriterMaintenancePollFailureDoesNotStopCommits(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-maintenance-poll-failure")
 	defer store.Close()
@@ -334,11 +332,15 @@ func TestWriterMaintenancePollFailureIsFinal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := awaitResult(t, waitAsync(ctx, w, seq)); !errors.Is(err, ErrWriterFailed) || !errors.Is(err, pollErr) {
-		t.Fatalf("WaitCommitted after a failed maintenance poll err=%v, want %v wrapping %v", err, ErrWriterFailed, pollErr)
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted with maintenance failing: %v", err)
 	}
-	if _, err := w.put(ctx, []byte("b"), []byte("2")); !errors.Is(err, ErrWriterFailed) {
-		t.Fatalf("Put after the failure err=%v, want %v", err, ErrWriterFailed)
+	seq, err = w.put(ctx, []byte("b"), []byte("2"))
+	if err != nil {
+		t.Fatalf("put after the failure: %v", err)
+	}
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted for a later write: %v", err)
 	}
 	select {
 	case err := <-notified:

@@ -24,10 +24,13 @@ var (
 	ErrNilContext           = errors.New("nil context")
 	ErrInvalidWriterOptions = errors.New("invalid writer options")
 	ErrWriterClosed         = errors.New("writer closed")
-	ErrWriterFailed         = errors.New("writer failed")
 )
 
 const (
+	// maxFlushRetryDelay caps the background flush's backoff while commits
+	// keep failing.
+	maxFlushRetryDelay = 30 * time.Second
+
 	minMemtableArenaHeadroom = 1 << 20
 	maxMemtableArenaBytes    = 1<<32 - 1
 	maxWriterOwnerIDBytes    = 256
@@ -50,6 +53,12 @@ type writer struct {
 	pendingMemtables int
 	seq              uint64
 	epoch            uint64
+	// activeSince is when the active memtable took its first mutation, zero
+	// while empty; pendingSince holds the same for each frozen memtable not
+	// yet committed, oldest first. Together they date the oldest write not yet
+	// in object storage.
+	activeSince  time.Time
+	pendingSince []time.Time
 
 	flushMu             sync.Mutex
 	flushTicker         *time.Ticker
@@ -62,20 +71,25 @@ type writer struct {
 	metrics    *WriterMetrics
 
 	// state is the writer's lifecycle, guarded by mu and changed only by
-	// transitionLocked. statusNow, failure and committed mirror it for
-	// lock-free reads on the write path.
+	// transitionLocked. statusNow and committed mirror it for lock-free reads
+	// on the write path.
 	state     writerState
 	statusNow atomic.Uint32
-	failure   atomic.Pointer[writerFailure]
 	committed atomic.Uint64
 	stopOnce  sync.Once
+
+	// Failures to commit and to apply maintenance are retried, never final,
+	// and reported as separate runs (see failureRun).
+	commitFailures      failureRun
+	maintenanceFailures failureRun
 	// onTransition, set only by tests, sees every state the writer enters.
 	onTransition func(writerState)
 }
 
 // writerStatus is where a writer is in its lifecycle. It only moves forward:
-// Open, then Closing, then one of the final statuses, and the first final
-// status wins.
+// Open, then Closing, then Closed or Fenced, and the first final status wins.
+// No error is final except losing the fence: a commit that fails stays
+// queued, and the next attempt reconciles and retries it.
 type writerStatus uint32
 
 const (
@@ -89,8 +103,6 @@ const (
 	writerClosed
 	// writerFenced: another writer holds the fence; nothing more commits.
 	writerFenced
-	// writerFailed: a background flush failed; nothing more commits.
-	writerFailed
 )
 
 func (s writerStatus) final() bool { return s >= writerClosed }
@@ -100,12 +112,7 @@ func (s writerStatus) final() bool { return s >= writerClosed }
 type writerState struct {
 	status    writerStatus
 	committed uint64
-	failure   error
 	changed   chan struct{}
-}
-
-type writerFailure struct {
-	err error
 }
 
 // pendingFlush owns one logical memtable publication. Uploaded objects and the
@@ -190,6 +197,8 @@ func newWriterWithMaintenanceWake(
 		fenceToken:      token,
 		metrics:         opts.Metrics,
 	}
+	w.commitFailures.kind = "commits"
+	w.maintenanceFailures.kind = "maintenance"
 
 	// What the manifest holds is committed: report it before the first
 	// commit, so a writer taking over continues the series.
@@ -320,7 +329,32 @@ func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlus
 	}
 	w.changeBuffer = nil
 	w.epoch++
+	w.pendingSince = append(w.pendingSince, w.activeSince)
+	w.activeSince = time.Time{}
 	return pending
+}
+
+// noteAcceptedLocked dates the active memtable's first mutation, with mu held.
+func (w *writer) noteAcceptedLocked() {
+	if w.activeSince.IsZero() {
+		w.activeSince = time.Now()
+		if len(w.pendingSince) == 0 {
+			w.metrics.ObserveOldestUncommitted(w.activeSince)
+		}
+	}
+}
+
+// noteMemtableCommittedLocked drops the oldest frozen memtable's date after
+// it commits, with mu held, and reports the next oldest uncommitted write.
+func (w *writer) noteMemtableCommittedLocked() {
+	if len(w.pendingSince) > 0 {
+		w.pendingSince = w.pendingSince[1:]
+	}
+	oldest := w.activeSince
+	if len(w.pendingSince) > 0 {
+		oldest = w.pendingSince[0]
+	}
+	w.metrics.ObserveOldestUncommitted(oldest)
 }
 
 // ensureWritable reports why the writer accepts no more mutations, without a
@@ -336,8 +370,6 @@ func (w *writer) statusError(s writerStatus) error {
 		return nil
 	case writerFenced:
 		return manifest.ErrFenced
-	case writerFailed:
-		return w.failure.Load().err
 	default:
 		return ErrWriterClosed
 	}
@@ -348,7 +380,7 @@ func (w *writer) statusError(s writerStatus) error {
 // is later and the current one is not final. Both change together, so a
 // waiter never sees a commit's fencing without the commit. It wakes waiters
 // once if anything changed. It never does I/O.
-func (w *writer) transitionLocked(committed uint64, status writerStatus, failure error) {
+func (w *writer) transitionLocked(committed uint64, status writerStatus) {
 	changed := false
 	if committed > w.state.committed {
 		w.state.committed = committed
@@ -358,10 +390,6 @@ func (w *writer) transitionLocked(committed uint64, status writerStatus, failure
 	}
 	if status > w.state.status && !w.state.status.final() {
 		w.state.status = status
-		if status == writerFailed {
-			w.state.failure = failure
-			w.failure.Store(&writerFailure{err: failure})
-		}
 		w.statusNow.Store(uint32(status))
 		changed = true
 	}
@@ -374,9 +402,9 @@ func (w *writer) transitionLocked(committed uint64, status writerStatus, failure
 	}
 }
 
-func (w *writer) transition(committed uint64, status writerStatus, failure error) {
+func (w *writer) transition(committed uint64, status writerStatus) {
 	w.mu.Lock()
-	w.transitionLocked(committed, status, failure)
+	w.transitionLocked(committed, status)
 	w.mu.Unlock()
 }
 
@@ -436,6 +464,7 @@ func (w *writer) putInline(key, value []byte, expireAt int64) (uint64, error) {
 			return 0, err
 		}
 	}
+	w.noteAcceptedLocked()
 	w.seq = seq
 	w.memtable.PutWithTTL(key, value, seq, expireAt)
 	w.mu.Unlock()
@@ -476,6 +505,7 @@ func (w *writer) delete(ctx context.Context, key []byte) (uint64, error) {
 			return 0, err
 		}
 	}
+	w.noteAcceptedLocked()
 	w.seq = seq
 	w.memtable.Delete(key, seq)
 	w.mu.Unlock()
@@ -514,22 +544,27 @@ func (w *writer) flush(ctx context.Context) error {
 	if err := w.ensureWritable(); err != nil {
 		return err
 	}
-	return w.flushInternal(ctx, false, false, false)
+	return w.flushInternal(ctx, false, false)
 }
 
 func (w *writer) flushBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true, false, false)
+	return w.flushInternal(ctx, false, false)
 }
 
 func (w *writer) flushMaintenanceBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true, true, true)
+	return w.flushInternal(ctx, true, true)
 }
 
 func (w *writer) flushFinal(ctx context.Context) error {
-	return w.flushInternal(ctx, false, true, false)
+	return w.flushInternal(ctx, true, false)
 }
 
-func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMaintenancePoll, maintenanceOnly bool) error {
+// flushInternal applies any pending maintenance command, then commits the
+// queued memtables oldest first. A memtable that fails to commit stays at the
+// head of the queue; the next attempt reconciles it, so a commit applied
+// before its response was lost is found, not repeated. Only losing the fence
+// is final. A maintenance failure is reported and does not hold up commits.
+func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, maintenanceOnly bool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -537,24 +572,27 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
-	if s := writerStatus(w.statusNow.Load()); s == writerFenced || s == writerFailed {
-		return w.statusError(s)
+	if writerStatus(w.statusNow.Load()) == writerFenced {
+		return manifest.ErrFenced
 	}
 	if w.consumeMaintenanceWake() {
 		forceMaintenancePoll = true
 	}
-	if err := w.pollPendingMaintenance(ctx, forceMaintenancePoll); err != nil {
-		err = fmt.Errorf("apply maintenance command: %w", err)
-		if isFenceError(err) {
-			w.transition(0, writerFenced, nil)
-		} else if terminalOnError && !errors.Is(err, context.Canceled) {
-			// Like any background flush failure, it is final: the flush
-			// loop stops, so the writer must not look open.
-			w.mu.Lock()
-			err = w.recordBackgroundFailureLocked(err)
-			w.mu.Unlock()
+	polled, err := w.pollPendingMaintenance(ctx, forceMaintenancePoll)
+	switch {
+	case err == nil:
+		if polled {
+			w.reportRecovery(&w.maintenanceFailures)
 		}
-		return err
+	case isFenceError(err):
+		w.transition(0, writerFenced)
+		return fmt.Errorf("apply maintenance command: %w", err)
+	case ctx.Err() != nil:
+		// The caller's own cancellation or deadline, not a storage failure.
+		return fmt.Errorf("apply maintenance command: %w", err)
+	default:
+		// Maintenance is retried with the next poll; commits go on.
+		w.reportFailure(&w.maintenanceFailures, fmt.Errorf("apply maintenance command: %w", err))
 	}
 	if maintenanceOnly {
 		// A process-local mailbox wake publishes only the maintenance command.
@@ -583,29 +621,29 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			if err != nil {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
-				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
-					err = w.recordBackgroundFailureLocked(err)
-				}
 				w.mu.Unlock()
 				return err
 			}
 			w.mu.Lock()
 			w.pendingMemtables--
+			w.noteMemtableCommittedLocked()
 			w.mu.Unlock()
+			w.reportRecovery(&w.commitFailures)
 		}
 	}
 }
 
-func (w *writer) pollPendingMaintenance(ctx context.Context, force bool) error {
+// pollPendingMaintenance applies a staged maintenance command once a poll is
+// due or forced, and reports whether it polled. A failed poll is next due a
+// poll interval later, like a successful one.
+func (w *writer) pollPendingMaintenance(ctx context.Context, force bool) (bool, error) {
 	now := time.Now()
 	if !force && !w.nextMaintenancePoll.IsZero() && now.Before(w.nextMaintenancePoll) {
-		return nil
+		return false, nil
 	}
+	w.nextMaintenancePoll = now.Add(w.opts.Maintenance.PollInterval)
 	_, err := w.manifestLog.ApplyPendingMaintenance(ctx)
-	if err == nil {
-		w.nextMaintenancePoll = now.Add(w.opts.Maintenance.PollInterval)
-	}
-	return err
+	return true, err
 }
 
 func (w *writer) consumeMaintenanceWake() bool {
@@ -617,25 +655,73 @@ func (w *writer) consumeMaintenanceWake() bool {
 	}
 }
 
-// backgroundError is the failure that made the writer final, if any.
-func (w *writer) backgroundError() error {
-	if writerStatus(w.statusNow.Load()) != writerFailed {
-		return nil
-	}
-	return w.failure.Load().err
+// failureRun tracks one kind of retried failure, commits or maintenance, from
+// its first failure to the next success: it dates the run and rate-limits
+// its reports.
+type failureRun struct {
+	kind  string
+	mu    sync.Mutex
+	since time.Time
+	limit readerDiagnosticLimiter
 }
 
-// recordBackgroundFailureLocked stores the first unobserved flush failure.
-// The caller holds w.mu so mutation acceptance and terminal failure recording
-// have one ordering point.
-func (w *writer) recordBackgroundFailureLocked(cause error) error {
-	if s := w.state.status; s.final() {
-		if err := w.statusError(s); err != ErrWriterClosed {
-			return err
-		}
+// fail records a failure and reports whether to report it.
+func (r *failureRun) fail(now time.Time) (report bool, since time.Time, suppressed uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.since.IsZero() {
+		r.since = now
 	}
-	w.transitionLocked(0, writerFailed, fmt.Errorf("%w: background flush: %w", ErrWriterFailed, cause))
-	return w.statusError(w.state.status)
+	report, suppressed = r.limit.allow(now)
+	return report, r.since, suppressed
+}
+
+// ok ends the run, if any, and returns when it started.
+func (r *failureRun) ok() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	since := r.since
+	if !since.IsZero() {
+		r.since = time.Time{}
+		r.limit = readerDiagnosticLimiter{}
+	}
+	return since
+}
+
+// failing reports whether a run is in progress.
+func (r *failureRun) failing() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.since.IsZero()
+}
+
+// reportFailure reports a failure that will be retried: through
+// OnFlushError, or a warning log without one, on the first failure of a run
+// and at most once a minute after.
+func (w *writer) reportFailure(run *failureRun, err error) {
+	now := time.Now()
+	report, since, suppressed := run.fail(now)
+	if !report {
+		return
+	}
+	if w.opts.OnFlushError != nil {
+		// Its own goroutine: the caller may hold flushMu or be the flush
+		// loop, and the callback may call Close, which waits for both.
+		go w.opts.OnFlushError(err)
+		return
+	}
+	slog.Warn("isledb: writer failure; retrying",
+		"component", "writer", "failing", run.kind, "error", err,
+		"failing_for", now.Sub(since).Round(time.Second),
+		"suppressed_since_last_log", suppressed)
+}
+
+// reportRecovery ends a run of failures, logging how long it lasted.
+func (w *writer) reportRecovery(run *failureRun) {
+	if since := run.ok(); !since.IsZero() {
+		slog.Info("isledb: writer recovered", "component", "writer",
+			"recovered", run.kind, "failed_for", time.Since(since).Round(time.Second))
+	}
 }
 
 // takeFlushBatchLocked returns pending work that may contain mutations at or
@@ -745,7 +831,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	fenced := !w.manifestLog.WriterFenceObservedActive(w.fenceToken)
 	if appendErr != nil {
 		if fenced || isFenceError(appendErr) {
-			w.transition(0, writerFenced, nil)
+			w.transition(0, writerFenced)
 		}
 		return fmt.Errorf("update manifest: %w", appendErr)
 	}
@@ -758,7 +844,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	if fenced {
 		status = writerFenced
 	}
-	w.transition(pending.sstable.SeqHi, status, nil)
+	w.transition(pending.sstable.SeqHi, status)
 
 	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
 		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
@@ -779,52 +865,53 @@ func writePendingChangeBatch(
 	)
 }
 
+// flushLoop commits on each tick until Close or until the writer loses its
+// fence. A failed commit stays queued and is retried, after a delay that
+// doubles while failures continue, up to maxFlushRetryDelay; nothing else
+// stops the loop, so an open writer always has its commits retried.
 func (w *writer) flushLoop() {
-	var notifyErr error
 	defer func() {
 		w.flushTicker.Stop()
-		// The flush worker is considered finished before user code runs.
-		// OnFlushError may therefore call Close without waiting on itself.
 		close(w.workerDone)
-		if notifyErr == nil {
-			return
-		}
-		if w.opts.OnFlushError != nil {
-			w.opts.OnFlushError(notifyErr)
-			return
-		}
-		slog.Error("isledb: background flush failed",
-			"component", "writer", "error", notifyErr)
 	}()
 
+	interval := w.opts.Flush.Interval
+	var delay time.Duration
+	var retryAt time.Time
 	for {
 		var err error
+		commit := false
 		select {
 		case <-w.flushTicker.C:
+			if time.Now().Before(retryAt) {
+				continue
+			}
+			commit = true
 			err = w.flushBackground(w.ctx)
 		case <-w.maintenanceWake:
+			// Applies maintenance only, so its result says nothing about
+			// commits: it leaves the backoff alone.
 			err = w.flushMaintenanceBackground(w.ctx)
 		case <-w.stopCh:
 			return
 		}
-		if err == nil {
-			continue
-		}
-		if errors.Is(err, context.Canceled) {
+		switch {
+		case err == nil:
+			if commit {
+				delay, retryAt = 0, time.Time{}
+			}
+		case errors.Is(err, context.Canceled):
 			return
-		}
-		if isFenceError(err) {
+		case isFenceError(err):
 			slog.Error("isledb: writer fenced, stopping background flush",
 				"component", "writer", "epoch", w.epoch)
-			w.transition(0, writerFenced, nil)
+			w.transition(0, writerFenced)
 			return
+		case commit:
+			w.reportFailure(&w.commitFailures, err)
+			delay = min(max(2*delay, interval), maxFlushRetryDelay)
+			retryAt = time.Now().Add(delay)
 		}
-		// The loop stops, so the writer must be final: never open with
-		// nothing flushing.
-		w.mu.Lock()
-		notifyErr = w.recordBackgroundFailureLocked(err)
-		w.mu.Unlock()
-		return
 	}
 }
 
@@ -833,7 +920,7 @@ func (w *writer) close(ctx context.Context) error {
 		return err
 	}
 
-	w.transition(0, writerClosing, nil)
+	w.transition(0, writerClosing)
 	w.stopOnce.Do(func() {
 		w.cancel()
 		close(w.stopCh)
@@ -851,7 +938,7 @@ func (w *writer) close(ctx context.Context) error {
 	// may still commit what is pending.
 	err := w.flushFinal(ctx)
 	if err == nil {
-		w.transition(0, writerClosed, nil)
+		w.transition(0, writerClosed)
 	}
 	return err
 }

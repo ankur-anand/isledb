@@ -324,7 +324,10 @@ func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	}
 }
 
-func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
+// TestDBOnFlushErrorCanCloseWriter closes the writer from OnFlushError after a
+// failed background commit: Close retries the commit, succeeds, and releases
+// the DB's writer reservation.
+func TestDBOnFlushErrorCanCloseWriter(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-writer-terminal-failure")
 	defer store.Close()
@@ -367,11 +370,11 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 	}
 	select {
 	case result := <-callback:
-		if !errors.Is(result.flushErr, ErrWriterFailed) || !errors.Is(result.flushErr, rootCause) {
-			t.Fatalf("callback error=%v", result.flushErr)
+		if !errors.Is(result.flushErr, rootCause) {
+			t.Fatalf("callback error=%v, want %v", result.flushErr, rootCause)
 		}
-		if result.closeErr != result.flushErr {
-			t.Fatalf("Close error=%v, want callback error %v", result.closeErr, result.flushErr)
+		if result.closeErr != nil {
+			t.Fatalf("Close from the callback: %v", result.closeErr)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnFlushError calling Writer.Close deadlocked")
@@ -379,7 +382,7 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 
 	reopened, err := db.OpenWriter(ctx, DefaultWriterOptions())
 	if err != nil {
-		t.Fatalf("OpenWriter after terminal close: %v", err)
+		t.Fatalf("OpenWriter after close: %v", err)
 	}
 	if err := reopened.Close(ctx); err != nil {
 		t.Fatalf("Close reopened writer: %v", err)
