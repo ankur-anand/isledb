@@ -681,6 +681,9 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	writerOpts := DefaultWriterOptions()
 	writerOpts.Flush.Interval = 0
 	writerOpts.Memtable.TargetBytes = 512
+	// Each flush spans many tiny memtables; how many varies with skiplist
+	// node heights, so leave room for them all.
+	writerOpts.Memtable.MaxPendingMemtables = 64
 
 	expectedData := make(map[string]string)
 
@@ -693,10 +696,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v1", i)
-			expectedData[key] = value
 			if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
+			expectedData[key] = value
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
@@ -705,10 +708,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		for i := 20; i < 40; i++ {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v1", i)
-			expectedData[key] = value
 			if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
+			expectedData[key] = value
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
@@ -774,10 +777,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v2-UPDATED", i)
-			expectedData[key] = value
 			if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
+			expectedData[key] = value
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
@@ -786,10 +789,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			key := fmt.Sprintf("key-%03d", i)
 			value := fmt.Sprintf("value-%03d-v3-LATEST", i)
-			expectedData[key] = value
 			if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
+			expectedData[key] = value
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
@@ -843,10 +846,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			for i := 0; i < 30; i++ {
 				key := fmt.Sprintf("batch%d-key-%03d", batch, i)
 				value := fmt.Sprintf("batch%d-value-%03d", batch, i)
-				expectedData[key] = value
 				if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 					t.Fatalf("put: %v", err)
 				}
+				expectedData[key] = value
 			}
 			if err := writer.flush(ctx); err != nil {
 				t.Fatalf("flush: %v", err)
@@ -855,10 +858,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 			for i := 30; i < 60; i++ {
 				key := fmt.Sprintf("batch%d-key-%03d", batch, i)
 				value := fmt.Sprintf("batch%d-value-%03d", batch, i)
-				expectedData[key] = value
 				if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 					t.Fatalf("put: %v", err)
 				}
+				expectedData[key] = value
 			}
 			if err := writer.flush(ctx); err != nil {
 				t.Fatalf("flush: %v", err)
@@ -940,10 +943,10 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			key := fmt.Sprintf("padding-key-%03d", i)
 			value := fmt.Sprintf("padding-value-%03d", i)
-			expectedData[key] = value
 			if _, err := writer.put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put: %v", err)
 			}
+			expectedData[key] = value
 		}
 		if err := writer.flush(ctx); err != nil {
 			t.Fatalf("flush: %v", err)
