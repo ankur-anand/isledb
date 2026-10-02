@@ -158,7 +158,7 @@ func benchmarkWriterChangeFeed(b *testing.B, payload ChangeFeedPayload, uniqueVa
 		}
 		for j := 0; j < records; j++ {
 			key := []byte(fmt.Sprintf("key-%08d-%08d", i, j))
-			if err := writer.Put(ctx, key, values[j]); err != nil {
+			if _, err := writer.Put(ctx, key, values[j]); err != nil {
 				b.Fatalf("put: %v", err)
 			}
 		}

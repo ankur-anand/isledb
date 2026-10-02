@@ -412,7 +412,7 @@ func TestReader_TruncatedSSTCacheSelfHealsAfterOriginRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
+	if _, err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.flush(ctx); err != nil {
@@ -470,7 +470,7 @@ func TestReader_EvictsInvalidCachedSSTAndRedownloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
+	if _, err := writer.put(ctx, []byte("key"), bytes.Repeat([]byte("v"), 4096)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.flush(ctx); err != nil {
@@ -536,7 +536,7 @@ func writePrefetchBatch(t *testing.T, ctx context.Context, w *writer, prefix str
 	for i := start; i < start+count; i++ {
 		key := fmt.Sprintf("%s:%03d", prefix, i)
 		value := fmt.Sprintf("%s:value:%03d", prefix, i)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put %s: %v", key, err)
 		}
 	}

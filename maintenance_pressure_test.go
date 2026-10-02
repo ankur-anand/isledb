@@ -301,16 +301,16 @@ func applyMaintenancePressureGeneration(
 		// last sequence is allowed to survive reads and compaction.
 		if index < 16 && generation > 0 {
 			intermediate := maintenancePressureValue(generation-1, index, 97)
-			if err := writer.Put(ctx, key, intermediate); err != nil {
+			if _, err := writer.Put(ctx, key, intermediate); err != nil {
 				t.Fatalf("generation %d intermediate Put(%d): %v", generation, index, err)
 			}
-			if err := writer.Delete(ctx, key); err != nil {
+			if _, err := writer.Delete(ctx, key); err != nil {
 				t.Fatalf("generation %d intermediate Delete(%d): %v", generation, index, err)
 			}
 		}
 
 		if (index*17+generation*31)%13 == 0 {
-			if err := writer.Delete(ctx, key); err != nil {
+			if _, err := writer.Delete(ctx, key); err != nil {
 				t.Fatalf("generation %d Delete(%d): %v", generation, index, err)
 			}
 			delete(expected, string(key))
@@ -324,9 +324,9 @@ func applyMaintenancePressureGeneration(
 		value := maintenancePressureValue(generation, index, size)
 		var err error
 		if (index+generation)%17 == 0 {
-			err = writer.PutWithTTL(ctx, key, value, time.Hour)
+			_, err = writer.PutWithTTL(ctx, key, value, time.Hour)
 		} else {
-			err = writer.Put(ctx, key, value)
+			_, err = writer.Put(ctx, key, value)
 		}
 		if err != nil {
 			t.Fatalf("generation %d Put(%d,%d bytes): %v", generation, index, size, err)

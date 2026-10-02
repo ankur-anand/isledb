@@ -80,7 +80,7 @@ func run() (retErr error) {
 		if err != nil {
 			return fmt.Errorf("encode account: %w", err)
 		}
-		if err := writer.Put(ctx, shared.AccountKey(id), value); err != nil {
+		if _, err := writer.Put(ctx, shared.AccountKey(id), value); err != nil {
 			return fmt.Errorf("put account %d: %w", id, err)
 		}
 		pending++

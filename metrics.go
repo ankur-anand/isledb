@@ -15,6 +15,11 @@ type WriterMetrics struct {
 	PutErrors         prometheus.Counter
 	BackPressureTotal prometheus.Counter
 	DeleteTotal       prometheus.Counter
+
+	// CommittedSequence is the highest change sequence committed to object
+	// storage and visible to readers. A writer sets it on open from the
+	// manifest, then after each memtable it commits.
+	CommittedSequence prometheus.Gauge
 }
 
 func (m *WriterMetrics) incCounter(counter prometheus.Counter) {
@@ -62,6 +67,14 @@ func (m *WriterMetrics) ObserveDelete() {
 	m.incCounter(m.DeleteTotal)
 }
 
+// ObserveCommittedSequence records the highest change sequence committed.
+func (m *WriterMetrics) ObserveCommittedSequence(seq uint64) {
+	if m == nil || m.CommittedSequence == nil {
+		return
+	}
+	m.CommittedSequence.Set(float64(seq))
+}
+
 func (m *WriterMetrics) ObserveFlushBytes(sizeBytes int64) {
 	if m == nil {
 		return
@@ -84,6 +97,13 @@ func (m *WriterMetrics) ObserveFlush(d time.Duration, err error) {
 
 func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 	return &WriterMetrics{
+		CommittedSequence: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "committed_sequence",
+			Help:        "Highest change sequence committed to object storage and visible to readers.",
+			ConstLabels: constLabels,
+		}),
 		FlushTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace:   "isledb",
 			Subsystem:   "writer",

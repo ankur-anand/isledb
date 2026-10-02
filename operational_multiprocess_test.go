@@ -187,7 +187,7 @@ func runMultiProcessWriter(t testing.TB, parent context.Context, store *blobstor
 		for range 8 {
 			key := fmt.Sprintf("mp-key-%08d", records)
 			value := fmt.Sprintf("mp-value-%08d", records)
-			if err := writer.Put(parent, []byte(key), []byte(value)); err != nil {
+			if _, err := writer.Put(parent, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("writer Put(%d): %v", records, err)
 			}
 			records++

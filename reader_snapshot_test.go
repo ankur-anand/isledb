@@ -78,7 +78,7 @@ func TestReaderBootstrapViewResumesAfterItsSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "reader-bootstrap-view")
 
-	if err := writer.Put(ctx, []byte("before"), []byte("v1")); err != nil {
+	if _, err := writer.Put(ctx, []byte("before"), []byte("v1")); err != nil {
 		t.Fatalf("Put(before): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -127,7 +127,7 @@ func TestReaderBootstrapViewResumesAfterItsSnapshot(t *testing.T) {
 			view.Cursor.String(), bounds.Head.String())
 	}
 
-	if err := writer.Put(ctx, []byte("after"), []byte("v2")); err != nil {
+	if _, err := writer.Put(ctx, []byte("after"), []byte("v2")); err != nil {
 		t.Fatalf("Put(after): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -208,16 +208,16 @@ func TestReaderBootstrapViewCursorRoundTripsAcrossMultiChangeBatch(t *testing.T)
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "reader-bootstrap-cursor-round-trip")
 
-	if err := writer.Put(ctx, []byte("keep"), []byte("old")); err != nil {
+	if _, err := writer.Put(ctx, []byte("keep"), []byte("old")); err != nil {
 		t.Fatalf("Put(keep): %v", err)
 	}
-	if err := writer.Put(ctx, []byte("gone"), []byte("temporary")); err != nil {
+	if _, err := writer.Put(ctx, []byte("gone"), []byte("temporary")); err != nil {
 		t.Fatalf("Put(gone): %v", err)
 	}
-	if err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
+	if _, err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
 		t.Fatalf("Put(empty): %v", err)
 	}
-	if err := writer.Delete(ctx, []byte("gone")); err != nil {
+	if _, err := writer.Delete(ctx, []byte("gone")); err != nil {
 		t.Fatalf("Delete(gone): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -251,13 +251,13 @@ func TestReaderBootstrapViewCursorRoundTripsAcrossMultiChangeBatch(t *testing.T)
 		t.Fatalf("restored cursor=%q want=%q", restored.String(), view.Cursor.String())
 	}
 
-	if err := writer.Put(ctx, []byte("keep"), []byte("new")); err != nil {
+	if _, err := writer.Put(ctx, []byte("keep"), []byte("new")); err != nil {
 		t.Fatalf("Put(keep after capture): %v", err)
 	}
-	if err := writer.Delete(ctx, []byte("empty")); err != nil {
+	if _, err := writer.Delete(ctx, []byte("empty")); err != nil {
 		t.Fatalf("Delete(empty after capture): %v", err)
 	}
-	if err := writer.Put(ctx, []byte("added"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("added"), []byte("value")); err != nil {
 		t.Fatalf("Put(added after capture): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -303,9 +303,9 @@ func TestReaderBootstrapViewsCapturedDuringWritesHaveNoGaps(t *testing.T) {
 			key := []byte(fmt.Sprintf("key-%02d", i%7))
 			var err error
 			if i%5 == 4 {
-				err = writer.Delete(ctx, key)
+				_, err = writer.Delete(ctx, key)
 			} else {
-				err = writer.Put(ctx, key, []byte(fmt.Sprintf("value-%02d", i)))
+				_, err = writer.Put(ctx, key, []byte(fmt.Sprintf("value-%02d", i)))
 			}
 			if err != nil {
 				writerResult <- fmt.Errorf("mutation %d: %w", i, err)
@@ -386,7 +386,7 @@ func TestReaderBootstrapCursorCanExpireWhileSnapshotRemainsReadable(t *testing.T
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "reader-bootstrap-retention")
 
-	if err := writer.Put(ctx, []byte("before"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("before"), []byte("value")); err != nil {
 		t.Fatalf("Put(before): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -403,7 +403,7 @@ func TestReaderBootstrapCursorCanExpireWhileSnapshotRemainsReadable(t *testing.T
 	}
 	defer view.Snapshot.Close()
 
-	if err := writer.Put(ctx, []byte("after"), []byte("later")); err != nil {
+	if _, err := writer.Put(ctx, []byte("after"), []byte("later")); err != nil {
 		t.Fatalf("Put(after): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {

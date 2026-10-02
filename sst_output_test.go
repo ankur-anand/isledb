@@ -126,7 +126,7 @@ func TestMixedSSTOutputEncodingsCompactAndRead(t *testing.T) {
 		for i := 0; i < 256; i++ {
 			key := []byte(fmt.Sprintf("key-%04d", i))
 			value := []byte(fmt.Sprintf("generation-%d-value-%04d", generation, i))
-			if err := writer.Put(ctx, key, value); err != nil {
+			if _, err := writer.Put(ctx, key, value); err != nil {
 				t.Fatalf("Put generation=%d key=%d: %v", generation, i, err)
 			}
 		}

@@ -60,22 +60,22 @@ func TestChangeReaderReadsAndResumesAcrossFlushes(t *testing.T) {
 	ctx := context.Background()
 	store, db, writer := openChangeReaderTestDB(t, "change-reader-resume")
 
-	if err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
 		t.Fatalf("put a: %v", err)
 	}
-	if err := writer.Delete(ctx, []byte("a")); err != nil {
+	if _, err := writer.Delete(ctx, []byte("a")); err != nil {
 		t.Fatalf("delete a: %v", err)
 	}
-	if err := writer.PutWithTTL(ctx, []byte("b"), []byte("two"), time.Hour); err != nil {
+	if _, err := writer.PutWithTTL(ctx, []byte("b"), []byte("two"), time.Hour); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
 		t.Fatalf("flush first batch: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("c"), []byte("three")); err != nil {
+	if _, err := writer.Put(ctx, []byte("c"), []byte("three")); err != nil {
 		t.Fatalf("put c: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("d"), []byte("four")); err != nil {
+	if _, err := writer.Put(ctx, []byte("d"), []byte("four")); err != nil {
 		t.Fatalf("put d: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -172,7 +172,7 @@ func TestChangeReaderCrossesManifestEntryScanLimit(t *testing.T) {
 		}
 	}
 
-	if err := writer.Put(ctx, []byte("beyond-boundary"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("beyond-boundary"), []byte("value")); err != nil {
 		t.Fatalf("put change beyond boundary: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -220,10 +220,10 @@ func TestChangeReaderReusesObservedCurrentWithinBatch(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-observed-current")
 
-	if err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
 		t.Fatalf("put a: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("b"), []byte("two")); err != nil {
+	if _, err := writer.Put(ctx, []byte("b"), []byte("two")); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -252,7 +252,7 @@ func TestChangeReaderReusesObservedCurrentWithinBatch(t *testing.T) {
 		t.Fatal("first page unexpectedly caught up")
 	}
 
-	if err := writer.Put(ctx, []byte("c"), []byte("three")); err != nil {
+	if _, err := writer.Put(ctx, []byte("c"), []byte("three")); err != nil {
 		t.Fatalf("put c: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -306,10 +306,10 @@ func TestChangeReaderRefreshesExpiredWithinBatchView(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("one")); err != nil {
 		t.Fatalf("put a: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("b"), []byte("two")); err != nil {
+	if _, err := writer.Put(ctx, []byte("b"), []byte("two")); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -358,10 +358,10 @@ func TestChangeReaderZeroCursorStartsAtOldestAndLargeChangeMakesProgress(t *test
 	for i := range value {
 		value[i] = byte(i)
 	}
-	if err := writer.Put(ctx, []byte("large"), value); err != nil {
+	if _, err := writer.Put(ctx, []byte("large"), value); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("next"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("next"), []byte("value")); err != nil {
 		t.Fatalf("put next: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -399,7 +399,7 @@ func TestChangeReaderZeroCursorStartsAtOldestAndLargeChangeMakesProgress(t *test
 func TestChangeReaderDetectsExpiredCursor(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-expired")
-	if err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -432,7 +432,7 @@ func TestChangeReaderDetectsExpiredCursor(t *testing.T) {
 func TestChangeReaderRejectsCorruptBatch(t *testing.T) {
 	ctx := context.Background()
 	store, db, writer := openChangeReaderTestDB(t, "change-reader-corrupt")
-	if err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -499,7 +499,7 @@ func TestChangeReaderRetriesMissingBatchAfterCurrentRefresh(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -539,7 +539,7 @@ func TestChangeReaderRetriesMissingBatchAfterCurrentRefresh(t *testing.T) {
 func TestChangeReaderReportsRetainedMissingBatchAsCorruption(t *testing.T) {
 	ctx := context.Background()
 	store, db, writer := openChangeReaderTestDB(t, "change-reader-retained-missing-batch")
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -569,7 +569,7 @@ func TestChangeReaderMissingContinuationRefreshesToExpiredCursor(t *testing.T) {
 	ctx := context.Background()
 	store, db, writer := openChangeReaderTestDB(t, "change-reader-missing-continuation-expired")
 	for i := 0; i < records; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), []byte("value")); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), []byte("value")); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -647,7 +647,7 @@ func TestChangeFeedEnablementPersistsAcrossDBInstances(t *testing.T) {
 		t.Fatalf("open writer: %v", err)
 	}
 	defer writer.Close(ctx)
-	if err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -772,10 +772,10 @@ func TestChangeFeedKeysOnlyPreservesKVAndOmitsFeedValues(t *testing.T) {
 		t.Fatalf("open writer: %v", err)
 	}
 	defer writer.Close(ctx)
-	if err := writer.PutWithTTL(ctx, []byte("stored"), []byte("complete-value"), time.Hour); err != nil {
+	if _, err := writer.PutWithTTL(ctx, []byte("stored"), []byte("complete-value"), time.Hour); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+	if _, err := writer.Delete(ctx, []byte("deleted")); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -873,7 +873,7 @@ func TestChangeReaderSupportsConcurrentConsumers(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-concurrent")
 	for i := 0; i < 100; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -907,7 +907,7 @@ func TestChangeReaderSupportsConcurrentConsumers(t *testing.T) {
 func TestChangeReaderPagesDoNotAliasDecodedCache(t *testing.T) {
 	ctx := context.Background()
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-page-ownership")
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -947,7 +947,7 @@ func TestChangeReaderRangeDecodesOnlyRequestedBlock(t *testing.T) {
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-bounded-range")
 	values := benchmarkChangeFeedValues(records, 256, true)
 	for i := 0; i < records; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -1037,7 +1037,7 @@ func TestChangeReaderMaxBytesExactBoundaryDoesNotReadNextBlock(t *testing.T) {
 	_, db, writer := openChangeReaderTestDB(t, "change-reader-max-bytes-boundary")
 	values := benchmarkChangeFeedValues(records, valueSize, true)
 	for i := 0; i < records; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -1126,7 +1126,7 @@ func TestChangeFeedEnablementFencesCommitWithoutBatch(t *testing.T) {
 		t.Fatalf("open old writer: %v", err)
 	}
 	defer writer.Close(ctx)
-	if err := writer.Put(ctx, []byte("before-enable"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("before-enable"), []byte("value")); err != nil {
 		t.Fatalf("put before enable: %v", err)
 	}
 

@@ -90,7 +90,7 @@ func run(ctx context.Context) error {
     if err != nil {
         return err
     }
-    if err := writer.Put(ctx, []byte("user:1"), []byte("Ankur")); err != nil {
+    if _, err := writer.Put(ctx, []byte("user:1"), []byte("Ankur")); err != nil {
         return err
     }
     if err := writer.Flush(ctx); err != nil {
@@ -240,14 +240,19 @@ configuration makes performance more predictable.
 ### Writer methods
 
 ```go
-func (w *Writer) Put(ctx context.Context, key, value []byte) error
-func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error
-func (w *Writer) Delete(ctx context.Context, key []byte) error
+func (w *Writer) Put(ctx context.Context, key, value []byte) (uint64, error)
+func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (uint64, error)
+func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
+func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error
+func (w *Writer) CommittedSequence() uint64
 func (w *Writer) Flush(ctx context.Context) error
 func (w *Writer) Close(ctx context.Context) error
 ```
 
-- `Put`, `PutWithTTL`, and `Delete` return after buffering the mutation locally.
+- `Put`, `PutWithTTL`, and `Delete` return after buffering the mutation locally,
+  with the mutation's sequence. Sequences increase by one per mutation and
+  continue across writers; change-feed consumers see the same number as
+  `Change.Sequence`.
 - `ttl == 0` means no expiration. Negative TTL values are rejected with
   `ErrInvalidMutation`.
 - Empty or oversized keys and oversized values also return an error wrapping
@@ -257,10 +262,42 @@ func (w *Writer) Close(ctx context.Context) error
 - `Flush` publishes all currently buffered and frozen memtables.
 - A successful background flush also publishes buffered data.
 - `Close` stops background flushing and flushes pending writes.
+- `WaitCommitted(ctx, seq)` returns once the mutation with that sequence, and
+  every one before it, is committed to object storage, where readers that
+  refresh see it. It does not flush; mutations commit with the next background
+  flush, `Flush`, or `Close`, so concurrent callers share one commit, and the
+  wait is at most one flush interval. Once the writer can no longer commit the
+  sequence, it returns `ErrFenced` or `ErrWriterFailed`. Without a background
+  flush interval, call `Flush`.
+- `CommittedSequence` returns the highest committed sequence without waiting.
 
-One writer uses internal locks for correctness, but public call ordering is not
-defined under concurrent use. Serialize `Put`, `PutWithTTL`, `Delete`, `Flush`,
-and `Close` for one writer.
+To acknowledge a client only once its write is durable:
+
+```go
+seq, err := writer.Put(ctx, key, value)
+if err != nil {
+    return err
+}
+if err := writer.WaitCommitted(ctx, seq); err != nil {
+    return err // not durable: fenced, failed, closed, or ctx ended
+}
+// The write is in object storage; a reader's Refresh now returns it.
+```
+
+`Put`, `PutWithTTL`, `Delete`, `WaitCommitted`, and `CommittedSequence` are
+safe to call concurrently from any goroutines; each mutation gets its own
+sequence, in the order mutations are accepted. Serialize `Flush` and `Close`
+against each other.
+
+A writer is open, closing, or final. With a flush interval, an open writer's
+background flush is running, so every accepted mutation eventually commits;
+without one, `Flush` or `Close` commits. `Close` makes the writer closing: a
+failed `Close` can be retried and may still commit pending mutations, so
+waiters keep waiting until it succeeds or their context ends. A writer
+becomes final, accepting and committing nothing more, when `Close` succeeds,
+another writer takes over (`ErrFenced`), or a background flush fails
+(`ErrWriterFailed`, reported once through `OnFlushError`); failing to read the
+maintenance mailbox counts as a background flush failure.
 
 ### Writer options and defaults
 
@@ -1267,7 +1304,25 @@ histograms but do not register them. Register the exported collectors with the
 application's `prometheus.Registerer`.
 
 Writer metrics cover puts, deletes, backpressure, flush count, errors, latency,
-and bytes. Reader metrics cover refreshes, point reads, scans and SST range
+and bytes, plus `isledb_writer_committed_sequence`: the highest change
+sequence committed to object storage and visible to readers. A writer sets it
+when it opens, from the manifest, and after each memtable it commits, so it
+never counts writes still in memory and continues across a writer failover.
+Every `Change` a change-feed consumer applies carries the same sequence, so
+a consumer that exports its last applied `Change.Sequence` gets its lag from
+Prometheus without extra reads or writes. With several databases, give each
+database's metrics a label naming it (through `constLabels`) and match on it:
+
+```promql
+clamp_min(
+  max by (db) (isledb_writer_committed_sequence)
+    - on(db) group_right isledb_follower_applied_sequence,
+  0)
+```
+
+`clamp_min` hides the brief negative values caused by scrape timing. Lag
+counts changes committed but not yet applied; writes still buffered in the
+writer, up to one flush interval, are not yet committed and not counted. Reader metrics cover refreshes, point reads, scans and SST range
 reads, plus `stale_reads_total`, reads answered from a view whose refresh
 failed (see [Freshness and outages](#freshness-and-outages)), and
 `view_loaded_timestamp_seconds`, the Unix time the published view was loaded:

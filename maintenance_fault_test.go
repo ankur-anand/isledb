@@ -241,7 +241,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 			current.ChangeFeedLogStart, command.ChangeFeedFloor.Floor)
 	}
 
-	if err := writer.Put(ctx, []byte("after-recovery"), []byte("visible")); err != nil {
+	if _, err := writer.Put(ctx, []byte("after-recovery"), []byte("visible")); err != nil {
 		t.Fatalf("Put after recovery: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {

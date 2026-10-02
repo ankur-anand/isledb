@@ -28,7 +28,7 @@ func TestReader_ScanLimit(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -106,7 +106,7 @@ func TestReader_Iterator(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -179,7 +179,7 @@ func TestReaderIteratorInvalidatesCurrentEntryAfterNextReturnsFalse(t *testing.T
 		t.Fatal(err)
 	}
 	defer writer.close(ctx)
-	if err := writer.put(ctx, []byte("only"), []byte("value")); err != nil {
+	if _, err := writer.put(ctx, []byte("only"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.flush(ctx); err != nil {
@@ -246,7 +246,7 @@ func TestReader_Iterator_Empty(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("other:key"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("other:key"), []byte("value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -303,7 +303,7 @@ func TestReader_Iterator_SeekGE(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -386,14 +386,14 @@ func TestReader_Iterator_WithDeletes(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
 
 	for i := 0; i < 10; i += 2 {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.delete(ctx, []byte(key)); err != nil {
+		if _, err := w.delete(ctx, []byte(key)); err != nil {
 			t.Fatalf("delete failed: %v", err)
 		}
 	}
@@ -447,14 +447,14 @@ func TestReader_ScanLimit_WithDeletes(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := fmt.Sprintf("value:%03d", i)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key:%03d", i)
-		if err := w.delete(ctx, []byte(key)); err != nil {
+		if _, err := w.delete(ctx, []byte(key)); err != nil {
 			t.Fatalf("delete failed: %v", err)
 		}
 	}
@@ -503,7 +503,7 @@ func TestReader_Iterator_SeekGE_RepositionAfterMiss(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}
@@ -563,7 +563,7 @@ func TestReader_Iterator_SeekGE_AfterExhaustion(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		key := fmt.Sprintf("key:%03d", i*10)
 		value := fmt.Sprintf("value:%03d", i*10)
-		if err := w.put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := w.put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put failed: %v", err)
 		}
 	}

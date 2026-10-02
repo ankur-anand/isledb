@@ -47,7 +47,7 @@ func TestWriter_FlushCreatesManifestAndFiles(t *testing.T) {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := w.put(ctx, []byte("a"), []byte("value-1")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("value-1")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -96,10 +96,10 @@ func TestWriter_RejectsNilContext(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(nil, []byte("a"), []byte("v")); !errors.Is(err, ErrNilContext) {
+	if _, err := w.put(nil, []byte("a"), []byte("v")); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("put(nil) error=%v, want %v", err, ErrNilContext)
 	}
-	if err := w.delete(nil, []byte("a")); !errors.Is(err, ErrNilContext) {
+	if _, err := w.delete(nil, []byte("a")); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("delete(nil) error=%v, want %v", err, ErrNilContext)
 	}
 	if err := w.flush(nil); !errors.Is(err, ErrNilContext) {
@@ -108,7 +108,7 @@ func TestWriter_RejectsNilContext(t *testing.T) {
 	if err := w.close(nil); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("close(nil) error=%v, want %v", err, ErrNilContext)
 	}
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("writer should remain usable after nil-context errors: %v", err)
 	}
 }
@@ -127,13 +127,13 @@ func TestWriter_FlushPublishesChangeBatch(t *testing.T) {
 	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
+	if _, err := w.put(ctx, []byte("b"), []byte("vb")); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
-	if err := w.delete(ctx, []byte("a")); err != nil {
+	if _, err := w.delete(ctx, []byte("a")); err != nil {
 		t.Fatalf("delete a: %v", err)
 	}
-	if err := w.put(ctx, []byte("c"), []byte("vc")); err != nil {
+	if _, err := w.put(ctx, []byte("c"), []byte("vc")); err != nil {
 		t.Fatalf("put c: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -211,7 +211,7 @@ func TestWriter_ChangeFeedDisabledByDefault(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("a"), []byte("va")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("va")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -254,10 +254,10 @@ func TestWriter_ChangeFeedBufferTriggersRotationForLargeValues(t *testing.T) {
 	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("large"), make([]byte, 2<<10)); err != nil {
+	if _, err := w.put(ctx, []byte("large"), make([]byte, 2<<10)); err != nil {
 		t.Fatalf("put large value: %v", err)
 	}
-	if err := w.put(ctx, []byte("next"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("next"), []byte("v")); err != nil {
 		t.Fatalf("put next value: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if err := w.put(ctx, []byte("a"), []byte("v1")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v1")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -298,7 +298,7 @@ func TestWriter_ReplaySeedsEpoch(t *testing.T) {
 	}
 	defer w2.close(ctx)
 
-	if err := w2.put(ctx, []byte("b"), []byte("v2")); err != nil {
+	if _, err := w2.put(ctx, []byte("b"), []byte("v2")); err != nil {
 		t.Fatalf("Put2: %v", err)
 	}
 	if err := w2.flush(ctx); err != nil {
@@ -352,13 +352,13 @@ func TestWriter_TakeoverReplaysCountersAfterClaimingFence(t *testing.T) {
 	}
 	defer func() { _ = incumbent.close(ctx) }()
 
-	if err := incumbent.put(ctx, []byte("before-takeover"), []byte("v1")); err != nil {
+	if _, err := incumbent.put(ctx, []byte("before-takeover"), []byte("v1")); err != nil {
 		t.Fatalf("incumbent put before takeover: %v", err)
 	}
 	if err := incumbent.flush(ctx); err != nil {
 		t.Fatalf("incumbent flush before takeover: %v", err)
 	}
-	if err := incumbent.put(ctx, []byte("during-takeover"), []byte("v2")); err != nil {
+	if _, err := incumbent.put(ctx, []byte("during-takeover"), []byte("v2")); err != nil {
 		t.Fatalf("incumbent put during takeover: %v", err)
 	}
 
@@ -379,7 +379,7 @@ func TestWriter_TakeoverReplaysCountersAfterClaimingFence(t *testing.T) {
 	}
 	defer func() { _ = successor.close(ctx) }()
 
-	if err := successor.put(ctx, []byte("after-takeover"), []byte("v3")); err != nil {
+	if _, err := successor.put(ctx, []byte("after-takeover"), []byte("v3")); err != nil {
 		t.Fatalf("successor put: %v", err)
 	}
 	if err := successor.flush(ctx); err != nil {
@@ -478,7 +478,7 @@ func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
 		t.Fatalf("newWriter: %v", err)
 	}
 
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	storage.block.Store(true)
@@ -536,7 +536,7 @@ func TestWriter_Backpressure(t *testing.T) {
 	var lastErr error
 	for i := 0; i < 10000; i++ {
 		key := []byte(fmt.Sprintf("k%06d", i))
-		lastErr = w.put(ctx, key, val)
+		_, lastErr = w.put(ctx, key, val)
 		if errors.Is(lastErr, ErrBackpressure) {
 			break
 		}
@@ -568,7 +568,7 @@ func TestWriter_Backpressure(t *testing.T) {
 	if pending != 0 {
 		t.Fatalf("pending memtables after flush=%d, want=0", pending)
 	}
-	if err := w.put(ctx, []byte("post"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("post"), []byte("v")); err != nil {
 		t.Fatalf("put after flush: %v", err)
 	}
 }
@@ -590,7 +590,7 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -653,7 +653,7 @@ func TestWriter_ChangeBatchUploadRetryReusesObjectIdentity(t *testing.T) {
 	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	w.mu.Lock()
@@ -711,7 +711,7 @@ func TestWriter_SSTUploadRetryReusesObjectIdentity(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	w.mu.Lock()
@@ -779,7 +779,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	w.changeFeedPayload = ChangeFeedFullValues
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
@@ -801,7 +801,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush retry: %v", err)
 	}
-	if w.fenced.Load() {
+	if writerStatus(w.statusNow.Load()) == writerFenced {
 		t.Fatal("writer became fenced while reconciling under the same fence")
 	}
 	ssts, err := store.ListSSTFiles(ctx)
@@ -866,7 +866,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterMultipleSuccessors(t *test
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
@@ -938,12 +938,20 @@ func TestWriter_ReconciledCommitMarksSupersededWriterFenced(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	seq, err := w.put(ctx, []byte("a"), []byte("v"))
+	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := w.flush(ctx); !errors.Is(err, lostResponse) {
 		t.Fatalf("first flush error=%v, want %v", err, lostResponse)
 	}
+	// A waiter for the mutation must learn it committed, though the writer
+	// ends fenced: the commit and the fencing are one transition.
+	waited := waitAsync(ctx, w, seq)
+	// No state the writer passes through may show it fenced without the
+	// commit, or a waiter could report the commit as lost.
+	var states []writerState
+	w.onTransition = func(state writerState) { states = append(states, state) }
 
 	successor := manifest.NewStoreWithStorage(base)
 	if _, err := successor.ClaimWriter(ctx, "successor-writer"); err != nil {
@@ -965,15 +973,23 @@ func TestWriter_ReconciledCommitMarksSupersededWriterFenced(t *testing.T) {
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("reconcile original flush: %v", err)
 	}
-	if !w.fenced.Load() {
+	if writerStatus(w.statusNow.Load()) != writerFenced {
 		t.Fatal("writer remained writable after reconciliation observed a successor fence")
+	}
+	if err := awaitResult(t, waited); err != nil {
+		t.Fatalf("WaitCommitted for the reconciled commit: %v, want success", err)
+	}
+	for _, state := range states {
+		if state.status == writerFenced && state.committed < seq {
+			t.Fatalf("writer entered fenced with committed=%d before recording commit %d", state.committed, seq)
+		}
 	}
 
 	before, err := store.ListSSTFiles(ctx)
 	if err != nil {
 		t.Fatalf("list SSTs before rejected mutation: %v", err)
 	}
-	if err := w.put(ctx, []byte("b"), []byte("should-not-be-accepted")); !errors.Is(err, manifest.ErrFenced) {
+	if _, err := w.put(ctx, []byte("b"), []byte("should-not-be-accepted")); !errors.Is(err, manifest.ErrFenced) {
 		t.Fatalf("put after reconciliation error=%v, want %v", err, manifest.ErrFenced)
 	}
 	if err := w.flush(ctx); !errors.Is(err, manifest.ErrFenced) {
@@ -1010,7 +1026,7 @@ func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -1054,8 +1070,8 @@ func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{name: "put", call: func() error { return w.put(ctx, []byte("b"), []byte("v")) }},
-		{name: "delete", call: func() error { return w.delete(ctx, []byte("a")) }},
+		{name: "put", call: func() error { _, err := w.put(ctx, []byte("b"), []byte("v")); return err }},
+		{name: "delete", call: func() error { _, err := w.delete(ctx, []byte("a")); return err }},
 		{name: "flush", call: func() error { return w.flush(ctx) }},
 	}
 	for _, operation := range operations {
@@ -1115,7 +1131,7 @@ func TestWriter_OnFlushErrorCanClose(t *testing.T) {
 		t.Fatalf("newWriter: %v", err)
 	}
 	writerRef.Store(w)
-	if err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -1151,7 +1167,7 @@ func TestWriter_InFlightMemtableCountsTowardBackpressure(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("initial"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("initial"), []byte("value")); err != nil {
 		t.Fatalf("put initial: %v", err)
 	}
 	storage.block.Store(true)
@@ -1189,7 +1205,7 @@ func TestWriter_InFlightMemtableCountsTowardBackpressure(t *testing.T) {
 		w.mu.Lock()
 		seqBefore := w.seq
 		w.mu.Unlock()
-		err := w.put(ctx, []byte(fmt.Sprintf("queued-%06d", i)), value)
+		_, err := w.put(ctx, []byte(fmt.Sprintf("queued-%06d", i)), value)
 		if errors.Is(err, ErrBackpressure) {
 			w.mu.Lock()
 			backpressureSeq = w.seq
@@ -1223,7 +1239,7 @@ func TestWriter_InFlightMemtableCountsTowardBackpressure(t *testing.T) {
 	if pending != 0 {
 		t.Fatalf("pending memtables after upload=%d, want=0", pending)
 	}
-	if err := w.put(ctx, []byte("after-flush"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("after-flush"), []byte("value")); err != nil {
 		t.Fatalf("put after capacity release: %v", err)
 	}
 }
@@ -1327,22 +1343,22 @@ func TestWriter_KeySizeBoundaryDoesNotPoisonMemtable(t *testing.T) {
 	defer w.close(ctx)
 
 	maxKey := bytes.Repeat([]byte("z"), maxMemtableUserKeyBytes)
-	if err := w.put(ctx, maxKey, []byte("boundary")); err != nil {
+	if _, err := w.put(ctx, maxKey, []byte("boundary")); err != nil {
 		t.Fatalf("put maximum key: %v", err)
 	}
 
 	overlongKey := append(append([]byte(nil), maxKey...), 'z')
-	if err := w.put(ctx, overlongKey, []byte("rejected")); err == nil {
+	if _, err := w.put(ctx, overlongKey, []byte("rejected")); err == nil {
 		t.Fatalf("put %d-byte key succeeded, want rejection", len(overlongKey))
 	}
-	if err := w.delete(ctx, overlongKey); err == nil {
+	if _, err := w.delete(ctx, overlongKey); err == nil {
 		t.Fatalf("delete %d-byte key succeeded, want rejection", len(overlongKey))
 	}
 
 	// A rejected key must not consume a sequence number or corrupt the active
 	// skiplist. The following mutation and flush exercise traversal of the
 	// maximum-size key, which is where the old uint16 length wrap surfaced.
-	if err := w.put(ctx, []byte("after-rejection"), []byte("ok")); err != nil {
+	if _, err := w.put(ctx, []byte("after-rejection"), []byte("ok")); err != nil {
 		t.Fatalf("put after rejected key: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -1380,7 +1396,7 @@ func TestOpenWriterRejectsMissingObservedCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {
@@ -1507,7 +1523,7 @@ func TestWriterMaintenanceWakeDoesNotPublishBufferedMutations(t *testing.T) {
 	}
 	defer reader.Close()
 
-	if err := w.Put(ctx, []byte("buffered"), []byte("value")); err != nil {
+	if _, err := w.Put(ctx, []byte("buffered"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
@@ -1581,7 +1597,7 @@ func TestWriter_DeleteBackpressureDoesNotAdvanceSeq(t *testing.T) {
 
 	for i := 0; i < 10000; i++ {
 		seqBefore := w.seq
-		err := w.delete(ctx, []byte(fmt.Sprintf("k%06d", i)))
+		_, err := w.delete(ctx, []byte(fmt.Sprintf("k%06d", i)))
 		if errors.Is(err, ErrBackpressure) {
 			if w.seq != seqBefore {
 				t.Fatalf("delete error should not advance seq: before=%d after=%d", seqBefore, w.seq)
@@ -1615,7 +1631,7 @@ func TestWriter_CanceledPutDoesNotAdvanceSequence(t *testing.T) {
 	putCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = w.put(putCtx, []byte("k"), []byte("v"))
+	_, err = w.put(putCtx, []byte("k"), []byte("v"))
 	if err == nil {
 		t.Fatalf("expected put error with canceled context")
 	}
@@ -1642,13 +1658,13 @@ func TestWriter_OpenContextCancellationDoesNotBlockWrites(t *testing.T) {
 	cancel()
 
 	opCtx := context.Background()
-	if err := w.put(opCtx, []byte("k-inline"), []byte("v")); err != nil {
+	if _, err := w.put(opCtx, []byte("k-inline"), []byte("v")); err != nil {
 		t.Fatalf("put inline after opening ctx cancel: %v", err)
 	}
-	if err := w.delete(opCtx, []byte("k-inline")); err != nil {
+	if _, err := w.delete(opCtx, []byte("k-inline")); err != nil {
 		t.Fatalf("delete after opening ctx cancel: %v", err)
 	}
-	if err := w.put(opCtx, []byte("k-large"), bytes.Repeat([]byte("b"), 256<<10)); err != nil {
+	if _, err := w.put(opCtx, []byte("k-large"), bytes.Repeat([]byte("b"), 256<<10)); err != nil {
 		t.Fatalf("put large value after opening ctx cancel: %v", err)
 	}
 }
@@ -1674,7 +1690,7 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 	val := bytes.Repeat([]byte("v"), 128)
 	lastErr := error(nil)
 	for i := 0; i < 10000; i++ {
-		lastErr = w.put(ctx, []byte(fmt.Sprintf("k%06d", i)), val)
+		_, lastErr = w.put(ctx, []byte(fmt.Sprintf("k%06d", i)), val)
 		if errors.Is(lastErr, ErrBackpressure) {
 			break
 		}
@@ -1686,7 +1702,7 @@ func TestWriter_PartialMetricsDoNotPanic(t *testing.T) {
 		t.Fatalf("expected ErrBackpressure, got %v", lastErr)
 	}
 
-	if err := w.delete(ctx, []byte("k-final")); err != nil && !errors.Is(err, ErrBackpressure) {
+	if _, err := w.delete(ctx, []byte("k-final")); err != nil && !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -1711,13 +1727,13 @@ func TestWriter_MetricsFlushAndTTLPaths(t *testing.T) {
 	defer w.close(ctx)
 
 	value := []byte("value")
-	if err := w.putWithTTL(ctx, []byte("k1"), value, time.Second); err != nil {
+	if _, err := w.putWithTTL(ctx, []byte("k1"), value, time.Second); err != nil {
 		t.Fatalf("putWithTTL success: %v", err)
 	}
-	if err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
+	if _, err := w.putWithTTL(ctx, nil, []byte("bad"), time.Second); err == nil {
 		t.Fatalf("expected putWithTTL error for empty key")
 	}
-	if err := w.delete(ctx, []byte("k1")); err != nil {
+	if _, err := w.delete(ctx, []byte("k1")); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := w.flush(ctx); err != nil {
@@ -1754,17 +1770,17 @@ func TestWriterRejectsOperationsAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put before close: %v", err)
 	}
 	if err := w.close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	if err := w.put(ctx, []byte("other"), []byte("value")); !errors.Is(err, ErrWriterClosed) {
+	if _, err := w.put(ctx, []byte("other"), []byte("value")); !errors.Is(err, ErrWriterClosed) {
 		t.Fatalf("put after close error=%v, want %v", err, ErrWriterClosed)
 	}
-	if err := w.delete(ctx, []byte("key")); !errors.Is(err, ErrWriterClosed) {
+	if _, err := w.delete(ctx, []byte("key")); !errors.Is(err, ErrWriterClosed) {
 		t.Fatalf("delete after close error=%v, want %v", err, ErrWriterClosed)
 	}
 	if err := w.flush(ctx); !errors.Is(err, ErrWriterClosed) {
@@ -1790,14 +1806,15 @@ func TestWriterMutationValidationErrors(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{name: "put empty key", run: func() error { return w.put(ctx, nil, []byte("v")) }},
-		{name: "put oversized key", run: func() error { return w.put(ctx, []byte("12345"), []byte("v")) }},
-		{name: "put oversized value", run: func() error { return w.put(ctx, []byte("key"), []byte("12345")) }},
+		{name: "put empty key", run: func() error { _, err := w.put(ctx, nil, []byte("v")); return err }},
+		{name: "put oversized key", run: func() error { _, err := w.put(ctx, []byte("12345"), []byte("v")); return err }},
+		{name: "put oversized value", run: func() error { _, err := w.put(ctx, []byte("key"), []byte("12345")); return err }},
 		{name: "put negative TTL", run: func() error {
-			return w.putWithTTL(ctx, []byte("key"), []byte("v"), -time.Second)
+			_, err := w.putWithTTL(ctx, []byte("key"), []byte("v"), -time.Second)
+			return err
 		}},
-		{name: "delete empty key", run: func() error { return w.delete(ctx, nil) }},
-		{name: "delete oversized key", run: func() error { return w.delete(ctx, []byte("12345")) }},
+		{name: "delete empty key", run: func() error { _, err := w.delete(ctx, nil); return err }},
+		{name: "delete oversized key", run: func() error { _, err := w.delete(ctx, []byte("12345")); return err }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1894,7 +1911,7 @@ func TestWriterRejectsInvalidMaintenanceWithoutBecomingTerminal(t *testing.T) {
 	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.Status != manifest.MaintenanceStatusRejected {
 		t.Fatalf("maintenance_receipt=%+v, want rejected", current.MaintenanceReceipt)
 	}
-	if err := w.put(ctx, []byte("still-writable"), []byte("value")); err != nil {
+	if _, err := w.put(ctx, []byte("still-writable"), []byte("value")); err != nil {
 		t.Fatalf("put after rejected maintenance: %v", err)
 	}
 }

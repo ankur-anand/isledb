@@ -252,7 +252,7 @@ func TestSnapshotCleanerRetirementSurvivesMaintenanceRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("key-1"), []byte("value-1")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key-1"), []byte("value-1")); err != nil {
 		t.Fatalf("Put(key-1): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -269,7 +269,7 @@ func TestSnapshotCleanerRetirementSurvivesMaintenanceRestart(t *testing.T) {
 	}
 	reconcileSnapshotCheckpoint(t, ctx, first)
 
-	if err := writer.Put(ctx, []byte("key-2"), []byte("value-2")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key-2"), []byte("value-2")); err != nil {
 		t.Fatalf("Put(key-2): %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {

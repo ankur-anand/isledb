@@ -180,7 +180,7 @@ func TestTTL_WriterPutWithTTL(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	err = w.putWithTTL(ctx, []byte("key1"), []byte("value1"), time.Hour)
+	_, err = w.putWithTTL(ctx, []byte("key1"), []byte("value1"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -220,13 +220,13 @@ func TestTTL_WriterRejectsNegativeTTL(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.putWithTTL(ctx, []byte("negative"), []byte("value"), -time.Nanosecond); !errors.Is(err, ErrInvalidMutation) {
+	if _, err := w.putWithTTL(ctx, []byte("negative"), []byte("value"), -time.Nanosecond); !errors.Is(err, ErrInvalidMutation) {
 		t.Fatalf("negative TTL error=%v, want %v", err, ErrInvalidMutation)
 	}
 	if !w.memtable.Empty() {
 		t.Fatal("negative-TTL put mutated the memtable")
 	}
-	if err := w.putWithTTL(ctx, []byte("permanent"), []byte("value"), 0); err != nil {
+	if _, err := w.putWithTTL(ctx, []byte("permanent"), []byte("value"), 0); err != nil {
 		t.Fatalf("zero TTL: %v", err)
 	}
 }
@@ -254,7 +254,7 @@ func TestTTL_ReaderFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("expired_key"), []byte("expired_value"), seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.putWithTTL(ctx, []byte("valid_key"), []byte("valid_value"), time.Hour)
+	_, err = w.putWithTTL(ctx, []byte("valid_key"), []byte("valid_value"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -315,11 +315,11 @@ func TestTTL_ScanFiltersExpired(t *testing.T) {
 	w.memtable.PutWithTTL([]byte("ccc"), []byte("expired2"), w.seq, expireAt)
 	w.mu.Unlock()
 
-	err = w.putWithTTL(ctx, []byte("bbb"), []byte("valid1"), time.Hour)
+	_, err = w.putWithTTL(ctx, []byte("bbb"), []byte("valid1"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
-	err = w.putWithTTL(ctx, []byte("ddd"), []byte("valid2"), time.Hour)
+	_, err = w.putWithTTL(ctx, []byte("ddd"), []byte("valid2"), time.Hour)
 	if err != nil {
 		t.Fatalf("putWithTTL failed: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestTTL_ExpiredEntryShadowsOlder(t *testing.T) {
 	}
 	defer w.close(ctx)
 
-	if err := w.put(ctx, []byte("key1"), []byte("old_value")); err != nil {
+	if _, err := w.put(ctx, []byte("key1"), []byte("old_value")); err != nil {
 		t.Fatalf("put failed: %v", err)
 	}
 

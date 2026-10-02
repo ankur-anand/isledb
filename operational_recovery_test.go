@@ -115,7 +115,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 		t.Fatalf("open first writer: %v", err)
 	}
 
-	if err := writer.Put(ctx, []byte("stable"), []byte("before-crash")); err != nil {
+	if _, err := writer.Put(ctx, []byte("stable"), []byte("before-crash")); err != nil {
 		t.Fatalf("put stable value: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -123,7 +123,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 	}
 
 	faults.failBeforeNextCAS(errOperationalPublishFailure)
-	if err := writer.Put(ctx, []byte("uncommitted"), []byte("must-not-appear")); err != nil {
+	if _, err := writer.Put(ctx, []byte("uncommitted"), []byte("must-not-appear")); err != nil {
 		t.Fatalf("put uncommitted value: %v", err)
 	}
 
@@ -166,7 +166,7 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 	if err != nil {
 		t.Fatalf("open restarted writer: %v", err)
 	}
-	if err := restartedWriter.Put(ctx, []byte("recovered"), []byte("after-crash")); err != nil {
+	if _, err := restartedWriter.Put(ctx, []byte("recovered"), []byte("after-crash")); err != nil {
 		t.Fatalf("put recovered value: %v", err)
 	}
 	if err := restartedWriter.Close(ctx); err != nil {
@@ -200,7 +200,7 @@ func TestOperationalRecovery_LostManifestResponseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("ambiguous"), []byte("committed-once")); err != nil {
+	if _, err := writer.Put(ctx, []byte("ambiguous"), []byte("committed-once")); err != nil {
 		t.Fatalf("put value: %v", err)
 	}
 
@@ -272,7 +272,7 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	for i := 0; i < 64; i++ {
 		key := fmt.Sprintf("key:%03d", i)
 		value := []byte(fmt.Sprintf("value:%03d", i))
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			t.Fatalf("put %s: %v", key, err)
 		}
 		if err := writer.Flush(ctx); err != nil {
@@ -332,7 +332,7 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first writer: %v", err)
 	}
-	if err := writer1.Put(ctx, []byte("before-fence"), []byte("visible")); err != nil {
+	if _, err := writer1.Put(ctx, []byte("before-fence"), []byte("visible")); err != nil {
 		t.Fatalf("put before fence: %v", err)
 	}
 	if err := writer1.Flush(ctx); err != nil {
@@ -346,7 +346,7 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open second writer: %v", err)
 	}
-	if err := writer1.Put(ctx, []byte("stale"), []byte("must-not-appear")); err != nil {
+	if _, err := writer1.Put(ctx, []byte("stale"), []byte("must-not-appear")); err != nil {
 		t.Fatalf("buffer stale write: %v", err)
 	}
 	if err := writer1.Flush(ctx); !errors.Is(err, manifest.ErrFenced) {
@@ -356,7 +356,7 @@ func TestOperationalRecovery_StaleWriterIsFenced(t *testing.T) {
 		t.Fatalf("stale writer close error=%v, want %v", err, manifest.ErrFenced)
 	}
 
-	if err := writer2.Put(ctx, []byte("after-fence"), []byte("visible")); err != nil {
+	if _, err := writer2.Put(ctx, []byte("after-fence"), []byte("visible")); err != nil {
 		t.Fatalf("put after fence: %v", err)
 	}
 	if err := writer2.Close(ctx); err != nil {
@@ -397,7 +397,7 @@ func TestOperationalSignals_BackpressureCounter(t *testing.T) {
 	value := make([]byte, 128)
 	var backpressure error
 	for i := 0; i < 10_000; i++ {
-		backpressure = writer.Put(ctx, []byte(fmt.Sprintf("key:%06d", i)), value)
+		_, backpressure = writer.Put(ctx, []byte(fmt.Sprintf("key:%06d", i)), value)
 		if errors.Is(backpressure, ErrBackpressure) {
 			break
 		}
@@ -456,7 +456,7 @@ func TestOperationalRecovery_Soak(t *testing.T) {
 		for i := 0; i < 16; i++ {
 			key := fmt.Sprintf("cycle:%06d:key:%02d", cycles, i)
 			value := []byte(fmt.Sprintf("value:%06d:%02d", cycles, i))
-			if err := writer.Put(ctx, []byte(key), value); err != nil {
+			if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 				t.Fatalf("cycle %d put %s: %v", cycles, key, err)
 			}
 			expected[key] = value

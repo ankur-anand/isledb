@@ -109,11 +109,10 @@ func DefaultSSTOutputOptions() SSTOutputOptions {
 // commits those SSTs through the manifest. Only manifest-committed SSTs are
 // visible to readers.
 //
-// Writer uses internal locks to protect its memtable, sequence assignment, and
-// background flush loop. Those locks are an implementation guard, not a
-// concurrent API contract: concurrent public calls do not have documented
-// ordering or Close/Flush semantics. Callers should serialize Put, Delete,
-// Flush, and Close for one Writer.
+// Put, PutWithTTL, Delete, WaitCommitted and CommittedSequence are safe to
+// call concurrently from any goroutines: each mutation gets its own sequence,
+// in the order mutations are accepted. Serialize Flush and Close against each
+// other.
 //
 // If WriterOptions.Flush.Interval is greater than zero, the Writer also runs a
 // background flush loop. An unobserved background flush failure makes the
@@ -125,29 +124,54 @@ type Writer struct {
 	release     func()
 }
 
-// Put writes a key-value pair to the active memtable.
+// Put writes a key-value pair to the active memtable and returns the
+// mutation's sequence.
 //
 // Put returns after the mutation is buffered locally. The mutation becomes
 // durable and visible to readers only after a successful Flush, background
-// flush, or Close.
-func (w *Writer) Put(ctx context.Context, key, value []byte) error {
+// flush, or Close; WaitCommitted with the returned sequence waits for that.
+func (w *Writer) Put(ctx context.Context, key, value []byte) (uint64, error) {
 	return w.w.put(ctx, key, value)
 }
 
 // PutWithTTL writes a key-value pair with a time-to-live duration.
 //
 // A zero ttl means no expiration. A negative ttl is rejected with
-// ErrInvalidMutation. Expired values are filtered by readers.
-func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error {
+// ErrInvalidMutation. Expired values are filtered by readers. Like Put, it
+// returns the mutation's sequence.
+func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (uint64, error) {
 	return w.w.putWithTTL(ctx, key, value, ttl)
 }
 
 // Delete marks a key as deleted.
 //
 // Like Put, the tombstone is buffered first and becomes durable and visible
-// after a successful Flush, background flush, or Close.
-func (w *Writer) Delete(ctx context.Context, key []byte) error {
+// after a successful Flush, background flush, or Close, and Delete returns
+// its sequence.
+func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error) {
 	return w.w.delete(ctx, key)
+}
+
+// WaitCommitted waits until the mutation with sequence seq, as returned by
+// Put, PutWithTTL or Delete, and every mutation before it are committed to
+// object storage, where readers that refresh see them.
+//
+// It does not flush: the mutation commits with the next background flush,
+// Flush or Close, so concurrent callers share one commit. It returns the
+// writer's error once the writer can no longer commit seq: ErrFenced after
+// another writer took over, or ErrWriterFailed after a background flush
+// failed. Without a background flush interval, committing is the caller's
+// Flush or Close, and WaitCommitted waits for one or for the context. A Close
+// that fails can be retried and may still commit seq, so until a Close
+// succeeds, WaitCommitted keeps waiting, bounded by the context.
+func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error {
+	return w.w.waitCommitted(ctx, seq)
+}
+
+// CommittedSequence returns the highest sequence committed to object
+// storage. Every mutation with a sequence at or below it is durable.
+func (w *Writer) CommittedSequence() uint64 {
+	return w.w.committed.Load()
 }
 
 // Flush synchronously publishes all currently buffered writes.

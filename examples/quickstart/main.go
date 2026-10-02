@@ -50,7 +50,7 @@ func run() (retErr error) {
 
 	for i, name := range []string{"Ada", "Grace", "Linus"} {
 		key := fmt.Appendf(nil, "accounts/%03d", i+1)
-		if err := writer.Put(ctx, key, []byte(name)); err != nil {
+		if _, err := writer.Put(ctx, key, []byte(name)); err != nil {
 			return fmt.Errorf("put %q: %w", key, err)
 		}
 	}
