@@ -266,9 +266,8 @@ func (w *Writer) Close(ctx context.Context) error
   every one before it, is committed to object storage, where readers that
   refresh see it. It does not flush; mutations commit with the next background
   flush, `Flush`, or `Close`, so concurrent callers share one commit, and the
-  wait is at most one flush interval. Once the writer can no longer commit the
-  sequence, it returns `ErrFenced` or `ErrWriterFailed`. Without a background
-  flush interval, call `Flush`.
+  wait is at most one flush interval while storage is healthy. Without a
+  background flush interval, call `Flush`.
 - `CommittedSequence` returns the highest committed sequence without waiting.
 
 To acknowledge a client only once its write is durable:
@@ -279,25 +278,41 @@ if err != nil {
     return err
 }
 if err := writer.WaitCommitted(ctx, seq); err != nil {
-    return err // not durable: fenced, failed, closed, or ctx ended
+    return err // ErrFenced: never committed; ctx error: not yet known
 }
 // The write is in object storage; a reader's Refresh now returns it.
 ```
+
+`WaitCommitted` has three outcomes:
+
+| Result | The write |
+|---|---|
+| `nil` | is committed |
+| `ErrFenced` | was not committed and never will be: another writer took over |
+| a context error | is not known yet: its commit is still being retried and may land |
+
+A client that times out should treat the write as unknown, not lost, and
+make retries idempotent (for example, a `Put` of the same key and value).
 
 `Put`, `PutWithTTL`, `Delete`, `WaitCommitted`, and `CommittedSequence` are
 safe to call concurrently from any goroutines; each mutation gets its own
 sequence, in the order mutations are accepted. Serialize `Flush` and `Close`
 against each other.
 
-A writer is open, closing, or final. With a flush interval, an open writer's
-background flush is running, so every accepted mutation eventually commits;
-without one, `Flush` or `Close` commits. `Close` makes the writer closing: a
-failed `Close` can be retried and may still commit pending mutations, so
-waiters keep waiting until it succeeds or their context ends. A writer
-becomes final, accepting and committing nothing more, when `Close` succeeds,
-another writer takes over (`ErrFenced`), or a background flush fails
-(`ErrWriterFailed`, reported once through `OnFlushError`); failing to read the
-maintenance mailbox counts as a background flush failure.
+A writer is open, closing, or final. A commit that fails stays queued and is
+retried until it lands: the background loop retries with a delay that
+doubles from the flush interval up to 30 seconds, and a failed `Flush` or
+`Close` returns its error with the commit still queued, so calling it again
+retries. Each attempt first checks whether the previous one applied before
+its response was lost, so a commit never lands twice. While commits fail,
+`MaxPendingMemtables` bounds memory: writes get `ErrBackpressure`. A failure
+to apply a maintenance command is reported and retried with the next poll;
+it does not hold up data commits.
+
+`Close` makes the writer closing: it accepts no more mutations, and a
+failed `Close` can be retried. A writer becomes final, accepting and
+committing nothing more, when `Close` succeeds or when another writer takes
+over (`ErrFenced`). Storage errors never make a writer final.
 
 ### Writer options and defaults
 
@@ -344,7 +359,7 @@ func DefaultWriterOptions() WriterOptions
 | `Maintenance.PollInterval` | 1 second | Mailbox polling in a separate writer process |
 | `Values.MaxKeyBytes` | 64 KiB | Largest accepted key |
 | `Values.MaxValueBytes` | 16 MiB | Largest accepted value |
-| `OnFlushError` | `nil` | Optional terminal background-error callback |
+| `OnFlushError` | `nil` | Optional callback for retried background failures |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
 `Flush.Interval` is intentionally different from most zero-valued options:
@@ -355,10 +370,23 @@ When `MaxPendingMemtables` is reached, a mutation that would require another
 rotation returns `ErrBackpressure` before accepting the mutation. Retry after a
 delay or call `Flush` from the serialized writer owner.
 
-The first background flush error makes the writer terminal. `OnFlushError` is
-called once after the background worker stops; later mutations, `Flush`, and
-`Close` return `ErrWriterFailed` wrapping the original error. A synchronous
-`Flush` error is returned directly and remains retryable.
+`OnFlushError` receives background commit and maintenance failures, such as
+an expired credential or an unavailable bucket: on the first failure of a
+run, then at most once a minute while failures continue. Commit failures and
+maintenance failures are separate runs; each ends at its next success, which
+is logged. It runs on its own goroutine, may call `Close`, and may run after
+`Close` returns, so it must not use anything the caller tears down on close.
+Without it, the writer logs a warning. A failed maintenance poll is retried
+once per `Maintenance.PollInterval`. A caller's own cancellation or deadline
+in `Flush` is returned, not reported.
+
+Errors are never final, so the callback is for alerting. That includes errors
+that cannot succeed until someone acts: missing permissions, a deleted
+bucket, a manifest entry storage rejects, or `ErrCommitIndeterminate`. Such a
+writer retries every 30 seconds indefinitely and never fails on its own;
+`Put` keeps succeeding until `ErrBackpressure`. Alert on `OnFlushError` or on
+`isledb_writer_oldest_uncommitted_timestamp_seconds` (see Metrics), fix the
+cause, or close the writer.
 
 ## Read key-value data
 
@@ -1308,6 +1336,15 @@ and bytes, plus `isledb_writer_committed_sequence`: the highest change
 sequence committed to object storage and visible to readers. A writer sets it
 when it opens, from the manifest, and after each memtable it commits, so it
 never counts writes still in memory and continues across a writer failover.
+`isledb_writer_oldest_uncommitted_timestamp_seconds` is the Unix time the
+oldest write not yet committed was accepted, or 0 when every write is
+committed. How long writes have waited to become durable, for an alert when
+commits keep failing:
+
+```promql
+time() - (isledb_writer_oldest_uncommitted_timestamp_seconds > 0) > 120
+```
+
 Every `Change` a change-feed consumer applies carries the same sequence, so
 a consumer that exports its last applied `Change.Sequence` gets its lag from
 Prometheus without extra reads or writes. With several databases, give each
@@ -1358,7 +1395,6 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrInvalidMutation` | Empty or oversized key, oversized value, or negative TTL |
 | `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or arena configuration |
 | `ErrWriterClosed` | Operation attempted after writer close |
-| `ErrWriterFailed` | Terminal background flush failure; wraps the cause |
 | `ErrNilContext` | A nil context was supplied |
 
 ### Reader and snapshots
