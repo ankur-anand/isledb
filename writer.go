@@ -58,12 +58,50 @@ type writer struct {
 	stopCh              chan struct{}
 	workerDone          chan struct{}
 
-	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
+	metrics    *WriterMetrics
 
-	closed            atomic.Bool
-	backgroundFailure atomic.Pointer[writerFailure]
-	metrics           *WriterMetrics
+	// state is the writer's lifecycle, guarded by mu and changed only by
+	// transitionLocked. statusNow, failure and committed mirror it for
+	// lock-free reads on the write path.
+	state     writerState
+	statusNow atomic.Uint32
+	failure   atomic.Pointer[writerFailure]
+	committed atomic.Uint64
+	stopOnce  sync.Once
+	// onTransition, set only by tests, sees every state the writer enters.
+	onTransition func(writerState)
+}
+
+// writerStatus is where a writer is in its lifecycle. It only moves forward:
+// Open, then Closing, then one of the final statuses, and the first final
+// status wins.
+type writerStatus uint32
+
+const (
+	// writerOpen accepts mutations. With a flush interval, the flush loop is
+	// running; without one, committing is the caller's Flush or Close.
+	writerOpen writerStatus = iota
+	// writerClosing is set when Close starts. The flush loop has stopped, and
+	// a failed Close can be retried, so pending mutations may still commit.
+	writerClosing
+	// writerClosed: Close committed everything.
+	writerClosed
+	// writerFenced: another writer holds the fence; nothing more commits.
+	writerFenced
+	// writerFailed: a background flush failed; nothing more commits.
+	writerFailed
+)
+
+func (s writerStatus) final() bool { return s >= writerClosed }
+
+// writerState is the writer's lifecycle record. changed is closed and
+// replaced on every transition, waking WaitCommitted callers.
+type writerState struct {
+	status    writerStatus
+	committed uint64
+	failure   error
+	changed   chan struct{}
 }
 
 type writerFailure struct {
@@ -152,6 +190,12 @@ func newWriterWithMaintenanceWake(
 		fenceToken:      token,
 		metrics:         opts.Metrics,
 	}
+
+	// What the manifest holds is committed: report it before the first
+	// commit, so a writer taking over continues the series.
+	w.state = writerState{status: writerOpen, committed: w.seq, changed: make(chan struct{})}
+	w.committed.Store(w.seq)
+	w.metrics.ObserveCommittedSequence(w.seq)
 
 	if opts.Flush.Interval > 0 {
 		w.flushTicker = time.NewTicker(opts.Flush.Interval)
@@ -279,47 +323,92 @@ func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlus
 	return pending
 }
 
+// ensureWritable reports why the writer accepts no more mutations, without a
+// lock: Put calls it before taking mu, and again under mu.
 func (w *writer) ensureWritable() error {
-	if err := w.backgroundError(); err != nil {
-		return err
-	}
-	if w.closed.Load() {
-		return ErrWriterClosed
-	}
-	if w.fenced.Load() {
-		return manifest.ErrFenced
-	}
-	return nil
+	return w.statusError(writerStatus(w.statusNow.Load()))
 }
 
-func (w *writer) put(ctx context.Context, key, value []byte) error {
+// statusError is the error for a writer in status s, or nil while open.
+func (w *writer) statusError(s writerStatus) error {
+	switch s {
+	case writerOpen:
+		return nil
+	case writerFenced:
+		return manifest.ErrFenced
+	case writerFailed:
+		return w.failure.Load().err
+	default:
+		return ErrWriterClosed
+	}
+}
+
+// transitionLocked moves the writer's state forward, with mu held: the
+// committed sequence to committed if higher, and the status to status if it
+// is later and the current one is not final. Both change together, so a
+// waiter never sees a commit's fencing without the commit. It wakes waiters
+// once if anything changed. It never does I/O.
+func (w *writer) transitionLocked(committed uint64, status writerStatus, failure error) {
+	changed := false
+	if committed > w.state.committed {
+		w.state.committed = committed
+		w.committed.Store(committed)
+		w.metrics.ObserveCommittedSequence(committed)
+		changed = true
+	}
+	if status > w.state.status && !w.state.status.final() {
+		w.state.status = status
+		if status == writerFailed {
+			w.state.failure = failure
+			w.failure.Store(&writerFailure{err: failure})
+		}
+		w.statusNow.Store(uint32(status))
+		changed = true
+	}
+	if changed {
+		close(w.state.changed)
+		w.state.changed = make(chan struct{})
+		if w.onTransition != nil {
+			w.onTransition(w.state)
+		}
+	}
+}
+
+func (w *writer) transition(committed uint64, status writerStatus, failure error) {
+	w.mu.Lock()
+	w.transitionLocked(committed, status, failure)
+	w.mu.Unlock()
+}
+
+func (w *writer) put(ctx context.Context, key, value []byte) (uint64, error) {
 	return w.putWithTTL(ctx, key, value, 0)
 }
 
-func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (err error) {
+// putWithTTL buffers a put and returns the sequence it was given.
+func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (seq uint64, err error) {
 	defer func() {
 		w.metrics.ObservePut(err)
 	}()
 
 	if err := checkContext(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	if err := w.ensureWritable(); err != nil {
-		return err
+		return 0, err
 	}
 	if ttl < 0 {
-		return fmt.Errorf("%w: negative TTL %s", ErrInvalidMutation, ttl)
+		return 0, fmt.Errorf("%w: negative TTL %s", ErrInvalidMutation, ttl)
 	}
 
 	if len(key) == 0 {
-		return fmt.Errorf("%w: empty key", ErrInvalidMutation)
+		return 0, fmt.Errorf("%w: empty key", ErrInvalidMutation)
 	}
 	if len(key) > w.opts.Values.MaxKeyBytes {
-		return fmt.Errorf("%w: key size %d exceeds max %d",
+		return 0, fmt.Errorf("%w: key size %d exceeds max %d",
 			ErrInvalidMutation, len(key), w.opts.Values.MaxKeyBytes)
 	}
 	if int64(len(value)) > w.opts.Values.MaxValueBytes {
-		return fmt.Errorf("%w: value size %d exceeds max %d",
+		return 0, fmt.Errorf("%w: value size %d exceeds max %d",
 			ErrInvalidMutation, len(value), w.opts.Values.MaxValueBytes)
 	}
 
@@ -331,11 +420,11 @@ func (w *writer) putWithTTL(ctx context.Context, key, value []byte, ttl time.Dur
 	return w.putInline(key, value, expireAt)
 }
 
-func (w *writer) putInline(key, value []byte, expireAt int64) error {
+func (w *writer) putInline(key, value []byte, expireAt int64) (uint64, error) {
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
-		return err
+		return 0, err
 	}
 	seq := w.seq + 1
 	if w.changeFeedPayload != 0 {
@@ -344,37 +433,38 @@ func (w *writer) putInline(key, value []byte, expireAt int64) error {
 		}
 		if err := w.changeBuffer.appendPutForPayload(seq, key, value, expireAt, w.changeFeedPayload); err != nil {
 			w.mu.Unlock()
-			return err
+			return 0, err
 		}
 	}
 	w.seq = seq
 	w.memtable.PutWithTTL(key, value, seq, expireAt)
 	w.mu.Unlock()
-	return nil
+	return seq, nil
 }
 
-func (w *writer) delete(ctx context.Context, key []byte) error {
+// delete buffers a tombstone and returns the sequence it was given.
+func (w *writer) delete(ctx context.Context, key []byte) (uint64, error) {
 	w.metrics.ObserveDelete()
 
 	if err := checkContext(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	if err := w.ensureWritable(); err != nil {
-		return err
+		return 0, err
 	}
 
 	if len(key) == 0 {
-		return fmt.Errorf("%w: empty key", ErrInvalidMutation)
+		return 0, fmt.Errorf("%w: empty key", ErrInvalidMutation)
 	}
 	if len(key) > w.opts.Values.MaxKeyBytes {
-		return fmt.Errorf("%w: key size %d exceeds max %d",
+		return 0, fmt.Errorf("%w: key size %d exceeds max %d",
 			ErrInvalidMutation, len(key), w.opts.Values.MaxKeyBytes)
 	}
 
 	w.mu.Lock()
 	if err := w.ensureCapacityLocked(); err != nil {
 		w.mu.Unlock()
-		return err
+		return 0, err
 	}
 	seq := w.seq + 1
 	if w.changeFeedPayload != 0 {
@@ -383,14 +473,14 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 		}
 		if err := w.changeBuffer.appendDelete(seq, key); err != nil {
 			w.mu.Unlock()
-			return err
+			return 0, err
 		}
 	}
 	w.seq = seq
 	w.memtable.Delete(key, seq)
 	w.mu.Unlock()
 
-	return nil
+	return seq, nil
 }
 
 func (w *writer) ensureCapacityLocked() error {
@@ -447,20 +537,24 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
-	if err := w.backgroundError(); err != nil {
-		return err
-	}
-	if w.fenced.Load() {
-		return manifest.ErrFenced
+	if s := writerStatus(w.statusNow.Load()); s == writerFenced || s == writerFailed {
+		return w.statusError(s)
 	}
 	if w.consumeMaintenanceWake() {
 		forceMaintenancePoll = true
 	}
 	if err := w.pollPendingMaintenance(ctx, forceMaintenancePoll); err != nil {
+		err = fmt.Errorf("apply maintenance command: %w", err)
 		if isFenceError(err) {
-			w.fenced.Store(true)
+			w.transition(0, writerFenced, nil)
+		} else if terminalOnError && !errors.Is(err, context.Canceled) {
+			// Like any background flush failure, it is final: the flush
+			// loop stops, so the writer must not look open.
+			w.mu.Lock()
+			err = w.recordBackgroundFailureLocked(err)
+			w.mu.Unlock()
 		}
-		return fmt.Errorf("apply maintenance command: %w", err)
+		return err
 	}
 	if maintenanceOnly {
 		// A process-local mailbox wake publishes only the maintenance command.
@@ -523,28 +617,25 @@ func (w *writer) consumeMaintenanceWake() bool {
 	}
 }
 
+// backgroundError is the failure that made the writer final, if any.
 func (w *writer) backgroundError() error {
-	failure := w.backgroundFailure.Load()
-	if failure == nil {
+	if writerStatus(w.statusNow.Load()) != writerFailed {
 		return nil
 	}
-	return failure.err
+	return w.failure.Load().err
 }
 
 // recordBackgroundFailureLocked stores the first unobserved flush failure.
 // The caller holds w.mu so mutation acceptance and terminal failure recording
 // have one ordering point.
 func (w *writer) recordBackgroundFailureLocked(cause error) error {
-	if err := w.backgroundError(); err != nil {
-		return err
+	if s := w.state.status; s.final() {
+		if err := w.statusError(s); err != ErrWriterClosed {
+			return err
+		}
 	}
-	failure := &writerFailure{
-		err: fmt.Errorf("%w: background flush: %w", ErrWriterFailed, cause),
-	}
-	if w.backgroundFailure.CompareAndSwap(nil, failure) {
-		return failure.err
-	}
-	return w.backgroundError()
+	w.transitionLocked(0, writerFailed, fmt.Errorf("%w: background flush: %w", ErrWriterFailed, cause))
+	return w.statusError(w.state.status)
 }
 
 // takeFlushBatchLocked returns pending work that may contain mutations at or
@@ -651,19 +742,23 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		SSTable:     *pending.sstable,
 		ChangeBatch: pending.changeBatch,
 	})
-	if !w.manifestLog.WriterFenceObservedActive(w.fenceToken) {
-		// Reconciliation can prove the pending commit succeeded after a
-		// successor claimed the writer fence. Preserve success for that commit,
-		// but make this writer terminal before it accepts or uploads more work.
-		w.fenced.Store(true)
-	}
+	fenced := !w.manifestLog.WriterFenceObservedActive(w.fenceToken)
 	if appendErr != nil {
-		if isFenceError(appendErr) {
-			w.fenced.Store(true)
+		if fenced || isFenceError(appendErr) {
+			w.transition(0, writerFenced, nil)
 		}
 		return fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
+	// One memtable committed: its last sequence, not the writer's counter,
+	// which counts mutations still in memory. Reconciliation can prove the
+	// commit succeeded after a successor claimed the writer fence: record the
+	// commit and the fencing as one transition, so the commit stays a success.
+	status := writerOpen
+	if fenced {
+		status = writerFenced
+	}
+	w.transition(pending.sstable.SeqHi, status, nil)
 
 	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
 		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
@@ -721,9 +816,14 @@ func (w *writer) flushLoop() {
 		if isFenceError(err) {
 			slog.Error("isledb: writer fenced, stopping background flush",
 				"component", "writer", "epoch", w.epoch)
+			w.transition(0, writerFenced, nil)
 			return
 		}
-		notifyErr = err
+		// The loop stops, so the writer must be final: never open with
+		// nothing flushing.
+		w.mu.Lock()
+		notifyErr = w.recordBackgroundFailureLocked(err)
+		w.mu.Unlock()
 		return
 	}
 }
@@ -733,20 +833,55 @@ func (w *writer) close(ctx context.Context) error {
 		return err
 	}
 
-	if w.closed.CompareAndSwap(false, true) {
+	w.transition(0, writerClosing, nil)
+	w.stopOnce.Do(func() {
 		w.cancel()
 		close(w.stopCh)
 		if w.flushTicker != nil {
 			w.flushTicker.Stop()
 		}
-	}
+	})
 	select {
 	case <-w.workerDone:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	return w.flushFinal(ctx)
+	// Only success ends a Closing writer: a failed Close can be retried, and
+	// may still commit what is pending.
+	err := w.flushFinal(ctx)
+	if err == nil {
+		w.transition(0, writerClosed, nil)
+	}
+	return err
+}
+
+// waitCommitted waits until seq is committed, or until the writer reaches a
+// final status without committing it. It reads one consistent snapshot of the
+// writer's state at a time.
+func (w *writer) waitCommitted(ctx context.Context, seq uint64) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	for {
+		w.mu.Lock()
+		state, assigned := w.state, w.seq
+		w.mu.Unlock()
+		if seq > assigned {
+			return fmt.Errorf("isledb: sequence %d has not been assigned; the writer is at %d", seq, assigned)
+		}
+		if state.committed >= seq {
+			return nil
+		}
+		if state.status.final() {
+			return w.statusError(state.status)
+		}
+		select {
+		case <-state.changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (w *writer) closeWithTimeout(timeout time.Duration) error {

@@ -276,7 +276,7 @@ func BenchmarkMaintenanceSchedulerExecution(b *testing.B) {
 		value := make([]byte, 100)
 		for generation := 0; generation < 8; generation++ {
 			for key := 0; key < 100; key++ {
-				if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%016d", key)), value); err != nil {
+				if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%016d", key)), value); err != nil {
 					b.Fatal(err)
 				}
 			}

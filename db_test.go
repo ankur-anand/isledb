@@ -362,7 +362,7 @@ func TestDBWriterTerminalFailureReleasesReservationOnClose(t *testing.T) {
 		t.Fatalf("OpenWriter: %v", err)
 	}
 	writerRef.Store(writer)
-	if err := writer.Put(ctx, []byte("a"), []byte("v")); err != nil {
+	if _, err := writer.Put(ctx, []byte("a"), []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	select {
@@ -468,7 +468,7 @@ func TestDBCloseClosesHandles(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if !writer.w.closed.Load() {
+	if writerStatus(writer.w.statusNow.Load()) != writerClosed {
 		t.Fatal("expected writer to be closed by DB.Close")
 	}
 	if !maintenance.closed.Load() {

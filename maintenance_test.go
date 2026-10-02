@@ -536,7 +536,7 @@ func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
 	if head.Pending != nil {
 		t.Fatalf("pending=%+v, want nil", head.Pending)
 	}
-	if err := firstWriter.Put(ctx, []byte("stale"), []byte("writer")); err != nil {
+	if _, err := firstWriter.Put(ctx, []byte("stale"), []byte("writer")); err != nil {
 		t.Fatalf("old writer Put: %v", err)
 	}
 	if err := firstWriter.Flush(ctx); !errors.Is(err, manifest.ErrFenced) {

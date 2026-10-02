@@ -262,7 +262,7 @@ func writeArtifactCacheTestBatches(
 	}
 	for _, batch := range batches {
 		for key, value := range batch {
-			if err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+			if _, err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
 				t.Fatalf("put %q: %v", key, err)
 			}
 		}

@@ -42,7 +42,7 @@ func runReplayFiltersStaleEntriesAfterNewFenceClaimMultiPhase(t *testing.T, stor
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("key-%03d", i)
 		val := fmt.Sprintf("value-%03d", i)
-		if err := writer1.put(ctx, []byte(key), []byte(val)); err != nil {
+		if _, err := writer1.put(ctx, []byte(key), []byte(val)); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}

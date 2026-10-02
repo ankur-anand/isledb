@@ -78,7 +78,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := writer.Put(ctx, []byte("hello"), []byte("world")); err != nil {
+	if _, err := writer.Put(ctx, []byte("hello"), []byte("world")); err != nil {
 		return err
 	}
 	if err := writer.Flush(ctx); err != nil {

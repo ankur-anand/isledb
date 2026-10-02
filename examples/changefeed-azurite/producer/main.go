@@ -98,14 +98,14 @@ func run() (retErr error) {
 			return fmt.Errorf("encode customer: %w", err)
 		}
 		key := fmt.Appendf(nil, "customers/%06d", id)
-		if err := writer.Put(ctx, key, value); err != nil {
+		if _, err := writer.Put(ctx, key, value); err != nil {
 			return fmt.Errorf("put customer %d: %w", id, err)
 		}
 		pending++
 
 		if revision%10 == 0 {
 			deleteID := int((revision/10-1)%uint64(*customerCount)) + 1
-			if err := writer.Delete(ctx, fmt.Appendf(nil, "customers/%06d", deleteID)); err != nil {
+			if _, err := writer.Delete(ctx, fmt.Appendf(nil, "customers/%06d", deleteID)); err != nil {
 				return fmt.Errorf("delete customer %d: %w", deleteID, err)
 			}
 			pending++

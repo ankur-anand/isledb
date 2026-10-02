@@ -128,7 +128,7 @@ func TestS3E2E_WriteCompactRead(t *testing.T) {
 			n := batch*recordsPerBatch + i
 			key := fmt.Sprintf("key:%06d", n)
 			value := []byte(fmt.Sprintf("value:%06d:%064d", n, n))
-			if err := writer.Put(ctx, []byte(key), value); err != nil {
+			if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 				t.Fatalf("put %s: %v", key, err)
 			}
 			expected[key] = append([]byte(nil), value...)
@@ -231,7 +231,7 @@ func TestS3E2E_ChangeReaderPaging(t *testing.T) {
 		t.Fatalf("open writer: %v", err)
 	}
 	for i := 0; i < 257; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%04d", i)), []byte(fmt.Sprintf("value-%04d", i))); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%04d", i)), []byte(fmt.Sprintf("value-%04d", i))); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
@@ -303,14 +303,14 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 		"updated": "version-1",
 		"deleted": "delete-me",
 	} {
-		if err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put %s: %v", key, err)
 		}
 	}
-	if err := writer.PutWithTTL(ctx, []byte("ttl-expired"), []byte("expires"), 100*time.Millisecond); err != nil {
+	if _, err := writer.PutWithTTL(ctx, []byte("ttl-expired"), []byte("expires"), 100*time.Millisecond); err != nil {
 		t.Fatalf("put ttl-expired: %v", err)
 	}
-	if err := writer.PutWithTTL(ctx, []byte("ttl-live"), []byte("still-live"), time.Hour); err != nil {
+	if _, err := writer.PutWithTTL(ctx, []byte("ttl-live"), []byte("still-live"), time.Hour); err != nil {
 		t.Fatalf("put ttl-live: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -325,13 +325,13 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 	assertReaderValue(t, ctx, reader, "updated", "version-1", true)
 	assertReaderValue(t, ctx, reader, "deleted", "delete-me", true)
 
-	if err := writer.Put(ctx, []byte("updated"), []byte("version-2")); err != nil {
+	if _, err := writer.Put(ctx, []byte("updated"), []byte("version-2")); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+	if _, err := writer.Delete(ctx, []byte("deleted")); err != nil {
 		t.Fatalf("delete key: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("new"), []byte("new-value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("new"), []byte("new-value")); err != nil {
 		t.Fatalf("put new key: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -460,14 +460,14 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("key:1"), []byte("value:1")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key:1"), []byte("value:1")); err != nil {
 		t.Fatalf("put key:1: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
 		t.Fatalf("flush key:1: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	if err := writer.Put(ctx, []byte("key:2"), []byte("value:2")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key:2"), []byte("value:2")); err != nil {
 		t.Fatalf("put key:2: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {
@@ -580,7 +580,7 @@ func BenchmarkS3E2E_WriteFlushWithCompactor(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := []byte(fmt.Sprintf("bench:%09d", i))
 		value := []byte(fmt.Sprintf("value:%09d:%064d", i, i))
-		if err := writer.Put(ctx, key, value); err != nil {
+		if _, err := writer.Put(ctx, key, value); err != nil {
 			b.Fatalf("put: %v", err)
 		}
 		if i%64 == 63 {

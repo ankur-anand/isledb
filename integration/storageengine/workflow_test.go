@@ -808,12 +808,12 @@ func applyStorageMutations(
 		switch mutation.operation {
 		case isledb.ChangePut:
 			if mutation.ttl > 0 {
-				err = writer.PutWithTTL(ctx, mutation.key, mutation.value, mutation.ttl)
+				_, err = writer.PutWithTTL(ctx, mutation.key, mutation.value, mutation.ttl)
 			} else {
-				err = writer.Put(ctx, mutation.key, mutation.value)
+				_, err = writer.Put(ctx, mutation.key, mutation.value)
 			}
 		case isledb.ChangeDelete:
-			err = writer.Delete(ctx, mutation.key)
+			_, err = writer.Delete(ctx, mutation.key)
 		default:
 			err = fmt.Errorf("unsupported operation %s", mutation.operation)
 		}

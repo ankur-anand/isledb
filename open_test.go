@@ -19,7 +19,7 @@ func TestOpenOwnsBucketAndSupportsReadWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {
@@ -98,7 +98,7 @@ func TestOpenBucketRejectsMissingCurrentWithExistingDatabaseObjects(t *testing.T
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := writer.Close(ctx); err != nil {

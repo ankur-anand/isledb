@@ -80,7 +80,7 @@ func BenchmarkDB_Put_Sequential(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -107,7 +107,7 @@ func BenchmarkDB_Put_Random(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%016d", rng.Int63())
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -141,7 +141,7 @@ func BenchmarkDB_Put_ValueSizes(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				key := fmt.Sprintf("key-%016d", i)
-				if err := writer.Put(ctx, []byte(key), value); err != nil {
+				if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 					b.Fatalf("Put: %v", err)
 				}
 			}
@@ -171,7 +171,7 @@ func BenchmarkDB_Put_WithFlush(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 		if (i+1)%flushEvery == 0 {
@@ -196,7 +196,7 @@ func BenchmarkDB_Get_Sequential(b *testing.B) {
 	value := make([]byte, 100)
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -241,7 +241,7 @@ func BenchmarkDB_Get_Random(b *testing.B) {
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
 		keys[i] = fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -287,7 +287,7 @@ func BenchmarkDB_Get_NotFound(b *testing.B) {
 	value := make([]byte, 100)
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -333,7 +333,7 @@ func BenchmarkDB_Get_MultipleSSTs(b *testing.B) {
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
 		keys[i] = fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 		if i%100 == 99 {
@@ -386,7 +386,7 @@ func BenchmarkDB_Get_AfterCompaction(b *testing.B) {
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
 		keys[i] = fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 		if i%100 == 99 {
@@ -452,7 +452,7 @@ func BenchmarkDB_Scan_Full(b *testing.B) {
 	value := make([]byte, 100)
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -497,7 +497,7 @@ func BenchmarkDB_Scan_Range(b *testing.B) {
 	value := make([]byte, 100)
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -557,7 +557,7 @@ func benchmarkMixedWorkload(b *testing.B, readPercent int) {
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
 		keys[i] = fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(keys[i]), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -591,7 +591,7 @@ func benchmarkMixedWorkload(b *testing.B, readPercent int) {
 		} else {
 			key := fmt.Sprintf("key-%016d", writeIdx)
 			writeIdx++
-			if err := writer.Put(ctx, []byte(key), value); err != nil {
+			if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 				b.Fatalf("Put: %v", err)
 			}
 			pendingKeys = append(pendingKeys, key)
@@ -639,7 +639,7 @@ func BenchmarkWriter_Put(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -660,7 +660,7 @@ func BenchmarkWriter_Flush(b *testing.B) {
 
 	for i := 0; i < 1000; i++ {
 		key := fmt.Sprintf("key-%016d", i)
-		if err := writer.Put(ctx, []byte(key), value); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -671,7 +671,7 @@ func BenchmarkWriter_Flush(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < 100; j++ {
 			key := fmt.Sprintf("key-%016d-%d", i, j)
-			if err := writer.Put(ctx, []byte(key), value); err != nil {
+			if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 				b.Fatalf("Put: %v", err)
 			}
 		}
@@ -707,7 +707,7 @@ func BenchmarkCompactor_L0Promotion(b *testing.B) {
 		for j := 0; j < 8; j++ {
 			for k := 0; k < 100; k++ {
 				key := fmt.Sprintf("key-%016d-%d", j, k)
-				if err := writer.Put(ctx, []byte(key), value); err != nil {
+				if _, err := writer.Put(ctx, []byte(key), value); err != nil {
 					b.Fatalf("Put: %v", err)
 				}
 			}
@@ -775,7 +775,7 @@ func BenchmarkCompactor_L0Rewrite(b *testing.B) {
 		value := make([]byte, 100)
 		for flush := 0; flush < 8; flush++ {
 			for key := 0; key < 100; key++ {
-				if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%016d", key)), value); err != nil {
+				if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%016d", key)), value); err != nil {
 					b.Fatal(err)
 				}
 			}

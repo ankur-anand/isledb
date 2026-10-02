@@ -1089,7 +1089,7 @@ func prepareFakeS3KVBenchmarkDB(
 	}
 	values := benchmarkChangeFeedValues(records, valueSize, true)
 	for i := 0; i < records; i++ {
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
 			b.Fatalf("put %d: %v", i, err)
 		}
 	}

@@ -63,7 +63,7 @@ func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open writer: %v", err)
 		}
-		if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+		if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		if err := writer.Flush(ctx); err != nil {
@@ -113,13 +113,13 @@ func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 			t.Fatalf("open writer: %v", err)
 		}
 		largeValue := benchmarkChangeFeedValues(1, 4<<10, true)[0]
-		if err := writer.PutWithTTL(ctx, []byte("stored"), largeValue, time.Hour); err != nil {
+		if _, err := writer.PutWithTTL(ctx, []byte("stored"), largeValue, time.Hour); err != nil {
 			t.Fatalf("put large value: %v", err)
 		}
-		if err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
+		if _, err := writer.Put(ctx, []byte("empty"), []byte{}); err != nil {
 			t.Fatalf("put empty value: %v", err)
 		}
-		if err := writer.Delete(ctx, []byte("deleted")); err != nil {
+		if _, err := writer.Delete(ctx, []byte("deleted")); err != nil {
 			t.Fatalf("delete: %v", err)
 		}
 		if err := writer.Flush(ctx); err != nil {
@@ -223,7 +223,7 @@ func TestS3E2E_ChangeFeedPayloadModes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open reopened writer: %v", err)
 		}
-		if err := writer.Put(ctx, []byte("after-reopen"), []byte("still-omitted")); err != nil {
+		if _, err := writer.Put(ctx, []byte("after-reopen"), []byte("still-omitted")); err != nil {
 			t.Fatalf("put after reopen: %v", err)
 		}
 		if err := writer.Flush(ctx); err != nil {
@@ -403,13 +403,13 @@ func TestS3E2E_ChangeReaderManifestRotationAndRestart(t *testing.T) {
 	for batch := 0; batch < flushes; batch++ {
 		key := []byte(fmt.Sprintf("key-%03d", batch))
 		value := []byte(fmt.Sprintf("value-%03d", batch))
-		if err := writer.Put(ctx, key, value); err != nil {
+		if _, err := writer.Put(ctx, key, value); err != nil {
 			t.Fatalf("put batch %d: %v", batch, err)
 		}
 		expected = append(expected, expectedChange{operation: ChangePut, key: string(key), value: string(value)})
 
 		ttlKey := []byte(fmt.Sprintf("ttl-%03d", batch))
-		if err := writer.PutWithTTL(ctx, ttlKey, value, time.Hour); err != nil {
+		if _, err := writer.PutWithTTL(ctx, ttlKey, value, time.Hour); err != nil {
 			t.Fatalf("put TTL batch %d: %v", batch, err)
 		}
 		expected = append(expected, expectedChange{
@@ -419,7 +419,7 @@ func TestS3E2E_ChangeReaderManifestRotationAndRestart(t *testing.T) {
 			hasTTL:    true,
 		})
 
-		if err := writer.Delete(ctx, key); err != nil {
+		if _, err := writer.Delete(ctx, key); err != nil {
 			t.Fatalf("delete batch %d: %v", batch, err)
 		}
 		expected = append(expected, expectedChange{operation: ChangeDelete, key: string(key)})
@@ -600,7 +600,7 @@ func writeSingleChangeBatch(t testing.TB, ctx context.Context, db *DB, records, 
 		if len(values[i]) >= 8 {
 			binary.BigEndian.PutUint64(values[i], uint64(i))
 		}
-		if err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
+		if _, err := writer.Put(ctx, []byte(fmt.Sprintf("key-%08d", i)), values[i]); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}

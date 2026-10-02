@@ -38,7 +38,7 @@ func TestSSTDeletionPlanEndToEndUsesOneWriterPublication(t *testing.T) {
 
 	writeAndFlush := func(key, value string) {
 		t.Helper()
-		if err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+		if _, err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
 			t.Fatalf("put %q: %v", key, err)
 		}
 		if err := writer.Flush(ctx); err != nil {
@@ -674,7 +674,7 @@ func TestMaintenanceKeepsCompactionPendingWhenPlanHandoffFails(t *testing.T) {
 		t.Fatalf("open writer: %v", err)
 	}
 	defer writer.Close(ctx)
-	if err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
+	if _, err := writer.Put(ctx, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := writer.Flush(ctx); err != nil {

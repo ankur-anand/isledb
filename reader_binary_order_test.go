@@ -31,7 +31,7 @@ func TestReaderBinaryKeyOrdering(t *testing.T) {
 	for index := len(keys) - 1; index >= 0; index-- {
 		value := fmt.Appendf(nil, "value-%02d", index)
 		values[string(keys[index])] = value
-		if err := writer.put(ctx, keys[index], value); err != nil {
+		if _, err := writer.put(ctx, keys[index], value); err != nil {
 			t.Fatalf("put key %x: %v", keys[index], err)
 		}
 	}
