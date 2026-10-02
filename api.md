@@ -120,9 +120,14 @@ func run(ctx context.Context) error {
 }
 ```
 
-`Open` uses [Go Cloud bucket URLs](https://gocloud.dev/howto/blob/). Typical
-schemes include `s3://`, `gs://`, `azblob://`, and `file://`. Provider
-credentials come from the corresponding Go Cloud driver and cloud SDK.
+`Open` uses [Go Cloud bucket URLs](https://gocloud.dev/howto/blob/). Supported
+production schemes are `s3://`, `gs://`, and `azblob://`. Provider credentials
+come from the corresponding Go Cloud driver and cloud SDK.
+
+`file://` and `mem://` buckets are for development and tests only. They lack
+atomic conditional writes, which IsleDB relies on to fence writers and commit
+safely, so never point more than one process at one, and never use them in
+production.
 
 ## Open and close a database
 
