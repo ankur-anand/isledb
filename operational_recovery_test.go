@@ -25,7 +25,7 @@ type operationalCASStorage struct {
 	*manifest.BlobStoreBackend
 
 	mu                    sync.Mutex
-	failBeforeNext        error
+	failAll               error
 	failAfterNext         error
 	conflictsPerCommit    int
 	conflictsRemaining    int
@@ -38,8 +38,7 @@ func (s *operationalCASStorage) WriteCurrentCAS(
 	expectedETag string,
 ) (string, error) {
 	s.mu.Lock()
-	if err := s.failBeforeNext; err != nil {
-		s.failBeforeNext = nil
+	if err := s.failAll; err != nil {
 		s.mu.Unlock()
 		return "", err
 	}
@@ -67,9 +66,10 @@ func (s *operationalCASStorage) WriteCurrentCAS(
 	return etag, nil
 }
 
-func (s *operationalCASStorage) failBeforeNextCAS(err error) {
+// failAllCAS fails every later CURRENT write before it applies.
+func (s *operationalCASStorage) failAllCAS(err error) {
 	s.mu.Lock()
-	s.failBeforeNext = err
+	s.failAll = err
 	s.mu.Unlock()
 }
 
@@ -122,25 +122,25 @@ func TestOperationalRecovery_RestartAfterUnpublishedBackgroundFlush(t *testing.T
 		t.Fatalf("flush stable value: %v", err)
 	}
 
-	faults.failBeforeNextCAS(errOperationalPublishFailure)
+	faults.failAllCAS(errOperationalPublishFailure)
 	if _, err := writer.Put(ctx, []byte("uncommitted"), []byte("must-not-appear")); err != nil {
 		t.Fatalf("put uncommitted value: %v", err)
 	}
 
 	select {
 	case err := <-backgroundErr:
-		if !errors.Is(err, ErrWriterFailed) || !errors.Is(err, errOperationalPublishFailure) {
-			t.Fatalf("background error=%v, want writer failure wrapping injected failure", err)
+		if !errors.Is(err, errOperationalPublishFailure) {
+			t.Fatalf("background error=%v, want %v", err, errOperationalPublishFailure)
 		}
 	case <-ctx.Done():
 		t.Fatalf("wait for background failure: %v", ctx.Err())
 	}
-	if err := writer.Close(ctx); !errors.Is(err, ErrWriterFailed) {
-		t.Fatalf("close failed writer error=%v, want %v", err, ErrWriterFailed)
+	// The store stays down, so Close fails and the writer is abandoned with
+	// its write uncommitted, as a crashed process would leave it.
+	if err := writer.Close(ctx); !errors.Is(err, errOperationalPublishFailure) {
+		t.Fatalf("close error=%v, want %v", err, errOperationalPublishFailure)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close first db: %v", err)
-	}
+	_ = db.Close() // fails the same way; it releases the DB's own resources
 
 	liveBeforeRestart := replayManifestForTest(t, ctx, store)
 	physicalBeforeRestart, err := store.ListSSTFiles(ctx)

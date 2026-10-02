@@ -20,6 +20,11 @@ type WriterMetrics struct {
 	// storage and visible to readers. A writer sets it on open from the
 	// manifest, then after each memtable it commits.
 	CommittedSequence prometheus.Gauge
+
+	// OldestUncommitted is the Unix time the oldest write not yet committed
+	// was accepted, or 0 when every write is committed: time() minus it is how
+	// long writes have waited to become durable.
+	OldestUncommitted prometheus.Gauge
 }
 
 func (m *WriterMetrics) incCounter(counter prometheus.Counter) {
@@ -67,6 +72,19 @@ func (m *WriterMetrics) ObserveDelete() {
 	m.incCounter(m.DeleteTotal)
 }
 
+// ObserveOldestUncommitted records when the oldest uncommitted write was
+// accepted; the zero time means none is uncommitted.
+func (m *WriterMetrics) ObserveOldestUncommitted(at time.Time) {
+	if m == nil || m.OldestUncommitted == nil {
+		return
+	}
+	if at.IsZero() {
+		m.OldestUncommitted.Set(0)
+		return
+	}
+	m.OldestUncommitted.Set(float64(at.UnixNano()) / 1e9)
+}
+
 // ObserveCommittedSequence records the highest change sequence committed.
 func (m *WriterMetrics) ObserveCommittedSequence(seq uint64) {
 	if m == nil || m.CommittedSequence == nil {
@@ -97,6 +115,13 @@ func (m *WriterMetrics) ObserveFlush(d time.Duration, err error) {
 
 func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 	return &WriterMetrics{
+		OldestUncommitted: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "oldest_uncommitted_timestamp_seconds",
+			Help:        "Unix time the oldest write not yet committed was accepted; 0 when all are committed.",
+			ConstLabels: constLabels,
+		}),
 		CommittedSequence: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   "isledb",
 			Subsystem:   "writer",

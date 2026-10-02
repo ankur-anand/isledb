@@ -598,11 +598,8 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	if firstErr == nil {
 		t.Fatalf("expected flush error")
 	}
-	if errors.Is(firstErr, ErrWriterFailed) {
-		t.Fatalf("explicit flush failure must remain retryable: %v", firstErr)
-	}
-	if err := w.backgroundError(); err != nil {
-		t.Fatalf("explicit flush stored terminal error: %v", err)
+	if got := writerStatus(w.statusNow.Load()); got != writerOpen {
+		t.Fatalf("status after a failed flush=%v, want open", got)
 	}
 
 	w.mu.Lock()
@@ -1004,7 +1001,10 @@ func TestWriter_ReconciledCommitMarksSupersededWriterFenced(t *testing.T) {
 	}
 }
 
-func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
+// TestWriter_BackgroundFlushFailureIsRetried fails one background commit
+// before it applies: the failure is reported, the commit stays queued, and
+// the loop retries it without the writer being rebuilt.
+func TestWriter_BackgroundFlushFailureIsRetried(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-background-failure")
 	defer store.Close()
@@ -1026,74 +1026,86 @@ func TestWriter_BackgroundFlushFailureIsTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
+	defer w.close(ctx)
+	seq, err := w.put(ctx, []byte("a"), []byte("v"))
+	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
-	var terminalErr error
 	select {
-	case terminalErr = <-callback:
+	case err := <-callback:
+		if !errors.Is(err, rootCause) {
+			t.Fatalf("background error=%v, want %v", err, rootCause)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("background flush failure was not reported")
 	}
-	if !errors.Is(terminalErr, ErrWriterFailed) {
-		t.Fatalf("background error=%v, want %v", terminalErr, ErrWriterFailed)
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted after a retried commit: %v", err)
 	}
-	if !errors.Is(terminalErr, rootCause) {
-		t.Fatalf("background error=%v, want root cause %v", terminalErr, rootCause)
+	if got := writerStatus(w.statusNow.Load()); got != writerOpen {
+		t.Fatalf("status after recovery=%v, want open", got)
 	}
-	select {
-	case <-w.workerDone:
-	default:
-		t.Fatal("flush worker still running when OnFlushError was delivered")
-	}
-	// Drain any tick that raced with Stop, then verify no new ticks arrive.
-	select {
-	case <-w.flushTicker.C:
-	default:
-	}
-	select {
-	case <-w.flushTicker.C:
-		t.Fatal("flush ticker remained active after terminal background failure")
-	case <-time.After(10 * time.Millisecond):
+	if w.commitFailures.failing() {
+		t.Fatal("the failure run did not end after the retry succeeded")
 	}
 
-	w.mu.Lock()
-	seqBefore := w.seq
-	pending := w.pendingMemtables
-	w.mu.Unlock()
-	if pending != 1 {
-		t.Fatalf("pending memtables after background failure=%d, want=1", pending)
+	// The writer keeps working.
+	seq, err = w.put(ctx, []byte("b"), []byte("v"))
+	if err != nil {
+		t.Fatalf("put after recovery: %v", err)
 	}
-
-	operations := []struct {
-		name string
-		call func() error
-	}{
-		{name: "put", call: func() error { _, err := w.put(ctx, []byte("b"), []byte("v")); return err }},
-		{name: "delete", call: func() error { _, err := w.delete(ctx, []byte("a")); return err }},
-		{name: "flush", call: func() error { return w.flush(ctx) }},
-	}
-	for _, operation := range operations {
-		err := operation.call()
-		if err != terminalErr {
-			t.Fatalf("%s error=%v, want stored error %v", operation.name, err, terminalErr)
-		}
-	}
-	w.mu.Lock()
-	seqAfter := w.seq
-	w.mu.Unlock()
-	if seqAfter != seqBefore {
-		t.Fatalf("terminal operations advanced seq: before=%d after=%d", seqBefore, seqAfter)
-	}
-
-	if err := w.close(ctx); err != terminalErr {
-		t.Fatalf("close error=%v, want stored error %v", err, terminalErr)
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted after recovery: %v", err)
 	}
 	select {
 	case err := <-callback:
-		t.Fatalf("OnFlushError called more than once: %v", err)
+		t.Fatalf("OnFlushError called again for one failure: %v", err)
 	default:
+	}
+}
+
+// TestWriter_BackgroundLostResponseCommits applies a background commit and
+// loses its response: the retry finds the commit, and the waiter is told it
+// committed, once.
+func TestWriter_BackgroundLostResponseCommits(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-background-lost-response")
+	defer store.Close()
+
+	lost := errors.New("injected lost response")
+	storage := &applyThenFailOnceStorage{
+		Storage:     manifest.NewBlobStoreBackend(store),
+		failOnWrite: 3,
+		failErr:     lost,
+	}
+	opts := testWriterOptions(1<<20, 0)
+	opts.Flush.Interval = 20 * time.Millisecond
+	opts.OnFlushError = func(error) {}
+	ms := manifest.NewStoreWithStorage(storage)
+	w, err := newWriter(ctx, store, ms, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	seq, err := w.put(ctx, []byte("a"), []byte("v"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted for an applied commit whose response was lost: %v", err)
+	}
+	if got := writerStatus(w.statusNow.Load()); got != writerOpen {
+		t.Fatalf("status=%v, want open", got)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	m, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if got := len(m.AllSSTIDs()); got != 1 {
+		t.Fatalf("live SSTs=%d, want 1: the commit applied twice", got)
 	}
 }
 
@@ -1137,11 +1149,11 @@ func TestWriter_OnFlushErrorCanClose(t *testing.T) {
 
 	select {
 	case got := <-result:
-		if !errors.Is(got.flushErr, ErrWriterFailed) || !errors.Is(got.flushErr, rootCause) {
-			t.Fatalf("callback flush error=%v", got.flushErr)
+		if !errors.Is(got.flushErr, rootCause) {
+			t.Fatalf("callback flush error=%v, want %v", got.flushErr, rootCause)
 		}
-		if got.closeErr != got.flushErr {
-			t.Fatalf("Close error=%v, want callback error %v", got.closeErr, got.flushErr)
+		if got.closeErr != nil {
+			t.Fatalf("Close from the callback: %v", got.closeErr)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnFlushError calling Close deadlocked")

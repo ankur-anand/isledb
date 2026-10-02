@@ -115,9 +115,14 @@ func DefaultSSTOutputOptions() SSTOutputOptions {
 // other.
 //
 // If WriterOptions.Flush.Interval is greater than zero, the Writer also runs a
-// background flush loop. An unobserved background flush failure makes the
-// Writer terminal. The callback, later mutations, Flush, and Close all observe
-// the same ErrWriterFailed value wrapping the original cause.
+// background flush loop. A commit that fails, in the background or in Flush or
+// Close, stays queued and is retried; the next attempt finds a commit that was
+// applied before its response was lost, so nothing commits twice. The only
+// failure that ends a Writer is losing its fence to another writer
+// (ErrFenced). Background failures are reported through
+// WriterOptions.OnFlushError. A failure that cannot succeed until an operator
+// acts, such as missing permissions, is also retried, and never fails the
+// Writer on its own: alert on OnFlushError or the oldest-uncommitted gauge.
 type Writer struct {
 	w           *writer
 	releaseOnce sync.Once
@@ -157,13 +162,12 @@ func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error) {
 // object storage, where readers that refresh see them.
 //
 // It does not flush: the mutation commits with the next background flush,
-// Flush or Close, so concurrent callers share one commit. It returns the
-// writer's error once the writer can no longer commit seq: ErrFenced after
-// another writer took over, or ErrWriterFailed after a background flush
-// failed. Without a background flush interval, committing is the caller's
-// Flush or Close, and WaitCommitted waits for one or for the context. A Close
-// that fails can be retried and may still commit seq, so until a Close
-// succeeds, WaitCommitted keeps waiting, bounded by the context.
+// Flush or Close, so concurrent callers share one commit. It returns nil once
+// seq is committed; ErrFenced once another writer took over, so seq was not
+// committed and never will be; or the context's error, which means the outcome
+// is not yet known: a failed commit is retried, and seq may still commit.
+// Without a background flush interval, committing is the caller's Flush or
+// Close.
 func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error {
 	return w.w.waitCommitted(ctx, seq)
 }
@@ -185,11 +189,12 @@ func (w *Writer) Flush(ctx context.Context) error {
 
 // Close stops background flushing and synchronously flushes pending writes.
 //
-// Close returns the first close or flush error it observes. After Close returns,
-// the Writer cannot be used again.
+// Close makes one attempt to commit what is pending and returns its error. A
+// failed Close leaves the writes queued and can be retried. After Close
+// starts, the Writer accepts no more writes.
 func (w *Writer) Close(ctx context.Context) error {
 	err := w.w.close(ctx)
-	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) {
 		w.releaseWriter()
 	}
 	return err
@@ -197,7 +202,7 @@ func (w *Writer) Close(ctx context.Context) error {
 
 func (w *Writer) closeDB() error {
 	err := w.w.closeWithTimeout(30 * time.Second)
-	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) {
 		w.releaseWriter()
 	}
 	return err
