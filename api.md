@@ -1395,6 +1395,7 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrInvalidMutation` | Empty or oversized key, oversized value, or negative TTL |
 | `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or arena configuration |
 | `ErrWriterClosed` | Operation attempted after writer close |
+| `ErrFenced` | Another writer took over; this writer commits nothing more |
 | `ErrNilContext` | A nil context was supplied |
 
 ### Reader and snapshots

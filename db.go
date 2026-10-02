@@ -30,6 +30,11 @@ var ErrChangeFeedPayloadMismatch = manifest.ErrChangeFeedPayloadMismatch
 // needed to prove whether that commit succeeded.
 var ErrCommitIndeterminate = manifest.ErrCommitIndeterminate
 
+// ErrFenced is returned once another writer has taken over the writer fence:
+// the fenced Writer commits nothing more, so a write WaitCommitted reports
+// ErrFenced for was not committed and never will be.
+var ErrFenced = manifest.ErrFenced
+
 // ErrManifestUnavailable is returned when a database that has already been
 // initialized loses its manifest/CURRENT root. Operations fail closed rather
 // than publishing or serving an empty replacement database.
