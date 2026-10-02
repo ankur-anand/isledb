@@ -32,8 +32,9 @@ IsleDB requires Go 1.25 or newer.
 
 ## Quick start
 
-This example uses a local file-backed bucket. `Put` buffers the mutation and
-`Flush` makes it durable and visible to readers.
+This example uses an Amazon S3 bucket; credentials come from the standard AWS
+environment (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, an instance role, and so on).
+`Put` buffers the mutation and `Flush` makes it durable and visible to readers.
 
 ```go
 package main
@@ -42,7 +43,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/ankur-anand/isledb"
@@ -55,15 +55,7 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	dataDir, err := filepath.Abs("./isledb-data")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return err
-	}
-
-	db, err := isledb.Open(ctx, "file://"+dataDir, isledb.DBOptions{
+	db, err := isledb.Open(ctx, "s3://my-bucket?region=us-east-1", isledb.DBOptions{
 		Prefix: "example",
 	})
 	if err != nil {
@@ -123,6 +115,12 @@ The same API works with cloud bucket URLs:
 Credentials and provider-specific options come from the corresponding
 [Go Cloud bucket driver](https://gocloud.dev/howto/blob/). Use a unique prefix
 for each database.
+
+> **Local stores are for development only.** `file://` and `mem://` buckets
+> work for local experiments and tests, but they cannot provide the atomic
+> conditional writes that IsleDB relies on to fence writers and commit safely.
+> Do not run more than one process against them, and do not use them in
+> production. Use S3, Google Cloud Storage, or Azure Blob Storage.
 
 ## Behavior to know
 

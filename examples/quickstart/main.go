@@ -34,6 +34,9 @@ func run() (retErr error) {
 		return fmt.Errorf("resolve data directory: %w", err)
 	}
 
+	// A local file:// bucket keeps this example self-contained. It is for
+	// development only: production databases need S3, GCS, or Azure Blob
+	// Storage, which provide the atomic conditional writes IsleDB relies on.
 	db, err := isledb.Open(ctx, "file://"+absDataDir, isledb.DBOptions{Prefix: "quickstart"})
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
