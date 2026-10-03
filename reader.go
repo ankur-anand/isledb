@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -59,12 +60,16 @@ type Reader struct {
 	viewLoadedAt time.Time
 	// refreshFailures counts refreshes failed since the view was loaded, and
 	// staleSince is when the first of them failed; see refreshFailed.
-	refreshFailures        int
-	staleSince             time.Time
-	version                Version
-	changeFeed             bool
-	changeHead             ChangeCursor
-	viewPolicy             ReaderViewPolicy
+	refreshFailures int
+	staleSince      time.Time
+	version         Version
+	changeFeed      bool
+	changeHead      ChangeCursor
+	viewPolicy      ReaderViewPolicy
+	// refreshGrid is this reader's first refresh time: its open time plus a
+	// random phase. Refreshes fall on refreshGrid + k*RefreshAfter and retries
+	// on refreshGrid + k*retry period (see nextOnGrid). Set once at open.
+	refreshGrid            time.Time
 	viewRefreshAt          time.Time
 	viewExpiresAt          time.Time
 	viewDue                atomic.Bool
@@ -111,7 +116,10 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		}
 	}()
 
-	viewRefreshAt := viewLoadedAt.Add(viewPolicy.RefreshAfter)
+	// A random phase in (0, RefreshAfter] spreads readers opened together,
+	// by a deploy, evenly across the interval for good.
+	refreshGrid := viewLoadedAt.Add(time.Duration(rand.Int64N(int64(viewPolicy.RefreshAfter))) + 1)
+	viewRefreshAt := refreshGrid
 	current := ms.CurrentData()
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
@@ -126,6 +134,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		viewLoadedAt:   viewLoadedAt,
 		refreshTimeout: backgroundRefreshTimeout,
 		viewPolicy:     viewPolicy,
+		refreshGrid:    refreshGrid,
 		viewRefreshAt:  viewRefreshAt,
 		viewExpiresAt:  viewExpiresAt,
 		diskCache:      disk,
@@ -321,12 +330,31 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	return nil
 }
 
+// nextOnGrid returns the first point of this reader's refresh grid,
+// refreshGrid + k*period for an integer k, after the given time. Scheduling on
+// a fixed grid with a random phase keeps readers spread out: each refreshes
+// exactly once a period, at its own offset, and nothing (a forced Refresh, a
+// failure, a slow reload) moves it into step with others. The next point is
+// at most period away, so a view is never older than RefreshAfter.
+func (r *Reader) nextOnGrid(after time.Time, period time.Duration) time.Time {
+	n := after.Sub(r.refreshGrid) / period
+	next := r.refreshGrid.Add(n * period)
+	for !next.After(after) {
+		next = next.Add(period)
+	}
+	for prev := next.Add(-period); prev.After(after); prev = next.Add(-period) {
+		next = prev
+	}
+	return next
+}
+
 // refreshRetryAfter is how long after a failed refresh the next is tried,
 // or RefreshAfter if that is shorter: reads meanwhile are answered from the
 // still valid view without reaching object storage.
 const refreshRetryAfter = 30 * time.Second
 
-// refreshFailed reschedules the next refresh, refreshRetryAfter later, and
+// refreshFailed reschedules the next refresh, about refreshRetryAfter later on
+// the reader's own schedule, and
 // logs the failure, at most once a minute. Reads of a view that has not expired
 // are answered from it meanwhile; reads of an expired view fail until a
 // refresh succeeds, which the retries keep trying in the background. A view
@@ -344,7 +372,10 @@ func (r *Reader) refreshFailed(err error) {
 		return
 	}
 	r.stale.Store(true)
-	retryAt := now.Add(min(refreshRetryAfter, r.viewPolicy.RefreshAfter))
+	// Retries keep the reader's phase, so readers that failed together, in
+	// an outage, retry and recover at their own offsets rather than in step.
+	retryPeriod := min(refreshRetryAfter, r.viewPolicy.RefreshAfter)
+	retryAt := r.nextOnGrid(now.Add(retryPeriod/2), retryPeriod)
 	// The timer wakes at the earlier of the two times; once expired, only
 	// the retry is ahead.
 	wakeExpiry := expiresAt
@@ -400,7 +431,7 @@ func (r *Reader) publishManifestView(
 	viewLoadedAt time.Time,
 ) (bool, uint64) {
 	changeFeed, changeHead := readerChangeFeedState(current)
-	refreshAt := viewLoadedAt.Add(r.viewPolicy.RefreshAfter)
+	refreshAt := r.nextOnGrid(viewLoadedAt, r.viewPolicy.RefreshAfter)
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
 	// Manifest states and SST IDs are immutable after publication. Swap the view

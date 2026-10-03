@@ -320,8 +320,8 @@ func TestReaderServesValidViewWhenRefreshFails(t *testing.T) {
 	reader.mu.RLock()
 	retryIn := reader.viewRefreshAt.Sub(failedAt)
 	reader.mu.RUnlock()
-	if retryIn < refreshRetryAfter-time.Second || retryIn > refreshRetryAfter+time.Second {
-		t.Fatalf("next refresh in %v, want about %v", retryIn, refreshRetryAfter)
+	if retryIn < refreshRetryAfter/2-time.Second || retryIn > refreshRetryAfter*3/2+time.Second {
+		t.Fatalf("next refresh in %v, want within [%v, %v]", retryIn, refreshRetryAfter/2, refreshRetryAfter*3/2)
 	}
 
 	storage.setFail(nil)
@@ -349,8 +349,8 @@ func TestReaderRefreshRetryFollowsShortRefreshAfter(t *testing.T) {
 	reader.mu.RLock()
 	retryIn := reader.viewRefreshAt.Sub(failedAt)
 	reader.mu.RUnlock()
-	if retryIn < 4*time.Second || retryIn > 6*time.Second {
-		t.Fatalf("next refresh in %v, want about 5s", retryIn)
+	if retryIn < 2*time.Second || retryIn > 8*time.Second {
+		t.Fatalf("next refresh in %v, want within [2.5s, 7.5s]", retryIn)
 	}
 }
 
@@ -530,4 +530,120 @@ func TestReaderExpiredViewRecoversInBackground(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	assertReaderHasB(t, ctx, reader)
+}
+
+// TestReaderRefreshGridSpreadsReaders opens several readers at the same
+// moment, as a deploy would: each gets its own phase, so their first refreshes
+// differ, and each first refresh comes within RefreshAfter of opening.
+func TestReaderRefreshGridSpreadsReaders(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-refresh-grid")
+	defer store.Close()
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("1")},
+	}, 0, 1)
+
+	const refreshAfter = time.Minute
+	offsets := map[time.Duration]bool{}
+	for i := 0; i < 8; i++ {
+		reader, err := newReader(ctx, store, readerOptions{
+			CacheDir:   t.TempDir(),
+			ViewPolicy: ReaderViewPolicy{RefreshAfter: refreshAfter},
+		})
+		if err != nil {
+			t.Fatalf("newReader: %v", err)
+		}
+		reader.mu.RLock()
+		wait := reader.viewRefreshAt.Sub(reader.viewLoadedAt)
+		reader.mu.RUnlock()
+		_ = reader.Close()
+		if wait <= 0 || wait > refreshAfter {
+			t.Fatalf("reader %d first refreshes %v after opening, want within (0, %v]", i, wait, refreshAfter)
+		}
+		offsets[wait] = true
+	}
+	if len(offsets) == 1 {
+		t.Fatal("every reader got the same phase")
+	}
+}
+
+// TestReaderRefreshGridKeepsPhase reloads at, between, and long after grid
+// points, and fails a refresh: the next refresh is always the next point of
+// the reader's grid, so a forced refresh or a failure never moves its phase.
+func TestReaderRefreshGridKeepsPhase(t *testing.T) {
+	const period = time.Minute
+	origin := time.Now()
+	r := &Reader{refreshGrid: origin}
+	for _, tc := range []struct {
+		after time.Duration
+		want  time.Duration
+	}{
+		{after: -30 * time.Second, want: 0},
+		{after: -period - time.Second, want: -period},
+		{after: 0, want: period},
+		{after: time.Millisecond, want: period},
+		{after: 59 * time.Second, want: period},
+		{after: period, want: 2 * period},
+		{after: 10*period + 7*time.Second, want: 11 * period},
+	} {
+		got := r.nextOnGrid(origin.Add(tc.after), period).Sub(origin)
+		if got != tc.want {
+			t.Errorf("nextOnGrid(origin%+v) = origin%+v, want origin%+v", tc.after, got, tc.want)
+		}
+	}
+}
+
+// TestReaderRefreshRetryKeepsPhase fails refreshes of two readers at the same
+// moment: each retries on its own phase, not in step, between half and one
+// and a half retry periods later.
+func TestReaderRefreshRetryKeepsPhase(t *testing.T) {
+	_, a, storageA, _, _ := newRefreshTestReader(t)
+	_, b, storageB, _, _ := newRefreshTestReader(t)
+	now := time.Now()
+	a.refreshGrid = now.Add(3 * time.Second)
+	b.refreshGrid = now.Add(17 * time.Second)
+	storageA.setFail(errors.New("object storage unavailable"))
+	storageB.setFail(errors.New("object storage unavailable"))
+	fireViewTimer(a)
+	fireViewTimer(b)
+
+	retryAt := func(r *Reader) time.Time {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.viewRefreshAt
+	}
+	for name, r := range map[string]*Reader{"a": a, "b": b} {
+		at := retryAt(r)
+		if wait := at.Sub(now); wait < refreshRetryAfter/2-time.Second || wait > refreshRetryAfter*3/2+time.Second {
+			t.Errorf("reader %s retries after %v, want within [%v, %v]", name, wait, refreshRetryAfter/2, refreshRetryAfter*3/2)
+		}
+		if off := at.Sub(r.refreshGrid) % refreshRetryAfter; off != 0 {
+			t.Errorf("reader %s retry is %v off its grid", name, off)
+		}
+	}
+	if retryAt(a).Equal(retryAt(b)) {
+		t.Error("readers that failed together retry at the same moment")
+	}
+}
+
+// TestReaderForcedRefreshKeepsPhase forces a Refresh between grid points: the
+// view's next background refresh stays on the reader's grid.
+func TestReaderForcedRefreshKeepsPhase(t *testing.T) {
+	ctx, reader, _, store, ms := newRefreshTestReader(t)
+	reader.refreshGrid = time.Now().Add(7 * time.Second)
+	commitKeyB(t, ctx, store, ms)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	reader.mu.RLock()
+	next, loaded := reader.viewRefreshAt, reader.viewLoadedAt
+	reader.mu.RUnlock()
+	period := reader.viewPolicy.RefreshAfter
+	if off := next.Sub(reader.refreshGrid) % period; off != 0 {
+		t.Fatalf("next refresh is %v off the reader's grid", off)
+	}
+	if wait := next.Sub(loaded); wait <= 0 || wait > period {
+		t.Fatalf("next refresh %v after the load, want within (0, %v]", wait, period)
+	}
 }
