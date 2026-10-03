@@ -19,9 +19,10 @@ const (
 type ReaderViewPolicy struct {
 	// RefreshAfter is how often the Reader refreshes its manifest view in the
 	// background. Reads never wait for a refresh; they use the last view
-	// published. A failed refresh is retried after 30 seconds, or RefreshAfter
-	// if shorter. Zero selects one minute; values under one second are
-	// rejected.
+	// published. A failed refresh is retried about every 30 seconds, or RefreshAfter
+	// if shorter. Each Reader refreshes on its own fixed schedule, offset by a
+	// random phase chosen at open, so readers started together do not refresh
+	// in step. Zero selects one minute; values under one second are rejected.
 	RefreshAfter time.Duration
 }
 

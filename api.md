@@ -437,11 +437,23 @@ never gets that old. A read waits for a refresh only if the view has expired,
 and fails if that refresh fails; background refreshes keep being retried
 after expiry, so reads work again as soon as object storage answers.
 
+Each reader refreshes on its own fixed schedule: at open it picks a random
+offset within `Views.RefreshAfter`, then refreshes exactly once per interval
+at that offset, so its view is never older than `Views.RefreshAfter`. Readers
+started together by a deploy are spread evenly across the interval, and stay
+spread: a forced `Refresh` or a failure does not move a reader's schedule.
+Retries after a failure follow the same offset on a 30-second schedule, so
+readers that failed together in an outage recover at their own offsets, not
+all at once. N readers read CURRENT a steady N / `Views.RefreshAfter` times a
+second. Opening is the exception: a reader loads its first view as it opens,
+so readers opened in the same moment read CURRENT together once.
+
 A background refresh that fails, or does not finish within 30 seconds, for
 example while object storage is unavailable or hangs, leaves the loaded view
 in place. Reads keep being answered from it and count in the
-`stale_reads_total` metric. The next refresh is tried after 30 seconds, or
-after `Views.RefreshAfter` if that is shorter; reads in between do not reach
+`stale_reads_total` metric. The next refresh is tried about 30 seconds later
+(15 to 45, on the reader's own schedule), or about `Views.RefreshAfter` if that
+is shorter; reads in between do not reach
 object storage. A warning is logged at most once a minute while this lasts,
 and an info message once a refresh succeeds again. During an outage, reads
 can therefore be up to `MaxPinnedViewAge` old.
