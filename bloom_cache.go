@@ -1,46 +1,39 @@
 package isledb
 
 import (
-	"container/list"
-	"sync"
+	"sync/atomic"
 )
 
 const (
 	defaultBloomCacheSize = 64 << 20
-	// Account for the cache entry, list node, map bucket share, string header,
-	// and filter slice header in addition to the filter's bit array.
-	// The exact Go heap cost is runtime-dependent, so the cache deliberately
-	// uses a conservative fixed allowance per entry.
+	// Account for the cache entry, map bucket share, string header, and
+	// filter slice header in addition to the filter's bit array. The exact
+	// Go heap cost is runtime-dependent, so the cache deliberately uses a
+	// conservative fixed allowance per entry.
 	bloomCacheEntryOverhead = 128
 )
 
 type bloomCacheEntry struct {
-	id     string
 	filter sstBloomFilter
 	bytes  int64
 }
 
 // bloomFilterCache bounds loaded bloom filters by their accounted heap cost.
 // Eviction is safe because every filter can be reloaded from its immutable SST
-// sidecar on the next point lookup.
+// sidecar on the next point lookup. Lookups take no lock (see clockCache).
 type bloomFilterCache struct {
-	mu       sync.Mutex
+	entries  *clockCache[bloomCacheEntry]
 	maxBytes int64
-	bytes    int64
-	entries  map[string]*list.Element
-	lru      list.List
-	hits     int64
-	misses   int64
+	bytes    atomic.Int64 // changed only by writers, under entries.mu
+	hits     atomic.Int64
+	misses   atomic.Int64
 }
 
 func newBloomFilterCache(maxBytes int64) *bloomFilterCache {
 	if maxBytes <= 0 {
 		maxBytes = defaultBloomCacheSize
 	}
-	return &bloomFilterCache{
-		maxBytes: maxBytes,
-		entries:  make(map[string]*list.Element),
-	}
+	return &bloomFilterCache{entries: newClockCache[bloomCacheEntry](), maxBytes: maxBytes}
 }
 
 func (c *bloomFilterCache) get(id string) (sstBloomFilter, bool) {
@@ -57,20 +50,18 @@ func (c *bloomFilterCache) lookup(id string, record bool) (sstBloomFilter, bool)
 	if c == nil {
 		return sstBloomFilter{}, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	element, ok := c.entries[id]
-	if !ok {
-		if record {
-			c.misses++
+	e, ok := c.entries.get(id)
+	if record {
+		if ok {
+			c.hits.Add(1)
+		} else {
+			c.misses.Add(1)
 		}
+	}
+	if !ok {
 		return sstBloomFilter{}, false
 	}
-	if record {
-		c.hits++
-	}
-	c.lru.MoveToBack(element)
-	return element.Value.(*bloomCacheEntry).filter, true
+	return e.value.filter, true
 }
 
 func (c *bloomFilterCache) put(id string, filter sstBloomFilter) {
@@ -79,65 +70,59 @@ func (c *bloomFilterCache) put(id string, filter sstBloomFilter) {
 	}
 	bytes := bloomFilterCacheCost(id, filter)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if existing := c.entries[id]; existing != nil {
-		c.removeElement(existing)
+	txn := c.entries.begin()
+	defer txn.commit()
+	if existing, ok := txn.lookup(id); ok {
+		txn.remove(existing)
+		c.bytes.Add(-existing.value.bytes)
 	}
 	if bytes > c.maxBytes {
 		return
 	}
-	for c.bytes+bytes > c.maxBytes && c.lru.Len() > 0 {
-		c.removeElement(c.lru.Front())
+	for c.bytes.Load()+bytes > c.maxBytes {
+		evicted := txn.victim()
+		if evicted == nil {
+			break
+		}
+		c.bytes.Add(-evicted.value.bytes)
 	}
-	entry := &bloomCacheEntry{id: id, filter: filter, bytes: bytes}
-	c.entries[id] = c.lru.PushBack(entry)
-	c.bytes += bytes
+	txn.insert(id, bloomCacheEntry{filter: filter, bytes: bytes})
+	c.bytes.Add(bytes)
 }
 
 func (c *bloomFilterCache) delete(id string) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.removeElement(c.entries[id])
+	txn := c.entries.begin()
+	defer txn.commit()
+	if existing, ok := txn.lookup(id); ok {
+		txn.remove(existing)
+		c.bytes.Add(-existing.value.bytes)
+	}
 }
 
 func (c *bloomFilterCache) clear() {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	clear(c.entries)
-	c.lru.Init()
-	c.bytes = 0
+	txn := c.entries.begin()
+	defer txn.commit()
+	txn.removeAll()
+	c.bytes.Store(0)
 }
 
 func (c *bloomFilterCache) stats() CacheStats {
 	if c == nil {
 		return CacheStats{}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return CacheStats{
-		Hits:       c.hits,
-		Misses:     c.misses,
-		Bytes:      c.bytes,
+		Hits:       c.hits.Load(),
+		Misses:     c.misses.Load(),
+		Bytes:      c.bytes.Load(),
 		MaxBytes:   c.maxBytes,
-		EntryCount: len(c.entries),
+		EntryCount: c.entries.len(),
 	}
-}
-
-func (c *bloomFilterCache) removeElement(element *list.Element) {
-	if element == nil {
-		return
-	}
-	entry := element.Value.(*bloomCacheEntry)
-	delete(c.entries, entry.id)
-	c.bytes -= entry.bytes
-	c.lru.Remove(element)
 }
 
 func bloomFilterCacheCost(id string, filter sstBloomFilter) int64 {

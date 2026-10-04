@@ -33,7 +33,7 @@ func testOpenSST(t *testing.T, id string) *openSST {
 
 func closed(s *openSST) bool { return s.closed.Load() }
 
-func TestOpenSSTCache_LRUAndReferences(t *testing.T) {
+func TestOpenSSTCache_ClockAndReferences(t *testing.T) {
 	c := newOpenSSTCache(2)
 	add := func(id string) *openSST {
 		s := testOpenSST(t, id)
@@ -43,14 +43,14 @@ func TestOpenSSTCache_LRUAndReferences(t *testing.T) {
 
 	a := add("a")
 	b := add("b")
-	if s := c.acquire("a"); s == nil { // a is now the most recently used
+	if s := c.acquire("a"); s == nil { // a has been read since it was cached; b has not
 		t.Fatal("a not cached")
 	} else {
 		s.unref()
 	}
 	cs := add("c")
 	if !closed(b) || closed(a) {
-		t.Fatalf("adding c closed a=%t b=%t, want the least recently used, b", closed(a), closed(b))
+		t.Fatalf("adding c closed a=%t b=%t, want b, the SST not read since it was cached", closed(a), closed(b))
 	}
 
 	// An SST in use when evicted stays open until its last user is done.
@@ -62,7 +62,7 @@ func TestOpenSSTCache_LRUAndReferences(t *testing.T) {
 	if !closed(cs) || !closed(dup) || closed(d) {
 		t.Fatalf("closed c=%t duplicate=%t d=%t, want true, true, false", closed(cs), closed(dup), closed(d))
 	}
-	if _, ok := c.entries["a"]; ok {
+	if c.isOpen("a") {
 		t.Fatal("a still cached after two newer adds")
 	}
 	if closed(a) {

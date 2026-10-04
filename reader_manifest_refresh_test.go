@@ -19,8 +19,8 @@ func TestPublishManifestViewDoesNotConsultBloomCache(t *testing.T) {
 
 	// Manifest publication must not scan or invalidate the independently bounded
 	// decoded-Bloom cache.
-	reader.bloomCache.mu.Lock()
-	defer reader.bloomCache.mu.Unlock()
+	reader.bloomCache.entries.mu.Lock()
+	defer reader.bloomCache.entries.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
