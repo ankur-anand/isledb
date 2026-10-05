@@ -616,7 +616,7 @@ func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, mainte
 
 		for i, pending := range toFlush {
 			start := time.Now()
-			err := w.flushPending(ctx, pending)
+			status, err := w.flushPending(ctx, pending)
 			w.metrics.ObserveFlush(time.Since(start), err)
 			if err != nil {
 				w.mu.Lock()
@@ -629,6 +629,11 @@ func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, mainte
 			w.noteMemtableCommittedLocked()
 			w.mu.Unlock()
 			w.reportRecovery(&w.commitFailures)
+			// Record the commit last: a waiter it wakes finds the memtable's
+			// slot free, the oldest-uncommitted gauge advanced and any failure
+			// run over, so a Put right after WaitCommitted is not refused for
+			// space the commit has already freed.
+			w.transition(pending.sstable.SeqHi, status)
 		}
 	}
 }
@@ -745,7 +750,11 @@ func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 	return toFlush
 }
 
-func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error {
+// flushPending uploads and commits one memtable. On success it returns the
+// status the commit leaves the writer in, open or, for a commit reconciled
+// after a successor took the fence, fenced; the caller records it, with the
+// commit, once its own bookkeeping is done.
+func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (writerStatus, error) {
 	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: w.sstOutput.BloomBitsPerKey,
 		BlockSize:       w.sstOutput.BlockBytes,
@@ -803,20 +812,20 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 			pending.changes = nil
 		}
 		if groupErr != nil {
-			return groupErr
+			return 0, groupErr
 		}
 	} else {
 		if needSST {
 			result, err := buildSST(ctx)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			pending.sstable = &result.Meta
 		}
 		if needChangeBatch {
 			result, err := buildChangeBatch(ctx)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			pending.changeBatch = &result.Meta
 			pending.changes = nil
@@ -833,7 +842,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		if fenced || isFenceError(appendErr) {
 			w.transition(0, writerFenced)
 		}
-		return fmt.Errorf("update manifest: %w", appendErr)
+		return 0, fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
 	// One memtable committed: its last sequence, not the writer's counter,
@@ -844,11 +853,10 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	if fenced {
 		status = writerFenced
 	}
-	w.transition(pending.sstable.SeqHi, status)
 
 	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
 		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
-	return nil
+	return status, nil
 }
 
 func writePendingChangeBatch(
