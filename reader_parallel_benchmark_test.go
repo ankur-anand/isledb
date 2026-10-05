@@ -49,12 +49,17 @@ func BenchmarkReaderWarmGetParallel(b *testing.B) {
 		}
 	}
 
+	// Keys are made before timing, so allocations counted are the lookup's.
+	lookupKeys := make([][]byte, keys)
+	for i := range lookupKeys {
+		lookupKeys[i] = benchKey(i)
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
-			if _, _, err := reader.Get(ctx, benchKey(rng.Intn(keys))); err != nil {
+			if _, _, err := reader.Get(ctx, lookupKeys[rng.Intn(keys)]); err != nil {
 				b.Error(err)
 				return
 			}

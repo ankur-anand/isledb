@@ -49,6 +49,9 @@ type Reader struct {
 	cacheDir      string
 
 	lifecycleMu sync.RWMutex
+	// endRead is lifecycleMu.RUnlock, made once: beginRead returns it, and a
+	// method value made on every read would allocate.
+	endRead     func()
 	iteratorsMu sync.Mutex
 	iterators   map[*Iterator]struct{}
 	mu          sync.RWMutex
@@ -146,6 +149,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:       opts.CacheDir,
 		metrics:        opts.Metrics,
 	}
+	reader.endRead = reader.lifecycleMu.RUnlock
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
 	cleanupDiskCache = false
@@ -336,16 +340,18 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 // exactly once a period, at its own offset, and nothing (a forced Refresh, a
 // failure, a slow reload) moves it into step with others. The next point is
 // at most period away, so a view is never older than RefreshAfter.
+//
+// A reader without a grid, built directly rather than opened, schedules one
+// period after after.
 func (r *Reader) nextOnGrid(after time.Time, period time.Duration) time.Time {
-	n := after.Sub(r.refreshGrid) / period
-	next := r.refreshGrid.Add(n * period)
-	for !next.After(after) {
-		next = next.Add(period)
+	if r.refreshGrid.IsZero() {
+		return after.Add(period)
 	}
-	for prev := next.Add(-period); prev.After(after); prev = next.Add(-period) {
-		next = prev
+	offset := after.Sub(r.refreshGrid) % period
+	if offset < 0 {
+		offset += period // after is before the grid's origin
 	}
-	return next
+	return after.Add(period - offset)
 }
 
 // refreshRetryAfter is how long after a failed refresh the next is tried,
@@ -611,6 +617,9 @@ func (r *Reader) beginRead() (func(), error) {
 		r.lifecycleMu.RUnlock()
 		return nil, ErrReaderClosed
 	}
+	if r.endRead != nil {
+		return r.endRead, nil
+	}
 	return r.lifecycleMu.RUnlock, nil
 }
 
@@ -718,10 +727,10 @@ func (r *Reader) Get(ctx context.Context, key []byte) (value []byte, found bool,
 	}
 
 	m, _, expiresAt := r.currentManifestState()
-	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, expiresAt, ErrReadViewExpired)
+	defer readCtx.release()
 	value, found, err = r.getWithManifest(readCtx, m, key)
-	return value, found, readViewError(readCtx, err)
+	return value, found, readCtx.err(err)
 }
 
 func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []byte) ([]byte, bool, error) {
@@ -784,10 +793,10 @@ func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) (out []KV, err
 	}
 
 	m, _, expiresAt := r.currentManifestState()
-	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, expiresAt, ErrReadViewExpired)
+	defer readCtx.release()
 	out, err = r.scanInternalWithManifest(readCtx, m, minKey, maxKey, 0)
-	return out, readViewError(readCtx, err)
+	return out, readCtx.err(err)
 }
 
 // ScanLimit returns at most limit key-value pairs in the half-open range
@@ -809,10 +818,10 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 	}
 
 	m, _, expiresAt := r.currentManifestState()
-	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, expiresAt, ErrReadViewExpired)
+	defer readCtx.release()
 	out, err = r.scanInternalWithManifest(readCtx, m, minKey, maxKey, limit)
-	return out, readViewError(readCtx, err)
+	return out, readCtx.err(err)
 }
 
 func (r *Reader) scanInternalWithManifest(ctx context.Context, m *manifestState, minKey, maxKey []byte, limit int) (out []KV, err error) {

@@ -78,8 +78,8 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		concurrency = defaultPrefetchConcurrency
 	}
 
-	readCtx, cancel := context.WithDeadlineCause(ctx, expiresAt, ErrReadViewExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, expiresAt, ErrReadViewExpired)
+	defer readCtx.release()
 
 	var bytesRead atomic.Int64
 	g, gctx := errgroup.WithContext(readCtx)
@@ -99,7 +99,7 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	}
 	stats.BytesRead = bytesRead.Load()
 	if err != nil {
-		return stats, readViewError(readCtx, err)
+		return stats, readCtx.err(err)
 	}
 	return stats, nil
 }
