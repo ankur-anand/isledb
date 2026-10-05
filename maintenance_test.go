@@ -513,7 +513,7 @@ func TestPendingMaintenanceSurvivesWriterReplacement(t *testing.T) {
 		t.Fatalf("OpenWriter(second): %v", err)
 	}
 	defer secondWriter.Close(ctx)
-	if err := secondWriter.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, secondWriter); err != nil {
 		t.Fatalf("second writer Flush: %v", err)
 	}
 	cycle := MaintenanceStats{State: MaintenanceWaitingForWriter}
@@ -572,7 +572,7 @@ func TestNewMaintenanceOwnerClearsReceiptAfterPreviousOwnerStops(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stageCommand: %v", err)
 	}
-	if err := writer.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, writer); err != nil {
 		t.Fatalf("writer Flush: %v", err)
 	}
 	if err := first.Close(ctx); err != nil {
@@ -702,4 +702,12 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal(message)
+}
+
+// flushApplyingMaintenance does at once what the writer's maintenance poller
+// does in the background: it reads maintenance/HEAD, so a command staged just
+// before is applied by this Flush rather than after the poller's next read.
+func flushApplyingMaintenance(ctx context.Context, w *Writer) error {
+	w.w.pollMaintenance(ctx)
+	return w.Flush(ctx)
 }

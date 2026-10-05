@@ -381,9 +381,9 @@ run, then at most once a minute while failures continue. Commit failures and
 maintenance failures are separate runs; each ends at its next success, which
 is logged. It runs on its own goroutine, may call `Close`, and may run after
 `Close` returns, so it must not use anything the caller tears down on close.
-Without it, the writer logs a warning. A failed maintenance poll is retried
-once per `Maintenance.PollInterval`. A caller's own cancellation or deadline
-in `Flush` is returned, not reported.
+Without it, the writer logs a warning. A failed or timed-out maintenance poll
+is retried at the next `Maintenance.PollInterval`. A caller's own cancellation
+or deadline in `Flush` is returned, not reported.
 
 Errors are never final, so the callback is for alerting. That includes errors
 that cannot succeed until someone acts: missing permissions, a deleted
@@ -1008,8 +1008,14 @@ reclamation workers  -> delete retired objects at bounded independent rates
 
 Compaction, checkpointing, and logical change-feed retention stage fenced
 commands. The active writer publishes or rejects those commands through its
-normal `CURRENT` update path. A separate writer process discovers commands at
-`WriterOptions.Maintenance.PollInterval`, which defaults to one second.
+normal `CURRENT` update path. A separate writer process discovers commands
+with a background poller that reads `maintenance/HEAD` every
+`WriterOptions.Maintenance.PollInterval` (default one second), each read
+bounded to 5 seconds. The next flush applies a fetched command, in order with
+data commits; `Flush` never reads the mailbox itself, so a slow or hung
+mailbox does not delay commits. `Close` reads the mailbox once more, bounded
+by its context, so a command staged just before shutdown is not left behind.
+A command that a later command has already superseded is skipped.
 
 Physical SST, change-feed, snapshot, and manifest-page deletion proceeds in
 independently paced reclamation lanes. Slow object deletion does not hold the

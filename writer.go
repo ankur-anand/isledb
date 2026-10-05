@@ -60,12 +60,17 @@ type writer struct {
 	activeSince  time.Time
 	pendingSince []time.Time
 
-	flushMu             sync.Mutex
-	flushTicker         *time.Ticker
-	maintenanceWake     <-chan struct{}
-	nextMaintenancePoll time.Time
-	stopCh              chan struct{}
-	workerDone          chan struct{}
+	flushMu         sync.Mutex
+	flushTicker     *time.Ticker
+	maintenanceWake <-chan struct{}
+	// stagedMaintenance is a maintenance command the poller has read from
+	// maintenance/HEAD and the next flush applies; nil when there is none.
+	stagedMaintenance atomic.Pointer[manifest.MaintenanceCommand]
+	// applyWake asks the flush loop to apply a newly fetched command.
+	applyWake  chan struct{}
+	pollerDone chan struct{}
+	stopCh     chan struct{}
+	workerDone chan struct{}
 
 	fenceToken *manifest.FenceToken
 	metrics    *WriterMetrics
@@ -194,6 +199,8 @@ func newWriterWithMaintenanceWake(
 		maintenanceWake: maintenanceWake,
 		stopCh:          make(chan struct{}),
 		workerDone:      make(chan struct{}),
+		applyWake:       make(chan struct{}, 1),
+		pollerDone:      make(chan struct{}),
 		fenceToken:      token,
 		metrics:         opts.Metrics,
 	}
@@ -206,6 +213,7 @@ func newWriterWithMaintenanceWake(
 	w.committed.Store(w.seq)
 	w.metrics.ObserveCommittedSequence(w.seq)
 
+	go w.maintenancePollLoop()
 	if opts.Flush.Interval > 0 {
 		w.flushTicker = time.NewTicker(opts.Flush.Interval)
 		go w.flushLoop()
@@ -552,19 +560,22 @@ func (w *writer) flushBackground(ctx context.Context) error {
 }
 
 func (w *writer) flushMaintenanceBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, true, true)
+	return w.flushInternal(ctx, false, true)
 }
 
 func (w *writer) flushFinal(ctx context.Context) error {
 	return w.flushInternal(ctx, true, false)
 }
 
-// flushInternal applies any pending maintenance command, then commits the
-// queued memtables oldest first. A memtable that fails to commit stays at the
-// head of the queue; the next attempt reconciles it, so a commit applied
-// before its response was lost is found, not repeated. Only losing the fence
-// is final. A maintenance failure is reported and does not hold up commits.
-func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, maintenanceOnly bool) error {
+// flushInternal applies the maintenance command the poller has fetched, if
+// any, then commits the queued memtables oldest first. A memtable that fails
+// to commit stays at the head of the queue; the next attempt reconciles it,
+// so a commit applied before its response was lost is found, not repeated.
+// Only losing the fence is final. A maintenance failure is reported and does
+// not hold up commits, and a flush never waits to read the maintenance
+// mailbox, except Close, which reads it once, bounded, so a command staged
+// just before shutdown is not left behind.
+func (w *writer) flushInternal(ctx context.Context, pollMaintenance, maintenanceOnly bool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -575,24 +586,11 @@ func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, mainte
 	if writerStatus(w.statusNow.Load()) == writerFenced {
 		return manifest.ErrFenced
 	}
-	if w.consumeMaintenanceWake() {
-		forceMaintenancePoll = true
+	if pollMaintenance {
+		w.pollMaintenance(ctx)
 	}
-	polled, err := w.pollPendingMaintenance(ctx, forceMaintenancePoll)
-	switch {
-	case err == nil:
-		if polled {
-			w.reportRecovery(&w.maintenanceFailures)
-		}
-	case isFenceError(err):
-		w.transition(0, writerFenced)
-		return fmt.Errorf("apply maintenance command: %w", err)
-	case ctx.Err() != nil:
-		// The caller's own cancellation or deadline, not a storage failure.
-		return fmt.Errorf("apply maintenance command: %w", err)
-	default:
-		// Maintenance is retried with the next poll; commits go on.
-		w.reportFailure(&w.maintenanceFailures, fmt.Errorf("apply maintenance command: %w", err))
+	if err := w.applyStagedMaintenance(ctx); err != nil {
+		return err
 	}
 	if maintenanceOnly {
 		// A process-local mailbox wake publishes only the maintenance command.
@@ -638,25 +636,91 @@ func (w *writer) flushInternal(ctx context.Context, forceMaintenancePoll, mainte
 	}
 }
 
-// pollPendingMaintenance applies a staged maintenance command once a poll is
-// due or forced, and reports whether it polled. A failed poll is next due a
-// poll interval later, like a successful one.
-func (w *writer) pollPendingMaintenance(ctx context.Context, force bool) (bool, error) {
-	now := time.Now()
-	if !force && !w.nextMaintenancePoll.IsZero() && now.Before(w.nextMaintenancePoll) {
-		return false, nil
+// minMaintenancePollInterval keeps a tiny PollInterval from turning the
+// poller into a loop of back-to-back mailbox reads.
+const minMaintenancePollInterval = 10 * time.Millisecond
+
+// maintenancePollTimeout bounds one read of maintenance/HEAD: a mailbox that
+// hangs costs the poller this long, never a commit.
+const maintenancePollTimeout = 5 * time.Second
+
+// maintenanceApplyTimeout bounds applying a fetched command, which writes
+// CURRENT: a hung apply delays the flush's data commit by at most this long.
+const maintenanceApplyTimeout = 30 * time.Second
+
+// maintenancePollLoop reads maintenance/HEAD every PollInterval, and at once
+// when maintenance in this process stages a command, until Close. It keeps
+// the mailbox read off the commit path: a flush applies what the poller has
+// fetched and never waits on the mailbox itself.
+func (w *writer) maintenancePollLoop() {
+	defer close(w.pollerDone)
+	ticker := time.NewTicker(max(w.opts.Maintenance.PollInterval, minMaintenancePollInterval))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.stopCh:
+			return
+		case <-ticker.C:
+		case <-w.maintenanceWake:
+		}
+		if writerStatus(w.statusNow.Load()) == writerFenced {
+			return
+		}
+		w.pollMaintenance(w.ctx)
 	}
-	w.nextMaintenancePoll = now.Add(w.opts.Maintenance.PollInterval)
-	_, err := w.manifestLog.ApplyPendingMaintenance(ctx)
-	return true, err
 }
 
-func (w *writer) consumeMaintenanceWake() bool {
+// pollMaintenance reads maintenance/HEAD, bounded by maintenancePollTimeout,
+// and hands a pending command to the next flush, nudging the flush loop to
+// apply it. A failed read is reported and tried again at the next poll.
+func (w *writer) pollMaintenance(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, maintenancePollTimeout)
+	defer cancel()
+	head, _, err := w.manifestLog.ReadMaintenanceHead(ctx)
+	if err != nil {
+		if parent.Err() == nil { // not our own shutdown or caller's deadline
+			w.reportFailure(&w.maintenanceFailures, fmt.Errorf("read maintenance command: %w", err))
+		}
+		return
+	}
+	if head == nil || head.Pending == nil {
+		w.reportRecovery(&w.maintenanceFailures)
+		return
+	}
+	command := *head.Pending
+	w.stagedMaintenance.Store(&command)
 	select {
-	case <-w.maintenanceWake:
-		return true
+	case w.applyWake <- struct{}{}:
 	default:
-		return false
+	}
+}
+
+// applyStagedMaintenance publishes the command the poller fetched, bounded by
+// maintenanceApplyTimeout. A failure other than losing the fence or the
+// caller's own deadline is reported, and the command stays for the next
+// flush; the flush's data commit goes on either way.
+func (w *writer) applyStagedMaintenance(ctx context.Context) error {
+	command := w.stagedMaintenance.Load()
+	if command == nil {
+		return nil
+	}
+	applyCtx, cancel := context.WithTimeout(ctx, maintenanceApplyTimeout)
+	defer cancel()
+	_, err := w.manifestLog.ApplyMaintenanceCommand(applyCtx, *command)
+	switch {
+	case err == nil:
+		w.stagedMaintenance.CompareAndSwap(command, nil)
+		w.reportRecovery(&w.maintenanceFailures)
+		return nil
+	case isFenceError(err):
+		w.transition(0, writerFenced)
+		return fmt.Errorf("apply maintenance command: %w", err)
+	case ctx.Err() != nil:
+		// The caller's own cancellation or deadline, not a storage failure.
+		return fmt.Errorf("apply maintenance command: %w", err)
+	default:
+		w.reportFailure(&w.maintenanceFailures, fmt.Errorf("apply maintenance command: %w", err))
+		return nil
 	}
 }
 
@@ -896,7 +960,7 @@ func (w *writer) flushLoop() {
 			}
 			commit = true
 			err = w.flushBackground(w.ctx)
-		case <-w.maintenanceWake:
+		case <-w.applyWake:
 			// Applies maintenance only, so its result says nothing about
 			// commits: it leaves the backoff alone.
 			err = w.flushMaintenanceBackground(w.ctx)
@@ -936,10 +1000,12 @@ func (w *writer) close(ctx context.Context) error {
 			w.flushTicker.Stop()
 		}
 	})
-	select {
-	case <-w.workerDone:
-	case <-ctx.Done():
-		return ctx.Err()
+	for _, done := range []chan struct{}{w.workerDone, w.pollerDone} {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	// Only success ends a Closing writer: a failed Close can be retried, and

@@ -171,8 +171,14 @@ func (s *toggleMaintenanceStorage) ReadMaintenanceHead(ctx context.Context) ([]b
 		return nil, "", errMaintenanceUnavailable
 	case maintenanceBlock:
 		s.reads.Add(1)
-		<-ctx.Done()
-		return nil, "", ctx.Err()
+		// Hang until the caller gives up or the test brings the mailbox back.
+		for s.mode.Load() == maintenanceBlock {
+			select {
+			case <-ctx.Done():
+				return nil, "", ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		}
 	}
 	return s.Storage.ReadMaintenanceHead(ctx)
 }
@@ -265,42 +271,37 @@ func TestWriterMaintenanceWakeKeepsCommitBackoff(t *testing.T) {
 	}
 }
 
-// TestWriterMaintenanceFailureRunEnds fails maintenance, recovers it, and
-// fails it again: a successful poll ends the run, so the next failure is
-// reported as a new one.
+// TestWriterMaintenanceFailureRunEnds fails the maintenance mailbox read,
+// recovers it, and fails it again: a successful poll ends the run, so the
+// next failure is reported as a new one. The background poller is slowed to
+// once an hour, so the test drives every poll itself.
 func TestWriterMaintenanceFailureRunEnds(t *testing.T) {
 	ctx := context.Background()
 	opts := testWriterOptions(1<<20, 16)
-	opts.Maintenance.PollInterval = time.Nanosecond
+	opts.Maintenance.PollInterval = time.Hour
 	w, storage, reports := newToggleMaintenanceWriter(t, ctx, opts)
 
 	storage.mode.Store(maintenanceFail)
-	if err := w.flush(ctx); err != nil {
-		t.Fatalf("flush with maintenance failing: %v", err)
-	}
+	w.pollMaintenance(ctx)
 	awaitReport(t, reports, errMaintenanceUnavailable)
 	if !w.maintenanceFailures.failing() || w.commitFailures.failing() {
 		t.Fatal("a maintenance failure was not recorded as a maintenance run")
 	}
 
 	storage.mode.Store(maintenanceOK)
-	if err := w.flush(ctx); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
+	w.pollMaintenance(ctx)
 	if w.maintenanceFailures.failing() {
 		t.Fatal("a successful poll did not end the maintenance failure run")
 	}
 
 	storage.mode.Store(maintenanceFail)
-	if err := w.flush(ctx); err != nil {
-		t.Fatalf("flush with maintenance failing again: %v", err)
-	}
+	w.pollMaintenance(ctx)
 	awaitReport(t, reports, errMaintenanceUnavailable)
 }
 
 // TestWriterFailedMaintenancePollBacksOff fails every maintenance poll with
-// a fast flush interval: the mailbox is read once per poll interval, not on
-// every tick.
+// a fast flush interval: the poller reads the mailbox once per poll
+// interval, and flushes, however frequent, do not read it at all.
 func TestWriterFailedMaintenancePollBacksOff(t *testing.T) {
 	ctx := context.Background()
 	opts := testWriterOptions(1<<20, 16)
@@ -317,29 +318,63 @@ func TestWriterFailedMaintenancePollBacksOff(t *testing.T) {
 	assertNoReport(t, reports)
 }
 
-// TestWriterFlushDeadlineIsNotReported runs out a Flush's own deadline
-// during the maintenance poll: Flush returns it, and it is not reported as
-// a writer failure.
-func TestWriterFlushDeadlineIsNotReported(t *testing.T) {
+// TestWriterHungMailboxDoesNotDelayFlush hangs every read of the maintenance
+// mailbox: a Flush still commits its data at once, because flushes never
+// read the mailbox, and a poll cut short by its caller's own deadline is not
+// reported as a writer failure.
+func TestWriterHungMailboxDoesNotDelayFlush(t *testing.T) {
 	ctx := context.Background()
 	opts := testWriterOptions(1<<20, 16)
-	opts.Maintenance.PollInterval = time.Nanosecond
+	opts.Maintenance.PollInterval = 20 * time.Millisecond
 	w, storage, reports := newToggleMaintenanceWriter(t, ctx, opts)
+	// Runs before the writer's Close, so a failure here does not hang Close.
+	t.Cleanup(func() { storage.mode.Store(maintenanceOK) })
 
 	storage.mode.Store(maintenanceBlock)
-	flushCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	defer cancel()
-	if err := w.flush(flushCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("flush err=%v, want %v", err, context.DeadlineExceeded)
+	seq, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	if storage.reads.Load() == 0 {
-		t.Fatal("the flush did not reach the maintenance poll")
+	start := time.Now()
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush with the mailbox hanging: %v", err)
 	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("flush took %v with the mailbox hanging", took)
+	}
+	if err := awaitResult(t, waitAsync(ctx, w, seq)); err != nil {
+		t.Fatalf("WaitCommitted: %v", err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); storage.reads.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("the poller never reached the hanging mailbox")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	w.pollMaintenance(pollCtx)
+	cancel()
 	assertNoReport(t, reports)
-	if w.maintenanceFailures.failing() {
-		t.Fatal("the caller's deadline started a maintenance failure run")
+
+	// The poller's own read gives up after maintenancePollTimeout, is
+	// reported, and the poller goes on: once the mailbox answers, it reads
+	// it again.
+	select {
+	case err := <-reports:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("reported %v, want the poll timing out", err)
+		}
+	case <-time.After(maintenancePollTimeout + 3*time.Second):
+		t.Fatal("the hung poll never timed out")
 	}
 	storage.mode.Store(maintenanceOK)
+	for deadline := time.Now().Add(2 * time.Second); w.maintenanceFailures.failing(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the poller did not recover once the mailbox answered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestWriterCommitRecordedAfterBookkeeping checks the order in which a

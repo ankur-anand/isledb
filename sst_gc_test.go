@@ -709,7 +709,7 @@ func TestMaintenanceKeepsCompactionPendingWhenPlanHandoffFails(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stage removal: %v", err)
 	}
-	if err := writer.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, writer); err != nil {
 		t.Fatalf("publish removal: %v", err)
 	}
 

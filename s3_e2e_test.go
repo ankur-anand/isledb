@@ -628,7 +628,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 			t.Fatalf("read maintenance HEAD(%d): %v", attempt, err)
 		}
 		if head != nil && head.Pending != nil {
-			if err := writer.Flush(ctx); err != nil {
+			if err := flushApplyingMaintenance(ctx, writer); err != nil {
 				t.Fatalf("writer apply maintenance(%d): %v", attempt, err)
 			}
 			continue

@@ -312,3 +312,91 @@ func TestWriterRejectsStaleCheckpointWithDurableReceipt(t *testing.T) {
 		t.Fatalf("current=%+v", current)
 	}
 }
+
+// TestApplyMaintenanceCommandSkipsSupersededCommand applies a compaction,
+// clears it, applies a later compaction of its output, and then hands the
+// writer the first command again, as a slow poll of maintenance/HEAD could.
+// It must change nothing: applying it again would bring back SST c, which the
+// second compaction already replaced.
+func TestApplyMaintenanceCommandSkipsSupersededCommand(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-superseded")
+	defer store.Close()
+	manifestStore := NewStoreWithStorage(NewBlobStoreBackend(store))
+	if _, err := manifestStore.Replay(ctx); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := manifestStore.ClaimWriter(ctx, "writer-1"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	for _, id := range []string{"a", "b"} {
+		if _, err := manifestStore.AppendAddSSTableWithFence(ctx, SSTMeta{ID: id, Level: 0}); err != nil {
+			t.Fatalf("AppendAddSSTableWithFence(%s): %v", id, err)
+		}
+	}
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	stageApplyClear := func(command MaintenanceCommand) MaintenanceCommand {
+		t.Helper()
+		head, err := manifestStore.StageMaintenance(ctx, command, token)
+		if err != nil {
+			t.Fatalf("StageMaintenance(%s): %v", command.ID, err)
+		}
+		staged := *head.Pending
+		if _, err := manifestStore.ApplyMaintenanceCommand(ctx, staged); err != nil {
+			t.Fatalf("ApplyMaintenanceCommand(%s): %v", command.ID, err)
+		}
+		if _, err := manifestStore.ClearMaintenance(ctx, staged.ID, staged.Epoch, staged.Generation, token); err != nil {
+			t.Fatalf("ClearMaintenance(%s): %v", command.ID, err)
+		}
+		return staged
+	}
+	first := stageApplyClear(MaintenanceCommand{
+		ID: "compact-1", Kind: MaintenanceCommandCompaction,
+		Compaction: &CompactionCommand{Payload: CompactionLogPayload{
+			RemoveSSTableIDs: []string{"a", "b"}, SourceLevel: 0, DestinationLevel: 1,
+			AddSSTables: []SSTMeta{{ID: "c", Level: 1}},
+		}, RetiredObjects: []RetiredObject{
+			{Kind: RetiredObjectSST, ID: "a", Key: "sstable/a"},
+			{Kind: RetiredObjectSST, ID: "b", Key: "sstable/b"},
+		}},
+	})
+	stageApplyClear(MaintenanceCommand{
+		ID: "compact-2", Kind: MaintenanceCommandCompaction,
+		Compaction: &CompactionCommand{Payload: CompactionLogPayload{
+			RemoveSSTableIDs: []string{"c"}, SourceLevel: 1, DestinationLevel: 2,
+			AddSSTables: []SSTMeta{{ID: "e", Level: 2}},
+		}, RetiredObjects: []RetiredObject{
+			{Kind: RetiredObjectSST, ID: "c", Key: "sstable/c"},
+		}},
+	})
+
+	before, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	result, err := manifestStore.ApplyMaintenanceCommand(ctx, first)
+	if err != nil {
+		t.Fatalf("ApplyMaintenanceCommand(stale): %v", err)
+	}
+	if result.CommandID != "" {
+		t.Fatalf("stale command applied: %+v", result)
+	}
+	after, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if after.NextSeq != before.NextSeq || after.MaintenanceReceipt.CommandID != "compact-2" {
+		t.Fatalf("stale command changed CURRENT: next_seq %d -> %d, receipt %q",
+			before.NextSeq, after.NextSeq, after.MaintenanceReceipt.CommandID)
+	}
+	m, err := manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if ids := m.AllSSTIDs(); len(ids) != 1 || ids[0] != "e" {
+		t.Fatalf("live SSTs = %v, want only e", ids)
+	}
+}
