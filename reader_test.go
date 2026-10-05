@@ -867,10 +867,7 @@ func TestReader_ChecksumMismatch(t *testing.T) {
 // sstOpenedByID reports whether the reader has opened the SST, which stays in
 // its open-SST cache.
 func (r *Reader) sstOpenedByID(id string) bool {
-	r.openSSTs.mu.Lock()
-	defer r.openSSTs.mu.Unlock()
-	_, ok := r.openSSTs.entries[id]
-	return ok
+	return r.openSSTs.isOpen(id)
 }
 
 // TestReader_OpenIteratorSurvivesDiskCacheRemoval empties the disk cache

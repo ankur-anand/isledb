@@ -647,3 +647,18 @@ func TestReaderForcedRefreshKeepsPhase(t *testing.T) {
 		t.Fatalf("next refresh %v after the load, want within (0, %v]", wait, period)
 	}
 }
+
+// TestReaderRefreshGridWithoutOrigin schedules on a reader built without a
+// grid, as tests build them: one period later, at once. Stepping toward the
+// zero time's grid would take millions of iterations.
+func TestReaderRefreshGridWithoutOrigin(t *testing.T) {
+	r := &Reader{}
+	now := time.Now()
+	start := time.Now()
+	if got := r.nextOnGrid(now, time.Hour); !got.Equal(now.Add(time.Hour)) {
+		t.Fatalf("nextOnGrid without a grid = %v, want %v", got, now.Add(time.Hour))
+	}
+	if took := time.Since(start); took > 10*time.Millisecond {
+		t.Fatalf("nextOnGrid took %v", took)
+	}
+}

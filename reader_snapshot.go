@@ -75,10 +75,10 @@ func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	}
 	defer done()
 
-	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, s.expiresAt, ErrSnapshotExpired)
+	defer readCtx.release()
 	value, found, err := s.reader.getWithManifest(readCtx, s.manifest, key)
-	return value, found, readViewError(readCtx, err)
+	return value, found, readCtx.err(err)
 }
 
 func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error) {
@@ -105,10 +105,10 @@ func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit i
 	}
 	defer done()
 
-	readCtx, cancel := context.WithDeadlineCause(ctx, s.expiresAt, ErrSnapshotExpired)
-	defer cancel()
+	readCtx := withReadDeadline(ctx, s.expiresAt, ErrSnapshotExpired)
+	defer readCtx.release()
 	values, err := s.reader.scanInternalWithManifest(readCtx, s.manifest, minKey, maxKey, limit)
-	return values, readViewError(readCtx, err)
+	return values, readCtx.err(err)
 }
 
 func (s *Snapshot) Close() error {

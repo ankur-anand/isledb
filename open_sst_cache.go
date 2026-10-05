@@ -1,8 +1,6 @@
 package isledb
 
 import (
-	"container/list"
-	"sync"
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -23,6 +21,20 @@ type openSST struct {
 	closed atomic.Bool
 }
 
+// tryRef takes a reference unless the last one is already gone: a reader
+// that is closing, or closed, is never brought back.
+func (s *openSST) tryRef() bool {
+	for {
+		refs := s.refs.Load()
+		if refs <= 0 {
+			return false
+		}
+		if s.refs.CompareAndSwap(refs, refs+1) {
+			return true
+		}
+	}
+}
+
 func (s *openSST) unref() {
 	if s.refs.Add(-1) != 0 {
 		return
@@ -31,17 +43,16 @@ func (s *openSST) unref() {
 	s.closed.Store(true)
 }
 
-// openSSTCache keeps up to max SSTs open, least recently used first out, so a
-// read of a cached SST parses no metadata. An SST leaves the cache when it is
-// evicted or reported corrupt, and closes once the last iterator over it does.
+// openSSTCache keeps up to max SSTs open, evicting with CLOCK, so a read of a
+// cached SST parses no metadata. An SST leaves the cache when it is evicted
+// or reported corrupt, and closes once the last iterator over it does.
+// Lookups take no lock (see clockCache).
 type openSSTCache struct {
-	mu        sync.Mutex
+	entries   *clockCache[*openSST]
 	max       int
-	entries   map[string]*list.Element
-	lru       list.List // *openSST, least recently used first
-	hits      int64
-	misses    int64
-	evictions int64
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
 }
 
 // newOpenSSTCache returns a cache of up to max open SSTs, or nil, which opens
@@ -50,26 +61,26 @@ func newOpenSSTCache(max int) *openSSTCache {
 	if max <= 0 {
 		return nil
 	}
-	return &openSSTCache{max: max, entries: make(map[string]*list.Element)}
+	return &openSSTCache{entries: newClockCache[*openSST](), max: max}
 }
 
 // acquire returns the cached SST with a reference for the caller, or nil.
+//
+// A lookup may find an SST that a writer has just removed from the cache. If
+// the cache's reference was its last, the SST is closing, so tryRef refuses it
+// and acquire reports a miss; otherwise an iterator still holds it open and
+// the caller may use it until it drops its reference.
 func (c *openSSTCache) acquire(id string) *openSST {
 	if c == nil {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	element, ok := c.entries[id]
-	if !ok {
-		c.misses++
+	e, ok := c.entries.get(id)
+	if !ok || !e.value.tryRef() {
+		c.misses.Add(1)
 		return nil
 	}
-	c.hits++
-	c.lru.MoveToBack(element)
-	s := element.Value.(*openSST)
-	s.refs.Add(1)
-	return s
+	c.hits.Add(1)
+	return e.value
 }
 
 // add caches s, which the caller has just opened, and returns it with a
@@ -80,23 +91,27 @@ func (c *openSSTCache) add(s *openSST) *openSST {
 	if c == nil {
 		return s
 	}
-	c.mu.Lock()
-	if element, ok := c.entries[s.id]; ok {
-		existing := element.Value.(*openSST)
-		existing.refs.Add(1)
-		c.lru.MoveToBack(element)
-		c.mu.Unlock()
+	txn := c.entries.begin()
+	if existing, ok := txn.lookup(s.id); ok {
+		// The cache holds a reference to every cached SST, so it is open.
+		existing.value.refs.Add(1)
+		existing.referenced.Store(true)
+		txn.commit()
 		s.unref()
-		return existing
+		return existing.value
+	}
+	var evicted []*openSST
+	for txn.len() >= c.max {
+		e := txn.victim()
+		if e == nil {
+			break
+		}
+		evicted = append(evicted, e.value)
+		c.evictions.Add(1)
 	}
 	s.refs.Add(1) // the cache's reference
-	c.entries[s.id] = c.lru.PushBack(s)
-	var evicted []*openSST
-	for c.lru.Len() > c.max {
-		evicted = append(evicted, c.removeLocked(c.lru.Front()))
-		c.evictions++
-	}
-	c.mu.Unlock()
+	txn.insert(s.id, s)
+	txn.commit()
 	for _, e := range evicted {
 		e.unref()
 	}
@@ -113,14 +128,12 @@ func (c *openSSTCache) drop(s *openSST) {
 	c.removeIf(func(cached *openSST) bool { return cached == s })
 }
 
-// isOpen reports whether id is cached open.
+// isOpen reports whether id is cached open. It takes no lock.
 func (c *openSSTCache) isOpen(id string) bool {
 	if c == nil {
 		return false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.entries[id]
+	_, ok := c.entries.peek(id)
 	return ok
 }
 
@@ -135,38 +148,31 @@ func (c *openSSTCache) removeIf(match func(*openSST) bool) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	var removed []*openSST
-	for element := c.lru.Front(); element != nil; {
-		next := element.Next()
-		if match(element.Value.(*openSST)) {
-			removed = append(removed, c.removeLocked(element))
+	txn := c.entries.begin()
+	var matched []*clockEntry[*openSST]
+	txn.each(func(e *clockEntry[*openSST]) {
+		if match(e.value) {
+			matched = append(matched, e)
 		}
-		element = next
+	})
+	for _, e := range matched {
+		txn.remove(e)
 	}
-	c.mu.Unlock()
-	for _, s := range removed {
-		s.unref()
+	txn.commit()
+	for _, e := range matched {
+		e.value.unref()
 	}
-}
-
-func (c *openSSTCache) removeLocked(element *list.Element) *openSST {
-	s := c.lru.Remove(element).(*openSST)
-	delete(c.entries, s.id)
-	return s
 }
 
 func (c *openSSTCache) stats() CacheStats {
 	if c == nil {
 		return CacheStats{}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return CacheStats{
-		Hits:       c.hits,
-		Misses:     c.misses,
-		EntryCount: c.lru.Len(),
+		Hits:       c.hits.Load(),
+		Misses:     c.misses.Load(),
+		EntryCount: c.entries.len(),
 		MaxEntries: c.max,
-		Evictions:  c.evictions,
+		Evictions:  c.evictions.Load(),
 	}
 }
