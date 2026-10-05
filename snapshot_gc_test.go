@@ -264,7 +264,7 @@ func TestSnapshotCleanerRetirementSurvivesMaintenanceRestart(t *testing.T) {
 		t.Fatalf("OpenMaintenance(first): %v", err)
 	}
 	firstCheckpoint := stageSnapshotCheckpoint(t, ctx, db.manifestStore, first)
-	if err := writer.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, writer); err != nil {
 		t.Fatalf("apply first checkpoint: %v", err)
 	}
 	reconcileSnapshotCheckpoint(t, ctx, first)
@@ -279,7 +279,7 @@ func TestSnapshotCleanerRetirementSurvivesMaintenanceRestart(t *testing.T) {
 	if secondCheckpoint.BaseSnapshot == nil || secondCheckpoint.BaseSnapshot.Path != firstCheckpoint.Snapshot.Path {
 		t.Fatalf("second checkpoint base=%+v, want %q", secondCheckpoint.BaseSnapshot, firstCheckpoint.Snapshot.Path)
 	}
-	if err := writer.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, writer); err != nil {
 		t.Fatalf("apply second checkpoint: %v", err)
 	}
 	if err := first.Close(ctx); err != nil {

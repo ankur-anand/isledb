@@ -153,8 +153,9 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "mailbox-fault-writer"
 	writerOpts.Flush.Interval = 0
-	// A failed poll is next due a poll interval later; poll on every flush.
-	writerOpts.Maintenance.PollInterval = time.Nanosecond
+	// No background mailbox reads to race the armed faults: the test polls
+	// explicitly (flushApplyingMaintenance).
+	writerOpts.Maintenance.PollInterval = time.Hour
 	reported := make(chan error, 4)
 	writerOpts.OnFlushError = func(err error) { reported <- err }
 	writer, err := db.OpenWriter(ctx, writerOpts)
@@ -205,8 +206,8 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 	if phase == "apply" {
 		storage.arm(point)
 		// A maintenance failure does not fail the data commit; it is
-		// reported, and the next flush retries the command.
-		if err := writer.Flush(ctx); err != nil {
+		// reported, and the next poll and flush retry the command.
+		if err := flushApplyingMaintenance(ctx, writer); err != nil {
 			t.Fatalf("writer Flush with maintenance failing: %v", err)
 		}
 		storage.assertFired(t)
@@ -219,7 +220,7 @@ func testMaintenanceMailboxRecovery(t testing.TB, phase string, point mailboxFau
 			t.Fatal("maintenance failure was not reported")
 		}
 	}
-	if err := writer.Flush(ctx); err != nil {
+	if err := flushApplyingMaintenance(ctx, writer); err != nil {
 		t.Fatalf("writer Flush recovery: %v", err)
 	}
 

@@ -1454,8 +1454,10 @@ func TestWriterMaintenancePollIntervalBoundsMailboxReads(t *testing.T) {
 			t.Fatalf("flush(%d): %v", i, err)
 		}
 	}
-	if got := storage.reads.Load(); got != 1 {
-		t.Fatalf("maintenance HEAD reads=%d, want 1 within one poll interval", got)
+	// Flushes never read the mailbox; the poller reads it once per poll
+	// interval, and an hour has not passed.
+	if got := storage.reads.Load(); got != 0 {
+		t.Fatalf("maintenance HEAD reads=%d after 100 flushes, want 0", got)
 	}
 }
 
@@ -1494,12 +1496,22 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 		t.Fatalf("stageCommand: %v", err)
 	}
 
+	// The wake sends the poller to read the mailbox at once, despite the
+	// hour-long poll interval; Flush then applies what it fetched without
+	// reading the mailbox itself.
+	deadline := time.Now().Add(2 * time.Second)
+	for w.w.stagedMaintenance.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the wake did not make the poller read the mailbox")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	readsBeforeFlush := storage.reads.Load()
 	if err := w.Flush(ctx); err != nil {
 		t.Fatalf("Flush after maintenance wake: %v", err)
 	}
-	if got := storage.reads.Load(); got != readsBeforeFlush+1 {
-		t.Fatalf("maintenance HEAD reads=%d, want %d after wake", got, readsBeforeFlush+1)
+	if got := storage.reads.Load(); got != readsBeforeFlush {
+		t.Fatalf("Flush read the maintenance mailbox: reads %d -> %d", readsBeforeFlush, got)
 	}
 
 	current, err := db.manifestStore.ReadCurrentData(ctx)
@@ -1508,6 +1520,10 @@ func TestWriterMaintenanceWakeBypassesPollInterval(t *testing.T) {
 	}
 	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.CommandID != "same-process-wake" {
 		t.Fatalf("maintenance receipt=%+v, want same-process-wake", current.MaintenanceReceipt)
+	}
+	// An applied command is dropped, so later flushes do not apply it again.
+	if staged := w.w.stagedMaintenance.Load(); staged != nil {
+		t.Fatalf("applied command %q still staged", staged.ID)
 	}
 }
 
@@ -1867,6 +1883,7 @@ func TestWriterFlushAppliesPendingMaintenanceWithoutUserData(t *testing.T) {
 		t.Fatalf("StageMaintenance: %v", err)
 	}
 
+	w.pollMaintenance(ctx) // what the background poller does, at once
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1913,6 +1930,7 @@ func TestWriterRejectsInvalidMaintenanceWithoutBecomingTerminal(t *testing.T) {
 		t.Fatalf("StageMaintenance: %v", err)
 	}
 
+	w.pollMaintenance(ctx) // what the background poller does, at once
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush rejected command: %v", err)
 	}
@@ -1937,6 +1955,7 @@ func TestWriterBackgroundFlushPollsMaintenanceWhenIdle(t *testing.T) {
 	manifestStore := newManifestStore(store, nil)
 	opts := DefaultWriterOptions()
 	opts.Flush.Interval = 5 * time.Millisecond
+	opts.Maintenance.PollInterval = 10 * time.Millisecond
 	w, err := newWriter(ctx, store, manifestStore, opts)
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)

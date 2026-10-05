@@ -405,7 +405,20 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 	if head == nil || head.Pending == nil {
 		return MaintenanceApplyResult{}, nil
 	}
-	command := *head.Pending
+	return s.ApplyMaintenanceCommand(ctx, *head.Pending)
+}
+
+// ApplyMaintenanceCommand publishes or rejects a command read from
+// maintenance/HEAD earlier, without reading HEAD again. The command may be
+// stale by the time it is applied: once a command is pending it cannot be
+// replaced, only cleared after its receipt, so a stale command is one already
+// applied, which the receipt shows. Generations only grow, across maintenance
+// fence claims too, so a command older than CURRENT's receipt has been
+// superseded and is skipped; applying it again could repeat a compaction.
+func (s *Store) ApplyMaintenanceCommand(ctx context.Context, command MaintenanceCommand) (MaintenanceApplyResult, error) {
+	if err := s.checkLocalFence(FenceRoleWriter); err != nil {
+		return MaintenanceApplyResult{}, err
+	}
 	if err := command.Validate(); err != nil {
 		return MaintenanceApplyResult{}, err
 	}
@@ -420,6 +433,9 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 		}
 		if err := s.checkFenceWithCurrent(FenceRoleWriter, current); err != nil {
 			return MaintenanceApplyResult{}, err
+		}
+		if receipt := current.MaintenanceReceipt; receipt != nil && command.Generation < receipt.Generation {
+			return MaintenanceApplyResult{}, nil // superseded: a later command has been applied
 		}
 		if receiptMatchesCommand(current.MaintenanceReceipt, &command) {
 			return MaintenanceApplyResult{

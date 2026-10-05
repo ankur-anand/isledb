@@ -74,9 +74,11 @@ type WriterFlushOptions struct {
 }
 
 type WriterMaintenanceOptions struct {
-	// PollInterval is the minimum interval between object-store reads of
-	// maintenance/HEAD. Same-process maintenance bypasses this interval through
-	// an in-memory notification. Zero selects the default.
+	// PollInterval is how often a background poller reads maintenance/HEAD,
+	// each read bounded to 5 seconds. A fetched command is applied by the next
+	// flush; Flush itself never reads the mailbox, so a slow or hung mailbox
+	// does not delay commits. Same-process maintenance wakes the poller at
+	// once. Zero selects the default.
 	PollInterval time.Duration
 }
 
