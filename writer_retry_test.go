@@ -341,3 +341,52 @@ func TestWriterFlushDeadlineIsNotReported(t *testing.T) {
 	}
 	storage.mode.Store(maintenanceOK)
 }
+
+// TestWriterCommitRecordedAfterBookkeeping checks the order in which a
+// commit becomes visible: when the committed sequence advances, waking
+// WaitCommitted, the memtable's pending slot is already free and a failure
+// run is already over, so a caller acting on WaitCommitted sees them.
+func TestWriterCommitRecordedAfterBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-commit-order")
+	defer store.Close()
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), testWriterOptions(1<<20, 16))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	type seen struct {
+		committed uint64
+		pending   int
+		failing   bool
+	}
+	var transitions []seen
+	w.onTransition = func(s writerState) { // called with w.mu held
+		transitions = append(transitions, seen{s.committed, w.pendingMemtables, w.commitFailures.failing()})
+	}
+	w.commitFailures.fail(time.Now()) // a failure run in progress
+
+	seq, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	var found bool
+	for _, s := range transitions {
+		if s.committed < seq {
+			continue
+		}
+		found = true
+		if s.pending != 0 || s.failing {
+			t.Fatalf("commit of seq %d recorded with %d pending memtables and failing=%v, want 0 and false",
+				seq, s.pending, s.failing)
+		}
+		break
+	}
+	if !found {
+		t.Fatalf("no transition recorded seq %d; saw %+v", seq, transitions)
+	}
+}
