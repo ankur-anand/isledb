@@ -1023,7 +1023,14 @@ func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key [
 	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
 		return filter.mayContain(bloomHashKey(key))
 	}
+	return r.bloomMayContainSlow(ctx, sstMeta, key)
+}
 
+// bloomMayContainSlow loads an SST's filter that is not cached. It is apart
+// from bloomMayContain so the load's closure, which escapes to the loading
+// goroutine and so moves sstMeta to the heap, costs that allocation only on a
+// miss, not on every lookup.
+func (r *Reader) bloomMayContainSlow(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
 	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
 		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
 			return filter, nil
