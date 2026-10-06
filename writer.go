@@ -24,6 +24,11 @@ var (
 	ErrNilContext           = errors.New("nil context")
 	ErrInvalidWriterOptions = errors.New("invalid writer options")
 	ErrWriterClosed         = errors.New("writer closed")
+	// ErrCommitTimeout reports a commit attempt that ran out of its own
+	// deadline, as when a storage request hangs. The writes stay queued and
+	// are retried. It is not the caller's context deadline, and does not wrap
+	// context.DeadlineExceeded.
+	ErrCommitTimeout = errors.New("commit attempt timed out")
 )
 
 const (
@@ -60,17 +65,35 @@ type writer struct {
 	activeSince  time.Time
 	pendingSince []time.Time
 
-	flushMu         sync.Mutex
-	flushTicker     *time.Ticker
 	maintenanceWake <-chan struct{}
 	// stagedMaintenance is a maintenance command the poller has read from
-	// maintenance/HEAD and the next flush applies; nil when there is none.
+	// maintenance/HEAD and the next pass applies; nil when there is none.
 	stagedMaintenance atomic.Pointer[manifest.MaintenanceCommand]
-	// applyWake asks the flush loop to apply a newly fetched command.
+	// applyWake asks the committer to apply a newly fetched command.
 	applyWake  chan struct{}
 	pollerDone chan struct{}
-	stopCh     chan struct{}
-	workerDone chan struct{}
+	stopCh     chan struct{} // stops the poller
+	stopOnce   sync.Once
+
+	// The committer is the one goroutine that commits. Flush and Close ask it
+	// for a pass and wait for it (requestPass); kick wakes it. Passes are
+	// numbered as they start; the fields below are guarded by mu.
+	kick            chan struct{}
+	committerCancel context.CancelFunc
+	committerDone   chan struct{}
+	passStarted     uint64
+	passDone        uint64
+	passErr         error         // the result of pass passDone
+	passChanged     chan struct{} // closed and replaced when a pass ends
+	finalRequested  bool          // the next pass reads the mailbox first (Close)
+	closing         chan struct{} // serializes Close calls
+	closeErr        error         // what Close returned; guarded by closing
+	// attemptTimeoutBase is the fixed part of commitAttemptTimeout; tests
+	// shorten it.
+	attemptTimeoutBase atomic.Int64
+	// attemptTimeouts counts attempts in a row that ran out of time; each
+	// doubles the next attempt's deadline. Only the committer uses it.
+	attemptTimeouts int
 
 	fenceToken *manifest.FenceToken
 	metrics    *WriterMetrics
@@ -81,7 +104,6 @@ type writer struct {
 	state     writerState
 	statusNow atomic.Uint32
 	committed atomic.Uint64
-	stopOnce  sync.Once
 
 	// Failures to commit and to apply maintenance are retried, never final,
 	// and reported as separate runs (see failureRun).
@@ -198,14 +220,17 @@ func newWriterWithMaintenanceWake(
 		epoch:           m.NextEpoch,
 		maintenanceWake: maintenanceWake,
 		stopCh:          make(chan struct{}),
-		workerDone:      make(chan struct{}),
 		applyWake:       make(chan struct{}, 1),
 		pollerDone:      make(chan struct{}),
+		kick:            make(chan struct{}, 1),
+		passChanged:     make(chan struct{}),
+		closing:         make(chan struct{}, 1),
 		fenceToken:      token,
 		metrics:         opts.Metrics,
 	}
 	w.commitFailures.kind = "commits"
 	w.maintenanceFailures.kind = "maintenance"
+	w.attemptTimeoutBase.Store(int64(commitAttemptBase))
 
 	// What the manifest holds is committed: report it before the first
 	// commit, so a writer taking over continues the series.
@@ -214,12 +239,9 @@ func newWriterWithMaintenanceWake(
 	w.metrics.ObserveCommittedSequence(w.seq)
 
 	go w.maintenancePollLoop()
-	if opts.Flush.Interval > 0 {
-		w.flushTicker = time.NewTicker(opts.Flush.Interval)
-		go w.flushLoop()
-	} else {
-		close(w.workerDone)
-	}
+	committerCtx, cancelCommitter := context.WithCancel(context.Background())
+	w.committerCancel, w.committerDone = cancelCommitter, make(chan struct{})
+	go w.commitLoop(committerCtx, w.committerDone)
 
 	return w, nil
 }
@@ -545,6 +567,9 @@ func (w *writer) ensureCapacityLocked() error {
 	return nil
 }
 
+// flush asks the committer for a pass and waits for it. ctx bounds the wait,
+// not the pass: a Flush that gives up leaves the commit going, under the
+// committer's own deadlines.
 func (w *writer) flush(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -552,52 +577,66 @@ func (w *writer) flush(ctx context.Context) error {
 	if err := w.ensureWritable(); err != nil {
 		return err
 	}
-	return w.flushInternal(ctx, false, false)
+	return w.requestPass(ctx, false)
 }
 
-func (w *writer) flushBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, false, false)
-}
-
-func (w *writer) flushMaintenanceBackground(ctx context.Context) error {
-	return w.flushInternal(ctx, false, true)
-}
-
-func (w *writer) flushFinal(ctx context.Context) error {
-	return w.flushInternal(ctx, true, false)
-}
-
-// flushInternal applies the maintenance command the poller has fetched, if
-// any, then commits the queued memtables oldest first. A memtable that fails
-// to commit stays at the head of the queue; the next attempt reconciles it,
-// so a commit applied before its response was lost is found, not repeated.
-// Only losing the fence is final. A maintenance failure is reported and does
-// not hold up commits, and a flush never waits to read the maintenance
-// mailbox, except Close, which reads it once, bounded, so a command staged
-// just before shutdown is not left behind.
-func (w *writer) flushInternal(ctx context.Context, pollMaintenance, maintenanceOnly bool) error {
-	if err := checkContext(ctx); err != nil {
-		return err
+// requestPass asks the committer for a pass that starts after this call, and
+// waits, bounded by ctx, until one ends. It returns nil once that pass, or a
+// later one, has committed everything accepted before the call; otherwise the
+// pass's error, or why the writer can commit nothing more. final makes the
+// pass read the maintenance mailbox first, as Close does.
+func (w *writer) requestPass(ctx context.Context, final bool) error {
+	w.mu.Lock()
+	target, want := w.seq, w.passStarted+1
+	if final {
+		w.finalRequested = true
 	}
+	w.mu.Unlock()
+	select {
+	case w.kick <- struct{}{}:
+	default:
+	}
+	for {
+		w.mu.Lock()
+		state, done, passErr, passChanged := w.state, w.passDone, w.passErr, w.passChanged
+		w.mu.Unlock()
+		if done >= want {
+			if passErr != nil && state.committed < target {
+				return passErr
+			}
+			return nil
+		}
+		if state.status.final() {
+			return w.statusError(state.status)
+		}
+		select {
+		case <-passChanged:
+		case <-state.changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
 
-	w.flushMu.Lock()
-	defer w.flushMu.Unlock()
-
+// commitPass applies the maintenance command the poller has fetched, if any,
+// then commits the queued memtables oldest first, each attempt under its own
+// deadline (commitAttemptTimeout). A memtable that fails to commit stays at
+// the head of the queue; the next attempt reconciles it, so a commit applied
+// before its response was lost, or after its attempt timed out, is found, not
+// repeated. Only losing the fence is final. A maintenance failure is reported
+// and does not hold up commits. A pass never waits to read the maintenance
+// mailbox, except Close's (final), which reads it once, bounded, so a command
+// staged just before shutdown is not left behind. ctx is the committer's
+// lifetime.
+func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if writerStatus(w.statusNow.Load()) == writerFenced {
 		return manifest.ErrFenced
 	}
-	if pollMaintenance {
+	if final {
 		w.pollMaintenance(ctx)
 	}
 	if err := w.applyStagedMaintenance(ctx); err != nil {
 		return err
-	}
-	if maintenanceOnly {
-		// A process-local mailbox wake publishes only the maintenance command.
-		// User mutations retain the same visibility boundary as when no
-		// maintenance handle exists: explicit Flush, configured background
-		// flush, or Close.
-		return nil
 	}
 
 	w.mu.Lock()
@@ -614,14 +653,27 @@ func (w *writer) flushInternal(ctx context.Context, pollMaintenance, maintenance
 
 		for i, pending := range toFlush {
 			start := time.Now()
-			status, err := w.flushPending(ctx, pending)
+			timeout := w.commitAttemptTimeout(pending)
+			attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+			status, err := w.flushPending(attemptCtx, pending)
+			// Whether the attempt ran out of time is read from its context,
+			// not its error, which each storage client wraps its own way.
+			timedOut := ctx.Err() == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+			cancel()
 			w.metrics.ObserveFlush(time.Since(start), err)
 			if err != nil {
+				if timedOut {
+					// The writer's deadline, not the caller's: report it without
+					// wrapping context.DeadlineExceeded.
+					w.attemptTimeouts++
+					err = fmt.Errorf("%w after %s: %v", ErrCommitTimeout, timeout, err)
+				}
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
 				w.mu.Unlock()
 				return err
 			}
+			w.attemptTimeouts = 0
 			w.mu.Lock()
 			w.pendingMemtables--
 			w.noteMemtableCommittedLocked()
@@ -634,6 +686,51 @@ func (w *writer) flushInternal(ctx context.Context, pollMaintenance, maintenance
 			w.transition(pending.sstable.SeqHi, status)
 		}
 	}
+}
+
+const (
+	// commitAttemptBase is the fixed part of an attempt's deadline: time for
+	// updating CURRENT and for a small upload.
+	commitAttemptBase = 30 * time.Second
+	// minCommitUploadBytesPerSecond is the slowest upload an attempt allows
+	// for: each MiB to upload adds a second to its deadline.
+	minCommitUploadBytesPerSecond = 1 << 20
+	// maxCommitAttemptTimeout caps how far timeouts in a row grow the
+	// deadline.
+	maxCommitAttemptTimeout = 10 * time.Minute
+)
+
+// commitAttemptTimeout is the deadline of one attempt to commit pending:
+// uploading its SST and change batch and updating CURRENT. A request that
+// hangs costs one attempt, which then fails, is reported and is retried.
+//
+// A timed-out attempt starts its upload again from the beginning, so on a
+// link slower than minCommitUploadBytesPerSecond every attempt would time out.
+// Each attempt in a row that runs out of time doubles the next one's
+// deadline, up to maxCommitAttemptTimeout, until one has time to finish; a
+// commit resets it.
+func (w *writer) commitAttemptTimeout(pending *pendingFlush) time.Duration {
+	bytes := pending.memtable.ApproxSize()
+	if pending.changes != nil {
+		bytes += pending.changes.bodySize
+	}
+	timeout := time.Duration(w.attemptTimeoutBase.Load()) + time.Duration(bytes/minCommitUploadBytesPerSecond)*time.Second
+	return grownAttemptTimeout(timeout, w.attemptTimeouts)
+}
+
+// grownAttemptTimeout doubles timeout once per earlier timeout in a row, up
+// to maxCommitAttemptTimeout; a timeout already above the cap is kept.
+func grownAttemptTimeout(timeout time.Duration, timeouts int) time.Duration {
+	if timeout <= 0 {
+		return timeout
+	}
+	for range timeouts {
+		if timeout >= maxCommitAttemptTimeout/2 {
+			return max(timeout, maxCommitAttemptTimeout)
+		}
+		timeout *= 2
+	}
+	return timeout
 }
 
 // minMaintenancePollInterval keeps a tiny PollInterval from turning the
@@ -774,8 +871,8 @@ func (w *writer) reportFailure(run *failureRun, err error) {
 		return
 	}
 	if w.opts.OnFlushError != nil {
-		// Its own goroutine: the caller may hold flushMu or be the flush
-		// loop, and the callback may call Close, which waits for both.
+		// Its own goroutine: the caller may be the committer, and the
+		// callback may call Close, which waits for it.
 		go w.opts.OnFlushError(err)
 		return
 	}
@@ -937,49 +1034,63 @@ func writePendingChangeBatch(
 	)
 }
 
-// flushLoop commits on each tick until Close or until the writer loses its
-// fence. A failed commit stays queued and is retried, after a delay that
-// doubles while failures continue, up to maxFlushRetryDelay; nothing else
-// stops the loop, so an open writer always has its commits retried.
-func (w *writer) flushLoop() {
-	defer func() {
-		w.flushTicker.Stop()
-		close(w.workerDone)
-	}()
+// commitLoop is the committer, from the writer's start until Close stops it
+// or the writer loses its fence. It runs passes: when Flush or Close asks
+// (kick), and on each flush tick while the writer is open. With a flush interval, it also applies a
+// newly fetched maintenance command when the poller asks (applyWake), without
+// committing data. A failed commit stays queued; ticks retry it after a delay
+// that doubles while failures continue, up to maxFlushRetryDelay, and a Flush
+// retries it at once, without waiting for the delay.
+func (w *writer) commitLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	// Without a flush interval, nothing commits on its own: neither data nor a
+	// fetched maintenance command, until Flush or Close.
+	var tick <-chan time.Time
+	var applyWake <-chan struct{}
+	if w.opts.Flush.Interval > 0 {
+		ticker := time.NewTicker(w.opts.Flush.Interval)
+		defer ticker.Stop()
+		tick = ticker.C
+		applyWake = w.applyWake
+	}
 
 	interval := w.opts.Flush.Interval
 	var delay time.Duration
 	var retryAt time.Time
 	for {
-		var err error
-		commit := false
+		pass := true
 		select {
-		case <-w.flushTicker.C:
-			if time.Now().Before(retryAt) {
+		case <-ctx.Done():
+			return
+		case <-w.kick:
+		case <-tick:
+			if writerStatus(w.statusNow.Load()) != writerOpen || time.Now().Before(retryAt) {
 				continue
 			}
-			commit = true
-			err = w.flushBackground(w.ctx)
-		case <-w.applyWake:
+		case <-applyWake:
 			// Applies maintenance only, so its result says nothing about
 			// commits: it leaves the backoff alone.
-			err = w.flushMaintenanceBackground(w.ctx)
-		case <-w.stopCh:
-			return
+			pass = false
+		}
+		var err error
+		if pass {
+			err = w.runPass(ctx)
+		} else if writerStatus(w.statusNow.Load()) != writerFenced {
+			err = w.applyStagedMaintenance(ctx)
 		}
 		switch {
 		case err == nil:
-			if commit {
+			if pass {
 				delay, retryAt = 0, time.Time{}
 			}
-		case errors.Is(err, context.Canceled):
+		case ctx.Err() != nil:
 			return
 		case isFenceError(err):
-			slog.Error("isledb: writer fenced, stopping background flush",
+			slog.Error("isledb: writer fenced, stopping commits",
 				"component", "writer", "epoch", w.epoch)
 			w.transition(0, writerFenced)
 			return
-		case commit:
+		case pass:
 			w.reportFailure(&w.commitFailures, err)
 			delay = min(max(2*delay, interval), maxFlushRetryDelay)
 			retryAt = time.Now().Add(delay)
@@ -987,34 +1098,104 @@ func (w *writer) flushLoop() {
 	}
 }
 
-func (w *writer) close(ctx context.Context) error {
-	if err := checkContext(ctx); err != nil {
-		return err
+// runPass numbers a pass, runs it, and publishes its result to requestPass.
+func (w *writer) runPass(ctx context.Context) error {
+	w.mu.Lock()
+	w.passStarted++
+	id, final := w.passStarted, w.finalRequested
+	w.finalRequested = false
+	w.mu.Unlock()
+
+	err := w.commitPass(ctx, final)
+	if err != nil && ctx.Err() != nil {
+		// Close stopped the committer: a Flush waiting for this pass learns
+		// the writer closed, not a cancellation it never asked for.
+		err = ErrWriterClosed
 	}
 
-	w.transition(0, writerClosing)
+	w.mu.Lock()
+	w.passDone, w.passErr = id, err
+	close(w.passChanged)
+	w.passChanged = make(chan struct{})
+	w.mu.Unlock()
+	return err
+}
+
+// stopPoller stops the maintenance poller; it does not wait for it.
+func (w *writer) stopPoller() {
 	w.stopOnce.Do(func() {
 		w.cancel()
 		close(w.stopCh)
-		if w.flushTicker != nil {
-			w.flushTicker.Stop()
-		}
 	})
-	for _, done := range []chan struct{}{w.workerDone, w.pollerDone} {
+}
+
+// close finishes the writer. It stops accepting writes and asks the
+// committer for one last pass, which commits what is pending under the
+// committer's own deadlines; ctx bounds the wait. Then it stops the committer
+// and the poller, ending any attempt in flight, and waits for both: after
+// Close returns, nothing of the writer runs. The writer is finished either
+// way. If the pass failed or ctx ended first, Close returns an error naming
+// the writes not known to be committed; the last attempt may still land, so
+// they are unknown, not lost. A later Close returns the same result.
+func (w *writer) close(ctx context.Context) error {
+	if ctx == nil {
+		return ErrNilContext
+	}
+	select {
+	case w.closing <- struct{}{}:
+	default:
 		select {
-		case <-done:
+		case w.closing <- struct{}{}:
 		case <-ctx.Done():
-			return ctx.Err()
+			return ctx.Err() // another Close is finishing the writer
 		}
+	}
+	defer func() { <-w.closing }()
+
+	switch writerStatus(w.statusNow.Load()) {
+	case writerClosed:
+		return w.closeErr
+	case writerFenced:
+		w.stop()
+		return manifest.ErrFenced
 	}
 
-	// Only success ends a Closing writer: a failed Close can be retried, and
-	// may still commit what is pending.
-	err := w.flushFinal(ctx)
-	if err == nil {
-		w.transition(0, writerClosed)
+	w.transition(0, writerClosing)
+	commitErr := w.requestPass(ctx, true) // true: read the maintenance mailbox once more
+	w.stop()
+
+	w.mu.Lock()
+	committed, accepted := w.state.committed, w.seq
+	w.mu.Unlock()
+	if writerStatus(w.statusNow.Load()) == writerFenced {
+		w.closeErr = manifest.ErrFenced
+		return w.closeErr
 	}
-	return err
+	if committed < accepted {
+		w.closeErr = fmt.Errorf("isledb: writer closed with writes %d to %d not known to be committed",
+			committed+1, accepted)
+		if commitErr != nil {
+			w.closeErr = fmt.Errorf("%w: %w", w.closeErr, commitErr)
+		}
+	}
+	w.transition(0, writerClosed)
+	return w.closeErr
+}
+
+// stop ends the poller and the committer, cancelling any read or attempt in
+// flight, and waits for both to exit. The wait has no bound: every storage
+// call runs under the cancelled context and returns promptly, and a bound
+// would let Close return while the writer still runs.
+func (w *writer) stop() {
+	w.stopPoller()
+	w.committerCancel()
+	<-w.pollerDone
+	<-w.committerDone
+}
+
+// finished reports whether the writer has stopped for good: closed or fenced.
+func (w *writer) finished() bool {
+	return writerStatus(w.statusNow.Load()).final()
 }
 
 // waitCommitted waits until seq is committed, or until the writer reaches a
