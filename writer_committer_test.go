@@ -432,3 +432,89 @@ func TestWriterTimeoutSeenWhateverTheStorageError(t *testing.T) {
 		t.Fatalf("attempt deadlines %v: the second did not grow", d[:2])
 	}
 }
+
+// TestWriterStopWritesThenDrain: after StopWrites, mutations are refused with
+// ErrWritesStopped, but Flush still commits what was accepted, and Close then
+// finds nothing pending.
+func TestWriterStopWritesThenDrain(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, _, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	seq, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	w.stopWrites()
+	if _, err := w.put(ctx, []byte("b"), []byte("2")); !errors.Is(err, ErrWritesStopped) {
+		t.Fatalf("put after StopWrites = %v, want ErrWritesStopped", err)
+	}
+	if _, err := w.delete(ctx, []byte("a")); !errors.Is(err, ErrWritesStopped) {
+		t.Fatalf("delete after StopWrites = %v, want ErrWritesStopped", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("Flush after StopWrites: %v", err)
+	}
+	if err := w.waitCommitted(ctx, seq); err != nil {
+		t.Fatalf("WaitCommitted: %v", err)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("Close after draining: %v", err)
+	}
+	if _, err := w.put(ctx, []byte("c"), []byte("3")); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("put after Close = %v, want ErrWriterClosed", err)
+	}
+}
+
+// TestWriterStopWritesDrainsInBackground: with a flush interval, a writer
+// that stopped taking writes commits the ones it has by itself.
+func TestWriterStopWritesDrainsInBackground(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 10 * time.Millisecond
+	w, storage, _, _ := newHangingCommitWriter(t, opts, 200*time.Millisecond)
+
+	storage.hang.Store(true) // nothing commits before StopWrites
+	seq, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	w.stopWrites()
+	storage.hang.Store(false)
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := w.waitCommitted(waitCtx, seq); err != nil {
+		t.Fatalf("the stopped writer did not commit in the background: %v", err)
+	}
+}
+
+// TestWriterWaiterKeepsWaitingAcrossStopWrites: StopWrites is not the end of
+// the writer, so a waiter is not told it closed; it learns its write
+// committed once a Flush gets it through.
+func TestWriterWaiterKeepsWaitingAcrossStopWrites(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, storage, _, _ := newHangingCommitWriter(t, opts, 100*time.Millisecond)
+
+	seq, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	done := waitAsync(ctx, w, seq)
+	storage.hang.Store(true)
+	w.stopWrites()
+	if err := w.flush(ctx); !errors.Is(err, ErrCommitTimeout) {
+		t.Fatalf("Flush with storage hanging = %v, want ErrCommitTimeout", err)
+	}
+	assertWaiting(t, done)
+
+	storage.hang.Store(false)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("Flush once storage answers: %v", err)
+	}
+	if err := awaitResult(t, done); err != nil {
+		t.Fatalf("WaitCommitted across StopWrites: %v", err)
+	}
+}

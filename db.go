@@ -183,6 +183,16 @@ func (w *Writer) CommittedSequence() uint64 {
 	return w.w.committed.Load()
 }
 
+// StopWrites makes the Writer refuse writes from now on: Put, PutWithTTL and
+// Delete return ErrWritesStopped. Everything else keeps working: Flush,
+// WaitCommitted, CommittedSequence and background commits go on, so what was
+// already accepted can be made durable before Close. With StopWrites first, a
+// Flush that returns nil means every write the Writer ever accepted is
+// committed. It is one-way, and Close implies it.
+func (w *Writer) StopWrites() {
+	w.w.stopWrites()
+}
+
 // Flush publishes all currently buffered writes and waits until they are
 // visible to newly refreshed readers.
 //

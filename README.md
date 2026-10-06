@@ -126,7 +126,10 @@ for each database.
 
 - `Put`, `PutWithTTL`, and `Delete` buffer mutations in memory.
 - A successful `Flush`, background flush, or `Writer.Close` is the durability
-  and visibility boundary.
+  and visibility boundary. `Flush` can be retried; `Close` makes one attempt
+  and finishes the writer either way, reporting any writes not known to be
+  committed. To stop gracefully, call `Flush` until it succeeds, then `Close`
+  with a deadline, then `DB.Close`; see [Shutting down](#shutting-down).
 - One writer owns a database prefix at a time. Writer ownership is fenced across
   processes.
 - A reader uses a consistent loaded view. It refreshes according to its view
@@ -136,6 +139,35 @@ for each database.
   their own local cache directories.
 - Run maintenance in production so compaction, checkpoints, configured
   retention, and physical cleanup continue to make progress.
+
+### Shutting down
+
+`StopWrites` ends intake, `Flush` is the retryable step and `Close` the final
+one. Stop taking writes, spend the shutdown window flushing, then close once:
+
+```go
+writer.StopWrites() // Put and Delete now return ErrWritesStopped
+backoff := time.Second
+for {
+    err := writer.Flush(ctx)
+    if err == nil || errors.Is(err, isledb.ErrFenced) || ctx.Err() != nil {
+        break
+    }
+    time.Sleep(backoff)
+    backoff = min(backoff*2, 30*time.Second)
+}
+closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+defer cancel()
+if err := writer.Close(closeCtx); err != nil {
+    log.Printf("writer closed with unconfirmed writes: %v", err) // the error names them
+}
+_ = db.Close()
+```
+
+`DB.Close` alone closes an open writer with a fixed 30-second deadline and no
+retry; it is cleanup, not the durability step. Set `Flush.Interval` so a
+crash loses at most one interval, and use `WaitCommitted` before acting on a
+write you cannot afford to lose.
 
 See the [Go API guide](api.md) for scans, iterators, snapshots, prefetching,
 configuration, metrics, and error handling.
