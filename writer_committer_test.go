@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -516,5 +517,203 @@ func TestWriterWaiterKeepsWaitingAcrossStopWrites(t *testing.T) {
 	}
 	if err := awaitResult(t, done); err != nil {
 		t.Fatalf("WaitCommitted across StopWrites: %v", err)
+	}
+}
+
+// TestWriterDrainWithoutFlushInterval: Drain commits everything accepted
+// although nothing commits on its own, and refuses later writes.
+func TestWriterDrainWithoutFlushInterval(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, _, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	for i := range 10 {
+		if _, err := w.put(ctx, fmt.Appendf(nil, "k%02d", i), []byte("v")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	accepted := w.acceptedSequence()
+	if err := w.drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if got := w.committed.Load(); got != accepted {
+		t.Fatalf("committed %d after Drain, want everything accepted, %d", got, accepted)
+	}
+	if _, err := w.put(ctx, []byte("late"), []byte("v")); !errors.Is(err, ErrWritesStopped) {
+		t.Fatalf("put after Drain = %v, want ErrWritesStopped", err)
+	}
+}
+
+// TestWriterDrainDuringOutage: with every write of CURRENT hanging, Drain
+// returns at its deadline, with the last commit failure; Close names exactly
+// the writes not known to be committed; and the next writer continues the
+// sequence from what was committed.
+func TestWriterDrainDuringOutage(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, storage, manifestStore, _ := newHangingCommitWriter(t, opts, 100*time.Millisecond)
+
+	first, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	storage.hang.Store(true)
+	for _, k := range []string{"b", "c", "d"} {
+		if _, err := w.put(ctx, []byte(k), []byte("2")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	err = w.drain(drainCtx)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "commit attempt timed out") {
+		t.Fatalf("Drain during the outage = %v, want its deadline with the last commit failure", err)
+	}
+	closeCtx, cancelClose := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelClose()
+	closeErr := w.close(closeCtx)
+	want := fmt.Sprintf("writes %d to %d not known to be committed", first+1, first+3)
+	if closeErr == nil || !strings.Contains(closeErr.Error(), want) {
+		t.Fatalf("Close = %v, want it to name %q", closeErr, want)
+	}
+
+	storage.hang.Store(false)
+	next, err := newWriter(ctx, w.store, manifestStore, testWriterOptions(1<<20, 16))
+	if err != nil {
+		t.Fatalf("open the next writer: %v", err)
+	}
+	defer next.close(ctx)
+	seq, err := next.put(ctx, []byte("b"), []byte("2"))
+	if err != nil {
+		t.Fatalf("put on the next writer: %v", err)
+	}
+	if seq != first+1 {
+		t.Fatalf("the next writer's first sequence = %d, want %d, after the last committed", seq, first+1)
+	}
+}
+
+// TestWriterPutRacingDrain: writes race a Drain. Every write that got a
+// sequence is committed and readable; every write refused with
+// ErrWritesStopped is in no SST.
+func TestWriterPutRacingDrain(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory(t.Name())
+	defer store.Close()
+	opts := testWriterOptions(64<<10, 64)
+	opts.Flush.Interval = 5 * time.Millisecond
+	w, err := newWriter(ctx, store, newManifestStore(store, nil), opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+
+	var mu sync.Mutex
+	accepted, refused := map[string]bool{}, map[string]bool{}
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				key := fmt.Sprintf("g%d-%05d", g, i)
+				_, err := w.put(ctx, []byte(key), []byte(key))
+				mu.Lock()
+				switch {
+				case err == nil:
+					accepted[key] = true
+				case errors.Is(err, ErrWritesStopped):
+					refused[key] = true
+				default:
+					t.Errorf("put %s: %v", key, err)
+				}
+				mu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := w.drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	wg.Wait()
+	if got, want := w.committed.Load(), w.acceptedSequence(); got != want {
+		t.Fatalf("committed %d after Drain, want everything accepted, %d", got, want)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	defer reader.Close()
+	rows, err := reader.Scan(ctx, nil, nil)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	visible := map[string]bool{}
+	for _, row := range rows {
+		visible[string(row.Key)] = true
+	}
+	if len(refused) != 4 {
+		t.Fatalf("%d writers were refused, want all 4", len(refused))
+	}
+	for key := range accepted {
+		if !visible[key] {
+			t.Errorf("accepted %s is not readable after Drain", key)
+		}
+	}
+	for key := range refused {
+		if visible[key] {
+			t.Errorf("refused %s is readable", key)
+		}
+	}
+	if len(visible) != len(accepted) {
+		t.Fatalf("%d keys readable, want the %d accepted", len(visible), len(accepted))
+	}
+	t.Logf("accepted %d writes before Drain", len(accepted))
+}
+
+// TestWriterFencedDuringDrain: another writer takes the fence while Drain
+// waits on a hung commit. Drain returns ErrFenced once the commit answers,
+// and the writes it was draining are not in the database.
+func TestWriterFencedDuringDrain(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, storage, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	if _, err := w.put(ctx, []byte("a"), []byte("1")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	storage.hang.Store(true)
+	drained := make(chan error, 1)
+	go func() { drained <- w.drain(ctx) }()
+	awaitCondition(t, "the drain's commit hangs", func() bool { return storage.hung.Load() > 0 })
+
+	successor := manifest.NewStoreWithStorage(storage.Storage)
+	if _, err := successor.ClaimWriter(ctx, "successor"); err != nil {
+		t.Fatalf("successor claim: %v", err)
+	}
+	storage.hang.Store(false)
+	select {
+	case err := <-drained:
+		if !errors.Is(err, manifest.ErrFenced) {
+			t.Fatalf("Drain = %v, want ErrFenced", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return after the fence")
+	}
+	m, err := successor.Replay(ctx)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if ids := m.AllSSTIDs(); len(ids) != 0 {
+		t.Fatalf("the fenced writer's drain landed SSTs %v", ids)
 	}
 }

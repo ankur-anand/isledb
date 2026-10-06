@@ -187,7 +187,8 @@ func (db *DB) Close() error
 handles explicitly when their errors matter; use `DB.Close` as the final
 process-level cleanup. A writer still open is closed with a fixed 30-second
 deadline and no `Flush` retry, so with writes in flight, flush and close the
-writer yourself first; see [Shutting down](#shutting-down).
+writer yourself first (`Drain`, then `Close`); see
+[Shutting down](#shutting-down).
 
 ## SST output policy
 
@@ -252,7 +253,9 @@ func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Dur
 func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
 func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error
 func (w *Writer) CommittedSequence() uint64
+func (w *Writer) AcceptedSequence() uint64
 func (w *Writer) StopWrites()
+func (w *Writer) Drain(ctx context.Context) error
 func (w *Writer) Flush(ctx context.Context) error
 func (w *Writer) Close(ctx context.Context) error
 ```
@@ -286,7 +289,7 @@ func (w *Writer) Close(ctx context.Context) error
   If the attempt fails or the context ends first, `Close` returns an error
   naming the writes not known to be committed. An already-expired context
   finishes the writer without a commit attempt. To ride out an outage before
-  closing, call `Flush` until it succeeds, then `Close`.
+  closing, call `Drain` first.
 - `WaitCommitted(ctx, seq)` returns once the mutation with that sequence, and
   every one before it, is committed to object storage, where readers that
   refresh see it. It does not flush; mutations commit with the next background
@@ -343,57 +346,44 @@ fence do.
 
 ### Shutting down
 
-`StopWrites` ends intake, `Flush` is the step that can be retried, and
-`Close` is the step that finishes the writer. A graceful stop with writes in
-flight does them in that order:
+`Drain` stops intake and commits everything the writer accepted, retrying
+while there is time; `Close` then finishes the writer:
 
 ```go
 func shutdownWriter(ctx context.Context, w *isledb.Writer) error {
-    // 1. Take no more writes: Put and Delete now return ErrWritesStopped.
-    w.StopWrites()
+    // 1. Take no more writes, and commit every accepted one. Put and Delete
+    //    now return ErrWritesStopped; failed attempts are retried until ctx.
+    drainErr := w.Drain(ctx)
 
-    // 2. Make every accepted write durable. Retry while there is time.
-    backoff := time.Second
-    for {
-        err := w.Flush(ctx)
-        if err == nil || errors.Is(err, isledb.ErrFenced) || ctx.Err() != nil {
-            break
-        }
-        select {
-        case <-time.After(backoff):
-        case <-ctx.Done():
-        }
-        backoff = min(backoff*2, 30*time.Second)
-    }
-
-    // 3. Finish the writer: one attempt, then everything it runs stops.
+    // 2. Finish the writer: one attempt, then everything it runs stops.
     closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
     defer cancel()
-    return w.Close(closeCtx)
+    return errors.Join(drainErr, w.Close(closeCtx))
 }
 ```
 
-- Call `StopWrites` first. Without it, other goroutines can keep calling
-  `Put` while you flush, and `Flush` only covers writes accepted before it
-  was called. After `StopWrites`, a `Flush` that returns nil means every
-  write the writer ever accepted is in object storage. Background commits
-  keep running too, so a writer with a flush interval drains by itself.
-- Spend most of the shutdown window in the `Flush` loop.
+- Spend most of the shutdown window in `Drain`. It returns nil once every
+  write the writer ever accepted is in object storage, `ErrFenced` at once if
+  another writer took over, or the context's error, with the last commit
+  failure, when time runs out. It needs no flush interval.
+- `Drain` is `StopWrites` plus the retry loop. To build your own, call
+  `StopWrites` first, then wait for `WaitCommitted(ctx, w.AcceptedSequence())`,
+  calling `Flush` if there is no flush interval. Without `StopWrites`, other
+  goroutines can keep calling `Put` while you flush, and `Flush` only covers
+  writes accepted before it was called.
 - Give `Close` its own deadline, long enough for one commit attempt (30
   seconds plus one second per MiB pending is the committer's own deadline).
-  Do not pass a context that has already ended: `Close` then finishes the
-  writer without attempting a commit.
+  After a successful `Drain` it has nothing to commit. Do not pass a context
+  that has already ended: `Close` then finishes the writer without
+  attempting a commit.
 - Check `Close`'s error. Nil means everything committed. Otherwise it names
   the sequence range not known to be committed; those writes are unknown,
   not confirmed lost, and the range tells you what to inspect or replay.
-- Stop retrying on `ErrFenced`: another writer owns the database, and
-  everything already confirmed by `Flush` or `WaitCommitted` is visible to
-  it.
 
 `DB.Close` is process-level cleanup, not the durability step. It closes a
 writer still open from that `DB` with a fixed 30-second deadline, makes no
 `Flush` attempt of its own, and returns the writer's error. With nothing
-pending that is enough; with writes in flight, run the `Flush` loop and
+pending that is enough; with writes in flight, call `Drain` and
 `Writer.Close` yourself first, then call `DB.Close`.
 
 To keep a crash cheap, set `Flush.Interval` so unflushed data is bounded by

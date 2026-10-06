@@ -193,6 +193,24 @@ func (w *Writer) StopWrites() {
 	w.w.stopWrites()
 }
 
+// AcceptedSequence returns the highest sequence the Writer has handed to a
+// write, committed or not. After StopWrites it no longer changes, so
+// WaitCommitted(ctx, AcceptedSequence()) waits for everything the Writer
+// accepted.
+func (w *Writer) AcceptedSequence() uint64 {
+	return w.w.acceptedSequence()
+}
+
+// Drain stops the Writer taking writes, as StopWrites does, and commits
+// everything it accepted, retrying failed attempts with a growing delay,
+// until all of it is committed or ctx ends. It needs no flush interval. It
+// returns nil when every accepted write is committed; ErrFenced if another
+// writer took over, after which nothing more commits; or ctx's error, with
+// the last commit failure, when time runs out. Call Close afterwards.
+func (w *Writer) Drain(ctx context.Context) error {
+	return w.w.drain(ctx)
+}
+
 // Flush publishes all currently buffered writes and waits until they are
 // visible to newly refreshed readers.
 //
@@ -214,8 +232,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 // committed; the last attempt may still land, so they are unknown, not lost,
 // and WaitCommitted reports them with ErrWriterClosed. An already-expired ctx
 // finishes the Writer without a commit attempt, with every pending write
-// reported that way. To ride out an outage before closing, call Flush until
-// it succeeds, then Close.
+// reported that way. To ride out an outage before closing, call Drain first.
 func (w *Writer) Close(ctx context.Context) error {
 	err := w.w.close(ctx)
 	if w.w.finished() {

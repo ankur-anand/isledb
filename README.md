@@ -128,8 +128,8 @@ for each database.
 - A successful `Flush`, background flush, or `Writer.Close` is the durability
   and visibility boundary. `Flush` can be retried; `Close` makes one attempt
   and finishes the writer either way, reporting any writes not known to be
-  committed. To stop gracefully, call `Flush` until it succeeds, then `Close`
-  with a deadline, then `DB.Close`; see [Shutting down](#shutting-down).
+  committed. To stop gracefully, call `Drain`, then `Close` with a deadline,
+  then `DB.Close`; see [Shutting down](#shutting-down).
 - One writer owns a database prefix at a time. Writer ownership is fenced across
   processes.
 - A reader uses a consistent loaded view. It refreshes according to its view
@@ -142,19 +142,12 @@ for each database.
 
 ### Shutting down
 
-`StopWrites` ends intake, `Flush` is the retryable step and `Close` the final
-one. Stop taking writes, spend the shutdown window flushing, then close once:
+`Drain` stops intake and commits everything accepted, retrying until its
+context ends; `Close` is the final step:
 
 ```go
-writer.StopWrites() // Put and Delete now return ErrWritesStopped
-backoff := time.Second
-for {
-    err := writer.Flush(ctx)
-    if err == nil || errors.Is(err, isledb.ErrFenced) || ctx.Err() != nil {
-        break
-    }
-    time.Sleep(backoff)
-    backoff = min(backoff*2, 30*time.Second)
+if err := writer.Drain(ctx); err != nil { // Put and Delete now return ErrWritesStopped
+    log.Printf("drain: %v", err)
 }
 closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 defer cancel()
