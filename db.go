@@ -183,23 +183,32 @@ func (w *Writer) CommittedSequence() uint64 {
 	return w.w.committed.Load()
 }
 
-// Flush synchronously publishes all currently buffered writes.
-//
-// Flush rotates the active memtable, writes all frozen memtables as SST files,
-// commits their manifest entries, and returns only after the flushed data is
+// Flush publishes all currently buffered writes and waits until they are
 // visible to newly refreshed readers.
+//
+// The writer's committer does the work: it rotates the active memtable,
+// writes the frozen memtables as SST files and commits their manifest
+// entries, each attempt under its own deadline. ctx bounds only the wait:
+// when it ends first, Flush returns ctx.Err() and the commit goes on. A
+// failed attempt's error is returned; the writes stay queued and are retried.
 func (w *Writer) Flush(ctx context.Context) error {
 	return w.w.flush(ctx)
 }
 
-// Close stops background flushing and synchronously flushes pending writes.
+// Close finishes the Writer: it accepts no more writes, makes one last
+// attempt to commit what is pending, and then stops everything the Writer
+// runs and waits for it. ctx bounds the wait for the commit.
 //
-// Close makes one attempt to commit what is pending and returns its error. A
-// failed Close leaves the writes queued and can be retried. After Close
-// starts, the Writer accepts no more writes.
+// The Writer is finished whether or not Close succeeds. If the commit fails
+// or ctx ends first, Close returns an error naming the writes not known to be
+// committed; the last attempt may still land, so they are unknown, not lost,
+// and WaitCommitted reports them with ErrWriterClosed. An already-expired ctx
+// finishes the Writer without a commit attempt, with every pending write
+// reported that way. To ride out an outage before closing, call Flush until
+// it succeeds, then Close.
 func (w *Writer) Close(ctx context.Context) error {
 	err := w.w.close(ctx)
-	if err == nil || errors.Is(err, manifest.ErrFenced) {
+	if w.w.finished() {
 		w.releaseWriter()
 	}
 	return err
@@ -207,7 +216,7 @@ func (w *Writer) Close(ctx context.Context) error {
 
 func (w *Writer) closeDB() error {
 	err := w.w.closeWithTimeout(30 * time.Second)
-	if err == nil || errors.Is(err, manifest.ErrFenced) {
+	if w.w.finished() {
 		w.releaseWriter()
 	}
 	return err

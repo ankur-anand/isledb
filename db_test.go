@@ -287,7 +287,10 @@ func TestDBClosedWritersAreNotRetained(t *testing.T) {
 	}
 }
 
-func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
+// TestDBWriterCloseReleasesReservation: Close finishes the writer even when
+// its context has already ended, so the DB's writer slot is free afterwards,
+// and a second Close returns what the first one did.
+func TestDBWriterCloseReleasesReservation(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("db-writer-close-error")
 	defer store.Close()
@@ -302,22 +305,19 @@ func TestDBWriterCloseErrorRetainsReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
+	if _, err := writer.Put(ctx, []byte("a"), []byte("1")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := writer.Close(canceled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close(canceled) error=%v, want %v", err, context.Canceled)
-	}
-	if _, err := db.OpenWriter(ctx, WriterOptions{}); !errors.Is(err, ErrWriterAlreadyOpen) {
-		t.Fatalf("OpenWriter(after failed close) error=%v, want %v", err, ErrWriterAlreadyOpen)
-	}
-
-	if err := writer.Close(ctx); err != nil {
-		t.Fatalf("Close(retry): %v", err)
+	first := writer.Close(canceled)
+	if second := writer.Close(ctx); second != first {
+		t.Fatalf("second Close = %v, want the first one's result %v", second, first)
 	}
 	reopened, err := db.OpenWriter(ctx, WriterOptions{})
 	if err != nil {
-		t.Fatalf("OpenWriter(after successful close): %v", err)
+		t.Fatalf("OpenWriter after Close: %v", err)
 	}
 	if err := reopened.Close(ctx); err != nil {
 		t.Fatalf("Close(reopened): %v", err)

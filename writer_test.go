@@ -459,66 +459,6 @@ func (s *blockingCurrentStorage) WriteCurrentCAS(ctx context.Context, data []byt
 	return s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
 }
 
-func TestWriter_CloseTimeoutCanBeRetried(t *testing.T) {
-	ctx := context.Background()
-	store := blobstore.NewMemory("writer-close-retry")
-	defer store.Close()
-
-	storage := &blockingCurrentStorage{
-		Storage: manifest.NewBlobStoreBackend(store),
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	manifestStore := manifest.NewStoreWithStorage(storage)
-
-	opts := testWriterOptions(1<<20, 0)
-	opts.Flush.Interval = 10 * time.Millisecond
-	w, err := newWriter(ctx, store, manifestStore, opts)
-	if err != nil {
-		t.Fatalf("newWriter: %v", err)
-	}
-
-	if _, err := w.put(ctx, []byte("a"), []byte("v")); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	storage.block.Store(true)
-
-	select {
-	case <-storage.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background flush did not reach blocking CURRENT write")
-	}
-	w.mu.Lock()
-	pending := w.pendingMemtables
-	w.mu.Unlock()
-	if pending != 1 {
-		t.Fatalf("pending memtables during background flush=%d, want=1", pending)
-	}
-
-	for attempt := 0; attempt < 20; attempt++ {
-		closeCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
-		err = w.close(closeCtx)
-		cancel()
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("close attempt %d error=%v, want %v", attempt, err, context.DeadlineExceeded)
-		}
-	}
-
-	close(storage.release)
-
-	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if err := w.close(retryCtx); err != nil {
-		t.Fatalf("retry close: %v", err)
-	}
-	w.mu.Lock()
-	pending = w.pendingMemtables
-	w.mu.Unlock()
-	if pending != 0 {
-		t.Fatalf("pending memtables after close=%d, want=0", pending)
-	}
-}
-
 func TestWriter_Backpressure(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-backpressure")

@@ -264,9 +264,26 @@ func (w *Writer) Close(ctx context.Context) error
   `ErrInvalidMutation`, allowing callers to avoid retrying invalid input.
 - Expired values are filtered by readers. TTL expiration is not an immediate
   object deletion operation.
-- `Flush` publishes all currently buffered and frozen memtables.
+- `Flush` publishes all currently buffered and frozen memtables. One
+  committer goroutine does every commit, each attempt under its own deadline
+  (30 seconds plus one second per MiB uploaded), so a hung storage request
+  costs one attempt, which is reported and retried. Each attempt in a row
+  that times out doubles the next one's deadline, up to 10 minutes, so a link
+  too slow for the first deadline still gets a commit through; a commit
+  resets it. A timed-out attempt is reported, and returned by a `Flush` that
+  asked for it, as `ErrCommitTimeout`, which does not wrap
+  `context.DeadlineExceeded`: it is the writer's own deadline, not the
+  caller's. `Flush` asks the committer
+  and waits: its context bounds the wait, not the commit, so a `Flush` that
+  times out or is cancelled returns at once and the commit goes on.
 - A successful background flush also publishes buffered data.
-- `Close` stops background flushing and flushes pending writes.
+- `Close` finishes the writer: it accepts no more writes, makes one last
+  attempt to commit what is pending, then stops everything the writer runs
+  and waits for it. The writer is finished whether or not `Close` succeeds.
+  If the attempt fails or the context ends first, `Close` returns an error
+  naming the writes not known to be committed. An already-expired context
+  finishes the writer without a commit attempt. To ride out an outage before
+  closing, call `Flush` until it succeeds, then `Close`.
 - `WaitCommitted(ctx, seq)` returns once the mutation with that sequence, and
   every one before it, is committed to object storage, where readers that
   refresh see it. It does not flush; mutations commit with the next background
@@ -295,6 +312,7 @@ if err := writer.WaitCommitted(ctx, seq); err != nil {
 | `nil` | is committed |
 | `ErrFenced` | was not committed and never will be: another writer took over |
 | a context error | is not known yet: its commit is still being retried and may land |
+| `ErrWriterClosed` | is not known: `Close` finished the writer before committing it, and its last attempt may have landed |
 
 A client that times out should treat the write as unknown, not lost, and
 make retries idempotent (for example, a `Put` of the same key and value).
@@ -375,8 +393,9 @@ When `MaxPendingMemtables` is reached, a mutation that would require another
 rotation returns `ErrBackpressure` before accepting the mutation. Retry after a
 delay or call `Flush` from the serialized writer owner.
 
-`OnFlushError` receives background commit and maintenance failures, such as
-an expired credential or an unavailable bucket: on the first failure of a
+`OnFlushError` receives commit and maintenance failures, such as an expired
+credential, an unavailable bucket or an attempt that timed out, whether the
+commit was a background one or one that `Flush` asked for: on the first failure of a
 run, then at most once a minute while failures continue. Commit failures and
 maintenance failures are separate runs; each ends at its next success, which
 is logged. It runs on its own goroutine, may call `Close`, and may run after
@@ -1418,6 +1437,7 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrInvalidMutation` | Empty or oversized key, oversized value, or negative TTL |
 | `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or arena configuration |
 | `ErrWriterClosed` | Operation attempted after writer close |
+| `ErrCommitTimeout` | A commit attempt ran out of its own deadline; the writes stay queued and are retried |
 | `ErrFenced` | Another writer took over; this writer commits nothing more |
 | `ErrNilContext` | A nil context was supplied |
 

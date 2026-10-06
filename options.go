@@ -41,8 +41,8 @@ type WriterOptions struct {
 	// Values controls key/value limits. Values are stored inline in SSTs.
 	Values ValueOptions
 
-	// OnFlushError is called when a background commit, or applying a
-	// maintenance command, fails: on the first failure of a run and at most
+	// OnFlushError is called when a commit, including one that Flush asked
+	// for or one that timed out, or applying a maintenance command, fails: on the first failure of a run and at most
 	// once a minute while failures continue. Commits and maintenance are
 	// separate runs, each ended by its next success. Failures are retried,
 	// never final, even ones that cannot succeed until an operator acts, such

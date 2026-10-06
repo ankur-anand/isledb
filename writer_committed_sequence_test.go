@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -376,12 +377,13 @@ func (s *failingCurrentWriteStorage) WriteCurrentCAS(ctx context.Context, data [
 	return s.Storage.WriteCurrentCAS(ctx, data, etag)
 }
 
-// TestWriterRetriedCloseCommits fails Close's final flush once: a waiter is
-// not told the writer closed, since a retried Close commits the mutation,
-// after which the waiter succeeds.
-func TestWriterRetriedCloseCommits(t *testing.T) {
+// TestWriterFailedCloseFinishesWriter fails Close's commit: Close returns
+// the failure, naming the write it could not commit, and the writer is
+// finished. A waiter learns the writer closed, which means the write is not
+// known to be committed, and a second Close returns the same result.
+func TestWriterFailedCloseFinishesWriter(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("writer-retried-close")
+	store := blobstore.NewMemory("writer-failed-close")
 	defer store.Close()
 	storage := &failingCurrentWriteStorage{Storage: manifest.NewBlobStoreBackend(store)}
 	w, err := newWriter(ctx, store, manifest.NewStoreWithStorage(storage), testWriterOptions(1<<20, 16))
@@ -396,23 +398,23 @@ func TestWriterRetriedCloseCommits(t *testing.T) {
 
 	transient := errors.New("transient CURRENT write failure")
 	storage.setFail(transient)
-	if err := w.close(ctx); !errors.Is(err, transient) {
-		t.Fatalf("first Close err=%v, want %v", err, transient)
+	err = w.close(ctx)
+	if !errors.Is(err, transient) || !strings.Contains(err.Error(), "not known to be committed") {
+		t.Fatalf("Close = %v, want the failure naming the uncommitted write", err)
 	}
-	assertWaiting(t, done)
-	if s := writerStatus(w.statusNow.Load()); s != writerClosing {
-		t.Fatalf("status after a failed Close = %d, want closing", s)
+	if s := writerStatus(w.statusNow.Load()); s != writerClosed {
+		t.Fatalf("status after a failed Close = %d, want closed", s)
+	}
+	if err := awaitResult(t, done); !errors.Is(err, ErrWriterClosed) {
+		t.Fatalf("WaitCommitted = %v, want ErrWriterClosed", err)
 	}
 
 	storage.setFail(nil)
-	if err := w.close(ctx); err != nil {
-		t.Fatalf("retried Close: %v", err)
+	if again := w.close(ctx); again != err {
+		t.Fatalf("second Close = %v, want %v", again, err)
 	}
-	if err := awaitResult(t, done); err != nil {
-		t.Fatalf("WaitCommitted after the retried Close: %v", err)
-	}
-	if s := writerStatus(w.statusNow.Load()); s != writerClosed {
-		t.Fatalf("status after Close = %d, want closed", s)
+	if got := w.committed.Load(); got >= seq {
+		t.Fatalf("committed %d after the writer finished", got)
 	}
 }
 
