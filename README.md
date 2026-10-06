@@ -196,7 +196,7 @@ is persisted when the feed is enabled and cannot later be changed for that
 database prefix.
 
 Consumers use `OpenChangeReader` with an opaque, persistent cursor. See
-[Enable and consume the change feed](api.md#enable-and-consume-the-change-feed)
+[Change feed](api.md#change-feed)
 for the complete example and retention behavior.
 
 ## Run maintenance separately
