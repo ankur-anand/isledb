@@ -1221,8 +1221,15 @@ func startStorageWorker(
 		return nil, fmt.Errorf("start %s worker: %w", role, err)
 	}
 
-	go worker.scanEvents(stdout, events)
+	scanned := make(chan struct{})
 	go func() {
+		defer close(scanned)
+		worker.scanEvents(stdout, events)
+	}()
+	go func() {
+		// Wait closes stdout once the process exits, so it must not run
+		// until the scanner has read all of it.
+		<-scanned
 		err := command.Wait()
 		worker.exitMu.Lock()
 		worker.exitErr = err
