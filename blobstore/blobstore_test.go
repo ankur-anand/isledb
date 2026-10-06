@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aws/smithy-go"
@@ -404,15 +405,17 @@ func TestBasicOperations(t *testing.T) {
 		if readAttr.Size != int64(len(data)) {
 			t.Errorf("Read size: got %d, want %d", readAttr.Size, len(data))
 		}
-		if readAttr.ETag != "" {
-			t.Errorf("Read ETag should be empty, got %q", readAttr.ETag)
-		}
 		attrs, err := store.Attributes(ctx, key)
 		if err != nil {
 			t.Fatalf("Attributes failed: %v", err)
 		}
 		if attrs.ETag != attr.ETag {
 			t.Errorf("ETag mismatch: got %q, want %q", attrs.ETag, attr.ETag)
+		}
+		// Read's ETag is the token a conditional write checks, taken from
+		// the bytes it returned.
+		if readAttr.ETag != attr.ETag {
+			t.Errorf("Read ETag %q, want the object's %q", readAttr.ETag, attr.ETag)
 		}
 
 		if err := store.Delete(ctx, key); err != nil {
@@ -826,4 +829,52 @@ func TestWalkStopsWithoutMaterializingRemainder(t *testing.T) {
 			t.Fatal("Walk accepted a nil visitor")
 		}
 	})
+}
+
+// TestWriteIfMatchFallbackOneWinner races conditional writes that all expect
+// the same ETag, on the in-memory store, which has no native conditional
+// write: exactly one must win each round, and the object must hold its data.
+func TestWriteIfMatchFallbackOneWinner(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemory("cas-race")
+	defer store.Close()
+	attr, err := store.WriteIfNotExist(ctx, "head", []byte("v0"))
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	etag := attr.ETag
+	for round := range 200 {
+		const writers = 8
+		var wg sync.WaitGroup
+		won := make(chan string, writers)
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				data := fmt.Sprintf("r%d-w%d", round, i)
+				next, err := store.WriteIfMatch(ctx, "head", []byte(data), etag)
+				switch {
+				case err == nil:
+					won <- data + "|" + next.ETag
+				case !errors.Is(err, ErrPreconditionFailed):
+					t.Errorf("round %d writer %d: %v", round, i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		close(won)
+		var winners []string
+		for w := range won {
+			winners = append(winners, w)
+		}
+		if len(winners) != 1 {
+			t.Fatalf("round %d: %d writers won the same conditional write: %v", round, len(winners), winners)
+		}
+		data, nextETag, _ := strings.Cut(winners[0], "|")
+		got, _, err := store.Read(ctx, "head")
+		if err != nil || string(got) != data {
+			t.Fatalf("round %d: object holds %q (%v), want the winner's %q", round, got, err, data)
+		}
+		etag = nextETag
+	}
 }

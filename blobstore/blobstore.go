@@ -3,7 +3,9 @@ package blobstore
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -222,6 +225,15 @@ func (s *Store) Read(ctx context.Context, key string) (data []byte, attrs Attrib
 	}
 
 	s.extractReaderAttrs(r, &attrs)
+	if s.providerKind() == providerUnknown {
+		// The in-memory and file stores give no ETag with the bytes, and
+		// their ETag (stableETag) is the content's MD5: derive it from the
+		// bytes just read. Asking for it in a second request could pair these
+		// bytes with a newer object's token, and a conditional write built on
+		// them would then overwrite that newer object.
+		sum := md5.Sum(data)
+		attrs.ETag = hex.EncodeToString(sum[:])
+	}
 
 	return data, attrs, nil
 }
@@ -417,7 +429,18 @@ func (s *Store) writeIfNotExist(ctx context.Context, key string, data []byte) (A
 	return s.WriteReader(ctx, key, bytes.NewReader(data), opts)
 }
 
+// fallbackCASMu makes writeIfMatchFallback's check and write one step for
+// every Store in this process. Backends without a native conditional write
+// (the in-memory and file stores) are for development and tests; across
+// processes sharing a file:// directory the write is still not atomic.
+var fallbackCASMu sync.Mutex
+
+// writeIfMatchFallback writes data if key's ETag is ifMatch, for backends
+// without a native conditional write. Without fallbackCASMu, two writers
+// could both pass the check and both write, each believing it won.
 func (s *Store) writeIfMatchFallback(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
+	fallbackCASMu.Lock()
+	defer fallbackCASMu.Unlock()
 	currentAttr, err := s.bucket.Attributes(ctx, key)
 	objectExists := err == nil
 	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
