@@ -717,3 +717,101 @@ func TestWriterFencedDuringDrain(t *testing.T) {
 		t.Fatalf("the fenced writer's drain landed SSTs %v", ids)
 	}
 }
+
+// TestWriterState follows one writer through its life: State reports what is
+// pending while writes wait, nothing once they commit, and the status at
+// each step.
+func TestWriterState(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, _, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	if s := w.snapshot(); s.Status != WriterOpen || s.PendingMemtables != 0 || s.PendingBytes != 0 || !s.OldestUncommitted.IsZero() {
+		t.Fatalf("new writer state = %+v, want open with nothing pending", s)
+	}
+	before := time.Now()
+	for i := range 3 {
+		if _, err := w.put(ctx, fmt.Appendf(nil, "k%d", i), []byte("v")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	s := w.snapshot()
+	if s.Status != WriterOpen || s.Accepted != 3 || s.Committed != 0 || s.PendingMemtables != 1 || s.PendingBytes <= 0 {
+		t.Fatalf("state with 3 writes pending = %+v", s)
+	}
+	if s.OldestUncommitted.Before(before) || s.OldestUncommitted.After(time.Now()) {
+		t.Fatalf("OldestUncommitted = %v, want the first write's time", s.OldestUncommitted)
+	}
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	s = w.snapshot()
+	if s.Committed != 3 || s.PendingMemtables != 0 || s.PendingBytes != 0 || !s.OldestUncommitted.IsZero() {
+		t.Fatalf("state after flush = %+v, want nothing pending", s)
+	}
+	w.stopWrites()
+	if s := w.snapshot(); s.Status != WriterStopped {
+		t.Fatalf("status after StopWrites = %v, want stopped", s.Status)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if s := w.snapshot(); s.Status != WriterClosed {
+		t.Fatalf("status after Close = %v, want closed", s.Status)
+	}
+}
+
+// TestWriterStateCountsFrozenMemtables: memtables frozen and waiting on a
+// hung commit are counted, with their bytes, until they commit.
+func TestWriterStateCountsFrozenMemtables(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(4<<10, 64)
+	opts.Flush.Interval = 0
+	w, storage, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	storage.hang.Store(true)
+	value := make([]byte, 1<<10)
+	for i := range 40 {
+		if _, err := w.put(ctx, fmt.Appendf(nil, "k%03d", i), value); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	flushed := make(chan error, 1)
+	go func() { flushed <- w.flush(ctx) }()
+	awaitCondition(t, "the commit hangs", func() bool { return storage.hung.Load() > 0 })
+	s := w.snapshot()
+	if s.PendingMemtables < 5 || s.PendingBytes < 40<<10 || s.Accepted-s.Committed != 40 {
+		t.Fatalf("state with 40 KiB pending = %+v, want several memtables and at least 40 KiB", s)
+	}
+
+	storage.hang.Store(false)
+	if err := <-flushed; err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if s := w.snapshot(); s.PendingMemtables != 0 || s.PendingBytes != 0 {
+		t.Fatalf("state after the commits = %+v, want nothing pending", s)
+	}
+}
+
+// TestWriterStateFenced: a writer that lost its fence reports it.
+func TestWriterStateFenced(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, storage, _, _ := newHangingCommitWriter(t, opts, time.Minute)
+
+	if _, err := w.put(ctx, []byte("a"), []byte("1")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := manifest.NewStoreWithStorage(storage.Storage).ClaimWriter(ctx, "successor"); err != nil {
+		t.Fatalf("successor claim: %v", err)
+	}
+	if err := w.flush(ctx); !errors.Is(err, manifest.ErrFenced) {
+		t.Fatalf("flush after takeover = %v, want ErrFenced", err)
+	}
+	if s := w.snapshot(); s.Status != WriterFenced || s.Status.String() != "fenced" {
+		t.Fatalf("status after takeover = %v, want fenced", s.Status)
+	}
+}

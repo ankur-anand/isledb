@@ -254,6 +254,7 @@ func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
 func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error
 func (w *Writer) CommittedSequence() uint64
 func (w *Writer) AcceptedSequence() uint64
+func (w *Writer) State() WriterState
 func (w *Writer) StopWrites()
 func (w *Writer) Drain(ctx context.Context) error
 func (w *Writer) Flush(ctx context.Context) error
@@ -297,6 +298,13 @@ func (w *Writer) Close(ctx context.Context) error
   wait is at most one flush interval while storage is healthy. Without a
   background flush interval, call `Flush`.
 - `CommittedSequence` returns the highest committed sequence without waiting.
+- `State` returns one consistent snapshot: the status (`WriterOpen`,
+  `WriterStopped`, `WriterClosed`, `WriterFenced`), the accepted and committed
+  sequences, the memtables and approximate bytes not yet committed, and when
+  the oldest of those writes was accepted. Use it for readiness probes (stop
+  routing writes once the status is not `WriterOpen`), for drain progress,
+  and to slow producers before `PendingMemtables` reaches
+  `MaxPendingMemtables`. It can be out of date as soon as it returns.
 
 To acknowledge a client only once its write is durable:
 
