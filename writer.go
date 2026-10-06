@@ -607,6 +607,12 @@ func (w *writer) requestPass(ctx context.Context, final bool) error {
 			return nil
 		}
 		if state.status.final() {
+			// No later pass will come. A commit reconciled after a successor
+			// took the fence is recorded together with the fencing, possibly
+			// before its pass ends: what was asked for is committed.
+			if state.committed >= target {
+				return nil
+			}
 			return w.statusError(state.status)
 		}
 		select {
