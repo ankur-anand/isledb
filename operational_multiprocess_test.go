@@ -71,6 +71,11 @@ func TestOperationalRecovery_MultiProcessWriterMaintenanceSoak(t *testing.T) {
 		t.Fatal("writer process committed no records")
 	}
 
+	// Verification has its own deadline, from when the workers exit: draining
+	// maintenance and scanning grow with how long the soak wrote.
+	ctx, cancelVerify := context.WithTimeout(context.Background(), time.Minute+duration/2)
+	defer cancelVerify()
+
 	store, err := blobstore.Open(ctx, bucketURL, prefix)
 	if err != nil {
 		t.Fatalf("open verification store: %v", err)

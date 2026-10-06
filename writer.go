@@ -24,6 +24,10 @@ var (
 	ErrNilContext           = errors.New("nil context")
 	ErrInvalidWriterOptions = errors.New("invalid writer options")
 	ErrWriterClosed         = errors.New("writer closed")
+	// ErrWritesStopped is returned by a mutation after StopWrites or while
+	// Close runs: the writer takes no more writes but is still committing
+	// those it has.
+	ErrWritesStopped = errors.New("writer stopped accepting writes")
 	// ErrCommitTimeout reports a commit attempt that ran out of its own
 	// deadline, as when a storage request hangs. The writes stay queued and
 	// are retried. It is not the caller's context deadline, and does not wrap
@@ -123,8 +127,9 @@ const (
 	// writerOpen accepts mutations. With a flush interval, the flush loop is
 	// running; without one, committing is the caller's Flush or Close.
 	writerOpen writerStatus = iota
-	// writerClosing is set when Close starts. The flush loop has stopped, and
-	// a failed Close can be retried, so pending mutations may still commit.
+	// writerClosing takes no more mutations but still commits the ones it
+	// has: set by StopWrites, or when Close starts. Flush and background
+	// commits go on until Close finishes the writer.
 	writerClosing
 	// writerClosed: Close committed everything.
 	writerClosed
@@ -398,11 +403,20 @@ func (w *writer) statusError(s writerStatus) error {
 	switch s {
 	case writerOpen:
 		return nil
+	case writerClosing:
+		return ErrWritesStopped
 	case writerFenced:
 		return manifest.ErrFenced
 	default:
 		return ErrWriterClosed
 	}
+}
+
+// stopWrites makes the writer refuse mutations from now on while it keeps
+// committing those it has. It is one-way, and a no-op once Close has
+// started.
+func (w *writer) stopWrites() {
+	w.transition(0, writerClosing)
 }
 
 // transitionLocked moves the writer's state forward, with mu held: the
@@ -569,13 +583,14 @@ func (w *writer) ensureCapacityLocked() error {
 
 // flush asks the committer for a pass and waits for it. ctx bounds the wait,
 // not the pass: a Flush that gives up leaves the commit going, under the
-// committer's own deadlines.
+// committer's own deadlines. It works after StopWrites, so what was accepted
+// can be drained before Close.
 func (w *writer) flush(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	if err := w.ensureWritable(); err != nil {
-		return err
+	if s := writerStatus(w.statusNow.Load()); s.final() {
+		return w.statusError(s)
 	}
 	return w.requestPass(ctx, false)
 }
@@ -1042,7 +1057,8 @@ func writePendingChangeBatch(
 
 // commitLoop is the committer, from the writer's start until Close stops it
 // or the writer loses its fence. It runs passes: when Flush or Close asks
-// (kick), and on each flush tick while the writer is open. With a flush interval, it also applies a
+// (kick), and on each flush tick, including after StopWrites, so a writer
+// with a flush interval drains itself. With a flush interval, it also applies a
 // newly fetched maintenance command when the poller asks (applyWake), without
 // committing data. A failed commit stays queued; ticks retry it after a delay
 // that doubles while failures continue, up to maxFlushRetryDelay, and a Flush
@@ -1070,7 +1086,7 @@ func (w *writer) commitLoop(ctx context.Context, done chan struct{}) {
 			return
 		case <-w.kick:
 		case <-tick:
-			if writerStatus(w.statusNow.Load()) != writerOpen || time.Now().Before(retryAt) {
+			if writerStatus(w.statusNow.Load()).final() || time.Now().Before(retryAt) {
 				continue
 			}
 		case <-applyWake:
