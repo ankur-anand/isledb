@@ -419,6 +419,46 @@ func (w *writer) stopWrites() {
 	w.transition(0, writerClosing)
 }
 
+// acceptedSequence is the highest sequence handed to a mutation.
+func (w *writer) acceptedSequence() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seq
+}
+
+// drainRetryDelay is the first wait before Drain asks again after a failed
+// pass; it doubles up to maxFlushRetryDelay.
+const drainRetryDelay = 100 * time.Millisecond
+
+// drain stops writes and asks the committer for passes, waiting between
+// failed ones, until every accepted write is committed, the writer can commit
+// nothing more (fenced or closed), or ctx ends. Each pass is reported by the
+// committer when it fails; drain only waits and asks again.
+func (w *writer) drain(ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	w.stopWrites()
+	var delay time.Duration
+	for {
+		err := w.requestPass(ctx, false)
+		switch {
+		case err == nil:
+			return nil
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case w.finished():
+			return err
+		}
+		delay = min(max(2*delay, drainRetryDelay), maxFlushRetryDelay)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return fmt.Errorf("%w; last commit attempt: %v", ctx.Err(), err)
+		}
+	}
+}
+
 // transitionLocked moves the writer's state forward, with mu held: the
 // committed sequence to committed if higher, and the status to status if it
 // is later and the current one is not final. Both change together, so a
