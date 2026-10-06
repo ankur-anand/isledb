@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -191,6 +192,61 @@ func (w *Writer) CommittedSequence() uint64 {
 // committed. It is one-way, and Close implies it.
 func (w *Writer) StopWrites() {
 	w.w.stopWrites()
+}
+
+// WriterStatus is where a Writer is in its life.
+type WriterStatus int
+
+const (
+	// WriterOpen takes writes.
+	WriterOpen WriterStatus = iota
+	// WriterStopped takes no more writes (StopWrites, Drain, or Close
+	// running) but still commits the ones it has.
+	WriterStopped
+	// WriterClosed was finished by Close.
+	WriterClosed
+	// WriterFenced lost its fence to another writer; nothing more commits.
+	WriterFenced
+)
+
+func (s WriterStatus) String() string {
+	switch s {
+	case WriterOpen:
+		return "open"
+	case WriterStopped:
+		return "stopped"
+	case WriterClosed:
+		return "closed"
+	case WriterFenced:
+		return "fenced"
+	default:
+		return fmt.Sprintf("WriterStatus(%d)", int(s))
+	}
+}
+
+// WriterState is a consistent snapshot of a Writer, for readiness probes,
+// dashboards and drain progress. It can be out of date as soon as it is
+// returned while writes and commits go on.
+type WriterState struct {
+	Status WriterStatus
+	// Accepted is the highest sequence handed to a write; Committed the
+	// highest one in object storage. Accepted - Committed writes are pending.
+	Accepted  uint64
+	Committed uint64
+	// PendingMemtables counts memtables not yet committed, the one taking
+	// writes included; ErrBackpressure comes when the frozen ones reach
+	// MaxPendingMemtables.
+	PendingMemtables int
+	// PendingBytes is their approximate in-memory size, before compression.
+	PendingBytes int64
+	// OldestUncommitted is when the oldest write not yet committed was
+	// accepted; zero when nothing is pending.
+	OldestUncommitted time.Time
+}
+
+// State returns a consistent snapshot of the Writer.
+func (w *Writer) State() WriterState {
+	return w.w.snapshot()
 }
 
 // AcceptedSequence returns the highest sequence the Writer has handed to a

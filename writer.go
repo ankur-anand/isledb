@@ -60,8 +60,11 @@ type writer struct {
 	changeBuffer     *changeBatchBuffer
 	immQueue         []*pendingFlush
 	pendingMemtables int
-	seq              uint64
-	epoch            uint64
+	// pendingBytes is the in-memory size of the frozen memtables not yet
+	// committed, queued or in a pass.
+	pendingBytes int64
+	seq          uint64
+	epoch        uint64
 	// activeSince is when the active memtable took its first mutation, zero
 	// while empty; pendingSince holds the same for each frozen memtable not
 	// yet committed, oldest first. Together they date the oldest write not yet
@@ -159,6 +162,7 @@ type pendingFlush struct {
 	changeBatch          *manifest.ChangeBatchMeta
 	changes              *changeBatchBuffer
 	changeBatchCreatedAt time.Time
+	bytes                int64 // in-memory size when frozen, for State
 }
 
 func (p *pendingFlush) SeqLo() uint64 {
@@ -362,6 +366,8 @@ func (w *writer) newPendingFlushLocked(memtable *internal.Memtable) *pendingFlus
 	if pending.changes != nil {
 		pending.changeBatchCreatedAt = createdAt
 	}
+	pending.bytes = activeBytes(memtable, w.changeBuffer)
+	w.pendingBytes += pending.bytes
 	w.changeBuffer = nil
 	w.epoch++
 	w.pendingSince = append(w.pendingSince, w.activeSince)
@@ -417,6 +423,51 @@ func (w *writer) statusError(s writerStatus) error {
 // started.
 func (w *writer) stopWrites() {
 	w.transition(0, writerClosing)
+}
+
+// activeBytes is the in-memory size of a memtable and its change buffer.
+func activeBytes(memtable *internal.Memtable, changes *changeBatchBuffer) int64 {
+	bytes := memtable.ApproxSize()
+	if changes != nil {
+		bytes += changes.bodySize
+	}
+	return bytes
+}
+
+// snapshot reads the writer's state in one consistent view.
+func (w *writer) snapshot() WriterState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	state := WriterState{
+		Status:           publicStatus(w.state.status),
+		Accepted:         w.seq,
+		Committed:        w.state.committed,
+		PendingMemtables: w.pendingMemtables,
+		PendingBytes:     w.pendingBytes,
+	}
+	if !w.memtable.Empty() {
+		state.PendingMemtables++
+		state.PendingBytes += activeBytes(w.memtable, w.changeBuffer)
+	}
+	if len(w.pendingSince) > 0 {
+		state.OldestUncommitted = w.pendingSince[0]
+	} else {
+		state.OldestUncommitted = w.activeSince
+	}
+	return state
+}
+
+func publicStatus(s writerStatus) WriterStatus {
+	switch s {
+	case writerOpen:
+		return WriterOpen
+	case writerClosing:
+		return WriterStopped
+	case writerFenced:
+		return WriterFenced
+	default:
+		return WriterClosed
+	}
 }
 
 // acceptedSequence is the highest sequence handed to a mutation.
@@ -737,6 +788,7 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 			w.attemptTimeouts = 0
 			w.mu.Lock()
 			w.pendingMemtables--
+			w.pendingBytes -= pending.bytes
 			w.noteMemtableCommittedLocked()
 			w.mu.Unlock()
 			w.reportRecovery(&w.commitFailures)
