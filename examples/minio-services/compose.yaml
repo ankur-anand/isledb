@@ -1,6 +1,9 @@
 services:
-  minio:
-    image: minio/minio:latest
+  # SILO is a maintained, S3-compatible fork of the MinIO server. It keeps
+  # MinIO's server command, port and MINIO_* variables, so the services in
+  # this example run against it unchanged.
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -9,18 +12,18 @@ services:
       - "${MINIO_API_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio-data:/data
+      - silo-data:/data
 
   create-bucket:
     image: minio/mc:latest
     depends_on:
-      - minio
+      - silo
     entrypoint:
       - /bin/sh
       - -c
       - |
-        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done
+        until mc alias set local http://silo:9000 minioadmin minioadmin; do sleep 1; done
         mc mb --ignore-existing local/isledb
 
 volumes:
-  minio-data:
+  silo-data:
