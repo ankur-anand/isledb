@@ -414,8 +414,7 @@ func TestSSTReadable_DamagedMetadataHealsWithinLookup(t *testing.T) {
 
 // TestSSTReadable_OriginChecksumMismatchIsNotDamage reads a small SST whose
 // object does not match its manifest checksum: the read fails without
-// dropping anything or retrying, so each lookup fetches the object once for
-// its Bloom filter and once for its open.
+// dropping anything, and every fetch is of the whole object.
 func TestSSTReadable_OriginChecksumMismatchIsNotDamage(t *testing.T) {
 	f := newReadableTestFixture(t, 2_000, false)
 	sum := []byte(f.meta.Checksum)

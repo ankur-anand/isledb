@@ -26,10 +26,8 @@ const (
 	// with its Bloom sidecar, in one request.
 	smallSSTBytes = 4 << 20
 	// maxBridgeChunks is the longest run of cached chunks a request fetches
-	// again to reach a missing chunk after it, rather than end and leave that
-	// chunk to a second request. Crossing 8 chunks (1 MiB) costs about 10 ms
-	// at 100 MB/s, half a typical 20 ms request; a longer run is read from
-	// disk instead.
+	// again to reach a missing chunk after it. 8 chunks (1 MiB) cost about
+	// 10 ms at 100 MB/s, half a typical request.
 	maxBridgeChunks = 8
 )
 
@@ -46,11 +44,8 @@ type sstObject struct {
 	checksum      string
 	bloomChecksum string
 	key           [32]byte
-	// whole reports that the SST is fetched and cached whole: it is no larger
-	// than the fetcher's small-SST limit, or its metadata offset is unknown.
-	// Every writer records the offset, so it is unknown only through a writer
-	// bug or for an SST written before offsets were recorded; such an SST is
-	// read whole whatever its size.
+	// whole reports that the SST is fetched and cached whole: it is small, or
+	// its metadata offset is unknown (an SST from before offsets were recorded).
 	whole bool
 }
 
@@ -145,7 +140,6 @@ func newSSTFetcher(store *blobstore.Store, disk *diskcache.Cache, metrics *Reade
 	return f
 }
 
-// object describes an SST's object for this fetcher.
 func (f *sstFetcher) object(meta sstMetadata) sstObject {
 	return newSSTObject(f.store, meta, f.smallLimit)
 }
@@ -168,11 +162,8 @@ func (f *sstFetcher) diskStore(k diskcache.Key, data []byte) {
 	}
 }
 
-// dropObject removes every cached part of an SST that proved damaged, so the
-// next read fetches it again. Which part was damaged is not known, so none is
-// counted as a corruption; the reader counts the drop once. The Bloom sidecar
-// stays: it is verified against its checksum whenever it is loaded, so it is
-// never the damage.
+// dropObject removes every cached part of a damaged SST, so the next read
+// fetches it again. The Bloom sidecar stays: it is checksummed on every load.
 func (f *sstFetcher) dropObject(o sstObject) {
 	if f.disk == nil {
 		return
@@ -232,10 +223,8 @@ func (f *sstFetcher) load(ctx context.Context, k diskcache.Key, fetch func(conte
 	return value.([]byte), nil
 }
 
-// whole returns a small SST's object from its start through the end of its
-// Bloom sidecar, fetched in one request shared by concurrent callers. It
-// verifies both parts and stores each as its own entry, once, before any
-// caller sees them.
+// whole returns a small SST's object through the end of its Bloom sidecar,
+// fetched in one request, with both parts verified and stored.
 func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 	return f.load(ctx, o.entry(diskcache.KindWhole, 0), func(ctx context.Context) ([]byte, error) {
 		end := o.size
@@ -264,8 +253,7 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 }
 
 // meta returns a large SST's metadata region, [MetaOffset, Size), fetched in
-// one request shared by concurrent callers and stored as one entry, once,
-// before any caller sees it.
+// one request and stored.
 func (f *sstFetcher) meta(ctx context.Context, o sstObject) ([]byte, error) {
 	return f.load(ctx, o.entry(diskcache.KindMeta, 0), func(ctx context.Context) ([]byte, error) {
 		data, err := f.readRange(ctx, o.path, o.metaOffset, o.size-o.metaOffset)
@@ -414,16 +402,12 @@ func (f *sstFetcher) chunksOnDisk(o sstObject, p []byte, off int64) bool {
 	return true
 }
 
-// fetchChunks returns a run of whole chunks covering chunks first through
-// last, extended toward want (exclusive) as far as the last chunk not yet
-// cached. Cached chunks between missing ones are fetched again rather than
-// split the run, since a request costs more than a few chunks' bytes, but no
-// more than maxBridgeChunks of them in a row; cached chunks after the last
-// missing one are left to be read from disk. The run stops before a chunk
-// already being fetched, so no request repeats another's; a reader needing a
-// chunk in flight waits for that request instead. It returns
-// where the run starts and its bytes. With store, the chunks are on disk when
-// it returns, whoever requested them.
+// fetchChunks fetches, in one request, chunks first through last, extended
+// toward want (exclusive) up to the last missing chunk, and returns where the
+// run starts and its bytes. Up to maxBridgeChunks cached chunks in a row are
+// fetched again rather than split the run. The run stops before a chunk in
+// flight; a caller needing such a chunk waits for its request instead. With
+// store, the chunks are on disk when it returns.
 func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, want uint32, store bool) (int64, []byte, error) {
 	waited := false
 	for {
@@ -506,20 +490,15 @@ func chunkLen(o sstObject, i uint32) int64 {
 	return end - start
 }
 
-// sstReadable serves Pebble's reads of one SST, through the disk cache, from
-// object storage. Decoded blocks are cached above it by Pebble's block cache,
-// so a read here is a block cache miss. It holds no fetched bytes of its own:
-// an entry the disk cache could not store costs a later read a fetch, never
-// memory.
+// sstReadable serves Pebble's block cache misses for one SST, from the disk
+// cache or object storage. It keeps no fetched bytes in memory.
 type sstReadable struct {
 	f *sstFetcher
 	o sstObject
 
 	mu sync.Mutex
-	// holding, while the SST is being opened, makes metadata reads come from
-	// held, the whole metadata region read once, so the open's several
-	// metadata reads cost one disk read rather than one each. Both are
-	// released when the open finishes.
+	// While an open holds the metadata (holding), its metadata reads are
+	// served from held, read from disk once rather than once per read.
 	holding bool
 	held    []byte
 }
@@ -597,15 +576,9 @@ func (r *sstReadable) NewReadHandle(objstorage.ReadBeforeSize) objstorage.ReadHa
 	return &sstReadHandle{r: r, nextOff: -1}
 }
 
-// sstReadHandle serves one iterator's reads. Pebble gives each iterator its
-// own handle and does not call a handle concurrently.
-//
-// A data read that does not continue the previous one, as a lookup's, fetches
-// the aligned chunk holding its block. A read that does, as a scan's, reads
-// ahead: each request fetches twice as many chunks as the last, up to
-// maxReadAheadChunks, into a buffer only this iterator uses. Either way the
-// request stops before chunks already cached or in flight, and chunks already
-// cached are read from disk without any read-ahead.
+// sstReadHandle serves one iterator's reads; Pebble never calls a handle
+// concurrently. A lookup's read fetches the aligned chunk holding its block;
+// a scan's reads ahead, doubling each request up to maxReadAheadChunks.
 type sstReadHandle struct {
 	r *sstReadable
 	// nextOff is where the previous data read ended, or -1.
@@ -658,13 +631,9 @@ func (h *sstReadHandle) ReadAt(ctx context.Context, p []byte, off int64) error {
 	return h.readData(ctx, p, off)
 }
 
-// readData fills p, at off in the data region, chunk by chunk: from this
-// iterator's read-ahead buffer, else from a chunk on disk, else by fetching a
-// run of chunks from the first one missing. A run covers the rest of this
-// read, so a block crossing chunks, or one larger than a chunk, costs one
-// request; it reads further ahead as far as the read-ahead allows. A run ends
-// at its last missing chunk, fetching cached chunks between missing ones
-// again, and stops before a chunk in flight (see fetchChunks).
+// readData fills p, at off in the data region, chunk by chunk: from the
+// read-ahead buffer, else from disk, else by fetching a run that covers the
+// rest of the read (see fetchChunks).
 func (h *sstReadHandle) readData(ctx context.Context, p []byte, off int64) error {
 	o, f := h.r.o, h.r.f
 	end := off + int64(len(p))
