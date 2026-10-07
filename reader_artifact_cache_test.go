@@ -94,7 +94,7 @@ func TestReaderArtifactCachePersistsSSTAndBloomAcrossReopen(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	contains := reopened.bloomMayContain(ctx, result.Meta, []byte("key"))
+	contains := bloomMayContainLoaded(reopened, result.Meta, []byte("key"))
 	if !contains {
 		t.Fatal("recovered Bloom returned definitely absent")
 	}
@@ -139,7 +139,7 @@ func TestReaderArtifactCacheCorruptionSelfHealsFromOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if contains := reopened.bloomMayContain(ctx, result.Meta, []byte("key")); !contains {
+	if contains := bloomMayContainLoaded(reopened, result.Meta, []byte("key")); !contains {
 		t.Fatal("self-healed Bloom returned definitely absent")
 	}
 	value, found, err := reopened.Get(ctx, []byte("key"))

@@ -216,6 +216,7 @@ type ReaderMetrics struct {
 	ScanLimitResults prometheus.Counter
 
 	BloomFilterErrors prometheus.Counter
+	BloomFilterSkips  prometheus.Counter
 
 	SSTRangeReadTotal   prometheus.Counter
 	SSTRangeReadErrors  prometheus.Counter
@@ -321,6 +322,13 @@ func (m *ReaderMetrics) ObserveBloomFilterError() {
 		return
 	}
 	m.incCounter(m.BloomFilterErrors)
+}
+
+func (m *ReaderMetrics) ObserveBloomFilterSkip() {
+	if m == nil {
+		return
+	}
+	m.incCounter(m.BloomFilterSkips)
 }
 
 func (m *ReaderMetrics) ObserveSSTRangeRead(d time.Duration, sizeBytes int64, err error) {
@@ -471,6 +479,13 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "bloom_filter_errors_total",
 			Help:        "Total Bloom-filter loading, verification, or decoding errors; operations either recover from origin or continue to the SST.",
+			ConstLabels: constLabels,
+		}),
+		BloomFilterSkips: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "bloom_filter_skips_total",
+			Help:        "Total point lookups that read an SST without its Bloom filter because the filter was still loading in the background.",
 			ConstLabels: constLabels,
 		}),
 		SSTRangeReadTotal: prometheus.NewCounter(prometheus.CounterOpts{

@@ -31,6 +31,11 @@ type Reader struct {
 	bloomCache    *bloomFilterCache
 	openSSTs      *openSSTCache
 	bloomLoads    coalescedLoadGroup
+	// bloomLoading holds the IDs of SSTs whose filter is loading in the
+	// background, or whose load failed within bloomRetryDelay.
+	bloomLoading      sync.Map
+	bloomLoadsRunning atomic.Int32
+	bloomBackground   sync.WaitGroup
 	// sstDrops counts dropSST calls.
 	sstDrops      atomic.Int64
 	manifestLoads coalescedLoadGroup
@@ -554,6 +559,7 @@ func (r *Reader) Close() error {
 	r.manifestLoads.Close(ErrReaderClosed)
 	r.background.Wait()
 	r.bloomLoads.Close(ErrReaderClosed)
+	r.bloomBackground.Wait()
 	r.fetcher.close()
 
 	var firstErr error
@@ -950,7 +956,7 @@ func (r *Reader) getFromSST(
 	key []byte,
 ) (value []byte, found bool, tombstone bool, err error) {
 	if hasUsableBloom(sstMeta) {
-		if !r.bloomMayContain(ctx, sstMeta, key) {
+		if !r.bloomMayContain(sstMeta, key) {
 			return nil, false, false, nil
 		}
 	}
@@ -1016,43 +1022,99 @@ func (r *Reader) lookupSST(
 	return append([]byte(nil), decoded.Value...), true, false, nil
 }
 
-// bloomMayContain returns false only when a verified, decoded Bloom filter
-// proves the key absent. Every loading, integrity, decoding, or cleanup
-// failure returns true so Bloom availability can never suppress an SST read.
-func (r *Reader) bloomMayContain(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
+// bloomMayContain returns false only when the SST's filter rules key out. A
+// lookup waits for a filter only to load it from the disk cache; one not on
+// disk loads in the background while the lookup reads the SST.
+func (r *Reader) bloomMayContain(sstMeta sstMetadata, key []byte) bool {
 	if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
 		return filter.mayContain(bloomHashKey(key))
 	}
-	return r.bloomMayContainSlow(ctx, sstMeta, key)
+	o := r.fetcher.object(sstMeta)
+	if r.fetcher.diskHas(o.entry(diskcache.KindBloom, 0), o.bloomLength) {
+		if filter, ok := r.bloomFromDisk(o); ok {
+			return filter.mayContain(bloomHashKey(key))
+		}
+	}
+	if r.bloomLoadToStart(sstMeta.ID) {
+		r.loadBloomInBackground(sstMeta)
+	}
+	r.metrics.ObserveBloomFilterSkip()
+	return true
 }
 
-// bloomMayContainSlow loads an SST's filter that is not cached. It is apart
-// from bloomMayContain so the load's closure, which escapes to the loading
-// goroutine and so moves sstMeta to the heap, costs that allocation only on a
-// miss, not on every lookup.
-func (r *Reader) bloomMayContainSlow(ctx context.Context, sstMeta sstMetadata, key []byte) bool {
-	value, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(loadCtx context.Context) (any, error) {
-		if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
+// bloomFromDisk loads an SST's filter from the disk cache, shared by
+// concurrent lookups. It never fetches from the store.
+func (r *Reader) bloomFromDisk(o sstObject) (sstBloomFilter, bool) {
+	value, err := r.bloomLoads.Do(context.Background(), "disk/"+o.id, func(context.Context) (any, error) {
+		if filter, ok := r.bloomCache.peek(o.id); ok {
 			return filter, nil
 		}
-		filter, err := r.loadBloomFilter(loadCtx, sstMeta)
+		data, ok := r.fetcher.diskBloom(o)
+		if !ok {
+			return nil, errBloomNotOnDisk
+		}
+		filter, err := parseSSTBloomFilter(data)
 		if err != nil {
 			return nil, err
 		}
-		r.bloomCache.put(sstMeta.ID, filter)
+		r.bloomCache.put(o.id, filter)
 		return filter, nil
 	})
 	if err != nil {
-		r.observeBloomFilterError(sstMeta.ID, err)
-		return true
+		return sstBloomFilter{}, false
 	}
-	filter, ok := value.(sstBloomFilter)
-	if !ok {
-		err := fmt.Errorf("bloom load %s returned %T", sstMeta.ID, value)
-		r.observeBloomFilterError(sstMeta.ID, err)
-		return true
+	return value.(sstBloomFilter), true
+}
+
+var errBloomNotOnDisk = errors.New("bloom filter not on disk")
+
+const (
+	bloomLoadTimeout = time.Minute
+	bloomRetryDelay  = 30 * time.Second
+	maxBloomLoads    = 4
+)
+
+// bloomLoadToStart claims a background load of the SST's filter. It refuses
+// when the filter is in bloomLoading or maxBloomLoads loads are running.
+func (r *Reader) bloomLoadToStart(id string) bool {
+	if _, busy := r.bloomLoading.LoadOrStore(id, struct{}{}); busy {
+		return false
 	}
-	return filter.mayContain(bloomHashKey(key))
+	if r.bloomLoadsRunning.Add(1) > maxBloomLoads {
+		r.bloomLoadsRunning.Add(-1)
+		r.bloomLoading.Delete(id)
+		return false
+	}
+	return true
+}
+
+// loadBloomInBackground is apart from bloomMayContain so that sstMeta, which
+// the goroutine captures, moves to the heap only when a load starts.
+func (r *Reader) loadBloomInBackground(sstMeta sstMetadata) {
+	r.bloomBackground.Add(1)
+	go func() {
+		defer r.bloomBackground.Done()
+		defer r.bloomLoadsRunning.Add(-1)
+		ctx, cancel := context.WithTimeout(context.Background(), bloomLoadTimeout)
+		defer cancel()
+		_, err := r.bloomLoads.Do(ctx, sstMeta.ID, func(ctx context.Context) (any, error) {
+			if filter, ok := r.bloomCache.peek(sstMeta.ID); ok {
+				return filter, nil
+			}
+			filter, err := r.loadBloomFilter(ctx, sstMeta)
+			if err != nil {
+				return nil, err
+			}
+			r.bloomCache.put(sstMeta.ID, filter)
+			return filter, nil
+		})
+		if err == nil || errors.Is(err, ErrReaderClosed) {
+			r.bloomLoading.Delete(sstMeta.ID)
+			return
+		}
+		r.observeBloomFilterError(sstMeta.ID, err)
+		time.AfterFunc(bloomRetryDelay, func() { r.bloomLoading.Delete(sstMeta.ID) })
+	}()
 }
 
 // loadBloomFilter reads an SST's filter from the disk cache, or else from

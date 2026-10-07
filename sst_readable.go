@@ -281,14 +281,11 @@ func (f *sstFetcher) meta(ctx context.Context, o sstObject) ([]byte, error) {
 // whole object for a small SST that is not cached either, else with one
 // request of its own.
 func (f *sstFetcher) bloom(ctx context.Context, o sstObject) ([]byte, error) {
-	k := o.entry(diskcache.KindBloom, 0)
-	data := make([]byte, o.bloomLength)
-	if f.diskRead(k, o.bloomLength, data, 0) {
-		if err := validateBloomChecksum(o.bloomChecksum, data); err == nil {
-			return data, nil
-		}
-		f.disk.ReportCorrupt(k)
+	if data, ok := f.diskBloom(o); ok {
+		return data, nil
 	}
+	k := o.entry(diskcache.KindBloom, 0)
+	var data []byte
 	if o.small() && !f.diskHas(o.entry(diskcache.KindWhole, 0), o.size) {
 		object, err := f.whole(ctx, o)
 		if err != nil {
@@ -317,6 +314,20 @@ func (f *sstFetcher) bloom(ctx context.Context, o sstObject) ([]byte, error) {
 		return nil, fmt.Errorf("validate bloom %s: %w", o.id, err)
 	}
 	return data, nil
+}
+
+// diskBloom returns an SST's filter from the disk cache, verified.
+func (f *sstFetcher) diskBloom(o sstObject) ([]byte, bool) {
+	k := o.entry(diskcache.KindBloom, 0)
+	data := make([]byte, o.bloomLength)
+	if !f.diskRead(k, o.bloomLength, data, 0) {
+		return nil, false
+	}
+	if validateBloomChecksum(o.bloomChecksum, data) != nil {
+		f.disk.ReportCorrupt(k)
+		return nil, false
+	}
+	return data, true
 }
 
 // resident reports whether every part of an SST is on disk.

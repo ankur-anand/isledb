@@ -113,14 +113,14 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 		metrics:    metrics,
 	}
 
-	if contains := reader.bloomMayContain(ctx, metaA, keyA); !contains {
+	if contains := bloomMayContainLoaded(reader, metaA, keyA); !contains {
 		t.Fatal("first bloom A lookup returned definitely absent")
 	}
 	// A cached filter remains usable without its origin object.
 	if err := store.Delete(ctx, store.SSTPath(metaA.ID)); err != nil {
 		t.Fatalf("delete bloom A: %v", err)
 	}
-	if contains := reader.bloomMayContain(ctx, metaA, keyA); !contains {
+	if contains := bloomMayContainLoaded(reader, metaA, keyA); !contains {
 		t.Fatal("cached bloom A lookup returned definitely absent")
 	}
 	if _, err := store.Write(ctx, store.SSTPath(metaA.ID), dataA); err != nil {
@@ -128,13 +128,13 @@ func TestReaderBloomCacheEvictionReloadsFromObjectStorage(t *testing.T) {
 	}
 
 	// Loading B uses the entire one-entry budget and evicts A.
-	if contains := reader.bloomMayContain(ctx, metaB, keyB); !contains {
+	if contains := bloomMayContainLoaded(reader, metaB, keyB); !contains {
 		t.Fatal("bloom B lookup returned definitely absent")
 	}
 	if err := store.Delete(ctx, store.SSTPath(metaA.ID)); err != nil {
 		t.Fatalf("delete evicted bloom A: %v", err)
 	}
-	if contains := reader.bloomMayContain(ctx, metaA, keyA); !contains {
+	if contains := bloomMayContainLoaded(reader, metaA, keyA); !contains {
 		t.Fatal("unavailable bloom did not fail open")
 	}
 	if got := testutil.ToFloat64(metrics.BloomFilterErrors); got != 1 {
@@ -173,7 +173,7 @@ func TestReaderRejectsBloomChecksumMismatchBeforeCaching(t *testing.T) {
 		store: store, fetcher: newSSTFetcher(store, nil, metrics),
 		bloomCache: newBloomFilterCache(1 << 20), metrics: metrics,
 	}
-	if contains := reader.bloomMayContain(ctx, meta, key); !contains {
+	if contains := bloomMayContainLoaded(reader, meta, key); !contains {
 		t.Fatal("corrupt bloom did not fail open")
 	}
 	if stats := reader.BloomCacheStats(); stats.EntryCount != 0 {
@@ -200,7 +200,7 @@ func TestReaderBloomWithoutChecksumFailsOpen(t *testing.T) {
 	}
 
 	reader := &Reader{store: store, fetcher: newSSTFetcher(store, nil, nil), bloomCache: newBloomFilterCache(1 << 20)}
-	contains := reader.bloomMayContain(ctx, meta, []byte("definitely-absent"))
+	contains := bloomMayContainLoaded(reader, meta, []byte("definitely-absent"))
 	if !contains {
 		t.Fatal("checksum-less bloom did not fail open")
 	}
