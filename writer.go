@@ -65,10 +65,8 @@ type writer struct {
 	pendingBytes int64
 	seq          uint64
 	epoch        uint64
-	// activeSince is when the active memtable took its first mutation, zero
-	// while empty; pendingSince holds the same for each frozen memtable not
-	// yet committed, oldest first. Together they date the oldest write not yet
-	// in object storage.
+	// activeSince and pendingSince (oldest first) date the first mutation of
+	// the active and each uncommitted frozen memtable; zero while empty.
 	activeSince  time.Time
 	pendingSince []time.Time
 
@@ -122,8 +120,6 @@ type writer struct {
 
 // writerStatus is where a writer is in its lifecycle. It only moves forward:
 // Open, then Closing, then Closed or Fenced, and the first final status wins.
-// No error is final except losing the fence: a commit that fails stays
-// queued, and the next attempt reconciles and retries it.
 type writerStatus uint32
 
 const (
@@ -418,9 +414,7 @@ func (w *writer) statusError(s writerStatus) error {
 	}
 }
 
-// stopWrites makes the writer refuse mutations from now on while it keeps
-// committing those it has. It is one-way, and a no-op once Close has
-// started.
+// stopWrites is a no-op once Close has started.
 func (w *writer) stopWrites() {
 	w.transition(0, writerClosing)
 }
@@ -481,10 +475,8 @@ func (w *writer) acceptedSequence() uint64 {
 // pass; it doubles up to maxFlushRetryDelay.
 const drainRetryDelay = 100 * time.Millisecond
 
-// drain stops writes and asks the committer for passes, waiting between
-// failed ones, until every accepted write is committed, the writer can commit
-// nothing more (fenced or closed), or ctx ends. Each pass is reported by the
-// committer when it fails; drain only waits and asks again.
+// drain asks the committer for passes, waiting between failed ones; the
+// committer reports each failure, so drain only waits and asks again.
 func (w *writer) drain(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -510,11 +502,9 @@ func (w *writer) drain(ctx context.Context) error {
 	}
 }
 
-// transitionLocked moves the writer's state forward, with mu held: the
-// committed sequence to committed if higher, and the status to status if it
-// is later and the current one is not final. Both change together, so a
-// waiter never sees a commit's fencing without the commit. It wakes waiters
-// once if anything changed. It never does I/O.
+// transitionLocked raises the committed sequence and advances the status, with
+// mu held, and wakes waiters once. Both change together, so a waiter never
+// sees a commit's fencing without the commit.
 func (w *writer) transitionLocked(committed uint64, status writerStatus) {
 	changed := false
 	if committed > w.state.committed {
@@ -672,10 +662,8 @@ func (w *writer) ensureCapacityLocked() error {
 	return nil
 }
 
-// flush asks the committer for a pass and waits for it. ctx bounds the wait,
-// not the pass: a Flush that gives up leaves the commit going, under the
-// committer's own deadlines. It works after StopWrites, so what was accepted
-// can be drained before Close.
+// flush asks the committer for a pass and waits for it; ctx bounds only the
+// wait.
 func (w *writer) flush(ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -730,16 +718,12 @@ func (w *writer) requestPass(ctx context.Context, final bool) error {
 	}
 }
 
-// commitPass applies the maintenance command the poller has fetched, if any,
-// then commits the queued memtables oldest first, each attempt under its own
-// deadline (commitAttemptTimeout). A memtable that fails to commit stays at
-// the head of the queue; the next attempt reconciles it, so a commit applied
-// before its response was lost, or after its attempt timed out, is found, not
-// repeated. Only losing the fence is final. A maintenance failure is reported
-// and does not hold up commits. A pass never waits to read the maintenance
-// mailbox, except Close's (final), which reads it once, bounded, so a command
-// staged just before shutdown is not left behind. ctx is the committer's
-// lifetime.
+// commitPass applies the maintenance command the poller fetched, if any, then
+// commits the queued memtables oldest first, each attempt under its own
+// deadline. A memtable that fails stays at the head of the queue, and the next
+// attempt reconciles it, so a commit whose response was lost is not repeated.
+// Only Close's final pass reads the maintenance mailbox itself, so a command
+// staged just before shutdown is not left behind.
 func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if writerStatus(w.statusNow.Load()) == writerFenced {
 		return manifest.ErrFenced
@@ -813,15 +797,10 @@ const (
 	maxCommitAttemptTimeout = 10 * time.Minute
 )
 
-// commitAttemptTimeout is the deadline of one attempt to commit pending:
-// uploading its SST and change batch and updating CURRENT. A request that
-// hangs costs one attempt, which then fails, is reported and is retried.
-//
-// A timed-out attempt starts its upload again from the beginning, so on a
-// link slower than minCommitUploadBytesPerSecond every attempt would time out.
-// Each attempt in a row that runs out of time doubles the next one's
-// deadline, up to maxCommitAttemptTimeout, until one has time to finish; a
-// commit resets it.
+// commitAttemptTimeout is the deadline of one attempt to commit pending. A
+// timed-out attempt restarts its upload, so on a link slower than
+// minCommitUploadBytesPerSecond every attempt would time out: each timeout in
+// a row doubles the next deadline, up to maxCommitAttemptTimeout.
 func (w *writer) commitAttemptTimeout(pending *pendingFlush) time.Duration {
 	bytes := pending.memtable.ApproxSize()
 	if pending.changes != nil {
@@ -859,9 +838,8 @@ const maintenancePollTimeout = 5 * time.Second
 const maintenanceApplyTimeout = 30 * time.Second
 
 // maintenancePollLoop reads maintenance/HEAD every PollInterval, and at once
-// when maintenance in this process stages a command, until Close. It keeps
-// the mailbox read off the commit path: a flush applies what the poller has
-// fetched and never waits on the mailbox itself.
+// when maintenance in this process stages a command, so a flush never waits
+// on the mailbox itself.
 func (w *writer) maintenancePollLoop() {
 	defer close(w.pollerDone)
 	ticker := time.NewTicker(max(w.opts.Maintenance.PollInterval, minMaintenancePollInterval))
@@ -1119,10 +1097,9 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 		return 0, fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
-	// One memtable committed: its last sequence, not the writer's counter,
-	// which counts mutations still in memory. Reconciliation can prove the
-	// commit succeeded after a successor claimed the writer fence: record the
-	// commit and the fencing as one transition, so the commit stays a success.
+	// Record this memtable's last sequence, not the writer's counter. A commit
+	// reconciled after a successor took the fence is recorded together with
+	// the fencing, so it stays a success.
 	status := writerOpen
 	if fenced {
 		status = writerFenced
@@ -1147,14 +1124,10 @@ func writePendingChangeBatch(
 	)
 }
 
-// commitLoop is the committer, from the writer's start until Close stops it
-// or the writer loses its fence. It runs passes: when Flush or Close asks
-// (kick), and on each flush tick, including after StopWrites, so a writer
-// with a flush interval drains itself. With a flush interval, it also applies a
-// newly fetched maintenance command when the poller asks (applyWake), without
-// committing data. A failed commit stays queued; ticks retry it after a delay
-// that doubles while failures continue, up to maxFlushRetryDelay, and a Flush
-// retries it at once, without waiting for the delay.
+// commitLoop is the committer. It runs a pass when Flush or Close asks (kick)
+// and on each flush tick, and applies a newly fetched maintenance command when
+// the poller asks (applyWake). Ticks retry failed commits with a doubling
+// delay up to maxFlushRetryDelay; a Flush retries at once.
 func (w *writer) commitLoop(ctx context.Context, done chan struct{}) {
 	defer close(done)
 	// Without a flush interval, nothing commits on its own: neither data nor a
@@ -1243,14 +1216,9 @@ func (w *writer) stopPoller() {
 	})
 }
 
-// close finishes the writer. It stops accepting writes and asks the
-// committer for one last pass, which commits what is pending under the
-// committer's own deadlines; ctx bounds the wait. Then it stops the committer
-// and the poller, ending any attempt in flight, and waits for both: after
-// Close returns, nothing of the writer runs. The writer is finished either
-// way. If the pass failed or ctx ended first, Close returns an error naming
-// the writes not known to be committed; the last attempt may still land, so
-// they are unknown, not lost. A later Close returns the same result.
+// close runs one last pass, then stops the committer and the poller and waits
+// for both, so nothing of the writer runs after it returns. A later Close
+// returns the same result.
 func (w *writer) close(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext
