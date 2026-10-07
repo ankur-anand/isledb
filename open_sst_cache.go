@@ -64,12 +64,10 @@ func newOpenSSTCache(max int) *openSSTCache {
 	return &openSSTCache{entries: newClockCache[*openSST](), max: max}
 }
 
-// acquire returns the cached SST with a reference for the caller, or nil.
-//
-// A lookup may find an SST that a writer has just removed from the cache. If
-// the cache's reference was its last, the SST is closing, so tryRef refuses it
-// and acquire reports a miss; otherwise an iterator still holds it open and
-// the caller may use it until it drops its reference.
+// acquire returns the cached SST with a reference for the caller, or nil. A
+// lookup may find an SST a writer just removed: if it is already closing,
+// tryRef refuses it and acquire reports a miss; otherwise it is still open
+// and safe to use.
 func (c *openSSTCache) acquire(id string) *openSST {
 	if c == nil {
 		return nil
