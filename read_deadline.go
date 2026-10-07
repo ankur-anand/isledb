@@ -10,14 +10,10 @@ import (
 // readDeadline is a read's context, bounded by its view's expiry, that makes
 // no timer until something waits on it.
 //
-// A read must not outlive its view: once the view expires, maintenance may
-// delete the SSTs it names. context.WithDeadlineCause enforces that, but it
-// starts a timer for every read, and a warm read, answered from memory in a
-// microsecond, never waits for anything; the timer, and its allocations,
-// cost more than the read. readDeadline reports the expiry through Deadline
-// and Err, which need only the clock, and starts the timer the first time a
-// caller asks for Done: a fetch from disk or object storage, the only part of
-// a read that waits.
+// A read must not outlive its view, whose SSTs maintenance may delete once it
+// expires. context.WithDeadlineCause would start a timer per read, costing
+// more than a warm read from memory; readDeadline answers Deadline and Err
+// from the clock and starts the timer only when a fetch first asks for Done.
 type readDeadline struct {
 	parent    context.Context
 	expiresAt time.Time

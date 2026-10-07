@@ -41,12 +41,10 @@ type WriterOptions struct {
 	// Values controls key/value limits. Values are stored inline in SSTs.
 	Values ValueOptions
 
-	// OnFlushError is called when a commit, including one that Flush asked
-	// for or one that timed out, or applying a maintenance command, fails: on the first failure of a run and at most
-	// once a minute while failures continue. Commits and maintenance are
-	// separate runs, each ended by its next success. Failures are retried,
-	// never final, even ones that cannot succeed until an operator acts, such
-	// as missing permissions; nil logs a warning instead. It runs on its own
+	// OnFlushError is called when a commit or a maintenance apply fails: on
+	// the first failure and at most once a minute while failures continue.
+	// Failures are always retried, even ones that need an operator, such as
+	// missing permissions. Nil logs a warning instead. It runs on its own
 	// goroutine, may call Writer.Close, and may run after Close returns.
 	OnFlushError func(error)
 
@@ -74,11 +72,9 @@ type WriterFlushOptions struct {
 }
 
 type WriterMaintenanceOptions struct {
-	// PollInterval is how often a background poller reads maintenance/HEAD,
-	// each read bounded to 5 seconds. A fetched command is applied by the next
-	// flush; Flush itself never reads the mailbox, so a slow or hung mailbox
-	// does not delay commits. Same-process maintenance wakes the poller at
-	// once. Zero selects the default.
+	// PollInterval is how often the writer checks for commands from a
+	// maintenance process; the next flush applies them, so a slow mailbox never
+	// delays commits. Zero selects the default.
 	PollInterval time.Duration
 }
 

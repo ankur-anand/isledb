@@ -9,14 +9,11 @@ import (
 // clockCache is the core of the reader's metadata caches: a map read without
 // locks, with CLOCK eviction.
 //
-// Every point lookup consults these caches, from every goroutine at once, and
-// nearly always hits. An LRU list would need an exclusive lock on every hit
-// to move the entry; under parallel reads that lock, not the lookup, becomes
-// the cost. Here a reader loads an immutable snapshot of the map and, on a
-// hit, sets the entry's referenced flag, only if it is not already set, so a
-// hot entry is not written by every reader. Writers, which insert, evict and
-// remove, are rare: they serialize on mu, change a copy of the map, and
-// publish it.
+// Every point lookup hits these caches from every goroutine at once. An LRU
+// would take an exclusive lock on every hit to move the entry; here a hit
+// loads an immutable map and sets the entry's referenced flag only if unset,
+// so a hot entry is not written by every reader. Rare writers serialize on
+// mu and publish a changed copy of the map.
 //
 // Eviction is CLOCK: a hand sweeps the entries, clearing referenced flags and
 // evicting the first entry not referenced since the hand last passed it. It

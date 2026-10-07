@@ -42,9 +42,8 @@ type Reader struct {
 	// reloads counts manifest reloads started, so a forced refresh can tell
 	// whether a reload began after it was called.
 	reloads atomic.Uint64
-	// refreshing is set while a background refresh runs; background tracks
-	// it so Close can wait for it. refreshTimeout bounds it. refreshRequested
-	// records a timer that fired while one ran, so it runs again.
+	// refreshing is set while a background refresh runs; refreshRequested
+	// makes it run again for a timer that fired meanwhile.
 	refreshing       atomic.Bool
 	refreshRequested atomic.Bool
 	background       sync.WaitGroup
@@ -74,9 +73,7 @@ type Reader struct {
 	changeFeed      bool
 	changeHead      ChangeCursor
 	viewPolicy      ReaderViewPolicy
-	// refreshGrid is this reader's first refresh time: its open time plus a
-	// random phase. Refreshes fall on refreshGrid + k*RefreshAfter and retries
-	// on refreshGrid + k*retry period (see nextOnGrid). Set once at open.
+	// refreshGrid is the origin of this reader's refresh schedule (see nextOnGrid).
 	refreshGrid            time.Time
 	viewRefreshAt          time.Time
 	viewExpiresAt          time.Time
@@ -221,12 +218,9 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 	return r.refreshManifest(ctx, true)
 }
 
-// checkManifestView is what every read does first. The view is refreshed in
-// the background when its timer fires (see armViewTimer), never by a read, so
-// a read only checks that the view has not expired: until then every SST it
-// names is kept. An expired view is refreshed before the read, which fails if
-// that refresh does. A read answered from a view whose refresh failed counts
-// as stale.
+// checkManifestView runs before every read. A view that has not expired is
+// used as is, since armViewTimer refreshes it; an expired one is refreshed
+// first, and the read fails if that refresh does.
 func (r *Reader) checkManifestView(ctx context.Context) error {
 	r.mu.RLock()
 	expired := !time.Now().Before(r.viewExpiresAt)
@@ -244,10 +238,9 @@ func (r *Reader) checkManifestView(ctx context.Context) error {
 // hangs counts as failing.
 const backgroundRefreshTimeout = 30 * time.Second
 
-// refreshInBackground refreshes the view detached from any read, unless the
-// reader is closed. A request while a refresh runs is not dropped: the running
-// one refreshes again when it finishes, so the timer chain, which each refresh
-// re-arms, never stops however soon the next timer fires.
+// refreshInBackground refreshes the view unless the reader is closed. A
+// request made while a refresh runs makes it run again, so the timer chain
+// that each refresh re-arms never stops.
 func (r *Reader) refreshInBackground() {
 	// Holding the read lifecycle orders the start before Close's wait.
 	done, err := r.beginRead()
@@ -284,12 +277,9 @@ func (r *Reader) refreshOnce() {
 	}
 }
 
-// refreshManifest reloads the manifest view, sharing a reload already in
-// progress. A forced refresh must reflect every commit made before it was
-// called, so it accepts only a reload that started after the call: joining
-// one that started earlier, or a check that found the view fresh and
-// reloaded nothing, it waits for the next. Callers arriving together share
-// that next reload.
+// refreshManifest reloads the view, sharing a reload in progress. A forced
+// refresh must see every commit made before the call, so it waits for a
+// reload that started after it.
 func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 	called := r.reloads.Load()
 	for {
@@ -339,15 +329,10 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 	return nil
 }
 
-// nextOnGrid returns the first point of this reader's refresh grid,
-// refreshGrid + k*period for an integer k, after the given time. Scheduling on
-// a fixed grid with a random phase keeps readers spread out: each refreshes
-// exactly once a period, at its own offset, and nothing (a forced Refresh, a
-// failure, a slow reload) moves it into step with others. The next point is
-// at most period away, so a view is never older than RefreshAfter.
-//
-// A reader without a grid, built directly rather than opened, schedules one
-// period after after.
+// nextOnGrid returns the first time after after on this reader's grid,
+// refreshGrid + k*period. The grid's random phase keeps readers spread out,
+// and nothing that happens to one reader moves it into step with others. A
+// reader without a grid schedules one period after after.
 func (r *Reader) nextOnGrid(after time.Time, period time.Duration) time.Time {
 	if r.refreshGrid.IsZero() {
 		return after.Add(period)
@@ -359,17 +344,13 @@ func (r *Reader) nextOnGrid(after time.Time, period time.Duration) time.Time {
 	return after.Add(period - offset)
 }
 
-// refreshRetryAfter is how long after a failed refresh the next is tried,
-// or RefreshAfter if that is shorter: reads meanwhile are answered from the
-// still valid view without reaching object storage.
+// refreshRetryAfter is the delay before retrying a failed refresh, capped at
+// RefreshAfter.
 const refreshRetryAfter = 30 * time.Second
 
-// refreshFailed reschedules the next refresh, about refreshRetryAfter later on
-// the reader's own schedule, and
-// logs the failure, at most once a minute. Reads of a view that has not expired
-// are answered from it meanwhile; reads of an expired view fail until a
-// refresh succeeds, which the retries keep trying in the background. A view
-// not yet due, whose forced refresh failed, keeps its schedule.
+// refreshFailed marks reads stale, schedules a retry about refreshRetryAfter
+// later on the reader's grid, and logs at most once a minute. A failed forced
+// refresh of a view not yet due changes nothing.
 func (r *Reader) refreshFailed(err error) {
 	if r.closed.Load() {
 		return
@@ -445,12 +426,8 @@ func (r *Reader) publishManifestView(
 	refreshAt := r.nextOnGrid(viewLoadedAt, r.viewPolicy.RefreshAfter)
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
-	// Manifest states and SST IDs are immutable after publication. Swap the view
-	// and its metadata under one short critical section. Caches age retired
-	// SSTs out through their own LRUs; the block cache only forgets the file
-	// numbers of retired SSTs no longer open, keeping its map bounded.
-	// Reloads can overlap and finish in any order; a view older than the one
-	// published is dropped, so reads never go back in time.
+	// Reloads can finish in any order; an older view is dropped, so reads
+	// never go back in time.
 	seq := currentNextSeq(current)
 	r.mu.Lock()
 	if seq < r.viewSeq {
@@ -490,10 +467,8 @@ func readerChangeFeedState(current *manifest.Current) (bool, ChangeCursor) {
 	return current.ChangeFeedEnabled, changeCursorAt(current.NextSeq, 0)
 }
 
-// armViewTimer schedules the view's next refresh at refreshAt, or at
-// expiresAt if sooner: the timer marks the view due and refreshes it in the
-// background. This, not reads, keeps a reader's view fresh, so an idle
-// reader's view does not expire while object storage answers.
+// armViewTimer schedules the next background refresh at refreshAt, or at
+// expiresAt if sooner, so even an idle reader's view stays fresh.
 func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	timerID := r.viewTimerID.Add(1)
 	r.viewDue.Store(false)
@@ -629,12 +604,8 @@ func (r *Reader) beginRead() (func(), error) {
 	return r.lifecycleMu.RUnlock, nil
 }
 
-// currentManifest returns the currently published manifest pointer.
-// Callers must treat it as read-only.
-//
-// It is safe for snapshots to retain this pointer because Refresh swaps
-// r.manifest to a new manifest; it does not mutate the previous manifest in
-// place.
+// currentManifest returns the published manifest. A refresh replaces it
+// rather than modifying it, so callers may keep it but must not modify it.
 func (r *Reader) currentManifest() *manifestState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -921,10 +892,9 @@ func (r *Reader) openRangeSources(
 	for i := range m.Levels {
 		overlapping := m.Levels[i].OverlappingSSTsHalfOpen(minKey, maxKey)
 		if len(overlapping) > 0 {
-			// Reader manifests are immutable after publication. Borrowing their
-			// metadata is therefore safe. A narrow long-lived iterator copies its
-			// selection only to avoid retaining a much larger backing level; a full
-			// level already needs all of that metadata, so copying saves no memory.
+			// Published manifests are immutable, so borrowing a level is safe.
+			// A narrow iterator copies its selection so it does not keep a
+			// large level alive.
 			if detachNarrowLevels && len(overlapping) < len(m.Levels[i].SSTs) {
 				sources = append(sources,
 					newLevelMergeIteratorSource(r, ctx, overlapping, minKey, maxKey))
@@ -962,10 +932,8 @@ func (r *Reader) getFromSST(
 	}
 	value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
 	if damaged(err) {
-		// Damage found while reading dropped the SST, so the retry reads it
-		// afresh: damaged cached bytes cost one more fetch, never a failed
-		// lookup. Any other error, as damage at the origin or a value that
-		// does not decode, fails the same way again.
+		// The damaged SST was dropped, so the retry fetches it again. Other
+		// errors would fail the same way again.
 		value, found, tombstone, err = r.lookupSST(ctx, sstMeta, key)
 	}
 	return value, found, tombstone, err
@@ -1145,13 +1113,9 @@ func (r *Reader) sstPayloadSize(meta sstMetadata) (int64, error) {
 	return 0, fmt.Errorf("sst %s: missing size in manifest", meta.ID)
 }
 
-// openSSTIterBounded opens an iterator over one SST's keys in [lower, upper),
-// reusing the SST if it is already open. private makes the iterator fill no
-// cache: it reads blocks into buffers of its own and stores no fetched bytes
-// on disk; the long tail of a scan reads this way (see scanSSTSource).
-//
-// An SST whose open or iterator fails on damage is dropped, as is one whose
-// iterator later fails on damage (see sstIterWithClose.Close).
+// openSSTIterBounded opens an iterator over the SST's keys in [lower, upper),
+// reusing an open SST. A private iterator fills no cache (see scanSSTSource).
+// An SST that fails on damage is dropped.
 func (r *Reader) openSSTIterBounded(ctx context.Context, sstMeta sstMetadata, lower, upper []byte, private bool) (*sstable.Reader, sstable.Iterator, error) {
 	if _, err := r.sstPayloadSize(sstMeta); err != nil {
 		return nil, nil, err
@@ -1250,16 +1214,14 @@ func (it *sstIterWithClose) Close() error {
 	return err
 }
 
-// DiskCacheStats reports the disk cache's two tiers.
+// DiskCacheStats describes the disk cache's two tiers.
 type DiskCacheStats struct {
 	// Meta holds SST metadata regions and Bloom filters.
 	Meta CacheStats
 	// Data holds small SSTs whole and chunks of larger SSTs' data.
 	Data CacheStats
-	// SSTDrops counts reads that failed on what looked like damaged bytes,
-	// each dropping the SST from every layer so it is fetched again. It
-	// counts drops, not distinct SSTs: concurrent readers of one damaged SST
-	// each count, and an SST bad at the origin counts on every read.
+	// SSTDrops counts reads that dropped an SST from every cache after
+	// finding damaged bytes. Each such read counts, not each SST.
 	SSTDrops int64
 }
 

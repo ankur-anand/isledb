@@ -83,19 +83,13 @@ type SSTEncodingOptions struct {
 	BloomBitsPerKey int
 }
 
-// DefaultSSTOutputOptions returns the current production SST encoding for both
-// writer flushes and compacted output.
+// DefaultSSTOutputOptions returns the production SST encoding for writer
+// flushes and compacted output.
 //
-// L0 filters get more bits per key than compacted ones: every overlapping L0
-// SST is checked on a point lookup, yet L0 holds few keys, so extra bits there
-// remove many false positives for little memory. At 16 and 12 bits per key the
-// filters answer "may contain" for about 0.05% and 0.3% of absent keys.
-//
-// Compacted SSTs use 16 KiB data blocks, L0 SSTs 4 KiB. Compacted SSTs are
-// large and hold most of the data, so larger blocks shrink their index about
-// fourfold, which is most of the metadata a cold range read fetches, and cut
-// the blocks a scan requests. Small, short-lived L0 SSTs keep 4 KiB blocks for
-// the cheapest warm point lookups.
+// L0 filters use 16 bits per key and compacted ones 12 (about 0.05% and 0.3%
+// false positives): every overlapping L0 SST is checked on a lookup, and L0
+// holds few keys. Compacted SSTs use 16 KiB blocks, which shrink their index
+// about fourfold; L0 SSTs keep 4 KiB blocks for cheaper point lookups.
 func DefaultSSTOutputOptions() SSTOutputOptions {
 	l0 := SSTEncodingOptions{
 		Compression:     "snappy",
@@ -121,14 +115,11 @@ func DefaultSSTOutputOptions() SSTOutputOptions {
 // other.
 //
 // If WriterOptions.Flush.Interval is greater than zero, the Writer also runs a
-// background flush loop. A commit that fails, in the background or in Flush or
-// Close, stays queued and is retried; the next attempt finds a commit that was
-// applied before its response was lost, so nothing commits twice. The only
-// failure that ends a Writer is losing its fence to another writer
-// (ErrFenced). Background failures are reported through
-// WriterOptions.OnFlushError. A failure that cannot succeed until an operator
-// acts, such as missing permissions, is also retried, and never fails the
-// Writer on its own: alert on OnFlushError or the oldest-uncommitted gauge.
+// background flush loop. A failed commit stays queued and is retried, and a
+// retry detects a commit whose response was lost, so nothing commits twice.
+// Only losing the fence (ErrFenced) ends a Writer. A failure that needs an
+// operator, such as missing permissions, is retried indefinitely: alert on
+// WriterOptions.OnFlushError or the oldest-uncommitted gauge.
 type Writer struct {
 	w           *writer
 	releaseOnce sync.Once
@@ -184,12 +175,9 @@ func (w *Writer) CommittedSequence() uint64 {
 	return w.w.committed.Load()
 }
 
-// StopWrites makes the Writer refuse writes from now on: Put, PutWithTTL and
-// Delete return ErrWritesStopped. Everything else keeps working: Flush,
-// WaitCommitted, CommittedSequence and background commits go on, so what was
-// already accepted can be made durable before Close. With StopWrites first, a
-// Flush that returns nil means every write the Writer ever accepted is
-// committed. It is one-way, and Close implies it.
+// StopWrites makes Put, PutWithTTL and Delete return ErrWritesStopped from now
+// on; commits go on. After it, a Flush that returns nil means every accepted
+// write is committed. It is one-way, and Close implies it.
 func (w *Writer) StopWrites() {
 	w.w.stopWrites()
 }

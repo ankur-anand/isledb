@@ -237,22 +237,15 @@ func (s *levelMergeIteratorSource) close() error {
 	return err
 }
 
-// scanCacheFillBytes is how much of each SST a scan, or each seek, reads
-// through the block cache, adding the blocks it reads, before it switches to
-// reading into buffers of its own. About four 16 KiB blocks: a short read,
-// such as a page, a prefix read or a seek, is cached like a lookup and is
-// warm when repeated, while a long scan adds at most this much per SST and
-// never evicts the blocks lookups reuse.
+// scanCacheFillBytes is how much each read of an SST adds to the block cache:
+// about four 16 KiB blocks, so a short read is cached like a lookup while a
+// long scan never evicts the blocks lookups reuse.
 const scanCacheFillBytes = 64 << 10
 
-// scanSSTSource reads one SST for a scan. Each read, from the start or from
-// a seek, begins with an iterator that fills the block cache, so a seek and
-// the short read after it are cached as a lookup would be. Once the keys and
-// values a read has returned exceed its budget, the source reopens the SST
-// with an iterator that reads into its own buffers, positioned just after the
-// last entry returned; the next seek starts a new read, filling again. Scans
-// only move forward, so a switch is invisible to the merge, which, as with
-// any Pebble iterator, does not keep an entry past the next call.
+// scanSSTSource reads one SST for a scan. Each read, from the start or a seek,
+// fills the block cache until it has returned its budget, then reopens the SST
+// reading into its own buffers, just after the last entry returned. Scans only
+// move forward, so the switch is invisible to the merge.
 type scanSSTSource struct {
 	reader       *Reader
 	ctx          context.Context
@@ -263,9 +256,8 @@ type scanSSTSource struct {
 	iter     sstable.Iterator
 	errValue error
 	private  bool
-	// budget is how many more bytes the filling iterator may return before
-	// the source switches to its own buffers; each seek resets it to
-	// fillBudget. A fillBudget of zero or less keeps the source private.
+	// budget is what the filling iterator may still return; each seek resets
+	// it. A fillBudget of zero or less keeps the source private.
 	budget     int64
 	fillBudget int64
 	// last is the entry most recently returned, valid until the iterator
@@ -323,10 +315,8 @@ func (s *scanSSTSource) next() (*sstable.InternalKey, []byte) {
 	return s.track(nil, nil)
 }
 
-// restart begins a new read from a seek: the read gets a fresh budget,
-// so a seek caches what it reads as a lookup does, and a source that had
-// switched to its own buffers reopens filling the cache. It reports false
-// once the source has failed.
+// restart begins a new read from a seek, with a fresh budget and a filling
+// iterator. It reports false once the source has failed.
 func (s *scanSSTSource) restart() bool {
 	if s.iter == nil {
 		return false
