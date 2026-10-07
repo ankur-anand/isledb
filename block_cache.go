@@ -11,12 +11,10 @@ import (
 // blockCache keeps SST blocks in memory after checksum and decompression, in
 // Pebble's block cache, so a hit costs neither and allocates nothing.
 //
-// Pebble keys blocks by file number and offset. Each SST ID gets a number
-// from a counter that never repeats, kept across opens, so an SST reopened
-// after leaving the open-SST cache still finds its blocks. An SST forgets its
-// number, and its blocks are evicted, when it is reported corrupt, or when it
-// has left the manifest and is not open; a later open takes a new number, so
-// blocks cached under the old one can never be served again.
+// Pebble keys blocks by file number and offset. Each SST ID keeps a number
+// across opens, so a reopened SST finds its blocks. A corrupt SST, or one that
+// left the manifest and is not open, forgets its number; numbers never repeat,
+// so its old blocks can never be served again.
 type blockCache struct {
 	cache    *pebble.Cache
 	maxBytes int64
@@ -141,9 +139,8 @@ func (b *blockCache) noteOpen() {
 	}
 }
 
-// stats reports the cache's occupancy and its hits and misses on index and
-// data blocks. The misses every open makes on blocks Pebble never caches are
-// left out, so the hit rate reflects blocks the cache could have served.
+// stats reports occupancy, hits and misses, leaving out the lookups each open
+// makes that can never hit (metaLookupsPerOpen).
 func (b *blockCache) stats() CacheStats {
 	if b == nil {
 		return CacheStats{}

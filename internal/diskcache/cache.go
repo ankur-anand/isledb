@@ -138,10 +138,7 @@ type Cache struct {
 	// progress, which Close waits for before releasing the directory lock.
 	closed  bool
 	storing sync.WaitGroup
-	// stores holds the keys with a Put in progress. A drop of such a key
-	// bumps its generation, and a Put that sees the generation change is not
-	// kept (see store), so a dropped entry never comes back from a write
-	// already in progress. Drops of other keys leave Puts alone.
+	// stores holds the keys with a Put in progress (see store).
 	stores map[Key]*storeState
 	// testHook, set only by tests, runs at named points: "renamed" between a
 	// store's rename and its commit, "read" after ReadAt reads a file.
@@ -378,13 +375,10 @@ func (c *Cache) Stats(tr Tier) Stats {
 	return stats
 }
 
-// store writes data to a temporary file and renames it into place, then
-// evicts the tier's least recently used entries to get back within budget.
-//
-// st and gen are k's Puts in progress and its generation when this Put
-// began. The file is written without the lock held. If k was dropped since,
-// the store is not kept and k is removed: the bytes being stored may be the
-// ones the drop meant to discard.
+// store writes data to a temporary file without the lock held, renames it
+// into place, then evicts least recently used entries to fit the budget. A
+// drop of k bumps its generation; if gen changed meanwhile, the store is not
+// kept, since its bytes may be the ones the drop meant to discard.
 func (c *Cache) store(k Key, data []byte, st *storeState, gen uint64) error {
 	t := c.tiers[k.Kind.Tier()]
 	size := int64(len(data))
