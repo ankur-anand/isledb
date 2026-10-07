@@ -436,8 +436,16 @@ func TestSSTReadable_OriginChecksumMismatchIsNotDamage(t *testing.T) {
 			!strings.Contains(err.Error(), "checksum mismatch") {
 			t.Fatalf("Get err=%v, want a checksum mismatch", err)
 		}
-		if got := f.ranges.take(); len(got) != 2 {
-			t.Fatalf("lookup ranges=%v, want the object fetched for the Bloom filter and the open", got)
+		f.reader.bloomBackground.Wait()
+		whole := byteRange{0, f.meta.Size + f.meta.Bloom.Length}
+		got := f.ranges.take()
+		if len(got) == 0 {
+			t.Fatal("lookup fetched nothing, so a mismatched object was served from a cache")
+		}
+		for _, r := range got {
+			if r != whole {
+				t.Fatalf("lookup ranges=%v, want only whole-object fetches %v", got, whole)
+			}
 		}
 	}
 	if stats := f.reader.DiskCacheStats(); stats.SSTDrops != 0 || stats.Data.EntryCount != 0 {
@@ -547,6 +555,7 @@ func TestSSTReadable_BloomMissFetchesOnlyBloom(t *testing.T) {
 	f.ranges.take()
 
 	f.get(t, 1_000)
+	f.reader.bloomBackground.Wait()
 	bloom := byteRange{f.meta.Bloom.Offset, f.meta.Bloom.Offset + f.meta.Bloom.Length}
 	if got := f.ranges.take(); len(got) != 1 || got[0] != bloom {
 		t.Fatalf("lookup after Bloom eviction ranges=%v, want only the Bloom range %v", got, bloom)

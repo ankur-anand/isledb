@@ -78,7 +78,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
 			t.Fatalf("decoded Bloom L1 survived Reader restart: %+v", stats)
 		}
-		if !healingReader.bloomMayContain(ctx, meta, []byte("accounts/001")) {
+		if !bloomMayContainLoaded(healingReader, meta, []byte("accounts/001")) {
 			t.Fatal("recovered Bloom returned definitely absent")
 		}
 		if stats := healingReader.BloomCacheStats(); stats.EntryCount != 1 || stats.Misses == 0 {
@@ -107,7 +107,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		if stats := cacheOnlyReader.BloomCacheStats(); stats.EntryCount != 0 || stats.Bytes != 0 {
 			t.Fatalf("cache-only decoded Bloom L1 survived Reader restart: %+v", stats)
 		}
-		if !cacheOnlyReader.bloomMayContain(ctx, meta, []byte("accounts/001")) {
+		if !bloomMayContainLoaded(cacheOnlyReader, meta, []byte("accounts/001")) {
 			t.Fatal("persisted Bloom returned definitely absent")
 		}
 		if stats := cacheOnlyReader.BloomCacheStats(); stats.EntryCount != 1 || stats.Misses == 0 {
