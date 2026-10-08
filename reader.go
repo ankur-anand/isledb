@@ -67,6 +67,14 @@ type Reader struct {
 	viewSeq uint64
 	// position mirrors viewSeq for ViewPosition, which takes no lock.
 	position atomic.Uint64
+	// In Manual mode, nextView is the newest loaded view newer than the
+	// published one, and outdatedSince when the published view first became
+	// outdated; both clear when the published position moves.
+	nextView      *loadedView
+	outdatedSince time.Time
+	// safetyPublishes counts views published after MaxLag in Manual mode.
+	safetyPublishes atomic.Int64
+	maxLagClamped   atomic.Bool
 	// viewLoadedAt is when the published view was loaded.
 	viewLoadedAt time.Time
 	// refreshFailures counts refreshes failed since the view was loaded, and
@@ -130,6 +138,10 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	refreshGrid := viewLoadedAt.Add(time.Duration(rand.Int64N(int64(viewPolicy.RefreshAfter))) + 1)
 	viewRefreshAt := refreshGrid
 	current := ms.CurrentData()
+	if viewPolicy.Manual && viewPolicy.MaxLag >= current.PinnedViewAge()/2 {
+		return nil, fmt.Errorf("%w: max_lag=%s, want below half the store's max pinned view age %s",
+			ErrInvalidReaderOptions, viewPolicy.MaxLag, current.PinnedViewAge())
+	}
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
@@ -303,7 +315,7 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 		// publishes, the others find it already published.
 		result, _ := value.(reloadResult)
 		if result.view != nil {
-			r.publishLoadedView(*result.view)
+			r.publishLoaded(*result.view, force)
 		}
 		if !force || result.started > called {
 			return nil
@@ -401,10 +413,18 @@ func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time) (load
 //     started: nothing, the reader is ahead;
 //   - older, with nothing published since: the store went back, a failure.
 func (r *Reader) publishLoadedView(view loadedView) {
+	r.publishLoaded(view, false)
+}
+
+// publishLoaded is publishLoadedView for a refresh, forced or not. In Manual
+// mode a newer view from an unforced refresh is kept as the next view rather
+// than published, unless the published view has expired or has been
+// outdated for MaxLag; a kept view is still a successful refresh.
+func (r *Reader) publishLoaded(view loadedView, force bool) {
 	r.publishMu.Lock()
 	defer r.publishMu.Unlock()
 	r.mu.RLock()
-	published, publishedAt := r.viewSeq, r.viewLoadedAt
+	published, publishedAt, expiresAt := r.viewSeq, r.viewLoadedAt, r.viewExpiresAt
 	r.mu.RUnlock()
 	seq := currentNextSeq(view.current)
 	switch {
@@ -417,8 +437,57 @@ func (r *Reader) publishLoadedView(view loadedView) {
 	case seq == published && !view.loadedAt.After(publishedAt):
 		return
 	}
+	if seq > published && r.viewPolicy.Manual && !force && time.Now().Before(expiresAt) {
+		next, due := r.keepNextView(view)
+		if !due {
+			r.refreshSucceeded()
+			return
+		}
+		view = next
+		r.safetyPublishes.Add(1)
+	}
 	r.publishManifestView(view.manifest, view.current, view.loadedAt)
 	r.refreshSucceeded()
+}
+
+// keepNextView keeps view as the next view if it is the newest loaded, and
+// reports the newest and whether the published view has now been outdated
+// for MaxLag. When not, it schedules the next refresh, which a published view
+// would have done.
+func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
+	r.mu.Lock()
+	if r.nextView == nil || currentNextSeq(view.current) >= currentNextSeq(r.nextView.current) {
+		r.nextView = &view
+	}
+	if r.outdatedSince.IsZero() {
+		r.outdatedSince = view.loadedAt
+	}
+	next := *r.nextView
+	due := !time.Now().Before(r.outdatedSince.Add(r.maxLag(view.current)))
+	refreshAt := r.nextOnGrid(view.loadedAt, r.viewPolicy.RefreshAfter)
+	if !due {
+		r.viewRefreshAt = refreshAt
+	}
+	expiresAt := r.viewExpiresAt
+	r.mu.Unlock()
+	if !due {
+		r.armViewTimer(refreshAt, expiresAt)
+	}
+	return next, due
+}
+
+// maxLag is the policy's MaxLag, kept below half of current's pinned view
+// age: a store opened before its first writer may get a shorter age later.
+func (r *Reader) maxLag(current *manifest.Current) time.Duration {
+	lag, half := r.viewPolicy.MaxLag, current.PinnedViewAge()/2
+	if lag < half {
+		return lag
+	}
+	if r.maxLagClamped.CompareAndSwap(false, true) {
+		slog.Warn("isledb: MaxLag is not below half the store's max pinned view age; using half",
+			"max_lag", lag, "max_pinned_view_age", current.PinnedViewAge())
+	}
+	return half
 }
 
 // nextOnGrid returns the first time after after on this reader's grid,
@@ -526,6 +595,14 @@ func (r *Reader) publishManifestView(
 		published := r.viewSeq
 		r.mu.Unlock()
 		return false, published
+	}
+	if seq > r.viewSeq {
+		r.outdatedSince = time.Time{}
+	}
+	if r.nextView != nil && currentNextSeq(r.nextView.current) <= seq {
+		r.nextView = nil
+	} else if r.nextView != nil {
+		r.outdatedSince = r.nextView.loadedAt
 	}
 	r.manifest = m
 	r.viewSeq = seq

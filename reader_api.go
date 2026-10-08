@@ -10,6 +10,7 @@ var ErrInvalidReaderOptions = errors.New("invalid reader options")
 
 const (
 	defaultReaderRefreshAfter = time.Minute
+	defaultReaderMaxLag       = 5 * time.Minute
 	// minReaderRefreshAfter is the shortest RefreshAfter accepted: each
 	// refresh reads CURRENT from object storage.
 	minReaderRefreshAfter = time.Second
@@ -24,6 +25,18 @@ type ReaderViewPolicy struct {
 	// random phase, so readers started together do not refresh in step. Zero
 	// selects one minute; values under one second are rejected.
 	RefreshAfter time.Duration
+
+	// Manual leaves publishing newer views to the application. The Reader
+	// still loads every RefreshAfter and renews an unchanged view, but keeps
+	// a newer one unpublished until the application publishes it, or until
+	// the published view has been outdated for MaxLag, when it publishes the
+	// newest view itself. Refresh still publishes at once.
+	Manual bool
+
+	// MaxLag bounds, in Manual mode, how long the published view may stay
+	// outdated. Zero selects 5 minutes. It must be below half the store's
+	// MaxPinnedViewAge.
+	MaxLag time.Duration
 }
 
 // CacheStats reports one reader cache's occupancy and lookup activity. Byte
@@ -129,6 +142,12 @@ func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error
 	}
 	if policy.RefreshAfter == 0 {
 		policy.RefreshAfter = defaultReaderRefreshAfter
+	}
+	if policy.MaxLag < 0 {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: max_lag=%s", ErrInvalidReaderOptions, policy.MaxLag)
+	}
+	if policy.MaxLag == 0 {
+		policy.MaxLag = defaultReaderMaxLag
 	}
 	return policy, nil
 }

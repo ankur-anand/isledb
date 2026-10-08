@@ -104,13 +104,7 @@ func TestSharedReloadPublishesOnce(t *testing.T) {
 	go func() { errs <- reader.Refresh(ctx) }()
 	<-storage.read
 	go func() { errs <- reader.refreshManifest(ctx, false) }()
-	for waiters := 0; waiters < 2; time.Sleep(time.Millisecond) {
-		reader.manifestLoads.mu.Lock()
-		if call := reader.manifestLoads.calls["manifest"]; call != nil {
-			waiters = call.waiters
-		}
-		reader.manifestLoads.mu.Unlock()
-	}
+	waitForManifestWaiters(t, reader, 2)
 	close(storage.release)
 	for range 2 {
 		if err := <-errs; err != nil {
