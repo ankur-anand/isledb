@@ -36,6 +36,8 @@ type Reader struct {
 	bloomLoading      sync.Map
 	bloomLoadsRunning atomic.Int32
 	bloomBackground   sync.WaitGroup
+	// publishMu serializes publishLoadedView.
+	publishMu sync.Mutex
 	// sstDrops counts dropSST calls.
 	sstDrops      atomic.Int64
 	manifestLoads coalescedLoadGroup
@@ -285,44 +287,60 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 	for {
 		value, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
 			if !force && !r.manifestViewDue() {
-				return uint64(0), nil
+				return reloadResult{}, nil
 			}
 			started := r.reloads.Add(1)
-			return started, r.reloadManifest(loadCtx)
+			view, err := r.reloadManifest(loadCtx)
+			return reloadResult{started: started, view: view}, err
 		})
-		if err != nil || !force {
+		if err != nil {
 			return err
 		}
-		if started, _ := value.(uint64); started > called {
+		// Every caller that receives a loaded view publishes it; the first
+		// publishes, the others find it already published.
+		result, _ := value.(reloadResult)
+		if result.view != nil {
+			r.publishLoadedView(*result.view)
+		}
+		if !force || result.started > called {
 			return nil
 		}
 	}
 }
 
-func (r *Reader) reloadManifest(ctx context.Context) (err error) {
+// reloadResult is what one shared reload hands each caller waiting for it.
+type reloadResult struct {
+	started uint64      // the reload's number; zero when none ran
+	view    *loadedView // nil when none ran
+}
+
+// reloadManifest loads the current view for publishing. It returns no view
+// when every caller waiting for it gave up, or when loading failed, which it
+// records.
+func (r *Reader) reloadManifest(ctx context.Context) (view *loadedView, err error) {
 	start := time.Now()
 	defer func() {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	view, err := r.loadManifestView(ctx, start)
-	// Every caller waiting for this reload gave up: publish nothing.
+	loaded, err := r.loadManifestView(ctx, start)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return nil, ctxErr
 	}
 	if err != nil {
 		r.refreshFailed(err)
-		return err
+		return nil, err
 	}
-	r.publishLoadedView(view)
-	return nil
+	return &loaded, nil
 }
 
 // loadedView is a manifest view read from the store and not yet published.
+// fromSeq is the published view's log position when the load started.
 type loadedView struct {
 	manifest *manifestState
 	current  *manifest.Current
 	loadedAt time.Time
+	fromSeq  uint64
 }
 
 // loadManifestView reads CURRENT and replays the manifest it names, without
@@ -330,21 +348,40 @@ type loadedView struct {
 // together: reading CURRENT again could observe an overlapping reload's
 // generation.
 func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time) (loadedView, error) {
+	r.mu.RLock()
+	fromSeq := r.viewSeq
+	r.mu.RUnlock()
 	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
-	return loadedView{manifest: m, current: current, loadedAt: loadedAt}, err
+	return loadedView{manifest: m, current: current, loadedAt: loadedAt, fromSeq: fromSeq}, err
 }
 
-// publishLoadedView makes view the reader's view and records the refresh as
-// succeeded, or, when view is older than the published one, as failed.
+// publishLoadedView publishes view, one caller at a time:
+//   - newer than the published view: it replaces it;
+//   - the same log position, loaded later: it renews the published view's
+//     refresh and expiry times, as every successful refresh must, or an idle
+//     reader's view would expire;
+//   - already published by another caller sharing the load: nothing;
+//   - older, after another reload published a newer view since this load
+//     started: nothing, the reader is ahead;
+//   - older, with nothing published since: the store went back, a failure.
 func (r *Reader) publishLoadedView(view loadedView) {
-	if published, viewSeq := r.publishManifestView(view.manifest, view.current, view.loadedAt); !published {
-		// CURRENT is older than the view: either an overlapping reload
-		// published a newer one, which leaves the view not due and so is
-		// ignored, or the store went back, which is retried like a failure.
-		r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
-			currentNextSeq(view.current), viewSeq))
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	published, publishedAt := r.viewSeq, r.viewLoadedAt
+	r.mu.RUnlock()
+	seq := currentNextSeq(view.current)
+	switch {
+	case seq < published:
+		if published == view.fromSeq {
+			r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
+				seq, published))
+		}
+		return
+	case seq == published && !view.loadedAt.After(publishedAt):
 		return
 	}
+	r.publishManifestView(view.manifest, view.current, view.loadedAt)
 	r.refreshSucceeded()
 }
 
