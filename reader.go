@@ -300,15 +300,12 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 }
 
 func (r *Reader) reloadManifest(ctx context.Context) (err error) {
-	viewLoadedAt := time.Now()
-	start := viewLoadedAt
+	start := time.Now()
 	defer func() {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	// The manifest and the CURRENT it was built from are published together:
-	// reading CURRENT again could observe an overlapping reload's generation.
-	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
+	view, err := r.loadManifestView(ctx, start)
 	// Every caller waiting for this reload gave up: publish nothing.
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -317,16 +314,38 @@ func (r *Reader) reloadManifest(ctx context.Context) (err error) {
 		r.refreshFailed(err)
 		return err
 	}
-	if published, viewSeq := r.publishManifestView(m, current, viewLoadedAt); !published {
+	r.publishLoadedView(view)
+	return nil
+}
+
+// loadedView is a manifest view read from the store and not yet published.
+type loadedView struct {
+	manifest *manifestState
+	current  *manifest.Current
+	loadedAt time.Time
+}
+
+// loadManifestView reads CURRENT and replays the manifest it names, without
+// publishing it. The manifest and the CURRENT it was built from stay
+// together: reading CURRENT again could observe an overlapping reload's
+// generation.
+func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time) (loadedView, error) {
+	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
+	return loadedView{manifest: m, current: current, loadedAt: loadedAt}, err
+}
+
+// publishLoadedView makes view the reader's view and records the refresh as
+// succeeded, or, when view is older than the published one, as failed.
+func (r *Reader) publishLoadedView(view loadedView) {
+	if published, viewSeq := r.publishManifestView(view.manifest, view.current, view.loadedAt); !published {
 		// CURRENT is older than the view: either an overlapping reload
 		// published a newer one, which leaves the view not due and so is
 		// ignored, or the store went back, which is retried like a failure.
 		r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
-			currentNextSeq(current), viewSeq))
-		return nil
+			currentNextSeq(view.current), viewSeq))
+		return
 	}
 	r.refreshSucceeded()
-	return nil
 }
 
 // nextOnGrid returns the first time after after on this reader's grid,
