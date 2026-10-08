@@ -34,8 +34,9 @@ type ReaderViewPolicy struct {
 	Manual bool
 
 	// MaxLag bounds, in Manual mode, how long the published view may stay
-	// outdated. Zero selects 5 minutes. It must be below half the store's
-	// MaxPinnedViewAge.
+	// outdated. Zero selects 5 minutes, or a quarter of the store's
+	// MaxPinnedViewAge if that is shorter. A value set explicitly must be
+	// below half the MaxPinnedViewAge.
 	MaxLag time.Duration
 }
 
@@ -145,9 +146,6 @@ func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error
 	}
 	if policy.MaxLag < 0 {
 		return ReaderViewPolicy{}, fmt.Errorf("%w: max_lag=%s", ErrInvalidReaderOptions, policy.MaxLag)
-	}
-	if policy.MaxLag == 0 {
-		policy.MaxLag = defaultReaderMaxLag
 	}
 	return policy, nil
 }

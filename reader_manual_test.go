@@ -273,3 +273,37 @@ func TestManualPublishOfOlderViewKeepsClockOfNewer(t *testing.T) {
 			publishedSeq(reader), reader.safetyPublishes.Load())
 	}
 }
+
+func TestManualDefaultMaxLagFollowsPinnedAge(t *testing.T) {
+	_, reader, _, _, _ := newManualTestReader(t)
+	reader.viewPolicy.MaxLag = 0
+	if got := reader.maxLag(&manifest.Current{}); got != defaultReaderMaxLag {
+		t.Fatalf("default maxLag with the default pinned age = %s, want %s", got, defaultReaderMaxLag)
+	}
+	if got := reader.maxLag(&manifest.Current{MaxPinnedViewAge: 2 * time.Minute}); got != 30*time.Second {
+		t.Fatalf("default maxLag with a 2m pinned age = %s, want 30s", got)
+	}
+}
+
+func TestManualDefaultMaxLagOpensOnShortPinnedAge(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-manual-short-age")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriterWithPolicy(ctx, "writer", 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("1")},
+	}, 0, 1)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir: t.TempDir(), ViewPolicy: ReaderViewPolicy{Manual: true},
+	})
+	if err != nil {
+		t.Fatalf("a manual reader with the default MaxLag on a 2m pinned age: %v", err)
+	}
+	defer reader.Close()
+	if got := reader.maxLag(reader.manifestStore.CurrentData()); got != 30*time.Second {
+		t.Fatalf("maxLag = %s, want 30s", got)
+	}
+}

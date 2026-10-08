@@ -72,6 +72,12 @@ type Reader struct {
 	// outdated; both clear when the published position moves.
 	nextView      *loadedView
 	outdatedSince time.Time
+	// nextLoads counts the loads kept as nextView and handedLoads the last
+	// handed out by NextView, so each load is handed out once; nextReady is
+	// closed and replaced on each kept load to wake NextView, and is nil
+	// once the reader is closed.
+	nextLoads, handedLoads uint64
+	nextReady              chan struct{}
 	// safetyPublishes counts views published after MaxLag in Manual mode.
 	safetyPublishes atomic.Int64
 	maxLagClamped   atomic.Bool
@@ -138,7 +144,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	refreshGrid := viewLoadedAt.Add(time.Duration(rand.Int64N(int64(viewPolicy.RefreshAfter))) + 1)
 	viewRefreshAt := refreshGrid
 	current := ms.CurrentData()
-	if viewPolicy.Manual && viewPolicy.MaxLag >= current.PinnedViewAge()/2 {
+	if viewPolicy.Manual && viewPolicy.MaxLag > 0 && viewPolicy.MaxLag >= current.PinnedViewAge()/2 {
 		return nil, fmt.Errorf("%w: max_lag=%s, want below half the store's max pinned view age %s",
 			ErrInvalidReaderOptions, viewPolicy.MaxLag, current.PinnedViewAge())
 	}
@@ -168,6 +174,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		metrics:        opts.Metrics,
 	}
 	reader.endRead = reader.lifecycleMu.RUnlock
+	reader.nextReady = make(chan struct{})
 	reader.position.Store(reader.viewSeq)
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
@@ -338,9 +345,15 @@ var (
 )
 
 // publishAt publishes view only if the published view is still at previous
-// and view is newer, returning ErrViewChanged otherwise, and
-// ErrNextViewExpired if view's pinned age has passed since it was loaded.
+// and view is newer, returning ErrViewChanged otherwise, ErrNextViewExpired
+// if view's pinned age has passed since it was loaded, and ErrReaderClosed
+// once the reader is closed.
 func (r *Reader) publishAt(view loadedView, previous uint64) error {
+	done, err := r.beginRead()
+	if err != nil {
+		return err
+	}
+	defer done()
 	r.publishMu.Lock()
 	defer r.publishMu.Unlock()
 	r.mu.RLock()
@@ -458,6 +471,11 @@ func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
 	r.mu.Lock()
 	if r.nextView == nil || currentNextSeq(view.current) >= currentNextSeq(r.nextView.current) {
 		r.nextView = &view
+		r.nextLoads++
+		if r.nextReady != nil {
+			close(r.nextReady)
+			r.nextReady = make(chan struct{})
+		}
 	}
 	if r.outdatedSince.IsZero() {
 		r.outdatedSince = view.loadedAt
@@ -476,10 +494,15 @@ func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
 	return next, due
 }
 
-// maxLag is the policy's MaxLag, kept below half of current's pinned view
-// age: a store opened before its first writer may get a shorter age later.
+// maxLag is the policy's MaxLag for current's pinned view age: by default
+// the shorter of defaultReaderMaxLag and a quarter of the age; an explicit
+// value is kept below half the age, since a store opened before its first
+// writer may get a shorter age later.
 func (r *Reader) maxLag(current *manifest.Current) time.Duration {
 	lag, half := r.viewPolicy.MaxLag, current.PinnedViewAge()/2
+	if lag == 0 {
+		return min(defaultReaderMaxLag, current.PinnedViewAge()/4)
+	}
 	if lag < half {
 		return lag
 	}
@@ -699,6 +722,12 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	defer r.releaseReader()
+	r.mu.Lock()
+	if r.nextReady != nil {
+		close(r.nextReady)
+		r.nextReady = nil
+	}
+	r.mu.Unlock()
 	r.stopViewTimer()
 	r.closeOpenIterators()
 	r.manifestLoads.Close(ErrReaderClosed)
