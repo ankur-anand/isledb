@@ -65,6 +65,8 @@ type Reader struct {
 	// viewSeq is the published CURRENT's NextSeq: the manifest log position
 	// the view reflects. A view is only ever replaced by one at least as new.
 	viewSeq uint64
+	// position mirrors viewSeq for ViewPosition, which takes no lock.
+	position atomic.Uint64
 	// viewLoadedAt is when the published view was loaded.
 	viewLoadedAt time.Time
 	// refreshFailures counts refreshes failed since the view was loaded, and
@@ -154,6 +156,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		metrics:        opts.Metrics,
 	}
 	reader.endRead = reader.lifecycleMu.RUnlock
+	reader.position.Store(reader.viewSeq)
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
 	cleanupDiskCache = false
@@ -306,6 +309,39 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 			return nil
 		}
 	}
+}
+
+// ViewPosition identifies a view's data: the manifest log position it
+// reflects. Two views at the same position hold the same data.
+type ViewPosition uint64
+
+// ViewPosition returns the published view's position, without a lock.
+func (r *Reader) ViewPosition() ViewPosition {
+	return ViewPosition(r.position.Load())
+}
+
+var (
+	ErrViewChanged     = errors.New("published view changed")
+	ErrNextViewExpired = errors.New("next view expired before it was published")
+)
+
+// publishAt publishes view only if the published view is still at previous
+// and view is newer, returning ErrViewChanged otherwise, and
+// ErrNextViewExpired if view's pinned age has passed since it was loaded.
+func (r *Reader) publishAt(view loadedView, previous uint64) error {
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	published := r.viewSeq
+	r.mu.RUnlock()
+	if published != previous || currentNextSeq(view.current) <= published {
+		return ErrViewChanged
+	}
+	if !time.Now().Before(view.loadedAt.Add(view.current.PinnedViewAge())) {
+		return ErrNextViewExpired
+	}
+	r.publishManifestView(view.manifest, view.current, view.loadedAt)
+	return nil
 }
 
 // reloadResult is what one shared reload hands each caller waiting for it.
@@ -493,6 +529,7 @@ func (r *Reader) publishManifestView(
 	}
 	r.manifest = m
 	r.viewSeq = seq
+	r.position.Store(seq)
 	r.viewLoadedAt = viewLoadedAt
 	r.version = versionFromCurrent(current)
 	r.changeFeed = changeFeed

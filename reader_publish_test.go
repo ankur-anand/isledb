@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -123,4 +124,74 @@ func TestSharedReloadPublishesOnce(t *testing.T) {
 		t.Fatal("the newer view was not published")
 	}
 	assertReaderHasB(t, ctx, reader)
+}
+
+func nextLoadedView(seq uint64, loadedAt time.Time) loadedView {
+	return loadedView{manifest: &manifestState{}, current: &manifest.Current{NextSeq: seq}, loadedAt: loadedAt}
+}
+
+func TestPublishAtPublishesNewerView(t *testing.T) {
+	_, reader, _, _, _ := newRefreshTestReader(t)
+	seq := publishedSeq(reader)
+	if err := reader.publishAt(nextLoadedView(seq+1, time.Now()), seq); err != nil {
+		t.Fatal(err)
+	}
+	if reader.ViewPosition() != ViewPosition(seq+1) || publishedSeq(reader) != seq+1 {
+		t.Fatalf("published position %d, ViewPosition %d, want %d", publishedSeq(reader), reader.ViewPosition(), seq+1)
+	}
+}
+
+func TestPublishAtFailsWhenPublishedViewMoved(t *testing.T) {
+	_, reader, _, _, _ := newRefreshTestReader(t)
+	seq := publishedSeq(reader)
+	if err := reader.publishAt(nextLoadedView(seq+1, time.Now()), seq); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.publishAt(nextLoadedView(seq+2, time.Now()), seq); !errors.Is(err, ErrViewChanged) {
+		t.Fatalf("publish against a moved view: %v, want ErrViewChanged", err)
+	}
+	if publishedSeq(reader) != seq+1 {
+		t.Fatal("a view prepared against a moved view was published")
+	}
+}
+
+func TestPublishAtFailsForViewNotNewer(t *testing.T) {
+	_, reader, _, _, _ := newRefreshTestReader(t)
+	seq := publishedSeq(reader)
+	if err := reader.publishAt(nextLoadedView(seq, time.Now()), seq); !errors.Is(err, ErrViewChanged) {
+		t.Fatalf("publish of a view at the published position: %v, want ErrViewChanged", err)
+	}
+}
+
+func TestPublishAtFailsForExpiredView(t *testing.T) {
+	_, reader, _, _, _ := newRefreshTestReader(t)
+	seq := publishedSeq(reader)
+	loadedAt := time.Now().Add(-manifest.DefaultMaxPinnedViewAge - time.Second)
+	if err := reader.publishAt(nextLoadedView(seq+1, loadedAt), seq); !errors.Is(err, ErrNextViewExpired) {
+		t.Fatalf("publish of an expired view: %v, want ErrNextViewExpired", err)
+	}
+	if publishedSeq(reader) != seq {
+		t.Fatal("an expired view was published")
+	}
+}
+
+func TestViewPositionFollowsRefreshes(t *testing.T) {
+	ctx, reader, _, store, ms := newRefreshTestReader(t)
+	if reader.ViewPosition() != ViewPosition(publishedSeq(reader)) {
+		t.Fatal("ViewPosition does not match the view opened")
+	}
+	commitKeyB(t, ctx, store, ms)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	moved := reader.ViewPosition()
+	if moved != ViewPosition(publishedSeq(reader)) {
+		t.Fatal("ViewPosition does not follow a refresh")
+	}
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if reader.ViewPosition() != moved {
+		t.Fatal("a renewal moved ViewPosition")
+	}
 }
