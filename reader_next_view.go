@@ -179,8 +179,7 @@ func (v *NextView) Prefetch(ctx context.Context, opts PrefetchOptions) (Prefetch
 	for _, sst := range v.added {
 		only[sst.ID] = struct{}{}
 	}
-	selected, stats := r.selectSSTsToPrefetch(v.view.manifest, opts, only)
-	return r.fetchPrefetchSSTs(ctx, selected, stats, opts.Concurrency, expiresAt, ErrNextViewExpired)
+	return r.prefetchSSTs(ctx, v.view.manifest, opts, only, expiresAt, ErrNextViewExpired)
 }
 
 func sstMetadataOf(m *manifestState) []sstMetadata {

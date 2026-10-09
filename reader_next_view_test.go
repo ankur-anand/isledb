@@ -3,6 +3,7 @@ package isledb
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -425,6 +426,83 @@ func TestNextViewPrefetchKeepsPublishedBloomFilters(t *testing.T) {
 	}
 	if err != nil || stats.CachedSSTs != 0 || stats.SkippedSSTs != 1 {
 		t.Fatalf("prefetch with no room for b's Bloom filter: %+v, %v; want b skipped", stats, err)
+	}
+}
+
+// TestConcurrentPrefetchesShareFreeSpace runs two next-view prefetches at
+// once into room for one: the second sees what the first stored, so it skips
+// its SST instead of evicting the published view's.
+func TestConcurrentPrefetchesShareFreeSpace(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("next-view-concurrent")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	for i, key := range []string{"a", "b", "c"} {
+		writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+			{Key: []byte(key), Seq: uint64(i + 1), Kind: internal.OpPut, Value: []byte(key)},
+		}, 0, uint64(i+1))
+	}
+	m, err := ms.Replay(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, sst := range m.L0SSTs {
+		total += sst.Size
+	}
+	// Room for the published SST and one other, not all three.
+	cache, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: total - 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	all := reader.currentManifest()
+	a, b, c := sstNamed(t, all, m.L0SSTs[0].ID), sstNamed(t, all, m.L0SSTs[1].ID), sstNamed(t, all, m.L0SSTs[2].ID)
+	if _, err := reader.fetcher.prefetch(ctx, reader.fetcher.object(a)); err != nil {
+		t.Fatal(err)
+	}
+	only := func(sst sstMetadata) *manifestState {
+		v := all.Clone()
+		v.L0SSTs = []sstMetadata{sst}
+		return v
+	}
+	published, current := only(a), reader.manifestStore.CurrentData()
+	next := func(sst sstMetadata) *NextView {
+		return newNextView(reader, loadedView{manifest: only(sst), current: current, loadedAt: time.Now()}, 0, published)
+	}
+
+	// Hold the first prefetch between selecting and downloading.
+	selected, release := make(chan struct{}, 2), make(chan struct{})
+	var calls atomic.Int32
+	reader.prefetchSelected = func() {
+		selected <- struct{}{}
+		if calls.Add(1) == 1 {
+			<-release
+		}
+	}
+	first := make(chan error, 1)
+	go func() { _, err := next(b).Prefetch(ctx, PrefetchOptions{All: true}); first <- err }()
+	<-selected
+	second := make(chan error, 1)
+	go func() { _, err := next(c).Prefetch(ctx, PrefetchOptions{All: true}); second <- err }()
+	select {
+	case <-selected: // selected beside the first: the race this test is for
+	case <-time.After(200 * time.Millisecond): // waits for the first
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if !reader.fetcher.resident(reader.fetcher.object(a)) || cache.Stats(diskcache.TierData).Evictions != 0 {
+		t.Fatalf("concurrent prefetches evicted the published SST: %+v", cache.Stats(diskcache.TierData))
 	}
 }
 

@@ -318,3 +318,33 @@ func TestManualDefaultMaxLagOpensOnShortPinnedAge(t *testing.T) {
 		t.Fatalf("maxLag = %s, want 30s", got)
 	}
 }
+
+func TestCloseResetsViewGauges(t *testing.T) {
+	ctx, reader, _, store, ms := newManualTestReader(t)
+	commitKeyB(t, ctx, store, ms)
+	if err := reader.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Retire both published SSTs while deletes are held: one stays queued.
+	reader.dead.gate = make(chan struct{})
+	seq := publishedSeq(reader)
+	if err := reader.publishAt(nextLoadedView(seq+1, time.Now()), seq); err != nil {
+		t.Fatal(err)
+	}
+	// A newer load is kept unpublished, so the published view is outdated.
+	commitKey(t, ctx, store, ms, "c", 3)
+	commitKey(t, ctx, store, ms, "d", 4)
+	fireViewTimer(reader)
+	outdated, pending := reader.metrics.ViewOutdatedSince, reader.metrics.DeadSSTsPending
+	if testutil.ToFloat64(outdated) == 0 || testutil.ToFloat64(pending) == 0 {
+		t.Fatalf("outdated since %v, pending %v; want both set before Close",
+			testutil.ToFloat64(outdated), testutil.ToFloat64(pending))
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.ToFloat64(outdated) != 0 || testutil.ToFloat64(pending) != 0 {
+		t.Fatalf("outdated since %v, pending %v after Close; want 0",
+			testutil.ToFloat64(outdated), testutil.ToFloat64(pending))
+	}
+}

@@ -679,6 +679,9 @@ concurrent reads.
 - `CachedSSTs` counts selected SSTs wholly on disk when it returns;
   `BytesRead` counts bytes it fetched.
 - It uses the reader's current view and does not force a refresh.
+- A reader runs one prefetch at a time, `NextView.Prefetch` included; another
+  waits for it, or for its context to end. Each then sees the space the last
+  one used, so two never fill the same free space.
 
 ### Freshness and outages
 

@@ -95,14 +95,19 @@ type Reader struct {
 	changeHead      ChangeCursor
 	viewPolicy      ReaderViewPolicy
 	// refreshGrid is the origin of this reader's refresh schedule (see nextOnGrid).
-	refreshGrid            time.Time
-	viewRefreshAt          time.Time
-	viewExpiresAt          time.Time
-	viewDue                atomic.Bool
-	viewTimerMu            sync.Mutex
-	viewTimer              *time.Timer
-	viewTimerID            atomic.Uint64
-	metrics                *ReaderMetrics
+	refreshGrid   time.Time
+	viewRefreshAt time.Time
+	viewExpiresAt time.Time
+	viewDue       atomic.Bool
+	viewTimerMu   sync.Mutex
+	viewTimer     *time.Timer
+	viewTimerID   atomic.Uint64
+	metrics       *ReaderMetrics
+	// prefetching admits one prefetch at a time (see prefetchSSTs).
+	prefetching chan struct{}
+	// prefetchSelected, set only by tests, runs after a prefetch selects its
+	// SSTs and before it downloads them.
+	prefetchSelected       func()
 	bloomDiagnosticLimiter readerDiagnosticLimiter
 	// stale reports that a refresh failed and reads are answered from an
 	// older, still valid view; it is cleared when a refresh succeeds.
@@ -154,6 +159,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
+		prefetching:    make(chan struct{}, 1),
 		store:          store,
 		manifestStore:  ms,
 		manifest:       m,

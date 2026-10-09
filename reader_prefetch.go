@@ -42,9 +42,9 @@ type PrefetchStats struct {
 }
 
 // Prefetch caches SSTs on disk for a fresh manifest view: their metadata,
-// Bloom filters and data, fetching only what is missing. It stops selecting
-// SSTs once they would exceed the disk cache's data budget, counting the rest
-// as skipped.
+// Bloom filters and data, fetching only what is missing. It selects only what
+// fits in the disk cache's free space, counting the rest as skipped, and runs
+// after any other prefetch of this Reader.
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error) {
 	if err := validatePrefetchOptions(opts); err != nil {
 		return PrefetchStats{}, err
@@ -68,8 +68,31 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		return PrefetchStats{}, nil
 	}
 
-	selected, stats := r.selectPrefetchSSTs(m, opts)
-	return r.fetchPrefetchSSTs(ctx, selected, stats, opts.Concurrency, expiresAt, ErrReadViewExpired)
+	return r.prefetchSSTs(ctx, m, opts, nil, expiresAt, ErrReadViewExpired)
+}
+
+// prefetchSSTs selects SSTs of m to cache and downloads them, one prefetch at
+// a time per Reader: each selects by free space once the last has stored, so
+// two never fill the same space and evict what reads use.
+func (r *Reader) prefetchSSTs(
+	ctx context.Context,
+	m *manifestState,
+	opts PrefetchOptions,
+	only map[string]struct{},
+	expiresAt time.Time,
+	expiredErr error,
+) (PrefetchStats, error) {
+	select {
+	case r.prefetching <- struct{}{}:
+	case <-ctx.Done():
+		return PrefetchStats{}, ctx.Err()
+	}
+	defer func() { <-r.prefetching }()
+	selected, stats := r.selectSSTsToPrefetch(m, opts, only)
+	if r.prefetchSelected != nil {
+		r.prefetchSelected()
+	}
+	return r.fetchPrefetchSSTs(ctx, selected, stats, opts.Concurrency, expiresAt, expiredErr)
 }
 
 // fetchPrefetchSSTs caches the selected SSTs on disk, a few at a time, before
@@ -133,10 +156,6 @@ func validatePrefetchOptions(opts PrefetchOptions) error {
 		return errors.New("prefetch requires a key range or All=true")
 	}
 	return nil
-}
-
-func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]sstMetadata, PrefetchStats) {
-	return r.selectSSTsToPrefetch(m, opts, nil)
 }
 
 // selectSSTsToPrefetch selects SSTs of m that are not on disk, and with only
