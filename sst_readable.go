@@ -134,7 +134,7 @@ func newSSTFetcher(store *blobstore.Store, disk *diskcache.Cache, metrics *Reade
 		inflight: make(map[diskcache.Key]*chunkFetch),
 	}
 	if disk != nil {
-		// A whole SST that the data tier could never hold is read in chunks.
+		// A whole SST that the disk cache could never hold is read in chunks.
 		f.smallLimit = min(f.smallLimit, disk.Stats(diskcache.TierData).MaxBytes)
 	}
 	return f

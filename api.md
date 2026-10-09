@@ -22,6 +22,7 @@ import "github.com/ankur-anand/isledb"
   - [Writer options](#writer-options)
 - [Read data](#read-data)
   - [Freshness and outages](#freshness-and-outages)
+  - [Prepare views before reads switch to them](#prepare-views-before-reads-switch-to-them)
 - [Change feed](#change-feed)
 - [Run maintenance](#run-maintenance)
 - [Prometheus metrics](#prometheus-metrics)
@@ -450,6 +451,8 @@ type ReaderOpenOptions struct {
 
 type ReaderViewPolicy struct {
     RefreshAfter time.Duration
+    Manual       bool
+    MaxLag       time.Duration
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
@@ -464,6 +467,8 @@ sizes select the defaults; negative sizes are rejected.
 | `BlockCacheSize` | 256 MiB | Decoded SST blocks kept in memory |
 | `BloomCacheSize` | 64 MiB | Parsed Bloom filters kept in memory |
 | `Views.RefreshAfter` | 1 minute | How often the view is refreshed in the background (at least 1 second) |
+| `Views.Manual` | `false` | Leave publishing newer views to the application; see [Prepare views before reads switch to them](#prepare-views-before-reads-switch-to-them) |
+| `Views.MaxLag` | 5 minutes, or a quarter of `MaxPinnedViewAge` if shorter | In manual mode, how long the published view may stay outdated before the reader publishes the newest view itself. A value set explicitly must be below half the store's `MaxPinnedViewAge`, or open fails with `ErrInvalidReaderOptions`; if the store's first writer later sets a shorter age, half of it is used and a warning logged once |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
 ```go
@@ -475,6 +480,8 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) Refresh(ctx context.Context) error
+func (r *Reader) ViewPosition() ViewPosition
+func (r *Reader) NextView(ctx context.Context) (*NextView, error)
 func (r *Reader) DiskCacheStats() DiskCacheStats
 func (r *Reader) BlockCacheStats() CacheStats
 func (r *Reader) OpenSSTCacheStats() CacheStats
@@ -504,8 +511,9 @@ type KV struct {
   evicts what is already cached. SSTs that do not fit are counted in
   `PrefetchStats.SkippedSSTs` and load on demand.
 - When a refresh retires SSTs, after a compaction, the reader deletes them
-  from its disk cache in the background, keeping the space for data a view
-  can read.
+  from its disk cache in the background, at most 1,000 files a second so the
+  deletes do not slow lookups, keeping the space for data a view can read.
+  `isledb_reader_dead_ssts_pending` shows how many are still queued.
 
 ### Iterate without loading the whole range
 
@@ -662,11 +670,12 @@ concurrent reads.
 
 - Use `All: true` to prefetch the whole keyspace.
 - Zero `MaxSSTs` or `MaxBytes` means no limit beyond the disk cache itself.
-  `MaxBytes` bounds what this call downloads, so repeated calls warm a large
-  range in steps.
-- It skips SSTs already on disk and stops selecting once the disk cache's
-  data budget is full, so repeating a prefetch larger than the cache keeps
-  what the last one cached. SSTs left out count in `SkippedSSTs`.
+  `MaxBytes` bounds what this call downloads, each SST's Bloom filter
+  included, so repeated calls warm a large range in steps.
+- It skips SSTs already on disk and selects only what fits in the disk
+  cache's free space, each SST counted with its Bloom filter, so repeating a
+  prefetch larger than the cache keeps what the last one cached. SSTs left
+  out count in `SkippedSSTs`.
 - `CachedSSTs` counts selected SSTs wholly on disk when it returns;
   `BytesRead` counts bytes it fetched.
 - It uses the reader's current view and does not force a refresh.
@@ -703,6 +712,97 @@ progress.
 
 Internals of how a reader fetches and caches data are in
 [the appendix](#appendix-how-a-reader-reads-ssts).
+
+### Prepare views before reads switch to them
+
+A compaction rewrites data into new SSTs. When reads switch to a view naming
+them, the first lookups of hot keys each wait for object storage. In manual
+mode the application takes each newer view the reader loads, prepares it, for
+example by downloading its new SSTs, and only then switches reads to it.
+
+```go
+type ViewPosition uint64
+
+type SSTInfo struct {
+    ID             string
+    Level          int
+    Size           int64 // in the manifest
+    BloomSize      int64 // stored after Size in the same object
+    MinKey, MaxKey []byte
+}
+
+func (v *NextView) Previous() ViewPosition
+func (v *NextView) Next() ViewPosition
+func (v *NextView) Version() Version
+func (v *NextView) Added() []SSTInfo
+func (v *NextView) Removed() []SSTInfo
+func (v *NextView) Snapshot() (*Snapshot, error)
+func (v *NextView) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
+func (v *NextView) Publish() error
+func (v *NextView) Discard()
+```
+
+```go
+opts := isledb.DefaultReaderOpenOptions("/var/cache/isledb")
+opts.Views.Manual = true
+reader, err := db.OpenReader(ctx, opts)
+if err != nil {
+    return err
+}
+for {
+    next, err := reader.NextView(ctx) // waits for the reader's next newer load
+    if err != nil {
+        return err // ctx ended or the reader closed
+    }
+    if _, err := next.Prefetch(ctx, isledb.PrefetchOptions{All: true}); err != nil {
+        log.Printf("warming view %d: %v", next.Next(), err) // still correct, only colder
+    }
+    switch err := next.Publish(); {
+    case err == nil, errors.Is(err, isledb.ErrViewChanged), errors.Is(err, isledb.ErrNextViewExpired):
+        // Published, or another view was; take the next one.
+    default:
+        return err
+    }
+}
+```
+
+- **The reader keeps loading.** Every `RefreshAfter` it loads the manifest
+  and renews an unchanged view, as in the default mode. A newer view is kept
+  unpublished for the application instead of replacing the published one.
+- **`NextView`** returns a loaded view newer than the published one, waiting
+  for the reader's next such load if none is pending. Each load is handed out
+  once: after a view is taken, published or not, the next call waits for a
+  later load, at most `RefreshAfter` away, so two goroutines calling it get
+  different loads. Outside manual mode it returns `ErrNotManual`.
+- **Positions.** A `ViewPosition` is the manifest log position a view
+  reflects; two views at the same position hold the same data.
+  `Reader.ViewPosition()` returns the published one without a lock, so state
+  prepared per view can be checked on every read. `Previous` is the published
+  position when the view was handed out, `Next` the view's own.
+- **`Added` and `Removed`** list the SSTs the view names that the published
+  one does not, and the reverse. An SST moved between levels is in neither.
+  Caching an SST downloads `Size + BloomSize` bytes.
+- **`Prefetch`** downloads the `Added` SSTs, as `Reader.Prefetch` does, into
+  the disk cache's free space only, so it never evicts what reads are using.
+  Give the disk cache room for the largest compaction's output beside the
+  live data, up to twice the store when a compaction rewrites all of it, or
+  warming covers only part of a view and the rest loads on demand.
+- **`Snapshot`** reads the view before it is published. It never refreshes.
+- **`Publish`** is a compare-and-swap: it switches reads to the view only if
+  the published view is still at `Previous`. Otherwise it returns
+  `ErrViewChanged`. A view past its readable life, `MaxPinnedViewAge` from
+  when it was loaded, returns `ErrNextViewExpired`. After `Publish` or
+  `Discard`, every method that acts returns `ErrNextViewDone`. `Discard`
+  releases nothing, so it is optional.
+- **`Refresh` publishes at once** in manual mode too, for read-your-writes.
+  A pending `Publish` then gets `ErrViewChanged`.
+- **The safety net.** If the published view has been outdated for `MaxLag`,
+  the reader publishes the newest view it loaded itself, so a stuck
+  application loop costs freshness, never availability. If the published
+  view has already expired when a newer one loads, the reader publishes at
+  once.
+- **The cost is visibility.** A change reaches reads after the next refresh
+  plus the time to prepare it, at most `MaxLag`.
 
 ## Change feed
 
@@ -1133,7 +1233,27 @@ plus:
 - `stale_reads_total`: reads answered from a view whose refresh failed (see
   [Freshness and outages](#freshness-and-outages));
 - `view_loaded_timestamp_seconds`: when the current view was loaded;
-  `time() - isledb_reader_view_loaded_timestamp_seconds` is its age.
+  `time() - isledb_reader_view_loaded_timestamp_seconds` is its age;
+- `dead_ssts_pending`: SSTs a publish retired that are not yet deleted from
+  the disk cache. It rises after a compaction and drains; one that keeps
+  rising means deletes fall behind compactions.
+
+In [manual mode](#prepare-views-before-reads-switch-to-them):
+
+- `next_view_publishes_total{result}`: `NextView.Publish` calls by result,
+  `published`, `changed` or `expired`. Calls on a view already done, or on a
+  closed reader, are not counted.
+- `view_outdated_since_timestamp_seconds`: when the published view became
+  outdated, the load time of a newer view not yet published, or 0 when it is
+  the newest loaded. Alert when preparation falls behind:
+
+```promql
+time() - (isledb_reader_view_outdated_since_timestamp_seconds > 0) > 60
+```
+
+- `view_safety_publishes_total`: views the reader published itself after
+  `MaxLag`. A rising count means the application's loop is stuck or too
+  slow.
 
 ## Error reference
 
@@ -1177,8 +1297,12 @@ error.
 
 | Error | Meaning |
 |---|---|
-| `ErrInvalidReaderOptions` | Negative refresh interval |
+| `ErrInvalidReaderOptions` | Negative or sub-second refresh interval, negative `MaxLag`, or `MaxLag` not below half the store's `MaxPinnedViewAge` |
 | `ErrReaderClosed` | The reader was closed |
+| `ErrNotManual` | `NextView` on a reader not in manual mode |
+| `ErrViewChanged` | `Publish` found another view published since the view was handed out |
+| `ErrNextViewExpired` | The next view passed `MaxPinnedViewAge` from its load before it was published |
+| `ErrNextViewDone` | The next view was already published or discarded |
 | `ErrReadViewExpired` | The reader's view passed `MaxPinnedViewAge` |
 | `ErrSnapshotClosed` | The snapshot was closed |
 | `ErrSnapshotExpired` | The snapshot's view passed its deadline |
@@ -1213,7 +1337,7 @@ Every SST is read from object storage by byte range, through four caches:
 | Open SSTs | Parsed SST readers, up to 1,024, least recently used out first | count |
 | Block cache | Decoded index and data blocks | `BlockCacheSize` |
 | Bloom cache | Parsed Bloom filters | `BloomCacheSize` |
-| Disk cache, under `CacheDir` | SST metadata and Bloom filters (an eighth of `DiskCacheSize`); whole small SSTs and 128 KiB chunks of larger ones (the rest) | `DiskCacheSize` |
+| Disk cache, under `CacheDir` | SST metadata and Bloom filters; whole small SSTs and 128 KiB chunks of larger ones. One budget; data is evicted first, never metadata to make room for data | `DiskCacheSize` |
 
 **Fetching.**
 
@@ -1294,9 +1418,14 @@ type DiskCacheStats struct {
   already open.
 - Byte-bounded caches report `MaxEntries == 0`; the open-SST cache, bounded by
   count, reports `MaxBytes == 0`.
+- The disk cache has one budget, `DiskCacheSize`, shared by metadata and
+  data: `Meta.MaxBytes` and `Data.MaxBytes` both report it, and
+  `Meta.Bytes + Data.Bytes` is what is in use. Data is evicted first, and data
+  is never stored by evicting metadata.
 - For the disk cache: `Corruptions` counts entries it found damaged itself (a
-  wrong size, or a Bloom filter failing its checksum); `Bypasses` entries
-  larger than their whole tier; `Failures` entries that could not be written.
+  wrong size, or a Bloom filter failing its checksum); `Bypasses` entries not
+  stored, because they are larger than the whole cache or are data that would
+  fit only by evicting metadata; `Failures` entries that could not be written.
   Bypassed and failed entries are still served, just not kept, so a disk that
   keeps failing means each later read fetches them again.
 - `SSTDrops` counts reads that failed on what looked like damaged bytes; each

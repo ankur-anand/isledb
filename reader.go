@@ -198,8 +198,8 @@ func openSSTCacheSize(size int) int {
 }
 
 // initReaderDiskCache opens the disk cache under CacheDir, unless the caller
-// supplied one. The budget is split between its tiers: an eighth for SST
-// metadata and Bloom filters, the rest for data.
+// supplied one. SST metadata, Bloom filters and data share its budget; data
+// is evicted first.
 func initReaderDiskCache(opts readerOptions) (*diskcache.Cache, bool, error) {
 	if opts.DiskCache != nil {
 		return opts.DiskCache, false, nil
@@ -208,13 +208,8 @@ func initReaderDiskCache(opts readerOptions) (*diskcache.Cache, bool, error) {
 		return nil, false, errors.New("cache dir is required")
 	}
 	budget := cmp.Or(opts.DiskCacheSize, defaultDiskCacheSize)
-	metaBudget := max(budget/8, 1)
 	dir := filepath.Join(opts.CacheDir, "artifacts")
-	cache, err := diskcache.Open(diskcache.Options{
-		Dir:          dir,
-		MetaMaxBytes: metaBudget,
-		DataMaxBytes: max(budget-metaBudget, 1),
-	})
+	cache, err := diskcache.Open(diskcache.Options{Dir: dir, MaxBytes: budget})
 	if err != nil {
 		return nil, false, fmt.Errorf("open disk cache: %w", err)
 	}
@@ -464,6 +459,7 @@ func (r *Reader) publishLoaded(view loadedView, force bool) {
 		}
 		view = next
 		r.safetyPublishes.Add(1)
+		r.metrics.ObserveSafetyPublish()
 	}
 	r.publishManifestView(view.manifest, view.current, view.loadedAt)
 	r.refreshSucceeded()
@@ -486,6 +482,7 @@ func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
 	if r.outdatedSince.IsZero() {
 		r.outdatedSince = view.loadedAt
 	}
+	outdatedSince := r.outdatedSince
 	next := *r.nextView
 	due := !time.Now().Before(r.outdatedSince.Add(r.maxLag(view.current)))
 	refreshAt := r.nextOnGrid(view.loadedAt, r.viewPolicy.RefreshAfter)
@@ -494,6 +491,7 @@ func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
 	}
 	expiresAt := r.viewExpiresAt
 	r.mu.Unlock()
+	r.metrics.ObserveViewOutdatedSince(outdatedSince)
 	if !due {
 		r.armViewTimer(refreshAt, expiresAt)
 	}
@@ -643,8 +641,10 @@ func (r *Reader) publishManifestView(
 	r.changeHead = changeHead
 	r.viewRefreshAt = refreshAt
 	r.viewExpiresAt = expiresAt
+	outdatedSince := r.outdatedSince
 	r.mu.Unlock()
 
+	r.metrics.ObserveViewOutdatedSince(outdatedSince)
 	r.blockCache.prune(m, r.openSSTs.isOpen)
 	r.dead.retire(retired, m)
 	r.armViewTimer(refreshAt, expiresAt)
@@ -1422,7 +1422,9 @@ func (it *sstIterWithClose) Close() error {
 	return err
 }
 
-// DiskCacheStats describes the disk cache's two tiers.
+// DiskCacheStats describes the disk cache's two kinds of entry. They share
+// one budget, each reporting it as MaxBytes; data is evicted first, metadata
+// only to make room for metadata.
 type DiskCacheStats struct {
 	// Meta holds SST metadata regions and Bloom filters.
 	Meta CacheStats

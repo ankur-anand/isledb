@@ -53,7 +53,9 @@ func (d *deadSSTs) retire(before, after *manifestState) {
 			queued = true
 		}
 	}
+	pending := len(d.pending)
 	d.mu.Unlock()
+	d.r.metrics.ObserveDeadSSTsPending(pending)
 	if queued {
 		select {
 		case d.wake <- struct{}{}:
@@ -84,10 +86,12 @@ func (d *deadSSTs) run() {
 				delete(d.pending, id)
 				break
 			}
+			pending := len(d.pending)
 			d.mu.Unlock()
 			if !ok {
 				break
 			}
+			d.r.metrics.ObserveDeadSSTsPending(pending)
 			select {
 			case <-d.done:
 				return

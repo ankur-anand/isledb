@@ -238,13 +238,13 @@ func TestReader_PrefetchRespectsMaxSSTs(t *testing.T) {
 }
 
 // TestReader_PrefetchTierBudgetCountsCachedSSTs repeats a prefetch of more
-// than the data tier holds: SSTs the first one cached count against the
-// tier, so the second fetches nothing rather than evicting them.
+// than the disk cache holds: SSTs the first one cached count against it, so
+// the second fetches nothing rather than evicting them.
 func TestReader_PrefetchTierBudgetCountsCachedSSTs(t *testing.T) {
 	ctx := context.Background()
 	store := newPrefetchBudgetTestStore(t, ctx, "prefetch-tier-budget")
 	sizes := prefetchTestSSTSizes(t, ctx, store)
-	// A data tier with room for any two of the three SSTs, not all three.
+	// A disk cache with room for any two of the three SSTs, not all three.
 	var total, smallest int64 = 0, sizes[0]
 	for _, size := range sizes {
 		total += size
@@ -252,7 +252,7 @@ func TestReader_PrefetchTierBudgetCountsCachedSSTs(t *testing.T) {
 	}
 	cacheDir := t.TempDir()
 	disk, err := diskcache.Open(diskcache.Options{
-		Dir: filepath.Join(cacheDir, "artifacts"), MetaMaxBytes: 1 << 20, DataMaxBytes: total - smallest,
+		Dir: filepath.Join(cacheDir, "artifacts"), MaxBytes: total - smallest,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -281,8 +281,8 @@ func TestReader_PrefetchTierBudgetCountsCachedSSTs(t *testing.T) {
 }
 
 // TestReader_PrefetchMaxBytesBoundsEachCall warms SSTs in steps with a
-// MaxBytes that fits one SST: SSTs already cached do not count against it, so
-// each call downloads one more.
+// MaxBytes that fits one SST's download, Bloom filter included: SSTs already
+// cached do not count against it, so each call downloads one more.
 func TestReader_PrefetchMaxBytesBoundsEachCall(t *testing.T) {
 	ctx := context.Background()
 	store := newPrefetchBudgetTestStore(t, ctx, "prefetch-max-bytes-steps")
@@ -314,6 +314,8 @@ func newPrefetchBudgetTestStore(t *testing.T, ctx context.Context, name string) 
 	return store
 }
 
+// prefetchTestSSTSizes returns what each SST takes in the disk cache, its
+// Bloom filter included.
 func prefetchTestSSTSizes(t *testing.T, ctx context.Context, store *blobstore.Store) []int64 {
 	t.Helper()
 	m, err := newManifestStore(store, nil).Replay(ctx)
@@ -325,7 +327,7 @@ func prefetchTestSSTSizes(t *testing.T, ctx context.Context, store *blobstore.St
 	}
 	sizes := make([]int64, len(m.L0SSTs))
 	for i, sst := range m.L0SSTs {
-		sizes[i] = sst.Size
+		sizes[i] = sst.Size + sst.Bloom.Length
 	}
 	return sizes
 }

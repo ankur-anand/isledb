@@ -69,9 +69,10 @@ type ReaderOpenOptions struct {
 	CacheDir string
 
 	// DiskCacheSize bounds everything the reader keeps on disk: SST metadata,
-	// Bloom filters, small SSTs and chunks of larger SSTs' data. An eighth of
-	// it is kept for metadata and Bloom filters, so bulk data cannot evict
-	// them. Zero selects the default (8 GiB).
+	// Bloom filters, small SSTs and chunks of larger SSTs' data. Data is
+	// evicted first, and never to make room for more data at the expense of
+	// metadata, so bulk data cannot evict what every lookup needs. Zero
+	// selects the default (8 GiB).
 	DiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes of SST blocks kept in memory,

@@ -160,7 +160,7 @@ func TestSSTReadable_MetaRegionServesPebbleOpen(t *testing.T) {
 	if _, err := store.Write(ctx, store.SSTPath(result.Meta.ID), result.SSTData); err != nil {
 		t.Fatalf("write SST: %v", err)
 	}
-	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MetaMaxBytes: 16 << 20, DataMaxBytes: 16 << 20})
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 32 << 20})
 	if err != nil {
 		t.Fatalf("open disk cache: %v", err)
 	}

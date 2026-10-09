@@ -10,6 +10,7 @@ import (
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func takeNextView(t *testing.T, r *Reader) *NextView {
@@ -142,6 +143,9 @@ func TestNextViewDoneAfterPublishOrDiscard(t *testing.T) {
 	if err := published.Publish(); !errors.Is(err, ErrNextViewDone) {
 		t.Fatalf("second Publish: %v, want ErrNextViewDone", err)
 	}
+	if got := testutil.ToFloat64(reader.metrics.NextViewPublishes.WithLabelValues("published")); got != 1 {
+		t.Fatalf("published metric %v, want 1: a done view's Publish is not counted", got)
+	}
 	commitKey(t, ctx, store, ms, "c", 3)
 	fireViewTimer(reader)
 	discarded := takeNextView(t, reader)
@@ -164,6 +168,9 @@ func TestNextViewPublishFailsAfterRefresh(t *testing.T) {
 	}
 	if err := v.Publish(); !errors.Is(err, ErrViewChanged) {
 		t.Fatalf("Publish after Refresh published: %v, want ErrViewChanged", err)
+	}
+	if got := testutil.ToFloat64(reader.metrics.NextViewPublishes.WithLabelValues("changed")); got != 1 {
+		t.Fatalf("changed metric %v, want 1", got)
 	}
 }
 
@@ -304,7 +311,7 @@ func TestNextViewPrefetchUsesOnlyFreeSpace(t *testing.T) {
 	}, 0, 1).Meta
 	commitKeyB(t, ctx, store, ms)
 
-	// A data tier that holds either SST, but not both.
+	// A disk cache that holds either SST, but not both.
 	var reader *Reader
 	for size := int64(1024); ; size += 64 {
 		r, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCacheSize: size})
@@ -358,6 +365,69 @@ func TestNextViewPrefetchUsesOnlyFreeSpace(t *testing.T) {
 	}
 }
 
+func TestNextViewPrefetchKeepsPublishedBloomFilters(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("next-view-meta")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriter(ctx, "next-view-meta"); err != nil {
+		t.Fatal(err)
+	}
+	write := func(key string, seq uint64) sstMetadata {
+		it := &sliceSSTIter{entries: []internal.MemEntry{{Key: []byte(key), Seq: seq, Kind: internal.OpPut, Value: []byte(key)}}}
+		res, err := writeSST(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none", BloomBitsPerKey: 10}, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Write(ctx, store.SSTPath(res.Meta.ID), res.SSTData); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ms.AppendAddSSTableWithFence(ctx, res.Meta); err != nil {
+			t.Fatal(err)
+		}
+		return res.Meta
+	}
+	a, b := write("a", 1), write("b", 2)
+	if a.Bloom.Length == 0 || b.Bloom.Length == 0 {
+		t.Fatal("test SSTs have no Bloom filters")
+	}
+	// Room for one byte less than both SSTs with their Bloom filters.
+	cache, err := diskcache.Open(diskcache.Options{
+		Dir:      t.TempDir(),
+		MaxBytes: a.Size + a.Bloom.Length + b.Size + b.Bloom.Length - 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	both := reader.currentManifest()
+	a, b = sstNamed(t, both, a.ID), sstNamed(t, both, b.ID)
+	if _, err := reader.fetcher.prefetch(ctx, reader.fetcher.object(a)); err != nil {
+		t.Fatal(err)
+	}
+
+	onlyA, onlyB := both.Clone(), both.Clone()
+	onlyA.L0SSTs = []sstMetadata{a}
+	onlyB.L0SSTs = []sstMetadata{b}
+	view := loadedView{manifest: onlyB, current: reader.manifestStore.CurrentData(), loadedAt: time.Now()}
+	next := newNextView(reader, view, 0, onlyA)
+	if added := next.Added(); len(added) != 1 || added[0].BloomSize != b.Bloom.Length {
+		t.Fatalf("Added = %+v, want b with its Bloom filter's size", added)
+	}
+	stats, err := next.Prefetch(ctx, PrefetchOptions{All: true})
+	if !reader.fetcher.resident(reader.fetcher.object(a)) {
+		t.Fatal("prefetching the next view evicted the Bloom filter of an SST reads use")
+	}
+	if err != nil || stats.CachedSSTs != 0 || stats.SkippedSSTs != 1 {
+		t.Fatalf("prefetch with no room for b's Bloom filter: %+v, %v; want b skipped", stats, err)
+	}
+}
+
 // twoSSTReader opens a reader over a store with SSTs a and b, whose disk cache
 // holds either but not both, and returns it with both SSTs.
 func twoSSTReader(t *testing.T) (context.Context, *Reader, sstMetadata, sstMetadata) {
@@ -371,7 +441,7 @@ func twoSSTReader(t *testing.T) (context.Context, *Reader, sstMetadata, sstMetad
 	}, 0, 1).Meta.ID
 	commitKeyB(t, ctx, store, ms)
 	for size := int64(1024); ; size += 64 {
-		r, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCacheSize: size})
+		r, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCacheSize: size, Metrics: DefaultReaderMetrics(nil)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -455,8 +525,14 @@ func TestPublishDoesNotWaitForDrops(t *testing.T) {
 	if !reader.fetcher.resident(reader.fetcher.object(a)) {
 		t.Fatal("a dead SST was deleted before the gate opened")
 	}
+	if got := testutil.ToFloat64(reader.metrics.DeadSSTsPending); got < 1 {
+		t.Fatalf("pending metric %v while deletes are held, want at least 1", got)
+	}
 	close(gate)
 	waitDeadDrops(t, reader, 2)
+	if got := testutil.ToFloat64(reader.metrics.DeadSSTsPending); got != 0 {
+		t.Fatalf("pending metric %v after every drop, want 0", got)
+	}
 }
 
 func TestCloseInterruptsDeletePause(t *testing.T) {

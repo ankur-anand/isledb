@@ -157,7 +157,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("SST larger than the data tier is read in chunks", func(t *testing.T) {
+	t.Run("SST larger than the disk cache is read without it", func(t *testing.T) {
 		cacheDir := filepath.Join(cacheRoot, "oversized")
 		db := openArtifactCacheTestDB(t, ctx, bucketURL, "oversized")
 		defer db.Close()
@@ -167,14 +167,15 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("replay oversized manifest: SSTs=%d err=%v", len(manifest.L0SSTs), err)
 		}
 		meta := manifest.L0SSTs[0]
-		// The data tier, seven eighths of the budget, is smaller than the SST,
-		// so it is never cached whole.
-		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, meta.Size)
+		// The disk cache is smaller than the SST: lookups still answer, and
+		// what does not fit is not stored.
+		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, meta.Size-1)
 		defer reader.Close()
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
 		assertArtifactCacheTestValue(t, ctx, reader, "key", "value")
-		stats := reader.DiskCacheStats().Data
-		if stats.Bytes > stats.MaxBytes || stats.Failures != 0 || stats.Bypasses != 0 {
+		disk := reader.DiskCacheStats()
+		stats := disk.Data
+		if disk.Meta.Bytes+stats.Bytes > stats.MaxBytes || stats.Failures != 0 || stats.Bypasses == 0 {
 			t.Fatalf("oversized SST data tier stats=%+v", stats)
 		}
 		assertArtifactCacheIncomingEmpty(t, cacheDir)
@@ -194,9 +195,9 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		}
 		first := artifactCacheTestSSTForKey(t, manifest, []byte("a"))
 		second := artifactCacheTestSSTForKey(t, manifest, []byte("b"))
-		// A data tier that holds one SST but not two.
-		one := max(first.Size, second.Size)
-		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, (one*8+6)/7+8)
+		// A disk cache that holds one SST with its Bloom filter, but not two.
+		one := max(first.Size+first.Bloom.Length, second.Size+second.Bloom.Length)
+		reader := openArtifactCacheTestReader(t, ctx, db, cacheDir, one+one/2)
 		defer reader.Close()
 
 		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")

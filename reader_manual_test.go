@@ -9,6 +9,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func newManualTestReader(t *testing.T) (context.Context, *Reader, *pausingManifestStorage, *blobstore.Store, *manifest.Store) {
@@ -24,6 +25,7 @@ func newManualTestReader(t *testing.T) (context.Context, *Reader, *pausingManife
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(), ManifestStorage: storage, DisableManifestPageCache: true,
 		ViewPolicy: ReaderViewPolicy{Manual: true, MaxLag: time.Minute},
+		Metrics:    DefaultReaderMetrics(nil),
 	})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
@@ -122,6 +124,9 @@ func TestManualSafetyNetPublishesNewestView(t *testing.T) {
 	if got := reader.safetyPublishes.Load(); got != 1 {
 		t.Fatalf("%d safety publishes, want 1", got)
 	}
+	if got := testutil.ToFloat64(reader.metrics.SafetyPublishes); got != 1 {
+		t.Fatalf("safety publishes metric %v, want 1", got)
+	}
 	if err := reader.publishAt(held, first); !errors.Is(err, ErrViewChanged) {
 		t.Fatalf("publishing the held view after the safety net: %v, want ErrViewChanged", err)
 	}
@@ -136,6 +141,9 @@ func TestManualOutdatedSinceSurvivesLoadsAndClearsWhenNewestPublished(t *testing
 	commitKey(t, ctx, store, ms, "b", 2)
 	fireViewTimer(reader)
 	since := outdatedSince(reader)
+	if got := testutil.ToFloat64(reader.metrics.ViewOutdatedSince); got != float64(since.UnixNano())/1e9 {
+		t.Fatalf("outdated-since metric %v, want %v", got, since)
+	}
 	commitKey(t, ctx, store, ms, "c", 3)
 	fireViewTimer(reader)
 	if !outdatedSince(reader).Equal(since) {
@@ -149,6 +157,9 @@ func TestManualOutdatedSinceSurvivesLoadsAndClearsWhenNewestPublished(t *testing
 	}
 	if !outdatedSince(reader).IsZero() || nextViewSeq(reader) != 0 {
 		t.Fatal("an application publish did not clear outdatedSince and the next view")
+	}
+	if got := testutil.ToFloat64(reader.metrics.ViewOutdatedSince); got != 0 {
+		t.Fatalf("outdated-since metric %v after publishing the newest view, want 0", got)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ankur-anand/isledb/internal/diskcache"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -25,8 +24,8 @@ type PrefetchOptions struct {
 	// limit.
 	MaxSSTs int
 
-	// MaxBytes limits the total manifest-declared SST bytes to download. Zero
-	// means no limit.
+	// MaxBytes limits the total bytes to download, each SST's Bloom filter
+	// included. Zero means no limit.
 	MaxBytes int64
 
 	// Concurrency limits parallel SST downloads. Zero uses a small default.
@@ -141,9 +140,9 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 }
 
 // selectSSTsToPrefetch selects SSTs of m that are not on disk, and with only
-// set only those in only, to fit in the disk cache's free data space. Using
-// only free space, a prefetch never evicts anything on disk, whichever view
-// reads are using it for.
+// set only those in only, to fit in the disk cache's free space. Using only
+// free space, a prefetch never evicts anything on disk, whichever view reads
+// are using it for.
 func (r *Reader) selectSSTsToPrefetch(
 	m *manifestState,
 	opts PrefetchOptions,
@@ -154,8 +153,7 @@ func (r *Reader) selectSSTsToPrefetch(
 	seen := make(map[string]struct{})
 	var free, downloadBytes int64
 	if r.diskCache != nil {
-		tier := r.diskCache.Stats(diskcache.TierData)
-		free = tier.MaxBytes - tier.Bytes
+		free = r.diskCache.Free()
 	}
 
 	visit := func(sst sstMetadata) {
@@ -174,7 +172,8 @@ func (r *Reader) selectSSTsToPrefetch(
 		}
 		stats.MatchedSSTs++
 
-		if r.fetcher.resident(r.fetcher.object(sst)) {
+		o := r.fetcher.object(sst)
+		if r.fetcher.resident(o) {
 			stats.SkippedSSTs++
 			return
 		}
@@ -182,14 +181,16 @@ func (r *Reader) selectSSTsToPrefetch(
 			stats.SkippedSSTs++
 			return
 		}
-		if sst.Size <= 0 || downloadBytes+sst.Size > free ||
-			(opts.MaxBytes > 0 && downloadBytes+sst.Size > opts.MaxBytes) {
+		// An SST takes its Size and its Bloom filter, stored after it.
+		download := sst.Size + o.bloomLength
+		if sst.Size <= 0 || downloadBytes+download > free ||
+			(opts.MaxBytes > 0 && downloadBytes+download > opts.MaxBytes) {
 			stats.SkippedSSTs++
 			return
 		}
 
 		selected = append(selected, sst)
-		downloadBytes += sst.Size
+		downloadBytes += download
 	}
 
 	for _, sst := range m.L0SSTs {

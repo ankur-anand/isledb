@@ -12,11 +12,14 @@ var (
 	ErrNextViewDone = errors.New("next view already published or discarded")
 )
 
-// SSTInfo describes one SST of a view.
+// SSTInfo describes one SST of a view. Size is the SST's size in the
+// manifest; its Bloom filter, BloomSize bytes, is stored after it in the same
+// object, so caching the SST downloads both.
 type SSTInfo struct {
 	ID             string
 	Level          int
 	Size           int64
+	BloomSize      int64
 	MinKey, MaxKey []byte
 }
 
@@ -98,10 +101,14 @@ func sstsByID(m *manifestState) map[string]SSTInfo {
 		return ssts
 	}
 	add := func(sst sstMetadata, level int) {
-		ssts[sst.ID] = SSTInfo{
+		info := SSTInfo{
 			ID: sst.ID, Level: level, Size: sst.Size,
 			MinKey: append([]byte(nil), sst.MinKey...), MaxKey: append([]byte(nil), sst.MaxKey...),
 		}
+		if hasUsableBloom(sst) {
+			info.BloomSize = sst.Bloom.Length
+		}
+		ssts[sst.ID] = info
 	}
 	for _, sst := range m.L0SSTs {
 		add(sst, 0)
@@ -198,7 +205,9 @@ func (v *NextView) Publish() error {
 	}
 	v.done = true
 	v.mu.Unlock()
-	return v.r.publishAt(v.view, v.previous)
+	err := v.r.publishAt(v.view, v.previous)
+	v.r.metrics.ObserveNextViewPublish(err)
+	return err
 }
 
 // Discard marks the view done. It releases nothing, so calling it after a
