@@ -23,11 +23,12 @@ type SSTInfo struct {
 // NextView is a view the Reader has loaded and not yet published, handed to
 // the application in Manual mode to prepare before reads switch to it.
 type NextView struct {
-	r        *Reader
-	view     loadedView
-	previous uint64
-	added    []SSTInfo
-	removed  []SSTInfo
+	r         *Reader
+	view      loadedView
+	previous  uint64
+	published *manifestState
+	added     []SSTInfo
+	removed   []SSTInfo
 
 	mu   sync.Mutex
 	done bool
@@ -77,7 +78,7 @@ func (r *Reader) NextView(ctx context.Context) (*NextView, error) {
 
 func newNextView(r *Reader, view loadedView, previous uint64, published *manifestState) *NextView {
 	before, after := sstsByID(published), sstsByID(view.manifest)
-	v := &NextView{r: r, view: view, previous: previous}
+	v := &NextView{r: r, view: view, previous: previous, published: published}
 	for id, info := range after {
 		if _, ok := before[id]; !ok {
 			v.added = append(v.added, info)
@@ -142,6 +143,48 @@ func (v *NextView) Snapshot() (*Snapshot, error) {
 		return nil, ErrNextViewExpired
 	}
 	return newSnapshot(v.r, v.view.manifest, v.Version(), expiresAt), nil
+}
+
+// Prefetch caches the Added SSTs on local disk, as Reader.Prefetch does for
+// the published view: All for every added SST, Range for those overlapping
+// it, within MaxSSTs and MaxBytes, using only the disk cache's free space, so
+// warming this view never evicts what reads are using. SSTs that do not fit
+// load on demand once published.
+func (v *NextView) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error) {
+	if err := validatePrefetchOptions(opts); err != nil {
+		return PrefetchStats{}, err
+	}
+	if err := v.check(); err != nil {
+		return PrefetchStats{}, err
+	}
+	r := v.r
+	done, err := r.beginRead()
+	if err != nil {
+		return PrefetchStats{}, err
+	}
+	defer done()
+	expiresAt := v.view.loadedAt.Add(v.view.current.PinnedViewAge())
+	if !time.Now().Before(expiresAt) {
+		return PrefetchStats{}, ErrNextViewExpired
+	}
+
+	only := make(map[string]struct{}, len(v.added))
+	for _, sst := range v.added {
+		only[sst.ID] = struct{}{}
+	}
+	selected, stats := r.selectSSTsToPrefetch(v.view.manifest, opts, only)
+	return r.fetchPrefetchSSTs(ctx, selected, stats, opts.Concurrency, expiresAt, ErrNextViewExpired)
+}
+
+func sstMetadataOf(m *manifestState) []sstMetadata {
+	if m == nil {
+		return nil
+	}
+	ssts := append([]sstMetadata(nil), m.L0SSTs...)
+	for _, level := range m.Levels {
+		ssts = append(ssts, level.SSTs...)
+	}
+	return ssts
 }
 
 // Publish switches reads to this view if the published view is still at

@@ -500,6 +500,12 @@ type KV struct {
   iterator.
 - `Refresh` loads the latest commits now; see
   [Freshness and outages](#freshness-and-outages).
+- `Prefetch` downloads only into the disk cache's free space, so it never
+  evicts what is already cached. SSTs that do not fit are counted in
+  `PrefetchStats.SkippedSSTs` and load on demand.
+- When a refresh retires SSTs, after a compaction, the reader deletes them
+  from its disk cache in the background, keeping the space for data a view
+  can read.
 
 ### Iterate without loading the whole range
 
@@ -554,6 +560,12 @@ A snapshot and its iterators share the view's fixed deadline
 extend it. Past it, operations return `ErrSnapshotExpired`,
 `ErrIteratorExpired` or `ErrReadViewExpired`: take a new snapshot rather than
 retrying. Closing the reader invalidates its snapshots and iterators.
+
+A snapshot of an older view keeps reading correctly after the reader moves
+on: object storage keeps its SSTs for `MaxPinnedViewAge`. Once a refresh
+retires those SSTs, the reader deletes them from its disk cache, so the
+snapshot may fetch them again from object storage. A long `BootstrapView`
+load running across a compaction is where that shows.
 
 ### Load state, then follow the change feed
 

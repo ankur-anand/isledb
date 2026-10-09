@@ -78,6 +78,9 @@ type Reader struct {
 	// once the reader is closed.
 	nextLoads, handedLoads uint64
 	nextReady              chan struct{}
+	// dead holds SSTs a publish retired, waiting for dropDeadSSTs to delete
+	// them from the disk cache in the background; see retire.
+	dead deadSSTs
 	// safetyPublishes counts views published after MaxLag in Manual mode.
 	safetyPublishes atomic.Int64
 	maxLagClamped   atomic.Bool
@@ -175,6 +178,9 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	}
 	reader.endRead = reader.lifecycleMu.RUnlock
 	reader.nextReady = make(chan struct{})
+	if reader.diskCache != nil {
+		reader.dead.start(reader)
+	}
 	reader.position.Store(reader.viewSeq)
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
@@ -627,6 +633,7 @@ func (r *Reader) publishManifestView(
 	} else if r.nextView != nil {
 		r.outdatedSince = r.nextView.loadedAt
 	}
+	retired := r.manifest
 	r.manifest = m
 	r.viewSeq = seq
 	r.position.Store(seq)
@@ -639,6 +646,7 @@ func (r *Reader) publishManifestView(
 	r.mu.Unlock()
 
 	r.blockCache.prune(m, r.openSSTs.isOpen)
+	r.dead.retire(retired, m)
 	r.armViewTimer(refreshAt, expiresAt)
 	r.metrics.ObserveViewLoaded(viewLoadedAt)
 	return true, seq
@@ -734,6 +742,7 @@ func (r *Reader) Close() error {
 	r.background.Wait()
 	r.bloomLoads.Close(ErrReaderClosed)
 	r.bloomBackground.Wait()
+	r.dead.stop()
 	r.fetcher.close()
 
 	var firstErr error

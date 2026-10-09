@@ -175,6 +175,25 @@ func (f *sstFetcher) dropObject(o sstObject) {
 	}
 }
 
+// dropDeadObject removes every cached part of an SST no view names any more,
+// its Bloom sidecar included, deleting the files outside the disk cache's
+// lock so lookups are not held behind them. It returns how many files it
+// removed.
+func (f *sstFetcher) dropDeadObject(o sstObject) int {
+	if f.disk == nil {
+		return 0
+	}
+	keys := []diskcache.Key{
+		o.entry(diskcache.KindWhole, 0),
+		o.entry(diskcache.KindMeta, 0),
+		o.entry(diskcache.KindBloom, 0),
+	}
+	for i := range o.numChunks() {
+		keys = append(keys, o.entry(diskcache.KindChunk, i))
+	}
+	return f.disk.RemoveAll(keys)
+}
+
 // fetchError is a failed or invalid fetch from object storage. It says nothing
 // about the SST's cached bytes; see damaged.
 type fetchError struct{ err error }

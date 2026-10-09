@@ -311,6 +311,38 @@ func (c *Cache) Remove(k Key) {
 	c.drop(k, false)
 }
 
+// RemoveAll drops every entry in keys under one hold of the cache's lock and
+// deletes their files after releasing it, so reads are not held behind the
+// deletes. Close waits for the deletes. After Close it does nothing. It
+// returns how many entries it dropped.
+func (c *Cache) RemoveAll(keys []Key) int {
+	var paths []string
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0
+	}
+	for _, k := range keys {
+		if !k.valid() {
+			continue
+		}
+		if st := c.stores[k]; st != nil {
+			st.gen++
+		}
+		if element, ok := c.tiers[k.Kind.Tier()].index[k]; ok {
+			e := c.removeIndexLocked(element)
+			paths = append(paths, c.path(e.key, e.size))
+		}
+	}
+	c.storing.Add(1)
+	c.mu.Unlock()
+	defer c.storing.Done()
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+	return len(paths)
+}
+
 // ReportCorrupt drops k after its contents proved damaged, and counts a
 // corruption.
 func (c *Cache) ReportCorrupt(k Key) {

@@ -520,3 +520,40 @@ func TestConcurrentUse(t *testing.T) {
 		t.Fatalf("data tier over budget: %+v", stats)
 	}
 }
+
+func TestRemoveAll(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep, gone := object(1), object(2)
+	keys := []Key{{Object: gone, Kind: KindChunk, Index: 0}, {Object: gone, Kind: KindChunk, Index: 1}, {Object: gone, Kind: KindMeta}}
+	for _, k := range append(keys, Key{Object: keep, Kind: KindChunk}) {
+		if err := c.Put(k, []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RemoveAll(append(keys, Key{Object: gone, Kind: KindChunk, Index: 9})) // one never stored
+	for _, k := range keys {
+		if c.Contains(k, 4) {
+			t.Fatalf("%v still cached", k)
+		}
+		if _, err := os.Stat(c.path(k, 4)); !os.IsNotExist(err) {
+			t.Fatalf("%v file still on disk: %v", k, err)
+		}
+	}
+	if !c.Contains(Key{Object: keep, Kind: KindChunk}, 4) {
+		t.Fatal("an entry not listed was removed")
+	}
+	if got := c.Stats(TierData).Bytes; got != 4 {
+		t.Fatalf("data tier holds %d bytes, want the one kept entry", got)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c.RemoveAll([]Key{{Object: keep, Kind: KindChunk}})
+	if _, err := os.Stat(c.path(Key{Object: keep, Kind: KindChunk}, 4)); err != nil {
+		t.Fatalf("RemoveAll after Close deleted a file: %v", err)
+	}
+}
