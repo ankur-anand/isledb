@@ -47,12 +47,13 @@ const (
 
 var kindSuffix = [kindCount]string{KindMeta: "meta", KindBloom: "bloom", KindWhole: "whole", KindChunk: "c"}
 
-// Tier is an independently budgeted part of the cache.
+// Tier is a class of entries. Both share the cache's budget, but data is
+// evicted first: metadata is evicted only to make room for metadata.
 type Tier uint8
 
 const (
-	// TierMeta holds metadata regions and Bloom sidecars: small, and needed
-	// on every open and lookup, so bulk data cannot evict them.
+	// TierMeta holds metadata regions and Bloom sidecars: needed on every
+	// open and lookup, so bulk data never evicts them.
 	TierMeta Tier = iota
 	// TierData holds whole small SSTs and data chunks.
 	TierData
@@ -97,19 +98,19 @@ func (k Key) name() string {
 // Options configures a cache. Dir should be dedicated to the cache: Open
 // removes earlier cache layouts from it but leaves other files alone.
 type Options struct {
-	Dir          string
-	MetaMaxBytes int64
-	DataMaxBytes int64
+	Dir      string
+	MaxBytes int64
 }
 
-// Stats reports one tier's activity and occupancy.
+// Stats reports one tier's activity and occupancy. MaxBytes is the budget
+// both tiers share.
 type Stats struct {
 	Hits        int64
 	Misses      int64
 	Evictions   int64
 	Corruptions int64
-	// Bypasses counts entries too large for the whole tier; they are not
-	// stored.
+	// Bypasses counts entries not stored: too large for the whole cache, or
+	// data that would only fit by evicting metadata.
 	Bypasses int64
 	// Failures counts entries that could not be written or renamed.
 	Failures int64
@@ -133,6 +134,7 @@ type Cache struct {
 	root     string
 	incoming string
 	lock     *flock.Flock
+	max      int64
 	tiers    [tierCount]*tier
 	// closed refuses new reads and writes; storing tracks the Puts still in
 	// progress, which Close waits for before releasing the directory lock.
@@ -152,7 +154,6 @@ type storeState struct {
 }
 
 type tier struct {
-	max   int64
 	bytes int64
 	lru   list.List // *entry, least recently used first
 	index map[Key]*list.Element
@@ -166,14 +167,13 @@ type entry struct {
 
 // Open locks dir for this process, removes unfinished writes and any layout
 // other than the current one, and loads the entries already cached, dropping
-// any beyond each tier's budget.
+// any beyond the budget.
 func Open(opts Options) (*Cache, error) {
 	if opts.Dir == "" {
 		return nil, errors.New("diskcache: directory is required")
 	}
-	if opts.MetaMaxBytes <= 0 || opts.DataMaxBytes <= 0 {
-		return nil, fmt.Errorf("diskcache: budgets must be positive: meta=%d data=%d",
-			opts.MetaMaxBytes, opts.DataMaxBytes)
+	if opts.MaxBytes <= 0 {
+		return nil, fmt.Errorf("diskcache: budget must be positive: %d", opts.MaxBytes)
 	}
 	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("diskcache: create directory: %w", err)
@@ -192,10 +192,11 @@ func Open(opts Options) (*Cache, error) {
 		root:     root,
 		incoming: filepath.Join(root, incomingName),
 		lock:     lock,
+		max:      opts.MaxBytes,
 		stores:   make(map[Key]*storeState),
 	}
-	for t, budget := range [tierCount]int64{TierMeta: opts.MetaMaxBytes, TierData: opts.DataMaxBytes} {
-		c.tiers[t] = &tier{max: budget, index: make(map[Key]*list.Element)}
+	for t := range tierCount {
+		c.tiers[t] = &tier{index: make(map[Key]*list.Element)}
 	}
 	if err := c.prepare(opts.Dir); err != nil {
 		_ = lock.Close()
@@ -403,8 +404,46 @@ func (c *Cache) Stats(tr Tier) Stats {
 	stats := t.stats
 	stats.Entries = t.lru.Len()
 	stats.Bytes = t.bytes
-	stats.MaxBytes = t.max
+	stats.MaxBytes = c.max
 	return stats
+}
+
+// Free reports the budget not in use by either tier.
+func (c *Cache) Free() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.max - c.bytesLocked()
+}
+
+func (c *Cache) bytesLocked() int64 {
+	return c.tiers[TierMeta].bytes + c.tiers[TierData].bytes
+}
+
+// fitsLocked reports whether an entry of size can be stored as k. Data may
+// evict only data, so it fits only beside all the metadata.
+func (c *Cache) fitsLocked(k Key, size int64) bool {
+	room := c.max
+	if k.Kind.Tier() != TierMeta {
+		room -= c.tiers[TierMeta].bytes
+	}
+	return size <= room
+}
+
+// fitLocked evicts least recently used entries until the cache is within its
+// budget: data first, and metadata only when evictMeta is set, so bulk data
+// never evicts what every lookup needs.
+func (c *Cache) fitLocked(evictMeta bool) {
+	for c.bytesLocked() > c.max {
+		t := c.tiers[TierData]
+		if t.lru.Len() == 0 {
+			if !evictMeta {
+				return
+			}
+			t = c.tiers[TierMeta]
+		}
+		c.removeLocked(t.lru.Front())
+		t.stats.Evictions++
+	}
 }
 
 // store writes data to a temporary file without the lock held, renames it
@@ -415,7 +454,7 @@ func (c *Cache) store(k Key, data []byte, st *storeState, gen uint64) error {
 	t := c.tiers[k.Kind.Tier()]
 	size := int64(len(data))
 	c.mu.Lock()
-	if size > t.max {
+	if !c.fitsLocked(k, size) {
 		t.stats.Bypasses++
 		c.mu.Unlock()
 		return nil
@@ -463,11 +502,14 @@ func (c *Cache) store(k Key, data []byte, st *storeState, gen uint64) error {
 			c.removeLocked(element)
 		}
 	}
-	c.insertLocked(k, size)
-	for t.bytes > t.max {
-		c.removeLocked(t.lru.Front())
-		t.stats.Evictions++
+	if !c.fitsLocked(k, size) {
+		// Metadata grew while the file was written.
+		_ = os.Remove(final)
+		t.stats.Bypasses++
+		return nil
 	}
+	c.insertLocked(k, size)
+	c.fitLocked(k.Kind.Tier() == TierMeta)
 	return nil
 }
 

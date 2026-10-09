@@ -11,7 +11,7 @@ import (
 
 // prepare readies dir: it removes earlier cache layouts, clears unfinished
 // writes, and loads each tier's entries in directory order, dropping any
-// beyond budget. Files it does not recognise as its own are left alone.
+// beyond the budget, data first. Files it does not recognise as its own are left alone.
 func (c *Cache) prepare(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -36,6 +36,7 @@ func (c *Cache) prepare(dir string) error {
 			return err
 		}
 	}
+	c.fitLocked(true)
 	return nil
 }
 
@@ -78,9 +79,6 @@ func (c *Cache) load(t Tier) error {
 			}
 			c.insertLocked(key, size)
 		}
-	}
-	for tr.bytes > tr.max {
-		c.removeLocked(tr.lru.Front())
 	}
 	return nil
 }

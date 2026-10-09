@@ -26,7 +26,7 @@ func TestMeasureRemoveContention(t *testing.T) {
 		batch      = 512 // about one 64 MiB SST's chunks
 		baseline   = 3 * time.Second
 	)
-	c, err := Open(Options{Dir: t.TempDir(), MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 40})
+	c, err := Open(Options{Dir: t.TempDir(), MaxBytes: 1 << 40})
 	if err != nil {
 		t.Fatal(err)
 	}
