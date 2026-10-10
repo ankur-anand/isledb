@@ -750,6 +750,9 @@ func (r *Reader) Close() error {
 	r.bloomBackground.Wait()
 	r.dead.stop()
 	r.fetcher.close()
+	// Nothing publishes or deletes any more: a closed Reader is not behind.
+	r.metrics.ObserveViewOutdatedSince(time.Time{})
+	r.metrics.ObserveDeadSSTsPending(0)
 
 	var firstErr error
 	r.openSSTs.clear()
