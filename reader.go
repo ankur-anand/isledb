@@ -257,6 +257,9 @@ func (r *Reader) checkManifestView(ctx context.Context) error {
 	expired := !time.Now().Before(r.viewExpiresAt)
 	r.mu.RUnlock()
 	if expired {
+		if r.publishHeldIfDue() {
+			return nil
+		}
 		return r.refreshManifest(ctx, false)
 	}
 	if r.stale.Load() {
@@ -306,6 +309,42 @@ func (r *Reader) refreshOnce() {
 	if err := r.refreshManifest(ctx, false); err != nil && ctx.Err() != nil {
 		r.refreshFailed(fmt.Errorf("manifest refresh timed out after %s: %w", r.refreshTimeout, err))
 	}
+	// A failed reload must not hold back a view already loaded.
+	r.publishHeldIfDue()
+}
+
+// publishHeldIfDue publishes, in Manual mode, the newer view the Reader holds
+// once the published one has been outdated for MaxLag or has expired. The
+// held view is already loaded, so this reads nothing from object storage and
+// works while reloads fail. It reports whether it published. The caller holds
+// a read, or runs on a goroutine Close waits for: it must not take the
+// lifecycle lock, which Close holds while it waits for those goroutines.
+func (r *Reader) publishHeldIfDue() bool {
+	if r.closed.Load() {
+		return false
+	}
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	held, since, expiresAt, published := r.nextView, r.outdatedSince, r.viewExpiresAt, r.viewSeq
+	r.mu.RUnlock()
+	if held == nil || currentNextSeq(held.current) <= published {
+		return false
+	}
+	now := time.Now()
+	lagged := !since.IsZero() && !now.Before(since.Add(r.maxLag(held.current)))
+	if !lagged && now.Before(expiresAt) {
+		return false
+	}
+	if !now.Before(held.loadedAt.Add(held.current.PinnedViewAge())) {
+		return false
+	}
+	if lagged {
+		r.safetyPublishes.Add(1)
+		r.metrics.ObserveSafetyPublish()
+	}
+	r.publishManifestView(held.manifest, held.current, held.loadedAt)
+	return true
 }
 
 // refreshManifest reloads the view, sharing a reload in progress. A forced
@@ -680,15 +719,30 @@ func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	timerID := r.viewTimerID.Add(1)
 	r.viewDue.Store(false)
 	wakeAt := minTime(refreshAt, expiresAt)
+	// A held view is published at MaxLag, which can come before both. A
+	// deadline already past is left to reloads: the held view may have
+	// expired, and waking for it would only repeat.
+	r.mu.RLock()
+	if held := r.nextView; held != nil && !r.outdatedSince.IsZero() {
+		if lagAt := r.outdatedSince.Add(r.maxLag(held.current)); lagAt.After(time.Now()) {
+			wakeAt = minTime(wakeAt, lagAt)
+		}
+	}
+	r.mu.RUnlock()
 	delay := time.Until(wakeAt)
 	if delay < 0 {
 		delay = 0
 	}
 	timer := time.AfterFunc(delay, func() {
-		if r.viewTimerID.Load() == timerID && !r.closed.Load() {
-			r.viewDue.Store(true)
-			r.refreshInBackground()
+		if r.viewTimerID.Load() != timerID || r.closed.Load() {
+			return
 		}
+		if time.Now().Before(minTime(refreshAt, expiresAt)) {
+			r.publishHeldInBackground() // woke for MaxLag alone
+			return
+		}
+		r.viewDue.Store(true)
+		r.refreshInBackground()
 	})
 
 	r.viewTimerMu.Lock()
@@ -698,6 +752,28 @@ func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	if previous != nil {
 		previous.Stop()
 	}
+}
+
+// publishHeldInBackground publishes the held view on a goroutine Close waits
+// for, re-arming the timer if it was not due after all.
+func (r *Reader) publishHeldInBackground() {
+	// Holding the read lifecycle orders the start before Close's wait.
+	done, err := r.beginRead()
+	if err != nil {
+		return
+	}
+	r.background.Add(1)
+	done()
+	go func() {
+		defer r.background.Done()
+		if r.publishHeldIfDue() {
+			return // the publish re-armed the timer
+		}
+		r.mu.RLock()
+		refreshAt, expiresAt := r.viewRefreshAt, r.viewExpiresAt
+		r.mu.RUnlock()
+		r.armViewTimer(refreshAt, expiresAt)
+	}()
 }
 
 func (r *Reader) manifestViewDue() bool {

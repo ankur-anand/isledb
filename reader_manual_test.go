@@ -348,3 +348,72 @@ func TestCloseResetsViewGauges(t *testing.T) {
 			testutil.ToFloat64(outdated), testutil.ToFloat64(pending))
 	}
 }
+
+func TestManualMaxLagPublishesHeldViewWhenReloadsFail(t *testing.T) {
+	ctx, reader, storage, store, ms := newManualTestReader(t)
+	commitKeyB(t, ctx, store, ms)
+	fireViewTimer(reader)
+	held := nextViewSeq(reader)
+	storage.setFail(errors.New("object storage unavailable"))
+	passMaxLag(reader)
+	fireViewTimer(reader)
+	if publishedSeq(reader) != held {
+		t.Fatalf("published %d after MaxLag with reloads failing, want the held view %d", publishedSeq(reader), held)
+	}
+}
+
+func TestManualMaxLagPublishesBeforeNextRefresh(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("reader-manual-lag")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("1")},
+	}, 0, 1)
+	reader, err := newReader(ctx, store, readerOptions{
+		CacheDir: t.TempDir(), DisableManifestPageCache: true,
+		ViewPolicy: ReaderViewPolicy{Manual: true, RefreshAfter: time.Minute, MaxLag: 200 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	initial := publishedSeq(reader)
+	commitKeyB(t, ctx, store, ms)
+	// Not fireViewTimer: its wait would race the MaxLag timer's goroutine,
+	// which only Close may wait for.
+	startViewTimer(reader)
+	held := uint64(0)
+	for deadline := time.Now().Add(3 * time.Second); held == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no newer view loaded")
+		}
+		if seq := nextViewSeq(reader); seq > 0 {
+			held = seq
+		} else if seq := publishedSeq(reader); seq > initial {
+			held = seq // already published at MaxLag
+		}
+	}
+	for deadline := time.Now().Add(3 * time.Second); publishedSeq(reader) != held; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("held view not published within MaxLag; it waited for the next refresh")
+		}
+	}
+}
+
+func TestManualExpiredViewPublishesHeldViewDuringOutage(t *testing.T) {
+	ctx, reader, storage, store, ms := newManualTestReader(t)
+	commitKeyB(t, ctx, store, ms)
+	fireViewTimer(reader)
+	held := nextViewSeq(reader)
+	storage.setFail(errors.New("object storage unavailable"))
+	reader.mu.Lock()
+	reader.viewExpiresAt = time.Now().Add(-time.Second)
+	reader.mu.Unlock()
+	if _, _, err := reader.Get(ctx, []byte("b")); err != nil {
+		t.Fatalf("read with the published view expired and a valid view held: %v", err)
+	}
+	if publishedSeq(reader) != held {
+		t.Fatalf("published %d, want the held view %d", publishedSeq(reader), held)
+	}
+}

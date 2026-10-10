@@ -800,10 +800,11 @@ for {
 - **`Refresh` publishes at once** in manual mode too, for read-your-writes.
   A pending `Publish` then gets `ErrViewChanged`.
 - **The safety net.** If the published view has been outdated for `MaxLag`,
-  the reader publishes the newest view it loaded itself, so a stuck
-  application loop costs freshness, never availability. If the published
-  view has already expired when a newer one loads, the reader publishes at
-  once.
+  the reader publishes the newest view it loaded itself, at that time and
+  without reading object storage, so a stuck application loop costs
+  freshness, never availability. If the published view expires while a
+  newer, valid view is loaded, the reader publishes that view, even when
+  refreshes are failing.
 - **The cost is visibility.** A change reaches reads after the next refresh
   plus the time to prepare it, at most `MaxLag`.
 
