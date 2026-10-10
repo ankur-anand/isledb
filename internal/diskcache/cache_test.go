@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -28,9 +29,9 @@ func content(seed string, size int) []byte {
 	return data
 }
 
-func openCache(t *testing.T, dir string, metaMax, dataMax int64) *Cache {
+func openCache(t *testing.T, dir string, maxBytes int64) *Cache {
 	t.Helper()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: metaMax, DataMaxBytes: dataMax})
+	c, err := Open(Options{Dir: dir, MaxBytes: maxBytes})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -52,7 +53,7 @@ func read(c *Cache, k Key, size int64, off, n int) ([]byte, bool) {
 }
 
 func TestPutAndReadAt(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	c := openCache(t, t.TempDir(), 1<<20)
 	data := content("chunk", 1000)
 	k := Key{Object: object(1), Kind: KindChunk, Index: 7}
 	put(t, c, k, data)
@@ -75,7 +76,7 @@ func TestPutAndReadAt(t *testing.T) {
 // TestWrongSizeIsCorrupt reads an entry expecting another size, as after a
 // crash left it short: the entry is dropped and counted as corrupt.
 func TestWrongSizeIsCorrupt(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	c := openCache(t, t.TempDir(), 1<<20)
 	k := Key{Object: object(2), Kind: KindMeta}
 	put(t, c, k, content("meta", 500))
 	if _, ok := read(c, k, 600, 0, 10); ok {
@@ -86,8 +87,8 @@ func TestWrongSizeIsCorrupt(t *testing.T) {
 	}
 }
 
-func TestTierLRUEviction(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 300)
+func TestLRUEvictionDataFirst(t *testing.T) {
+	c := openCache(t, t.TempDir(), 300)
 	chunk := func(i uint32) Key { return Key{Object: object(5), Kind: KindChunk, Index: i} }
 	put(t, c, chunk(0), content("a", 100))
 	put(t, c, chunk(1), content("b", 100))
@@ -100,28 +101,157 @@ func TestTierLRUEviction(t *testing.T) {
 		t.Fatal("eviction did not take the least recently used entry")
 	}
 
-	// The meta tier has its own budget: data churn never evicts it.
+	// Metadata makes room by evicting data, then data churn never evicts it.
 	meta := Key{Object: object(5), Kind: KindMeta}
 	put(t, c, meta, content("m", 200))
+	if !c.Contains(meta, 200) || c.Stats(TierData).Bytes != 100 {
+		t.Fatalf("meta entry did not evict data: data tier %+v", c.Stats(TierData))
+	}
 	for i := uint32(10); i < 20; i++ {
 		put(t, c, chunk(i), content("e", 100))
 	}
 	if !c.Contains(meta, 200) {
 		t.Fatal("data churn evicted a meta entry")
 	}
-	if stats := c.Stats(TierData); stats.Bytes > 300 || stats.Evictions == 0 {
-		t.Fatalf("data tier stats = %+v", stats)
+
+	// Data that fits only by evicting metadata is not stored.
+	put(t, c, chunk(30), content("f", 150))
+	if c.Contains(chunk(30), 150) || !c.Contains(meta, 200) || c.Stats(TierData).Bypasses != 1 {
+		t.Fatalf("data stored over metadata: data tier %+v", c.Stats(TierData))
 	}
 
-	// An entry larger than its whole tier is not stored.
+	// Metadata evicts metadata when no data is left.
+	meta2 := Key{Object: object(6), Kind: KindMeta}
+	put(t, c, meta2, content("n", 200))
+	if c.Contains(meta, 200) || !c.Contains(meta2, 200) {
+		t.Fatal("a new meta entry did not evict the least recently used one")
+	}
+
+	// An entry larger than the whole cache is not stored.
 	put(t, c, chunk(99), content("big", 301))
-	if c.Contains(chunk(99), 301) || c.Stats(TierData).Bypasses != 1 {
+	if c.Contains(chunk(99), 301) || c.Stats(TierData).Bypasses != 2 {
 		t.Fatal("oversized entry stored")
+	}
+	if free := c.Free(); free != 100 {
+		t.Fatalf("Free = %d, want 100", free)
+	}
+}
+
+// TestDataRefusedWhenMetadataGrewDuringStore fills the cache with metadata
+// while a data Put is between its rename and its commit: the data entry is
+// not kept, its file is deleted, and nothing is evicted for it.
+func TestDataRefusedWhenMetadataGrewDuringStore(t *testing.T) {
+	c := openCache(t, t.TempDir(), 300)
+	older := Key{Object: object(39), Kind: KindChunk}
+	put(t, c, older, content("old", 100))
+	chunk := Key{Object: object(40), Kind: KindChunk}
+	meta := Key{Object: object(41), Kind: KindMeta}
+	renamed, resume := make(chan struct{}), make(chan struct{})
+	c.testHook = func(point string, k Key) {
+		if point == "renamed" && k == chunk {
+			close(renamed)
+			<-resume
+		}
+	}
+	stored := make(chan error, 1)
+	go func() { stored <- c.Put(chunk, content("data", 150)) }()
+	<-renamed
+	put(t, c, meta, content("meta", 200))
+	close(resume)
+	if err := <-stored; err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if c.Contains(chunk, 150) || !c.Contains(meta, 200) {
+		t.Fatal("data kept over metadata stored during its write")
+	}
+	if !c.Contains(older, 100) {
+		t.Fatal("a refused data entry evicted other data")
+	}
+	if _, err := os.Stat(c.path(chunk, 150)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused data entry left its file: %v", err)
+	}
+	if stats := c.Stats(TierData); stats.Bypasses != 1 || stats.Evictions != 0 {
+		t.Fatalf("data tier %+v, want one bypass and no eviction", stats)
+	}
+}
+
+func TestPutOfStoredEntryIsANoOp(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	k := Key{Object: object(42), Kind: KindChunk}
+	put(t, c, k, content("first", 100))
+	put(t, c, k, content("second", 100))
+	if got, ok := read(c, k, 100, 0, 100); !ok || !bytes.Equal(got, content("first", 100)) {
+		t.Fatal("a Put of the same size replaced the stored entry")
+	}
+	if stats := c.Stats(TierData); stats.Entries != 1 || stats.Bytes != 100 {
+		t.Fatalf("stats = %+v, want one entry", stats)
+	}
+}
+
+func TestFailedWriteCountsAndLeavesNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	c := openCache(t, t.TempDir(), 1<<20)
+	if err := os.Chmod(c.incoming, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(c.incoming, 0o700) })
+	k := Key{Object: object(43), Kind: KindChunk}
+	if err := c.Put(k, content("x", 100)); err == nil {
+		t.Fatal("Put succeeded with an unwritable directory")
+	}
+	if c.Contains(k, 100) || c.Stats(TierData).Failures != 1 {
+		t.Fatalf("stats = %+v, want one failure and no entry", c.Stats(TierData))
+	}
+	if left, _ := os.ReadDir(c.incoming); len(left) != 0 {
+		t.Fatalf("failed write left %d files behind", len(left))
+	}
+}
+
+func TestInvalidKeysAndCallsAfterClose(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	k := Key{Object: object(44), Kind: KindChunk}
+	put(t, c, k, content("k", 100))
+	for _, bad := range []Key{{Kind: kindCount}, {Kind: KindMeta, Index: 1}} {
+		if c.Contains(bad, 100) || c.ReadAt(bad, 100, make([]byte, 1), 0) {
+			t.Fatalf("invalid key %v found", bad)
+		}
+		if c.Put(bad, content("x", 10)) == nil {
+			t.Fatalf("Put of invalid key %v succeeded", bad)
+		}
+		if n := c.RemoveAll([]Key{bad}); n != 0 {
+			t.Fatalf("RemoveAll of invalid key %v dropped %d", bad, n)
+		}
+		c.Remove(bad)
+	}
+	c.Purge(tierCount)
+	if stats := c.Stats(tierCount); stats != (Stats{}) {
+		t.Fatalf("Stats of an invalid tier = %+v", stats)
+	}
+	if !c.Contains(k, 100) {
+		t.Fatal("calls with invalid keys or tiers dropped a valid entry")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Contains(k, 100) || c.ReadAt(k, 100, make([]byte, 1), 0) {
+		t.Fatal("entry readable after Close")
+	}
+	if c.Put(Key{Object: object(45), Kind: KindChunk}, content("y", 10)) == nil {
+		t.Fatal("Put succeeded after Close")
+	}
+	if n := c.RemoveAll([]Key{k}); n != 0 {
+		t.Fatalf("RemoveAll after Close dropped %d", n)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
 func TestRemovePurgeAndVanishedFiles(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	c := openCache(t, t.TempDir(), 1<<20)
 	a := Key{Object: object(6), Kind: KindWhole}
 	b := Key{Object: object(7), Kind: KindChunk, Index: 3}
 	bloom := Key{Object: object(6), Kind: KindBloom}
@@ -153,7 +283,7 @@ func TestRemovePurgeAndVanishedFiles(t *testing.T) {
 // across a restart, and a later Put of it is kept.
 func TestDropDuringStoreIsNotUndone(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -180,7 +310,7 @@ func TestDropDuringStoreIsNotUndone(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	c = openCache(t, dir, 1<<20, 1<<20)
+	c = openCache(t, dir, 1<<20)
 	if c.Contains(k, 4096) {
 		t.Fatal("dropped entry came back from a write in progress")
 	}
@@ -206,7 +336,7 @@ func TestOtherDropsKeepPut(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+			c := openCache(t, t.TempDir(), 1<<20)
 			k := Key{Object: object(30), Kind: KindChunk}
 			renamed, resume := make(chan struct{}), make(chan struct{})
 			c.testHook = func(point string, _ Key) {
@@ -237,7 +367,7 @@ func TestOtherDropsKeepPut(t *testing.T) {
 // vanished, while the entry is stored again before the read takes the lock:
 // the new entry stays.
 func TestFailedReadKeepsReplacedEntry(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	c := openCache(t, t.TempDir(), 1<<20)
 	k := Key{Object: object(21), Kind: KindChunk, Index: 0}
 	put(t, c, k, content("old", 100))
 	if err := os.Remove(c.path(k, 100)); err != nil {
@@ -260,7 +390,7 @@ func TestFailedReadKeepsReplacedEntry(t *testing.T) {
 
 func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -294,12 +424,16 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	mustWrite(duplicate, content("keep", 301))
 	unfinished := filepath.Join(root, incomingName, "entry-123")
 	mustWrite(unfinished, []byte("partial"))
+	junkShard := filepath.Join(root, "data", "zz", "file")
+	mustWrite(junkShard, []byte("x"))
+	strayFile := filepath.Join(root, "data", "stray")
+	mustWrite(strayFile, []byte("x"))
 	oldLayout := filepath.Join(dir, "v2", "sst", "aa", "file")
 	mustWrite(oldLayout, []byte("old"))
 	foreign := filepath.Join(dir, "notes.txt")
 	mustWrite(foreign, []byte("not ours"))
 
-	c = openCache(t, dir, 1<<20, 1<<20)
+	c = openCache(t, dir, 1<<20)
 	if got, ok := read(c, keep, 300, 0, 300); !ok || !bytes.Equal(got, content("keep", 300)) {
 		t.Fatal("chunk lost across restart")
 	}
@@ -309,7 +443,7 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 	if stats := c.Stats(TierData); stats.Entries != 1 {
 		t.Fatalf("data tier entries=%d after recovery, want 1", stats.Entries)
 	}
-	for _, gone := range []string{sizeless, wrongTier, unfinished, filepath.Join(dir, "v2")} {
+	for _, gone := range []string{sizeless, wrongTier, unfinished, filepath.Join(root, "data", "zz"), strayFile, filepath.Join(dir, "v2")} {
 		if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s survived recovery", gone)
 		}
@@ -321,22 +455,27 @@ func TestRestartKeepsEntriesAndClearsDebris(t *testing.T) {
 
 func TestRestartTrimsToBudget(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	for i := range uint32(3) {
 		put(t, c, Key{Object: object(11), Kind: KindChunk, Index: i}, content("z", 100))
 	}
+	put(t, c, Key{Object: object(11), Kind: KindMeta}, content("m", 100))
 	_ = c.Close()
 
-	c = openCache(t, dir, 1<<20, 200)
-	if stats := c.Stats(TierData); stats.Entries != 2 || stats.Bytes != 200 {
-		t.Fatalf("restart kept %d entries of %d bytes, want 2 of 200", stats.Entries, stats.Bytes)
+	// Data is trimmed first: the meta entry and one chunk remain.
+	c = openCache(t, dir, 200)
+	if stats := c.Stats(TierData); stats.Entries != 1 || stats.Bytes != 100 {
+		t.Fatalf("restart kept %d data entries of %d bytes, want 1 of 100", stats.Entries, stats.Bytes)
+	}
+	if stats := c.Stats(TierMeta); stats.Entries != 1 {
+		t.Fatalf("restart kept %d meta entries, want 1", stats.Entries)
 	}
 	files, err := filepath.Glob(filepath.Join(dir, versionDir, "data", "*", "*"))
-	if err != nil || len(files) != 2 {
-		t.Fatalf("files after trim=%v err=%v, want 2", files, err)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("data files after trim=%v err=%v, want 1", files, err)
 	}
 }
 
@@ -345,7 +484,7 @@ func TestRestartTrimsToBudget(t *testing.T) {
 // counts a corruption and drops the entry.
 func TestShortFileDroppedOnRead(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -357,7 +496,7 @@ func TestShortFileDroppedOnRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c = openCache(t, dir, 1<<20, 1<<20)
+	c = openCache(t, dir, 1<<20)
 	if !c.Contains(k, 100) {
 		t.Fatal("recovery did not index the entry from its name")
 	}
@@ -375,7 +514,7 @@ func TestShortFileDroppedOnRead(t *testing.T) {
 // TestReplacingWithAnotherSizeDeletesOldFile stores an entry under one size
 // and then another: the first file, whose name differs, is deleted.
 func TestReplacingWithAnotherSizeDeletesOldFile(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 1<<20)
+	c := openCache(t, t.TempDir(), 1<<20)
 	k := Key{Object: object(23), Kind: KindChunk, Index: 0}
 	put(t, c, k, content("a", 100))
 	put(t, c, k, content("b", 200))
@@ -395,7 +534,7 @@ func TestReplacingWithAnotherSizeDeletesOldFile(t *testing.T) {
 // reopened cache has it.
 func TestCloseWaitsForPut(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -437,7 +576,7 @@ func TestCloseWaitsForPut(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	c = openCache(t, dir, 1<<20, 1<<20)
+	c = openCache(t, dir, 1<<20)
 	if !c.Contains(k, 100) {
 		t.Fatal("Put in progress at Close was not kept")
 	}
@@ -447,7 +586,7 @@ func TestCloseWaitsForPut(t *testing.T) {
 // stay, since the directory may belong to another process by then.
 func TestDropsAfterCloseLeaveFiles(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20})
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -467,8 +606,8 @@ func TestDropsAfterCloseLeaveFiles(t *testing.T) {
 
 func TestLockedDirectory(t *testing.T) {
 	dir := t.TempDir()
-	openCache(t, dir, 1<<20, 1<<20)
-	if _, err := Open(Options{Dir: dir, MetaMaxBytes: 1 << 20, DataMaxBytes: 1 << 20}); !errors.Is(err, ErrLocked) {
+	openCache(t, dir, 1<<20)
+	if _, err := Open(Options{Dir: dir, MaxBytes: 1 << 20}); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second Open error = %v, want ErrLocked", err)
 	}
 }
@@ -500,7 +639,7 @@ func TestParseNameRoundTrip(t *testing.T) {
 
 // TestConcurrentUse writes, reads and evicts from many goroutines.
 func TestConcurrentUse(t *testing.T) {
-	c := openCache(t, t.TempDir(), 1<<20, 8<<10)
+	c := openCache(t, t.TempDir(), 8<<10)
 	var wg sync.WaitGroup
 	for g := range 8 {
 		wg.Go(func() {
@@ -518,5 +657,96 @@ func TestConcurrentUse(t *testing.T) {
 	wg.Wait()
 	if stats := c.Stats(TierData); stats.Bytes > 8<<10 {
 		t.Fatalf("data tier over budget: %+v", stats)
+	}
+}
+
+func TestRemoveAll(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep, gone := object(1), object(2)
+	keys := []Key{{Object: gone, Kind: KindChunk, Index: 0}, {Object: gone, Kind: KindChunk, Index: 1}, {Object: gone, Kind: KindMeta}}
+	for _, k := range append(keys, Key{Object: keep, Kind: KindChunk}) {
+		if err := c.Put(k, []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RemoveAll(append(keys, Key{Object: gone, Kind: KindChunk, Index: 9})) // one never stored
+	for _, k := range keys {
+		if c.Contains(k, 4) {
+			t.Fatalf("%v still cached", k)
+		}
+		if _, err := os.Stat(c.path(k, 4)); !os.IsNotExist(err) {
+			t.Fatalf("%v file still on disk: %v", k, err)
+		}
+	}
+	if !c.Contains(Key{Object: keep, Kind: KindChunk}, 4) {
+		t.Fatal("an entry not listed was removed")
+	}
+	if got := c.Stats(TierData).Bytes; got != 4 {
+		t.Fatalf("data tier holds %d bytes, want the one kept entry", got)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c.RemoveAll([]Key{{Object: keep, Kind: KindChunk}})
+	if _, err := os.Stat(c.path(Key{Object: keep, Kind: KindChunk}, 4)); err != nil {
+		t.Fatalf("RemoveAll after Close deleted a file: %v", err)
+	}
+}
+
+// TestPutDuringRemoveAllKeepsIndexTrue stores a key again after RemoveAll
+// dropped it and before RemoveAll deletes its file, which has the same name:
+// the cache must not report the entry while its file is gone.
+func TestPutDuringRemoveAllKeepsIndexTrue(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	k := Key{Object: object(46), Kind: KindChunk}
+	put(t, c, k, content("old", 100))
+	c.testHook = func(point string, _ Key) {
+		if point == "unlocked" {
+			c.testHook = nil
+			put(t, c, k, content("new", 100))
+		}
+	}
+	c.RemoveAll([]Key{k})
+	if c.Contains(k, 100) {
+		if _, err := os.Stat(c.path(k, 100)); err != nil {
+			t.Fatalf("entry indexed but its file is gone: %v", err)
+		}
+	}
+	if stats := c.Stats(TierData); stats.Bypasses != 1 {
+		t.Fatalf("stats = %+v, want the Put during the delete bypassed", stats)
+	}
+	// Once the delete is done, the key is cached again.
+	put(t, c, k, content("again", 100))
+	if got, ok := read(c, k, 100, 0, 100); !ok || !bytes.Equal(got, content("again", 100)) {
+		t.Fatal("key not cached after RemoveAll finished")
+	}
+}
+
+func TestKeys(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	want := []Key{
+		{Object: object(47), Kind: KindMeta},
+		{Object: object(47), Kind: KindBloom},
+		{Object: object(48), Kind: KindChunk, Index: 3},
+	}
+	for _, k := range want {
+		put(t, c, k, content("k", 10))
+	}
+	got := c.Keys()
+	if len(got) != len(want) {
+		t.Fatalf("Keys = %v, want %v", got, want)
+	}
+	for _, k := range want {
+		if !slices.Contains(got, k) {
+			t.Fatalf("Keys = %v, missing %v", got, k)
+		}
+	}
+	_ = c.Close()
+	if keys := c.Keys(); keys != nil {
+		t.Fatalf("Keys after Close = %v", keys)
 	}
 }

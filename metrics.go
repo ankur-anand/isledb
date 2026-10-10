@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"errors"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -198,6 +199,20 @@ type ReaderMetrics struct {
 	// ViewLoaded is the Unix time the published manifest view was loaded;
 	// time() minus it is the view's age.
 	ViewLoaded prometheus.Gauge
+	// ViewOutdatedSince is the Unix time the published view first became
+	// outdated in Manual mode, the load time of a newer view not yet
+	// published, or 0 when it is the newest loaded: time() minus it climbing
+	// toward MaxLag means preparation is falling behind.
+	ViewOutdatedSince prometheus.Gauge
+	// NextViewPublishes counts NextView.Publish calls by result: published,
+	// changed or expired.
+	NextViewPublishes *prometheus.CounterVec
+	// SafetyPublishes counts views the Reader published itself after MaxLag.
+	SafetyPublishes prometheus.Counter
+	// DeadSSTsPending is how many SSTs a publish retired that are not yet
+	// deleted from the disk cache; one that keeps rising means deletes fall
+	// behind compactions.
+	DeadSSTsPending prometheus.Gauge
 
 	GetTotal   prometheus.Counter
 	GetErrors  prometheus.Counter
@@ -268,6 +283,47 @@ func (m *ReaderMetrics) ObserveViewLoaded(at time.Time) {
 		return
 	}
 	m.ViewLoaded.Set(float64(at.UnixNano()) / 1e9)
+}
+
+// ObserveViewOutdatedSince records when the published view became outdated;
+// the zero time means it is not.
+func (m *ReaderMetrics) ObserveViewOutdatedSince(at time.Time) {
+	if m == nil || m.ViewOutdatedSince == nil {
+		return
+	}
+	if at.IsZero() {
+		m.ViewOutdatedSince.Set(0)
+		return
+	}
+	m.ViewOutdatedSince.Set(float64(at.UnixNano()) / 1e9)
+}
+
+func (m *ReaderMetrics) ObserveNextViewPublish(err error) {
+	if m == nil || m.NextViewPublishes == nil {
+		return
+	}
+	switch {
+	case err == nil:
+		m.NextViewPublishes.WithLabelValues("published").Inc()
+	case errors.Is(err, ErrViewChanged):
+		m.NextViewPublishes.WithLabelValues("changed").Inc()
+	case errors.Is(err, ErrNextViewExpired):
+		m.NextViewPublishes.WithLabelValues("expired").Inc()
+	}
+}
+
+func (m *ReaderMetrics) ObserveSafetyPublish() {
+	if m == nil {
+		return
+	}
+	m.incCounter(m.SafetyPublishes)
+}
+
+func (m *ReaderMetrics) ObserveDeadSSTsPending(n int) {
+	if m == nil || m.DeadSSTsPending == nil {
+		return
+	}
+	m.DeadSSTsPending.Set(float64(n))
 }
 
 func (m *ReaderMetrics) ObserveGet(d time.Duration, found bool, err error) {
@@ -381,6 +437,34 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Subsystem:   "reader",
 			Name:        "view_loaded_timestamp_seconds",
 			Help:        "Unix time the published manifest view was loaded.",
+			ConstLabels: constLabels,
+		}),
+		ViewOutdatedSince: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "view_outdated_since_timestamp_seconds",
+			Help:        "Unix time the published view became outdated in manual mode, or 0 when it is the newest loaded.",
+			ConstLabels: constLabels,
+		}),
+		NextViewPublishes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "next_view_publishes_total",
+			Help:        "NextView.Publish calls by result: published, changed or expired.",
+			ConstLabels: constLabels,
+		}, []string{"result"}),
+		SafetyPublishes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "view_safety_publishes_total",
+			Help:        "Views the reader published itself after MaxLag in manual mode.",
+			ConstLabels: constLabels,
+		}),
+		DeadSSTsPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "dead_ssts_pending",
+			Help:        "SSTs retired by a publish and not yet deleted from the disk cache.",
 			ConstLabels: constLabels,
 		}),
 		GetTotal: prometheus.NewCounter(prometheus.CounterOpts{

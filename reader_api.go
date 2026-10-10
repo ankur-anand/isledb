@@ -10,6 +10,7 @@ var ErrInvalidReaderOptions = errors.New("invalid reader options")
 
 const (
 	defaultReaderRefreshAfter = time.Minute
+	defaultReaderMaxLag       = 5 * time.Minute
 	// minReaderRefreshAfter is the shortest RefreshAfter accepted: each
 	// refresh reads CURRENT from object storage.
 	minReaderRefreshAfter = time.Second
@@ -24,6 +25,19 @@ type ReaderViewPolicy struct {
 	// random phase, so readers started together do not refresh in step. Zero
 	// selects one minute; values under one second are rejected.
 	RefreshAfter time.Duration
+
+	// Manual leaves publishing newer views to the application. The Reader
+	// still loads every RefreshAfter and renews an unchanged view, but keeps
+	// a newer one unpublished until the application publishes it, or until
+	// the published view has been outdated for MaxLag, when it publishes the
+	// newest view itself. Refresh still publishes at once.
+	Manual bool
+
+	// MaxLag bounds, in Manual mode, how long the published view may stay
+	// outdated. Zero selects 5 minutes, or a quarter of the store's
+	// MaxPinnedViewAge if that is shorter. A value set explicitly must be
+	// below half the MaxPinnedViewAge.
+	MaxLag time.Duration
 }
 
 // CacheStats reports one reader cache's occupancy and lookup activity. Byte
@@ -55,9 +69,10 @@ type ReaderOpenOptions struct {
 	CacheDir string
 
 	// DiskCacheSize bounds everything the reader keeps on disk: SST metadata,
-	// Bloom filters, small SSTs and chunks of larger SSTs' data. An eighth of
-	// it is kept for metadata and Bloom filters, so bulk data cannot evict
-	// them. Zero selects the default (8 GiB).
+	// Bloom filters, small SSTs and chunks of larger SSTs' data. Data is
+	// evicted first, and never to make room for more data at the expense of
+	// metadata, so bulk data cannot evict what every lookup needs. Zero
+	// selects the default (8 GiB).
 	DiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes of SST blocks kept in memory,
@@ -129,6 +144,9 @@ func normalizeReaderViewPolicy(policy ReaderViewPolicy) (ReaderViewPolicy, error
 	}
 	if policy.RefreshAfter == 0 {
 		policy.RefreshAfter = defaultReaderRefreshAfter
+	}
+	if policy.MaxLag < 0 {
+		return ReaderViewPolicy{}, fmt.Errorf("%w: max_lag=%s", ErrInvalidReaderOptions, policy.MaxLag)
 	}
 	return policy, nil
 }

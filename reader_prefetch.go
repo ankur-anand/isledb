@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"golang.org/x/sync/errgroup"
@@ -24,8 +25,8 @@ type PrefetchOptions struct {
 	// limit.
 	MaxSSTs int
 
-	// MaxBytes limits the total manifest-declared SST bytes to download. Zero
-	// means no limit.
+	// MaxBytes limits the total bytes to download, each SST's Bloom filter
+	// included. Zero means no limit.
 	MaxBytes int64
 
 	// Concurrency limits parallel SST downloads. Zero uses a small default.
@@ -42,9 +43,9 @@ type PrefetchStats struct {
 }
 
 // Prefetch caches SSTs on disk for a fresh manifest view: their metadata,
-// Bloom filters and data, fetching only what is missing. It stops selecting
-// SSTs once they would exceed the disk cache's data budget, counting the rest
-// as skipped.
+// Bloom filters and data, fetching only what is missing. It selects only what
+// fits in the disk cache's free space, counting the rest as skipped, and runs
+// after any other prefetch of this Reader.
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error) {
 	if err := validatePrefetchOptions(opts); err != nil {
 		return PrefetchStats{}, err
@@ -68,17 +69,101 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 		return PrefetchStats{}, nil
 	}
 
-	selected, stats := r.selectPrefetchSSTs(m, opts)
+	return r.prefetchSSTs(ctx, m, opts, nil, expiresAt, ErrReadViewExpired)
+}
+
+// pruneBatch is how many entries PruneDiskCache deletes between checks of
+// its context.
+const pruneBatch = 4096
+
+// PruneDiskCache deletes from the disk cache every SST that neither the
+// published view nor a view held for NextView names, such as those a previous
+// process cached before compactions replaced them. Prefetch uses free space
+// only, so a cache full of such SSTs leaves it none: call PruneDiskCache after
+// opening and before a start-up Prefetch. It deletes without pacing, so call
+// it before serving reads. Snapshots of older views fetch again what they
+// need. It returns how many cache entries it deleted.
+func (r *Reader) PruneDiskCache(ctx context.Context) (int, error) {
+	done, err := r.beginRead()
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if r.diskCache == nil {
+		return 0, nil
+	}
+	keep := make(map[[32]byte]struct{})
+	r.mu.RLock()
+	views := []*manifestState{r.manifest}
+	if r.nextView != nil {
+		views = append(views, r.nextView.manifest)
+	}
+	r.mu.RUnlock()
+	for _, m := range views {
+		for _, sst := range sstMetadataOf(m) {
+			keep[r.fetcher.object(sst).key] = struct{}{}
+		}
+	}
+	var drop []diskcache.Key
+	for _, k := range r.diskCache.Keys() {
+		if _, ok := keep[k.Object]; !ok {
+			drop = append(drop, k)
+		}
+	}
+	removed := 0
+	for len(drop) > 0 {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		n := min(len(drop), pruneBatch)
+		removed += r.diskCache.RemoveAll(drop[:n])
+		drop = drop[n:]
+	}
+	return removed, nil
+}
+
+// prefetchSSTs selects SSTs of m to cache and downloads them, one prefetch at
+// a time per Reader: each selects by free space once the last has stored, so
+// two never fill the same space and evict what reads use.
+func (r *Reader) prefetchSSTs(
+	ctx context.Context,
+	m *manifestState,
+	opts PrefetchOptions,
+	only map[string]struct{},
+	expiresAt time.Time,
+	expiredErr error,
+) (PrefetchStats, error) {
+	select {
+	case r.prefetching <- struct{}{}:
+	case <-ctx.Done():
+		return PrefetchStats{}, ctx.Err()
+	}
+	defer func() { <-r.prefetching }()
+	selected, stats := r.selectSSTsToPrefetch(m, opts, only)
+	if r.prefetchSelected != nil {
+		r.prefetchSelected()
+	}
+	return r.fetchPrefetchSSTs(ctx, selected, stats, opts.Concurrency, expiresAt, expiredErr)
+}
+
+// fetchPrefetchSSTs caches the selected SSTs on disk, a few at a time, before
+// expiresAt, after which it fails with expiredErr.
+func (r *Reader) fetchPrefetchSSTs(
+	ctx context.Context,
+	selected []sstMetadata,
+	stats PrefetchStats,
+	concurrency int,
+	expiresAt time.Time,
+	expiredErr error,
+) (PrefetchStats, error) {
 	if len(selected) == 0 {
 		return stats, nil
 	}
-
-	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = defaultPrefetchConcurrency
 	}
 
-	readCtx := withReadDeadline(ctx, expiresAt, ErrReadViewExpired)
+	readCtx := withReadDeadline(ctx, expiresAt, expiredErr)
 	defer readCtx.release()
 
 	var bytesRead atomic.Int64
@@ -91,7 +176,7 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 			return err
 		})
 	}
-	err = g.Wait()
+	err := g.Wait()
 	for _, sst := range selected {
 		if r.fetcher.resident(r.fetcher.object(sst)) {
 			stats.CachedSSTs++
@@ -124,17 +209,21 @@ func validatePrefetchOptions(opts PrefetchOptions) error {
 	return nil
 }
 
-func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]sstMetadata, PrefetchStats) {
+// selectSSTsToPrefetch selects SSTs of m that are not on disk, and with only
+// set only those in only, to fit in the disk cache's free space. Using only
+// free space, a prefetch never evicts anything on disk, whichever view reads
+// are using it for.
+func (r *Reader) selectSSTsToPrefetch(
+	m *manifestState,
+	opts PrefetchOptions,
+	only map[string]struct{},
+) ([]sstMetadata, PrefetchStats) {
 	var selected []sstMetadata
 	var stats PrefetchStats
 	seen := make(map[string]struct{})
-	// The disk cache's data tier bounds the SSTs on disk and selected, so a
-	// prefetch neither evicts what it fetches nor, repeated over more than
-	// fits, what the last one cached. MaxBytes bounds only what this one
-	// downloads.
-	var tierMax, tierBytes, downloadBytes int64
+	var free, downloadBytes int64
 	if r.diskCache != nil {
-		tierMax = r.diskCache.Stats(diskcache.TierData).MaxBytes
+		free = r.diskCache.Free()
 	}
 
 	visit := func(sst sstMetadata) {
@@ -143,15 +232,18 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 		}
 		seen[sst.ID] = struct{}{}
 
+		if only != nil {
+			if _, ok := only[sst.ID]; !ok {
+				return
+			}
+		}
 		if !opts.All && !sstOverlapsHalfOpenRange(sst, opts.Range) {
 			return
 		}
 		stats.MatchedSSTs++
 
-		if r.fetcher.resident(r.fetcher.object(sst)) {
-			if sst.Size > 0 && tierBytes+sst.Size <= tierMax {
-				tierBytes += sst.Size
-			}
+		o := r.fetcher.object(sst)
+		if r.fetcher.resident(o) {
 			stats.SkippedSSTs++
 			return
 		}
@@ -159,15 +251,16 @@ func (r *Reader) selectPrefetchSSTs(m *manifestState, opts PrefetchOptions) ([]s
 			stats.SkippedSSTs++
 			return
 		}
-		if sst.Size <= 0 || tierBytes+sst.Size > tierMax ||
-			(opts.MaxBytes > 0 && downloadBytes+sst.Size > opts.MaxBytes) {
+		// An SST takes its Size and its Bloom filter, stored after it.
+		download := sst.Size + o.bloomLength
+		if sst.Size <= 0 || downloadBytes+download > free ||
+			(opts.MaxBytes > 0 && downloadBytes+download > opts.MaxBytes) {
 			stats.SkippedSSTs++
 			return
 		}
 
 		selected = append(selected, sst)
-		tierBytes += sst.Size
-		downloadBytes += sst.Size
+		downloadBytes += download
 	}
 
 	for _, sst := range m.L0SSTs {

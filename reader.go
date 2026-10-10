@@ -36,6 +36,8 @@ type Reader struct {
 	bloomLoading      sync.Map
 	bloomLoadsRunning atomic.Int32
 	bloomBackground   sync.WaitGroup
+	// publishMu serializes publishLoadedView.
+	publishMu sync.Mutex
 	// sstDrops counts dropSST calls.
 	sstDrops      atomic.Int64
 	manifestLoads coalescedLoadGroup
@@ -63,6 +65,25 @@ type Reader struct {
 	// viewSeq is the published CURRENT's NextSeq: the manifest log position
 	// the view reflects. A view is only ever replaced by one at least as new.
 	viewSeq uint64
+	// position mirrors viewSeq for ViewPosition, which takes no lock.
+	position atomic.Uint64
+	// In Manual mode, nextView is the newest loaded view newer than the
+	// published one, and outdatedSince when the published view first became
+	// outdated; both clear when the published position moves.
+	nextView      *loadedView
+	outdatedSince time.Time
+	// nextLoads counts the loads kept as nextView and handedLoads the last
+	// handed out by NextView, so each load is handed out once; nextReady is
+	// closed and replaced on each kept load to wake NextView, and is nil
+	// once the reader is closed.
+	nextLoads, handedLoads uint64
+	nextReady              chan struct{}
+	// dead holds SSTs a publish retired, waiting for dropDeadSSTs to delete
+	// them from the disk cache in the background; see retire.
+	dead deadSSTs
+	// safetyPublishes counts views published after MaxLag in Manual mode.
+	safetyPublishes atomic.Int64
+	maxLagClamped   atomic.Bool
 	// viewLoadedAt is when the published view was loaded.
 	viewLoadedAt time.Time
 	// refreshFailures counts refreshes failed since the view was loaded, and
@@ -74,14 +95,19 @@ type Reader struct {
 	changeHead      ChangeCursor
 	viewPolicy      ReaderViewPolicy
 	// refreshGrid is the origin of this reader's refresh schedule (see nextOnGrid).
-	refreshGrid            time.Time
-	viewRefreshAt          time.Time
-	viewExpiresAt          time.Time
-	viewDue                atomic.Bool
-	viewTimerMu            sync.Mutex
-	viewTimer              *time.Timer
-	viewTimerID            atomic.Uint64
-	metrics                *ReaderMetrics
+	refreshGrid   time.Time
+	viewRefreshAt time.Time
+	viewExpiresAt time.Time
+	viewDue       atomic.Bool
+	viewTimerMu   sync.Mutex
+	viewTimer     *time.Timer
+	viewTimerID   atomic.Uint64
+	metrics       *ReaderMetrics
+	// prefetching admits one prefetch at a time (see prefetchSSTs).
+	prefetching chan struct{}
+	// prefetchSelected, set only by tests, runs after a prefetch selects its
+	// SSTs and before it downloads them.
+	prefetchSelected       func()
 	bloomDiagnosticLimiter readerDiagnosticLimiter
 	// stale reports that a refresh failed and reads are answered from an
 	// older, still valid view; it is cleared when a refresh succeeds.
@@ -126,9 +152,14 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 	refreshGrid := viewLoadedAt.Add(time.Duration(rand.Int64N(int64(viewPolicy.RefreshAfter))) + 1)
 	viewRefreshAt := refreshGrid
 	current := ms.CurrentData()
+	if viewPolicy.Manual && viewPolicy.MaxLag > 0 && viewPolicy.MaxLag >= current.PinnedViewAge()/2 {
+		return nil, fmt.Errorf("%w: max_lag=%s, want below half the store's max pinned view age %s",
+			ErrInvalidReaderOptions, viewPolicy.MaxLag, current.PinnedViewAge())
+	}
 	changeFeed, changeHead := readerChangeFeedState(current)
 	viewExpiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 	reader := &Reader{
+		prefetching:    make(chan struct{}, 1),
 		store:          store,
 		manifestStore:  ms,
 		manifest:       m,
@@ -152,6 +183,11 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		metrics:        opts.Metrics,
 	}
 	reader.endRead = reader.lifecycleMu.RUnlock
+	reader.nextReady = make(chan struct{})
+	if reader.diskCache != nil {
+		reader.dead.start(reader)
+	}
+	reader.position.Store(reader.viewSeq)
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
 	cleanupDiskCache = false
@@ -168,8 +204,8 @@ func openSSTCacheSize(size int) int {
 }
 
 // initReaderDiskCache opens the disk cache under CacheDir, unless the caller
-// supplied one. The budget is split between its tiers: an eighth for SST
-// metadata and Bloom filters, the rest for data.
+// supplied one. SST metadata, Bloom filters and data share its budget; data
+// is evicted first.
 func initReaderDiskCache(opts readerOptions) (*diskcache.Cache, bool, error) {
 	if opts.DiskCache != nil {
 		return opts.DiskCache, false, nil
@@ -178,13 +214,8 @@ func initReaderDiskCache(opts readerOptions) (*diskcache.Cache, bool, error) {
 		return nil, false, errors.New("cache dir is required")
 	}
 	budget := cmp.Or(opts.DiskCacheSize, defaultDiskCacheSize)
-	metaBudget := max(budget/8, 1)
 	dir := filepath.Join(opts.CacheDir, "artifacts")
-	cache, err := diskcache.Open(diskcache.Options{
-		Dir:          dir,
-		MetaMaxBytes: metaBudget,
-		DataMaxBytes: max(budget-metaBudget, 1),
-	})
+	cache, err := diskcache.Open(diskcache.Options{Dir: dir, MaxBytes: budget})
 	if err != nil {
 		return nil, false, fmt.Errorf("open disk cache: %w", err)
 	}
@@ -226,6 +257,9 @@ func (r *Reader) checkManifestView(ctx context.Context) error {
 	expired := !time.Now().Before(r.viewExpiresAt)
 	r.mu.RUnlock()
 	if expired {
+		if r.publishHeldIfDue() {
+			return nil
+		}
 		return r.refreshManifest(ctx, false)
 	}
 	if r.stale.Load() {
@@ -275,6 +309,42 @@ func (r *Reader) refreshOnce() {
 	if err := r.refreshManifest(ctx, false); err != nil && ctx.Err() != nil {
 		r.refreshFailed(fmt.Errorf("manifest refresh timed out after %s: %w", r.refreshTimeout, err))
 	}
+	// A failed reload must not hold back a view already loaded.
+	r.publishHeldIfDue()
+}
+
+// publishHeldIfDue publishes, in Manual mode, the newer view the Reader holds
+// once the published one has been outdated for MaxLag or has expired. The
+// held view is already loaded, so this reads nothing from object storage and
+// works while reloads fail. It reports whether it published. The caller holds
+// a read, or runs on a goroutine Close waits for: it must not take the
+// lifecycle lock, which Close holds while it waits for those goroutines.
+func (r *Reader) publishHeldIfDue() bool {
+	if r.closed.Load() {
+		return false
+	}
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	held, since, expiresAt, published := r.nextView, r.outdatedSince, r.viewExpiresAt, r.viewSeq
+	r.mu.RUnlock()
+	if held == nil || currentNextSeq(held.current) <= published {
+		return false
+	}
+	now := time.Now()
+	lagged := !since.IsZero() && !now.Before(since.Add(r.maxLag(held.current)))
+	if !lagged && now.Before(expiresAt) {
+		return false
+	}
+	if !now.Before(held.loadedAt.Add(held.current.PinnedViewAge())) {
+		return false
+	}
+	if lagged {
+		r.safetyPublishes.Add(1)
+		r.metrics.ObserveSafetyPublish()
+	}
+	r.publishManifestView(held.manifest, held.current, held.loadedAt)
+	return true
 }
 
 // refreshManifest reloads the view, sharing a reload in progress. A forced
@@ -285,48 +355,211 @@ func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 	for {
 		value, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
 			if !force && !r.manifestViewDue() {
-				return uint64(0), nil
+				return reloadResult{}, nil
 			}
 			started := r.reloads.Add(1)
-			return started, r.reloadManifest(loadCtx)
+			view, err := r.reloadManifest(loadCtx)
+			return reloadResult{started: started, view: view}, err
 		})
-		if err != nil || !force {
+		if err != nil {
 			return err
 		}
-		if started, _ := value.(uint64); started > called {
+		// Every caller that receives a loaded view publishes it; the first
+		// publishes, the others find it already published.
+		result, _ := value.(reloadResult)
+		if result.view != nil {
+			r.publishLoaded(*result.view, force)
+		}
+		if !force || result.started > called {
 			return nil
 		}
 	}
 }
 
-func (r *Reader) reloadManifest(ctx context.Context) (err error) {
-	viewLoadedAt := time.Now()
-	start := viewLoadedAt
+// ViewPosition identifies a view's data: the manifest log position it
+// reflects. Two views at the same position hold the same data.
+type ViewPosition uint64
+
+// ViewPosition returns the published view's position, without a lock.
+func (r *Reader) ViewPosition() ViewPosition {
+	return ViewPosition(r.position.Load())
+}
+
+var (
+	ErrViewChanged     = errors.New("published view changed")
+	ErrNextViewExpired = errors.New("next view expired before it was published")
+)
+
+// publishAt publishes view only if the published view is still at previous
+// and view is newer, returning ErrViewChanged otherwise, ErrNextViewExpired
+// if view's pinned age has passed since it was loaded, and ErrReaderClosed
+// once the reader is closed.
+func (r *Reader) publishAt(view loadedView, previous uint64) error {
+	done, err := r.beginRead()
+	if err != nil {
+		return err
+	}
+	defer done()
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	published := r.viewSeq
+	r.mu.RUnlock()
+	if published != previous || currentNextSeq(view.current) <= published {
+		return ErrViewChanged
+	}
+	if !time.Now().Before(view.loadedAt.Add(view.current.PinnedViewAge())) {
+		return ErrNextViewExpired
+	}
+	r.publishManifestView(view.manifest, view.current, view.loadedAt)
+	return nil
+}
+
+// reloadResult is what one shared reload hands each caller waiting for it.
+type reloadResult struct {
+	started uint64      // the reload's number; zero when none ran
+	view    *loadedView // nil when none ran
+}
+
+// reloadManifest loads the current view for publishing. It returns no view
+// when every caller waiting for it gave up, or when loading failed, which it
+// records.
+func (r *Reader) reloadManifest(ctx context.Context) (view *loadedView, err error) {
+	start := time.Now()
 	defer func() {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	// The manifest and the CURRENT it was built from are published together:
-	// reading CURRENT again could observe an overlapping reload's generation.
-	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
-	// Every caller waiting for this reload gave up: publish nothing.
+	loaded, err := r.loadManifestView(ctx, start)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return nil, ctxErr
 	}
 	if err != nil {
 		r.refreshFailed(err)
-		return err
+		return nil, err
 	}
-	if published, viewSeq := r.publishManifestView(m, current, viewLoadedAt); !published {
-		// CURRENT is older than the view: either an overlapping reload
-		// published a newer one, which leaves the view not due and so is
-		// ignored, or the store went back, which is retried like a failure.
-		r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
-			currentNextSeq(current), viewSeq))
-		return nil
+	return &loaded, nil
+}
+
+// loadedView is a manifest view read from the store and not yet published.
+// fromSeq is the published view's log position when the load started.
+type loadedView struct {
+	manifest *manifestState
+	current  *manifest.Current
+	loadedAt time.Time
+	fromSeq  uint64
+}
+
+// loadManifestView reads CURRENT and replays the manifest it names, without
+// publishing it. The manifest and the CURRENT it was built from stay
+// together: reading CURRENT again could observe an overlapping reload's
+// generation.
+func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time) (loadedView, error) {
+	r.mu.RLock()
+	fromSeq := r.viewSeq
+	r.mu.RUnlock()
+	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
+	return loadedView{manifest: m, current: current, loadedAt: loadedAt, fromSeq: fromSeq}, err
+}
+
+// publishLoadedView publishes view, one caller at a time:
+//   - newer than the published view: it replaces it;
+//   - the same log position, loaded later: it renews the published view's
+//     refresh and expiry times, as every successful refresh must, or an idle
+//     reader's view would expire;
+//   - already published by another caller sharing the load: nothing;
+//   - older, after another reload published a newer view since this load
+//     started: nothing, the reader is ahead;
+//   - older, with nothing published since: the store went back, a failure.
+func (r *Reader) publishLoadedView(view loadedView) {
+	r.publishLoaded(view, false)
+}
+
+// publishLoaded is publishLoadedView for a refresh, forced or not. In Manual
+// mode a newer view from an unforced refresh is kept as the next view rather
+// than published, unless the published view has expired or has been
+// outdated for MaxLag; a kept view is still a successful refresh.
+func (r *Reader) publishLoaded(view loadedView, force bool) {
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.RLock()
+	published, publishedAt, expiresAt := r.viewSeq, r.viewLoadedAt, r.viewExpiresAt
+	r.mu.RUnlock()
+	seq := currentNextSeq(view.current)
+	switch {
+	case seq < published:
+		if published == view.fromSeq {
+			r.refreshFailed(fmt.Errorf("manifest CURRENT at log position %d is older than the loaded view at %d",
+				seq, published))
+		}
+		return
+	case seq == published && !view.loadedAt.After(publishedAt):
+		return
 	}
+	if seq > published && r.viewPolicy.Manual && !force && time.Now().Before(expiresAt) {
+		next, due := r.keepNextView(view)
+		if !due {
+			r.refreshSucceeded()
+			return
+		}
+		view = next
+		r.safetyPublishes.Add(1)
+		r.metrics.ObserveSafetyPublish()
+	}
+	r.publishManifestView(view.manifest, view.current, view.loadedAt)
 	r.refreshSucceeded()
-	return nil
+}
+
+// keepNextView keeps view as the next view if it is the newest loaded, and
+// reports the newest and whether the published view has now been outdated
+// for MaxLag. When not, it schedules the next refresh, which a published view
+// would have done.
+func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
+	r.mu.Lock()
+	if r.nextView == nil || currentNextSeq(view.current) >= currentNextSeq(r.nextView.current) {
+		r.nextView = &view
+		r.nextLoads++
+		if r.nextReady != nil {
+			close(r.nextReady)
+			r.nextReady = make(chan struct{})
+		}
+	}
+	if r.outdatedSince.IsZero() {
+		r.outdatedSince = view.loadedAt
+	}
+	outdatedSince := r.outdatedSince
+	next := *r.nextView
+	due := !time.Now().Before(r.outdatedSince.Add(r.maxLag(view.current)))
+	refreshAt := r.nextOnGrid(view.loadedAt, r.viewPolicy.RefreshAfter)
+	if !due {
+		r.viewRefreshAt = refreshAt
+	}
+	expiresAt := r.viewExpiresAt
+	r.mu.Unlock()
+	r.metrics.ObserveViewOutdatedSince(outdatedSince)
+	if !due {
+		r.armViewTimer(refreshAt, expiresAt)
+	}
+	return next, due
+}
+
+// maxLag is the policy's MaxLag for current's pinned view age: by default
+// the shorter of defaultReaderMaxLag and a quarter of the age; an explicit
+// value is kept below half the age, since a store opened before its first
+// writer may get a shorter age later.
+func (r *Reader) maxLag(current *manifest.Current) time.Duration {
+	lag, half := r.viewPolicy.MaxLag, current.PinnedViewAge()/2
+	if lag == 0 {
+		return min(defaultReaderMaxLag, current.PinnedViewAge()/4)
+	}
+	if lag < half {
+		return lag
+	}
+	if r.maxLagClamped.CompareAndSwap(false, true) {
+		slog.Warn("isledb: MaxLag is not below half the store's max pinned view age; using half",
+			"max_lag", lag, "max_pinned_view_age", current.PinnedViewAge())
+	}
+	return half
 }
 
 // nextOnGrid returns the first time after after on this reader's grid,
@@ -435,17 +668,30 @@ func (r *Reader) publishManifestView(
 		r.mu.Unlock()
 		return false, published
 	}
+	if seq > r.viewSeq {
+		r.outdatedSince = time.Time{}
+	}
+	if r.nextView != nil && currentNextSeq(r.nextView.current) <= seq {
+		r.nextView = nil
+	} else if r.nextView != nil {
+		r.outdatedSince = r.nextView.loadedAt
+	}
+	retired := r.manifest
 	r.manifest = m
 	r.viewSeq = seq
+	r.position.Store(seq)
 	r.viewLoadedAt = viewLoadedAt
 	r.version = versionFromCurrent(current)
 	r.changeFeed = changeFeed
 	r.changeHead = changeHead
 	r.viewRefreshAt = refreshAt
 	r.viewExpiresAt = expiresAt
+	outdatedSince := r.outdatedSince
 	r.mu.Unlock()
 
+	r.metrics.ObserveViewOutdatedSince(outdatedSince)
 	r.blockCache.prune(m, r.openSSTs.isOpen)
+	r.dead.retire(retired, m)
 	r.armViewTimer(refreshAt, expiresAt)
 	r.metrics.ObserveViewLoaded(viewLoadedAt)
 	return true, seq
@@ -473,15 +719,30 @@ func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	timerID := r.viewTimerID.Add(1)
 	r.viewDue.Store(false)
 	wakeAt := minTime(refreshAt, expiresAt)
+	// A held view is published at MaxLag, which can come before both. A
+	// deadline already past is left to reloads: the held view may have
+	// expired, and waking for it would only repeat.
+	r.mu.RLock()
+	if held := r.nextView; held != nil && !r.outdatedSince.IsZero() {
+		if lagAt := r.outdatedSince.Add(r.maxLag(held.current)); lagAt.After(time.Now()) {
+			wakeAt = minTime(wakeAt, lagAt)
+		}
+	}
+	r.mu.RUnlock()
 	delay := time.Until(wakeAt)
 	if delay < 0 {
 		delay = 0
 	}
 	timer := time.AfterFunc(delay, func() {
-		if r.viewTimerID.Load() == timerID && !r.closed.Load() {
-			r.viewDue.Store(true)
-			r.refreshInBackground()
+		if r.viewTimerID.Load() != timerID || r.closed.Load() {
+			return
 		}
+		if time.Now().Before(minTime(refreshAt, expiresAt)) {
+			r.publishHeldInBackground() // woke for MaxLag alone
+			return
+		}
+		r.viewDue.Store(true)
+		r.refreshInBackground()
 	})
 
 	r.viewTimerMu.Lock()
@@ -491,6 +752,28 @@ func (r *Reader) armViewTimer(refreshAt, expiresAt time.Time) {
 	if previous != nil {
 		previous.Stop()
 	}
+}
+
+// publishHeldInBackground publishes the held view on a goroutine Close waits
+// for, re-arming the timer if it was not due after all.
+func (r *Reader) publishHeldInBackground() {
+	// Holding the read lifecycle orders the start before Close's wait.
+	done, err := r.beginRead()
+	if err != nil {
+		return
+	}
+	r.background.Add(1)
+	done()
+	go func() {
+		defer r.background.Done()
+		if r.publishHeldIfDue() {
+			return // the publish re-armed the timer
+		}
+		r.mu.RLock()
+		refreshAt, expiresAt := r.viewRefreshAt, r.viewExpiresAt
+		r.mu.RUnlock()
+		r.armViewTimer(refreshAt, expiresAt)
+	}()
 }
 
 func (r *Reader) manifestViewDue() bool {
@@ -529,13 +812,23 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	defer r.releaseReader()
+	r.mu.Lock()
+	if r.nextReady != nil {
+		close(r.nextReady)
+		r.nextReady = nil
+	}
+	r.mu.Unlock()
 	r.stopViewTimer()
 	r.closeOpenIterators()
 	r.manifestLoads.Close(ErrReaderClosed)
 	r.background.Wait()
 	r.bloomLoads.Close(ErrReaderClosed)
 	r.bloomBackground.Wait()
+	r.dead.stop()
 	r.fetcher.close()
+	// Nothing publishes or deletes any more: a closed Reader is not behind.
+	r.metrics.ObserveViewOutdatedSince(time.Time{})
+	r.metrics.ObserveDeadSSTsPending(0)
 
 	var firstErr error
 	r.openSSTs.clear()
@@ -1214,7 +1507,9 @@ func (it *sstIterWithClose) Close() error {
 	return err
 }
 
-// DiskCacheStats describes the disk cache's two tiers.
+// DiskCacheStats describes the disk cache's two kinds of entry. They share
+// one budget, each reporting it as MaxBytes; data is evicted first, metadata
+// only to make room for metadata.
 type DiskCacheStats struct {
 	// Meta holds SST metadata regions and Bloom filters.
 	Meta CacheStats

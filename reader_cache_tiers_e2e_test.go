@@ -15,9 +15,8 @@ import (
 )
 
 // TestReaderCacheTierBudgetsAndRestart reopens a reader's disk cache with
-// smaller tier budgets: recovery trims each tier to its own budget, and the
-// tiers stay independent, so churn in the data tier never evicts Bloom
-// filters from the meta tier.
+// smaller budgets: data and Bloom filters share one, recovery trims data
+// first, and data churn never evicts Bloom filters.
 func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -52,44 +51,44 @@ func TestReaderCacheTierBudgetsAndRestart(t *testing.T) {
 	}
 
 	// Room for all three; the parsed Bloom cache holds only one filter.
-	reader, done := openTierTestReader(t, ctx, db, cacheDir, 3*oneBloomBytes, 3*oneSSTBytes, oneLoadedBloomBytes)
+	budget := 3 * (oneSSTBytes + oneBloomBytes)
+	reader, done := openTierTestReader(t, ctx, db, cacheDir, budget, oneLoadedBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
 	stats := reader.DiskCacheStats()
-	assertArtifactCacheTierBound(t, "data tier", stats.Data, 3, 3*oneSSTBytes)
-	assertArtifactCacheTierBound(t, "meta tier", stats.Meta, 3, 3*oneBloomBytes)
+	assertArtifactCacheTierBound(t, "data tier", stats.Data, 3, budget)
+	assertArtifactCacheTierBound(t, "meta tier", stats.Meta, 3, budget)
 	assertArtifactCacheTierBound(t, "parsed Bloom cache", reader.BloomCacheStats(), 1, oneLoadedBloomBytes)
 	done()
 
-	// Shrink only the data tier. Recovery trims it, and reading all three
-	// churns it, while every Bloom filter stays on disk and is reused.
-	reader, done = openTierTestReader(t, ctx, db, cacheDir, 3*oneBloomBytes, oneSSTBytes, oneLoadedBloomBytes)
+	// Room for every Bloom filter and one SST. Recovery trims data first,
+	// and reading all three churns data while every filter stays on disk.
+	budget = 3*oneBloomBytes + oneSSTBytes
+	reader, done = openTierTestReader(t, ctx, db, cacheDir, budget, oneLoadedBloomBytes)
 	stats = reader.DiskCacheStats()
-	assertArtifactCacheTierBound(t, "recovered data tier", stats.Data, 1, oneSSTBytes)
-	assertArtifactCacheTierBound(t, "recovered meta tier", stats.Meta, 3, 3*oneBloomBytes)
+	assertArtifactCacheTierBound(t, "recovered data tier", stats.Data, 1, budget)
+	assertArtifactCacheTierBound(t, "recovered meta tier", stats.Meta, 3, budget)
 	assertArtifactCacheEmptyL1(t, reader, "first budget restart")
 	assertArtifactCacheBudgetValues(t, ctx, reader)
 	stats = reader.DiskCacheStats()
-	assertArtifactCacheTierBound(t, "churning data tier", stats.Data, 1, oneSSTBytes)
+	assertArtifactCacheTierBound(t, "churning data tier", stats.Data, 1, budget)
 	if stats.Data.Evictions == 0 || stats.Data.Bypasses != 0 {
-		t.Fatalf("data tier did not evict cleanly under its reduced budget: %+v", stats.Data)
+		t.Fatalf("data tier did not evict cleanly within the budget: %+v", stats.Data)
 	}
 	if stats.Meta.Hits == 0 || stats.Meta.Evictions != 0 {
-		t.Fatalf("meta tier was not reused independently: %+v", stats.Meta)
+		t.Fatalf("data churn evicted Bloom filters: %+v", stats.Meta)
 	}
 	done()
 
-	// Shrink the meta tier too. Both tiers stay within their budgets.
-	reader, done = openTierTestReader(t, ctx, db, cacheDir, oneBloomBytes, oneSSTBytes, oneLoadedBloomBytes)
+	// Room for the Bloom filters only. No SST is kept, since data never
+	// evicts metadata, and lookups still answer correctly.
+	budget = 3 * oneBloomBytes
+	reader, done = openTierTestReader(t, ctx, db, cacheDir, budget, oneLoadedBloomBytes)
 	defer done()
-	stats = reader.DiskCacheStats()
-	assertArtifactCacheTierBound(t, "recovered one-entry data tier", stats.Data, 1, oneSSTBytes)
-	assertArtifactCacheTierBound(t, "recovered one-entry meta tier", stats.Meta, 1, oneBloomBytes)
 	assertArtifactCacheBudgetValues(t, ctx, reader)
 	stats = reader.DiskCacheStats()
-	assertArtifactCacheTierBound(t, "bounded data tier", stats.Data, 1, oneSSTBytes)
-	assertArtifactCacheTierBound(t, "bounded meta tier", stats.Meta, 1, oneBloomBytes)
-	if stats.Meta.Evictions == 0 || stats.Meta.Bypasses != 0 {
-		t.Fatalf("bounded meta tier churn stats=%+v", stats.Meta)
+	assertArtifactCacheTierBound(t, "filters-only meta tier", stats.Meta, 3, budget)
+	if stats.Data.EntryCount != 0 || stats.Data.Bypasses == 0 || stats.Meta.Evictions != 0 {
+		t.Fatalf("data stored over Bloom filters: data=%+v meta=%+v", stats.Data, stats.Meta)
 	}
 }
 
@@ -170,17 +169,17 @@ func TestReaderProcessLocalL1RestartsWithPersistentBloomL2(t *testing.T) {
 }
 
 // openTierTestReader opens a reader on db whose disk cache under cacheDir has
-// the given tier budgets. done closes the reader and then the cache.
+// the given budget. done closes the reader and then the cache.
 func openTierTestReader(
 	t *testing.T,
 	ctx context.Context,
 	db *DB,
 	cacheDir string,
-	metaBytes, dataBytes, bloomCacheBytes int64,
+	diskBytes, bloomCacheBytes int64,
 ) (*Reader, func()) {
 	t.Helper()
 	disk, err := diskcache.Open(diskcache.Options{
-		Dir: filepath.Join(cacheDir, "artifacts"), MetaMaxBytes: metaBytes, DataMaxBytes: dataBytes,
+		Dir: filepath.Join(cacheDir, "artifacts"), MaxBytes: diskBytes,
 	})
 	if err != nil {
 		t.Fatalf("open disk cache: %v", err)

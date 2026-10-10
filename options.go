@@ -121,8 +121,8 @@ type readerOptions struct {
 	// must stay open until every Reader using it has closed.
 	DiskCache *diskcache.Cache
 
-	// DiskCacheSize bounds the disk cache (default 8 GiB), an eighth of it
-	// for SST metadata and Bloom filters.
+	// DiskCacheSize bounds the disk cache (default 8 GiB), shared by SST
+	// metadata, Bloom filters and data; data is evicted first.
 	DiskCacheSize int64
 
 	// BlockCacheSize is the maximum bytes of decoded SST blocks kept in memory
