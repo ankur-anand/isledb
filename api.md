@@ -481,6 +481,7 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) PruneDiskCache(ctx context.Context) (int, error)
 func (r *Reader) Refresh(ctx context.Context) error
+func (r *Reader) RequestRefresh()
 func (r *Reader) ViewPosition() ViewPosition
 func (r *Reader) NextView(ctx context.Context) (*NextView, error)
 func (r *Reader) DiskCacheStats() DiskCacheStats
@@ -748,6 +749,23 @@ needs the latest commits learns when it cannot have them. It reflects every
 commit made before the call, even when it joins a refresh already in
 progress.
 
+**`RequestRefresh`** starts the background refresh now instead of at the next
+interval and returns at once. Use it when something tells you the data
+changed, such as a message from the writer, so readers pick up the change
+without polling more often. It runs the refresh the interval would run, so in
+manual mode the newer view is held for `NextView` and warmed before it is
+published. Requests within a second of the last are merged into one refresh at
+the end of that second, never dropped. Failures are logged and counted, as for
+any background refresh. Keep `RefreshAfter` as the safety net for a missed
+request.
+
+| | `Refresh` | `RequestRefresh` |
+|---|---|---|
+| Caller waits | yes | no |
+| In manual mode | publishes at once | holds the view for `NextView` |
+| Errors | returned | logged and counted |
+| Use for | read-your-writes | "the data changed" notifications |
+
 Internals of how a reader fetches and caches data are in
 [the appendix](#appendix-how-a-reader-reads-ssts).
 
@@ -833,7 +851,8 @@ for {
   `Discard`, every method that acts returns `ErrNextViewDone`. `Discard`
   releases nothing, so it is optional.
 - **`Refresh` publishes at once** in manual mode too, for read-your-writes.
-  A pending `Publish` then gets `ErrViewChanged`.
+  A pending `Publish` then gets `ErrViewChanged`. To load a newer view early
+  and still warm it, call `RequestRefresh` instead.
 - **The safety net.** If the published view has been outdated for `MaxLag`,
   the reader publishes the newest view it loaded itself, at that time and
   without reading object storage, so a stuck application loop costs
