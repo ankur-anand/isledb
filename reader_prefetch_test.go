@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
