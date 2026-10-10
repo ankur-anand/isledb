@@ -257,24 +257,28 @@ func (r *Reader) RequestRefresh() {
 	if r.closed.Load() {
 		return
 	}
+	// The refresh starts after requestMu is released: Close holds the
+	// lifecycle lock that starting it waits for, and then takes requestMu.
 	r.requestMu.Lock()
-	defer r.requestMu.Unlock()
 	if r.requestPending != nil {
+		r.requestMu.Unlock()
 		return // the deferred refresh starts after this request
 	}
 	wait := time.Until(r.requestLast.Add(requestRefreshGap))
-	if wait <= 0 {
-		r.requestLast = time.Now()
-		r.startRequestedRefresh()
+	if wait > 0 {
+		r.requestPending = time.AfterFunc(wait, func() {
+			r.requestMu.Lock()
+			r.requestPending = nil
+			r.requestLast = time.Now()
+			r.requestMu.Unlock()
+			r.startRequestedRefresh()
+		})
+		r.requestMu.Unlock()
 		return
 	}
-	r.requestPending = time.AfterFunc(wait, func() {
-		r.requestMu.Lock()
-		r.requestPending = nil
-		r.requestLast = time.Now()
-		r.requestMu.Unlock()
-		r.startRequestedRefresh()
-	})
+	r.requestLast = time.Now()
+	r.requestMu.Unlock()
+	r.startRequestedRefresh()
 }
 
 // startRequestedRefresh runs what the view timer runs when it fires.

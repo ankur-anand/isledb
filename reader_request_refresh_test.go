@@ -1,8 +1,13 @@
 package isledb
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
 func TestRequestRefreshLoadsWithoutWaitingForInterval(t *testing.T) {
@@ -72,5 +77,47 @@ func TestRequestRefreshAfterCloseDoesNothing(t *testing.T) {
 	time.Sleep(requestRefreshGap + requestRefreshGap/2)
 	if got := storage.currentReads(); got != reads {
 		t.Fatalf("CURRENT read %d more times after Close", got-reads)
+	}
+}
+
+// TestRequestRefreshDuringCloseDoesNotDeadlock requests a refresh while Close
+// waits for a read in progress: Close then holds the lifecycle lock and needs
+// requestMu, so RequestRefresh must not wait for the lifecycle lock holding it.
+func TestRequestRefreshDuringCloseDoesNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("request-refresh-close")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("1")},
+	}, 0, 1)
+	// Not closed in cleanup: if Close deadlocks, a second Close would hang.
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader.lifecycleMu.RLock() // a read in progress
+	closed := make(chan struct{})
+	go func() {
+		_ = reader.Close()
+		close(closed)
+	}()
+	time.Sleep(50 * time.Millisecond) // Close now waits for the read
+	go reader.RequestRefresh()
+	waitForCondition(t, 3*time.Second, func() bool {
+		if !reader.requestMu.TryLock() {
+			return true // RequestRefresh holds it
+		}
+		defer reader.requestMu.Unlock()
+		return !reader.requestLast.IsZero()
+	}, "RequestRefresh never decided to refresh")
+	time.Sleep(50 * time.Millisecond) // RequestRefresh now waits for the lifecycle lock
+	reader.lifecycleMu.RUnlock()
+
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close deadlocked with RequestRefresh")
 	}
 }
