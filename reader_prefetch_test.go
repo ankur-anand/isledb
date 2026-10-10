@@ -9,6 +9,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -544,5 +545,57 @@ func writePrefetchBatch(t *testing.T, ctx context.Context, w *writer, prefix str
 	}
 	if err := w.flush(ctx); err != nil {
 		t.Fatalf("flush %s: %v", prefix, err)
+	}
+}
+
+// TestPruneDiskCacheMakesRoomForPrefetch reopens on a disk cache full of SSTs
+// no view names, as a restart after compactions leaves it: a prefetch, using
+// free space only, caches nothing until PruneDiskCache deletes them.
+func TestPruneDiskCacheMakesRoomForPrefetch(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("prune-disk-cache")
+	t.Cleanup(func() { _ = store.Close() })
+	ms := manifest.NewStore(store)
+	live := writeTestSST(t, ctx, store, ms, []internal.MemEntry{
+		{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: []byte("1")},
+	}, 0, 1).Meta
+	cache, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: live.Size})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	var dead []diskcache.Key
+	for i := range uint32(4) {
+		k := diskcache.Key{Object: [32]byte{0xde, 0xad}, Kind: diskcache.KindChunk, Index: i}
+		if err := cache.Put(k, make([]byte, live.Size/4)); err != nil {
+			t.Fatal(err)
+		}
+		dead = append(dead, k)
+	}
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir(), DiskCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+
+	stats, err := reader.Prefetch(ctx, PrefetchOptions{All: true})
+	if err != nil || stats.CachedSSTs != 0 {
+		t.Fatalf("prefetch into a cache full of dead SSTs: %+v, %v; want nothing cached", stats, err)
+	}
+	removed, err := reader.PruneDiskCache(ctx)
+	if err != nil || removed != len(dead) {
+		t.Fatalf("PruneDiskCache = %d, %v; want %d", removed, err, len(dead))
+	}
+	for _, k := range dead {
+		if cache.Contains(k, live.Size/4) {
+			t.Fatalf("dead entry %v survived the prune", k)
+		}
+	}
+	stats, err = reader.Prefetch(ctx, PrefetchOptions{All: true})
+	if err != nil || stats.CachedSSTs != 1 {
+		t.Fatalf("prefetch after the prune: %+v, %v; want the live SST cached", stats, err)
+	}
+	if removed, err := reader.PruneDiskCache(ctx); err != nil || removed != 0 {
+		t.Fatalf("second prune = %d, %v; want the live SST kept", removed, err)
 	}
 }

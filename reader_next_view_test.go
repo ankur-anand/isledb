@@ -638,3 +638,34 @@ func TestCloseInterruptsDeletePause(t *testing.T) {
 		t.Fatalf("Close took %v while the deleter paused", took)
 	}
 }
+
+func TestPruneDiskCacheKeepsHeldView(t *testing.T) {
+	ctx, reader, _, store, ms := newManualTestReader(t)
+	commitKeyB(t, ctx, store, ms)
+	fireViewTimer(reader)
+	reader.mu.RLock()
+	held := reader.nextView.manifest
+	reader.mu.RUnlock()
+	var added sstMetadata
+	for _, sst := range held.L0SSTs {
+		if _, ok := sstsByID(reader.currentManifest())[sst.ID]; !ok {
+			added = sst
+		}
+	}
+	if added.ID == "" {
+		t.Fatal("held view adds no SST")
+	}
+	if _, err := reader.fetcher.prefetch(ctx, reader.fetcher.object(added)); err != nil {
+		t.Fatal(err)
+	}
+	dead := diskcache.Key{Object: [32]byte{0xde, 0xad}, Kind: diskcache.KindWhole}
+	if err := reader.diskCache.Put(dead, []byte("dead")); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := reader.PruneDiskCache(ctx); err != nil || removed != 1 {
+		t.Fatalf("PruneDiskCache = %d, %v; want only the dead entry", removed, err)
+	}
+	if !reader.fetcher.resident(reader.fetcher.object(added)) {
+		t.Fatal("prune deleted an SST the held view names")
+	}
+}

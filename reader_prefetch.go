@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ankur-anand/isledb/internal/diskcache"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -69,6 +70,56 @@ func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchSt
 	}
 
 	return r.prefetchSSTs(ctx, m, opts, nil, expiresAt, ErrReadViewExpired)
+}
+
+// pruneBatch is how many entries PruneDiskCache deletes between checks of
+// its context.
+const pruneBatch = 4096
+
+// PruneDiskCache deletes from the disk cache every SST that neither the
+// published view nor a view held for NextView names, such as those a previous
+// process cached before compactions replaced them. Prefetch uses free space
+// only, so a cache full of such SSTs leaves it none: call PruneDiskCache after
+// opening and before a start-up Prefetch. It deletes without pacing, so call
+// it before serving reads. Snapshots of older views fetch again what they
+// need. It returns how many cache entries it deleted.
+func (r *Reader) PruneDiskCache(ctx context.Context) (int, error) {
+	done, err := r.beginRead()
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if r.diskCache == nil {
+		return 0, nil
+	}
+	keep := make(map[[32]byte]struct{})
+	r.mu.RLock()
+	views := []*manifestState{r.manifest}
+	if r.nextView != nil {
+		views = append(views, r.nextView.manifest)
+	}
+	r.mu.RUnlock()
+	for _, m := range views {
+		for _, sst := range sstMetadataOf(m) {
+			keep[r.fetcher.object(sst).key] = struct{}{}
+		}
+	}
+	var drop []diskcache.Key
+	for _, k := range r.diskCache.Keys() {
+		if _, ok := keep[k.Object]; !ok {
+			drop = append(drop, k)
+		}
+	}
+	removed := 0
+	for len(drop) > 0 {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		n := min(len(drop), pruneBatch)
+		removed += r.diskCache.RemoveAll(drop[:n])
+		drop = drop[n:]
+	}
+	return removed, nil
 }
 
 // prefetchSSTs selects SSTs of m to cache and downloads them, one prefetch at

@@ -366,6 +366,23 @@ func (c *Cache) RemoveAll(keys []Key) int {
 	return len(paths)
 }
 
+// Keys returns the key of every entry cached, in no order. After Close it
+// returns none.
+func (c *Cache) Keys() []Key {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	var keys []Key
+	for _, t := range c.tiers {
+		for k := range t.index {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
 // ReportCorrupt drops k after its contents proved damaged, and counts a
 // corruption.
 func (c *Cache) ReportCorrupt(k Key) {

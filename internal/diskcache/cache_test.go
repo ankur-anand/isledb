@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -722,5 +723,30 @@ func TestPutDuringRemoveAllKeepsIndexTrue(t *testing.T) {
 	put(t, c, k, content("again", 100))
 	if got, ok := read(c, k, 100, 0, 100); !ok || !bytes.Equal(got, content("again", 100)) {
 		t.Fatal("key not cached after RemoveAll finished")
+	}
+}
+
+func TestKeys(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	want := []Key{
+		{Object: object(47), Kind: KindMeta},
+		{Object: object(47), Kind: KindBloom},
+		{Object: object(48), Kind: KindChunk, Index: 3},
+	}
+	for _, k := range want {
+		put(t, c, k, content("k", 10))
+	}
+	got := c.Keys()
+	if len(got) != len(want) {
+		t.Fatalf("Keys = %v, want %v", got, want)
+	}
+	for _, k := range want {
+		if !slices.Contains(got, k) {
+			t.Fatalf("Keys = %v, missing %v", got, k)
+		}
+	}
+	_ = c.Close()
+	if keys := c.Keys(); keys != nil {
+		t.Fatalf("Keys after Close = %v", keys)
 	}
 }

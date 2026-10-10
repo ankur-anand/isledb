@@ -479,6 +479,7 @@ func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterat
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
+func (r *Reader) PruneDiskCache(ctx context.Context) (int, error)
 func (r *Reader) Refresh(ctx context.Context) error
 func (r *Reader) ViewPosition() ViewPosition
 func (r *Reader) NextView(ctx context.Context) (*NextView, error)
@@ -679,6 +680,25 @@ concurrent reads.
 - `CachedSSTs` counts selected SSTs wholly on disk when it returns;
   `BytesRead` counts bytes it fetched.
 - It uses the reader's current view and does not force a refresh.
+- **Reusing a `CacheDir` across restarts.** The disk cache keeps its files,
+  so a restarted reader can find it full of SSTs that compactions replaced
+  while it was down. Prefetch never evicts, so it would cache nothing. Call
+  `PruneDiskCache` after opening and before the start-up prefetch: it deletes
+  every SST that neither the published view nor a view held for `NextView`
+  names, and returns how many cache entries it deleted. It deletes without
+  pacing, so call it before serving reads; a snapshot of an older view
+  fetches again what it needs.
+
+```go
+reader, err := db.OpenReader(ctx, opts)
+if err != nil {
+    return err
+}
+if _, err := reader.PruneDiskCache(ctx); err != nil {
+    return err
+}
+stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{All: true})
+```
 - A reader runs one prefetch at a time, `NextView.Prefetch` included; another
   waits for it, or for its context to end. Each then sees the space the last
   one used, so two never fill the same free space.
