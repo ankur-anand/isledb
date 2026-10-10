@@ -463,7 +463,7 @@ sizes select the defaults; negative sizes are rejected.
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `DiskCacheSize` | 8 GiB | Bytes kept on disk: SST metadata, Bloom filters and SST data |
+| `DiskCacheSize` | 8 GiB | Bytes kept on disk: SST metadata, Bloom filters and SST data. Kept across restarts; the reader never deletes stale SSTs from it on its own (see `PruneDiskCache` under [Prefetch SSTs to disk](#prefetch-ssts-to-disk)) |
 | `BlockCacheSize` | 256 MiB | Decoded SST blocks kept in memory |
 | `BloomCacheSize` | 64 MiB | Parsed Bloom filters kept in memory |
 | `Views.RefreshAfter` | 1 minute | How often the view is refreshed in the background (at least 1 second) |
@@ -687,7 +687,21 @@ concurrent reads.
   every SST that neither the published view nor a view held for `NextView`
   names, and returns how many cache entries it deleted. It deletes without
   pacing, so call it before serving reads; a snapshot of an older view
-  fetches again what it needs.
+  fetches again what it needs. The reader never prunes on its own, at open
+  or later.
+- **Stale entries on a long-running reader.** The reader deletes a retired
+  SST's files once, at the publish that retires it. A snapshot, iterator or
+  `BootstrapView` opened before that publish that reads the SST afterwards
+  caches it again, and nothing deletes it a second time. Such entries are
+  evicted first when lookups need space, so reads are unaffected, but until
+  then they take free space that prefetch and `NextView.Prefetch` could use.
+  A reader that serves long reads of older views across compactions and
+  also warms views can call `PruneDiskCache` periodically; with nothing to
+  delete it only scans the cache's index in memory.
+- **Partly cached SSTs count at full size.** An SST with some parts already
+  on disk, from an interrupted prefetch or from lookups, is selected only if
+  its whole size fits in free space. On a nearly full cache it may be
+  skipped and load on demand.
 
 ```go
 reader, err := db.OpenReader(ctx, opts)
@@ -699,6 +713,7 @@ if _, err := reader.PruneDiskCache(ctx); err != nil {
 }
 stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{All: true})
 ```
+
 - A reader runs one prefetch at a time, `NextView.Prefetch` included; another
   waits for it, or for its context to end. Each then sees the space the last
   one used, so two never fill the same free space.
