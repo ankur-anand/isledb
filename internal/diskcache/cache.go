@@ -109,8 +109,9 @@ type Stats struct {
 	Misses      int64
 	Evictions   int64
 	Corruptions int64
-	// Bypasses counts entries not stored: too large for the whole cache, or
-	// data that would only fit by evicting metadata.
+	// Bypasses counts entries not stored: too large for the whole cache,
+	// data that would only fit by evicting metadata, or an entry whose file
+	// RemoveAll is still deleting.
 	Bypasses int64
 	// Failures counts entries that could not be written or renamed.
 	Failures int64
@@ -142,8 +143,14 @@ type Cache struct {
 	storing sync.WaitGroup
 	// stores holds the keys with a Put in progress (see store).
 	stores map[Key]*storeState
+	// deleting holds the keys whose files RemoveAll is deleting after
+	// releasing the lock, with how many calls are; a Put of one is not kept,
+	// since its file would have the name being deleted.
+	deleting map[Key]int
 	// testHook, set only by tests, runs at named points: "renamed" between a
-	// store's rename and its commit, "read" after ReadAt reads a file.
+	// store's rename and its commit, "read" after ReadAt reads a file,
+	// "unlocked" after RemoveAll drops its entries and before it deletes
+	// their files.
 	testHook func(point string, k Key)
 }
 
@@ -194,6 +201,7 @@ func Open(opts Options) (*Cache, error) {
 		lock:     lock,
 		max:      opts.MaxBytes,
 		stores:   make(map[Key]*storeState),
+		deleting: make(map[Key]int),
 	}
 	for t := range tierCount {
 		c.tiers[t] = &tier{index: make(map[Key]*list.Element)}
@@ -314,10 +322,12 @@ func (c *Cache) Remove(k Key) {
 
 // RemoveAll drops every entry in keys under one hold of the cache's lock and
 // deletes their files after releasing it, so reads are not held behind the
-// deletes. Close waits for the deletes. After Close it does nothing. It
-// returns how many entries it dropped.
+// deletes. Until a key's file is deleted, a Put of it is not kept: its file
+// would have the same name. Close waits for the deletes. After Close it does
+// nothing. It returns how many entries it dropped.
 func (c *Cache) RemoveAll(keys []Key) int {
 	var paths []string
+	var removed []Key
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -333,14 +343,26 @@ func (c *Cache) RemoveAll(keys []Key) int {
 		if element, ok := c.tiers[k.Kind.Tier()].index[k]; ok {
 			e := c.removeIndexLocked(element)
 			paths = append(paths, c.path(e.key, e.size))
+			removed = append(removed, k)
+			c.deleting[k]++
 		}
 	}
 	c.storing.Add(1)
 	c.mu.Unlock()
 	defer c.storing.Done()
+	if c.testHook != nil {
+		c.testHook("unlocked", Key{})
+	}
 	for _, path := range paths {
 		_ = os.Remove(path)
 	}
+	c.mu.Lock()
+	for _, k := range removed {
+		if c.deleting[k]--; c.deleting[k] == 0 {
+			delete(c.deleting, k)
+		}
+	}
+	c.mu.Unlock()
 	return len(paths)
 }
 
@@ -454,7 +476,7 @@ func (c *Cache) store(k Key, data []byte, st *storeState, gen uint64) error {
 	t := c.tiers[k.Kind.Tier()]
 	size := int64(len(data))
 	c.mu.Lock()
-	if !c.fitsLocked(k, size) {
+	if !c.fitsLocked(k, size) || c.deleting[k] > 0 {
 		t.stats.Bypasses++
 		c.mu.Unlock()
 		return nil

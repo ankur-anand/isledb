@@ -695,3 +695,32 @@ func TestRemoveAll(t *testing.T) {
 		t.Fatalf("RemoveAll after Close deleted a file: %v", err)
 	}
 }
+
+// TestPutDuringRemoveAllKeepsIndexTrue stores a key again after RemoveAll
+// dropped it and before RemoveAll deletes its file, which has the same name:
+// the cache must not report the entry while its file is gone.
+func TestPutDuringRemoveAllKeepsIndexTrue(t *testing.T) {
+	c := openCache(t, t.TempDir(), 1<<20)
+	k := Key{Object: object(46), Kind: KindChunk}
+	put(t, c, k, content("old", 100))
+	c.testHook = func(point string, _ Key) {
+		if point == "unlocked" {
+			c.testHook = nil
+			put(t, c, k, content("new", 100))
+		}
+	}
+	c.RemoveAll([]Key{k})
+	if c.Contains(k, 100) {
+		if _, err := os.Stat(c.path(k, 100)); err != nil {
+			t.Fatalf("entry indexed but its file is gone: %v", err)
+		}
+	}
+	if stats := c.Stats(TierData); stats.Bypasses != 1 {
+		t.Fatalf("stats = %+v, want the Put during the delete bypassed", stats)
+	}
+	// Once the delete is done, the key is cached again.
+	put(t, c, k, content("again", 100))
+	if got, ok := read(c, k, 100, 0, 100); !ok || !bytes.Equal(got, content("again", 100)) {
+		t.Fatal("key not cached after RemoveAll finished")
+	}
+}

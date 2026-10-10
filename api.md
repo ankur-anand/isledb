@@ -1427,8 +1427,9 @@ type DiskCacheStats struct {
   is never stored by evicting metadata.
 - For the disk cache: `Corruptions` counts entries it found damaged itself (a
   wrong size, or a Bloom filter failing its checksum); `Bypasses` entries not
-  stored, because they are larger than the whole cache or are data that would
-  fit only by evicting metadata; `Failures` entries that could not be written.
+  stored, because they are larger than the whole cache, are data that would
+  fit only by evicting metadata, or belong to an SST whose files are being
+  deleted; `Failures` entries that could not be written.
   Bypassed and failed entries are still served, just not kept, so a disk that
   keeps failing means each later read fetches them again.
 - `SSTDrops` counts reads that failed on what looked like damaged bytes; each

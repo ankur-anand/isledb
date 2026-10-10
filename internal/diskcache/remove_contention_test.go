@@ -12,8 +12,8 @@ import (
 )
 
 // TestMeasureRemoveContention measures how deleting many entries slows reads
-// of other entries: reads alone, then while RemoveAll deletes dead entries in
-// another shard directory, in the readers' own directory, and paced. It runs
+// of other entries: reads alone, then while RemoveAll deletes dead entries,
+// unpaced and paced as the reader paces. It runs
 // only with ISLEDB_MEASURE set; run it with -v to see the table.
 func TestMeasureRemoveContention(t *testing.T) {
 	if os.Getenv("ISLEDB_MEASURE") == "" {
@@ -35,13 +35,6 @@ func TestMeasureRemoveContention(t *testing.T) {
 	shard := func(object string) string {
 		sum := sha256.Sum256([]byte(object))
 		return hex.EncodeToString(sum[:1])
-	}
-	// An object name whose entries share the shard directory of "live".
-	sameDir := ""
-	for i := 0; sameDir == ""; i++ {
-		if name := fmt.Sprintf("same-%d", i); shard(name) == shard("live") {
-			sameDir = name
-		}
 	}
 	key := func(object string, i int) Key {
 		return Key{Object: sha256.Sum256([]byte(object)), Kind: KindChunk, Index: uint32(i)}
@@ -104,29 +97,25 @@ func TestMeasureRemoveContention(t *testing.T) {
 		reads := read(stop)
 		return reads, took
 	}
-	paced := func(keys []Key, perSecond int) func() {
+	paced := func(remove func([]Key) int, keys []Key, perSecond int) func() {
 		return func() {
 			start := time.Now()
 			for i := 0; i < len(keys); i += batch {
-				c.RemoveAll(keys[i:min(i+batch, len(keys))])
+				remove(keys[i:min(i+batch, len(keys))])
 				due := start.Add(time.Duration(min(i+batch, len(keys))) * time.Second / time.Duration(perSecond))
 				time.Sleep(time.Until(due))
 			}
 		}
 	}
 
-	otherKeys := put("dead-other", 40_000)
-	sameKeys := put(sameDir, 40_000)
-	fast := put("dead-paced-2000", 10_000)
-	slow := put("dead-paced-500", 10_000)
+	unpaced := put("dead-unpaced", 40_000)
+	paced1000 := put("dead-paced", 10_000)
 
 	stop := make(chan struct{})
 	go func() { time.Sleep(baseline); close(stop) }()
 	alone := read(stop)
-	other, otherTook := during(func() { c.RemoveAll(otherKeys) })
-	same, sameTook := during(func() { c.RemoveAll(sameKeys) })
-	pacedFast, fastTook := during(paced(fast, 2000))
-	pacedSlow, slowTook := during(paced(slow, 500))
+	a, aTook := during(func() { c.RemoveAll(unpaced) })
+	p, pTook := during(paced(c.RemoveAll, paced1000, 1000))
 
 	pct := func(d []time.Duration, p float64) time.Duration {
 		return d[int(p*float64(len(d)-1))].Round(time.Microsecond)
@@ -136,15 +125,13 @@ func TestMeasureRemoveContention(t *testing.T) {
 		if files > 0 {
 			rate = fmt.Sprintf("%.0f", float64(files)/span.Seconds())
 		}
-		fmt.Printf("| %s | %s | %s | %.0f | %s | %s | %s |\n", name, rate, span.Round(100*time.Millisecond),
-			float64(len(d))/span.Seconds(), pct(d, 0.5), pct(d, 0.99), pct(d, 0.999))
+		fmt.Printf("| %s | %s | %s | %.0f | %s | %s | %s | %s |\n", name, rate, span.Round(100*time.Millisecond),
+			float64(len(d))/span.Seconds(), pct(d, 0.5), pct(d, 0.99), pct(d, 0.999), d[len(d)-1].Round(time.Microsecond))
 	}
-	fmt.Printf("\n%d readers on %d live entries in shard %s; deletes with RemoveAll\n\n", readers, live, shard("live"))
-	fmt.Println("| phase | files deleted/s | duration | reads/s | p50 | p99 | p99.9 |")
-	fmt.Println("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+	fmt.Printf("\n%d readers on %d live entries in shard %s\n\n", readers, live, shard("live"))
+	fmt.Println("| phase | files deleted/s | duration | reads/s | p50 | p99 | p99.9 | max |")
+	fmt.Println("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
 	row("reads alone", alone, baseline, 0)
-	row("delete 40,000, another directory", other, otherTook, len(otherKeys))
-	row("delete 40,000, readers' directory", same, sameTook, len(sameKeys))
-	row("delete 10,000 paced at 2,000/s", pacedFast, fastTook, len(fast))
-	row("delete 10,000 paced at 500/s", pacedSlow, slowTook, len(slow))
+	row("RemoveAll 40,000 unpaced", a, aTook, len(unpaced))
+	row("RemoveAll 10,000 at 1,000/s", p, pTook, len(paced1000))
 }
