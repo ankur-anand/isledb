@@ -102,7 +102,12 @@ type Reader struct {
 	viewTimerMu   sync.Mutex
 	viewTimer     *time.Timer
 	viewTimerID   atomic.Uint64
-	metrics       *ReaderMetrics
+	// requestMu guards the RequestRefresh state: when the last requested
+	// refresh started, and the timer of one deferred to the end of the gap.
+	requestMu      sync.Mutex
+	requestLast    time.Time
+	requestPending *time.Timer
+	metrics        *ReaderMetrics
 	// prefetching admits one prefetch at a time (see prefetchSSTs).
 	prefetching chan struct{}
 	// prefetchSelected, set only by tests, runs after a prefetch selects its
@@ -237,6 +242,48 @@ func warnIfCacheDirTooSmall(dir string, cache *diskcache.Cache, budget int64) {
 		slog.Warn("isledb: cache directory has less space than the disk cache budget",
 			"dir", dir, "available_bytes", available, "budget_bytes", budget)
 	}
+}
+
+// requestRefreshGap is the least time between refreshes RequestRefresh
+// starts, so a burst of requests reads CURRENT once or twice.
+const requestRefreshGap = time.Second
+
+// RequestRefresh starts a background refresh now instead of at the next
+// interval, and returns at once. The refresh is the one the interval would
+// run: in Manual mode a newer view is held for NextView, not published.
+// Requests within requestRefreshGap of the last are merged into one refresh
+// at the end of the gap, never dropped. After Close it does nothing.
+func (r *Reader) RequestRefresh() {
+	if r.closed.Load() {
+		return
+	}
+	r.requestMu.Lock()
+	defer r.requestMu.Unlock()
+	if r.requestPending != nil {
+		return // the deferred refresh starts after this request
+	}
+	wait := time.Until(r.requestLast.Add(requestRefreshGap))
+	if wait <= 0 {
+		r.requestLast = time.Now()
+		r.startRequestedRefresh()
+		return
+	}
+	r.requestPending = time.AfterFunc(wait, func() {
+		r.requestMu.Lock()
+		r.requestPending = nil
+		r.requestLast = time.Now()
+		r.requestMu.Unlock()
+		r.startRequestedRefresh()
+	})
+}
+
+// startRequestedRefresh runs what the view timer runs when it fires.
+func (r *Reader) startRequestedRefresh() {
+	if r.closed.Load() {
+		return
+	}
+	r.viewDue.Store(true)
+	r.refreshInBackground()
 }
 
 // Refresh reloads and publishes the current manifest view.
@@ -819,6 +866,12 @@ func (r *Reader) Close() error {
 	}
 	r.mu.Unlock()
 	r.stopViewTimer()
+	r.requestMu.Lock()
+	if r.requestPending != nil {
+		r.requestPending.Stop()
+		r.requestPending = nil
+	}
+	r.requestMu.Unlock()
 	r.closeOpenIterators()
 	r.manifestLoads.Close(ErrReaderClosed)
 	r.background.Wait()
