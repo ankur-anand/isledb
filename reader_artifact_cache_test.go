@@ -181,6 +181,7 @@ func TestReaderCorruptOriginBloomFallsThroughToValidSST(t *testing.T) {
 	if err != nil || !found || string(value) != "value" {
 		t.Fatalf("Get through corrupt Bloom value=%q found=%t err=%v", value, found, err)
 	}
+	reader.bloomBackground.Wait() // the failed load is counted in the background
 	if got := testutil.ToFloat64(metrics.BloomFilterErrors); got != 1 {
 		t.Fatalf("Bloom errors=%v, want 1", got)
 	}

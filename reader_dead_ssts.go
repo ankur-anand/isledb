@@ -8,8 +8,7 @@ import (
 
 // deadSSTDeleteRate caps how many files a Reader's dead-SST goroutine deletes
 // per second. Unpaced deletes cut lookups on the same disk by about a quarter
-// while they run; see docs/design/reader-next-view.md. A variable so tests can
-// change it before opening a Reader.
+// while they run. A variable so tests can change it before opening a Reader.
 var deadSSTDeleteRate = 1000
 
 // deadSSTs deletes from the disk cache the SSTs a publish retired, so the
