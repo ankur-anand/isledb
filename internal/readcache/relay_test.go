@@ -13,7 +13,7 @@ import (
 
 // currentBytes encodes a valid CURRENT at position; epoch varies the bytes at
 // one position, as a checkpoint does.
-func currentBytes(t *testing.T, position, epoch uint64) []byte {
+func currentBytes(t testing.TB, position, epoch uint64) []byte {
 	t.Helper()
 	data, err := json.Marshal(manifest.Current{
 		LayoutVersion: manifest.LayoutVersion, Format: manifest.CurrentFormat,
@@ -44,7 +44,7 @@ func (s *fakeSource) ReadCurrent(context.Context) ([]byte, string, error) {
 	return s.data, "etag", s.err
 }
 
-func soon(t *testing.T) context.Context {
+func soon(t testing.TB) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)

@@ -1,6 +1,6 @@
 // Package readcache is a regional read cache for IsleDB readers: it relays
-// CURRENT to many readers from one copy, and (later) serves immutable
-// objects. See docs/design/read-cache.md.
+// CURRENT to many readers from one copy, and serves immutable objects from
+// chunks kept on disk. See docs/design/read-cache.md.
 //
 // The relay never moves its copy of CURRENT back. A store recreated under the
 // same prefix, whose position starts again below the copy, is reported on
