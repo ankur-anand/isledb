@@ -93,7 +93,16 @@ func newObjectsIn(t *testing.T, dir string, store *blobstore.Store, size int) (*
 	}
 	t.Cleanup(func() { _ = disk.Close() })
 	src := &countingSource{Store: store}
-	return NewObjects(src, disk), src, key, data
+	return mustObjects(t, src, disk, ObjectsOptions{}), src, key, data
+}
+
+func mustObjects(t testing.TB, src ObjectSource, disk *diskcache.Cache, opts ObjectsOptions) *Objects {
+	t.Helper()
+	o, err := NewObjects(src, disk, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return o
 }
 
 func readRange(t *testing.T, o *Objects, key string, offset, length int64, fill bool) []byte {
@@ -422,7 +431,7 @@ func TestObjectsServeFromDiskAfterRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		src := &countingSource{Store: store}
-		return NewObjects(src, disk), src, disk
+		return mustObjects(t, src, disk, ObjectsOptions{}), src, disk
 	}
 	o, _, disk := open()
 	readSized(t, o, key, size, 0, size, true)
@@ -469,5 +478,62 @@ func TestObjectsSizeLookupOutlivesItsFirstCaller(t *testing.T) {
 	}
 	if n := src.attrs.Load(); n != 1 {
 		t.Fatalf("%d size lookups, want 1 shared", n)
+	}
+}
+
+func TestObjectsReadLimitQueuesStorageReadsNotHits(t *testing.T) {
+	store := blobstore.NewMemory("db")
+	keys := []string{store.SSTPath("000001.sst"), store.SSTPath("000002.sst"), store.SSTPath("000003.sst")}
+	const size = maxRunChunks * chunkSize
+	for _, key := range keys {
+		if _, err := store.Write(context.Background(), key, bytes.Repeat([]byte{7}, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	src := &countingSource{Store: store}
+	o := mustObjects(t, src, disk, ObjectsOptions{MaxReadBytes: size})
+	readSized(t, o, keys[2], size, 0, size, true)
+
+	src.reads.Store(0)
+	src.gate = make(chan struct{})
+	done := make(chan error, 2)
+	for _, key := range keys[:2] {
+		go func() { done <- o.WriteRange(soon(t), io.Discard, key, size, 0, size, true, nil) }()
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := src.reads.Load(); n != 1 {
+		t.Fatalf("%d storage reads under way with room for one, want 1", n)
+	}
+	if s := o.Stats(); s.StorageQueued != 1 || s.StorageBytesReading != size {
+		t.Fatalf("stats %+v, want 1 queued and %d bytes reading", s, size)
+	}
+	if got := readSized(t, o, keys[2], size, 0, size, true); len(got) != size {
+		t.Fatal("a hit waited for the read limit")
+	}
+	close(src.gate)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := src.reads.Load(); n != 2 {
+		t.Fatalf("%d storage reads, want 2", n)
+	}
+}
+
+func TestObjectsReadLimitBelowTheLargestReadIsRefused(t *testing.T) {
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	src := &countingSource{Store: blobstore.NewMemory("db")}
+	if _, err := NewObjects(src, disk, ObjectsOptions{MaxReadBytes: maxRunChunks*chunkSize - 1}); err == nil {
+		t.Fatal("NewObjects accepted a limit below the largest single read")
 	}
 }

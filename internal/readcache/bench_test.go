@@ -39,7 +39,7 @@ func newBenchEnv(b *testing.B, diskBytes int64, delay time.Duration) *benchEnv {
 	}
 	b.Cleanup(func() { _ = disk.Close() })
 	src := &countingSource{Store: store, delay: delay}
-	objects := NewObjects(src, disk)
+	objects := mustObjects(b, src, disk, ObjectsOptions{})
 	server := httptest.NewServer(ObjectHandler(objects))
 	b.Cleanup(server.Close)
 	transport := &http.Transport{MaxIdleConns: 2048, MaxIdleConnsPerHost: 2048}

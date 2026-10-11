@@ -15,6 +15,7 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"gocloud.dev/blob"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -26,6 +27,19 @@ const (
 	fetchTimeout    = 30 * time.Second
 	maxKnownSizes   = 1 << 20
 )
+
+// DefaultMaxReadBytes is ObjectsOptions.MaxReadBytes when it is zero.
+const DefaultMaxReadBytes int64 = 256 << 20
+
+// ObjectsOptions configures Objects.
+type ObjectsOptions struct {
+	// MaxReadBytes caps the bytes being read from storage at once; a read
+	// that would pass it waits for others to finish. It bounds the memory
+	// held by storage reads and the load a burst of misses puts on storage.
+	// Hits and requests waiting on another's read are not counted. At least
+	// 4 MiB, the largest single read; zero means DefaultMaxReadBytes.
+	MaxReadBytes int64
+}
 
 // MaxObjectSize is the largest object served: 5 TiB, the most S3 and GCS
 // store in one object. It keeps chunk arithmetic far from overflowing.
@@ -64,6 +78,10 @@ type ObjectStats struct {
 	SizeLookups  int64
 	StorageReads int64
 	StorageBytes int64
+	// StorageQueued counts storage reads that waited for MaxReadBytes.
+	StorageQueued int64
+	// StorageBytesReading is the bytes of storage reads in progress now.
+	StorageBytesReading int64
 }
 
 // Objects serves byte ranges of immutable objects from 128 KiB chunks kept
@@ -74,6 +92,7 @@ type ObjectStats struct {
 type Objects struct {
 	source ObjectSource
 	disk   *diskcache.Cache
+	reads  *semaphore.Weighted
 
 	sizeCalls singleflight.Group
 
@@ -83,6 +102,7 @@ type Objects struct {
 
 	chunkHits, chunkMisses, chunkShared, chunkBridged atomic.Int64
 	sizeLookups, storageReads, storageBytes           atomic.Int64
+	storageQueued, storageBytesReading                atomic.Int64
 }
 
 type chunkFetch struct {
@@ -91,13 +111,21 @@ type chunkFetch struct {
 	err  error
 }
 
-func NewObjects(source ObjectSource, disk *diskcache.Cache) *Objects {
+func NewObjects(source ObjectSource, disk *diskcache.Cache, opts ObjectsOptions) (*Objects, error) {
+	if opts.MaxReadBytes == 0 {
+		opts.MaxReadBytes = DefaultMaxReadBytes
+	}
+	if opts.MaxReadBytes < maxRunChunks*chunkSize {
+		return nil, fmt.Errorf("readcache: MaxReadBytes %d is below %d, the largest single read",
+			opts.MaxReadBytes, maxRunChunks*chunkSize)
+	}
 	return &Objects{
 		source:   source,
 		disk:     disk,
+		reads:    semaphore.NewWeighted(opts.MaxReadBytes),
 		sizes:    make(map[string]int64),
 		inflight: make(map[diskcache.Key]*chunkFetch),
-	}
+	}, nil
 }
 
 func (o *Objects) Stats() ObjectStats {
@@ -109,6 +137,9 @@ func (o *Objects) Stats() ObjectStats {
 		SizeLookups:  o.sizeLookups.Load(),
 		StorageReads: o.storageReads.Load(),
 		StorageBytes: o.storageBytes.Load(),
+
+		StorageQueued:       o.storageQueued.Load(),
+		StorageBytesReading: o.storageBytesReading.Load(),
 	}
 }
 
@@ -376,8 +407,17 @@ func (o *Objects) release(k diskcache.Key, result *chunkFetch) {
 }
 
 // read reads [offset, offset+length) of key from storage, checking that
-// the object is size bytes.
+// the object is size bytes. It waits while MaxReadBytes are being read.
 func (o *Objects) read(ctx context.Context, key string, size, offset, length int64) ([]byte, error) {
+	if !o.reads.TryAcquire(length) {
+		o.storageQueued.Add(1)
+		if err := o.reads.Acquire(ctx, length); err != nil {
+			return nil, err
+		}
+	}
+	defer o.reads.Release(length)
+	o.storageBytesReading.Add(length)
+	defer o.storageBytesReading.Add(-length)
 	o.storageReads.Add(1)
 	r, err := o.source.ReadRangeStream(ctx, key, offset, length)
 	if err != nil {
