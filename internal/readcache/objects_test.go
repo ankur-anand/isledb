@@ -15,14 +15,17 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
+	"gocloud.dev/blob"
 )
 
-// countingSource counts storage requests; gate, when set, holds every range
-// read until it is closed, and delay is added to every request.
+// countingSource counts storage requests; gate and attrGate, when set, hold
+// range reads and size lookups until closed, and delay is added to every
+// request.
 type countingSource struct {
 	*blobstore.Store
 	attrs, reads atomic.Int64
 	gate         chan struct{}
+	attrGate     chan struct{}
 	fail         atomic.Bool
 	delay        time.Duration
 }
@@ -44,10 +47,17 @@ func (s *countingSource) Attributes(ctx context.Context, key string) (blobstore.
 	if err := s.wait(ctx); err != nil {
 		return blobstore.Attributes{}, err
 	}
+	if s.attrGate != nil {
+		select {
+		case <-s.attrGate:
+		case <-ctx.Done():
+			return blobstore.Attributes{}, ctx.Err()
+		}
+	}
 	return s.Store.Attributes(ctx, key)
 }
 
-func (s *countingSource) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+func (s *countingSource) ReadRangeStream(ctx context.Context, key string, offset, length int64) (*blob.Reader, error) {
 	s.reads.Add(1)
 	if err := s.wait(ctx); err != nil {
 		return nil, err
@@ -58,12 +68,16 @@ func (s *countingSource) ReadRange(ctx context.Context, key string, offset, leng
 	if s.fail.Load() {
 		return nil, errors.New("storage unreachable")
 	}
-	return s.Store.ReadRange(ctx, key, offset, length)
+	return s.Store.ReadRangeStream(ctx, key, offset, length)
 }
 
 func newObjects(t *testing.T, size int) (*Objects, *countingSource, string, []byte) {
 	t.Helper()
-	store := blobstore.NewMemory("db")
+	return newObjectsIn(t, t.TempDir(), blobstore.NewMemory("db"), size)
+}
+
+func newObjectsIn(t *testing.T, dir string, store *blobstore.Store, size int) (*Objects, *countingSource, string, []byte) {
+	t.Helper()
 	key := store.SSTPath("000001.sst")
 	data := make([]byte, size)
 	for i := range data {
@@ -72,7 +86,7 @@ func newObjects(t *testing.T, size int) (*Objects, *countingSource, string, []by
 	if _, err := store.Write(context.Background(), key, data); err != nil {
 		t.Fatal(err)
 	}
-	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
+	disk, err := diskcache.Open(diskcache.Options{Dir: dir, MaxBytes: 64 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,8 +101,13 @@ func readRange(t *testing.T, o *Objects, key string, offset, length int64, fill 
 	if err != nil {
 		t.Fatal(err)
 	}
+	return readSized(t, o, key, size, offset, length, fill)
+}
+
+func readSized(t *testing.T, o *Objects, key string, size, offset, length int64, fill bool) []byte {
+	t.Helper()
 	var buf bytes.Buffer
-	if err := o.WriteRange(soon(t), &buf, key, size, offset, length, fill); err != nil {
+	if err := o.WriteRange(soon(t), &buf, key, size, offset, length, fill, nil); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -125,8 +144,16 @@ func TestObjectsMergeConcurrentMisses(t *testing.T) {
 	const clients = 20
 	var wg sync.WaitGroup
 	got := make([][]byte, clients)
+	statuses := make([]CacheStatus, clients)
 	for i := range clients {
-		wg.Go(func() { got[i] = readRange(t, o, key, chunkSize+10, 100, true) })
+		wg.Go(func() {
+			var buf bytes.Buffer
+			ready := func(s CacheStatus) { statuses[i] = s }
+			if err := o.WriteRange(soon(t), &buf, key, 4*chunkSize, chunkSize+10, 100, true, ready); err != nil {
+				t.Error(err)
+			}
+			got[i] = buf.Bytes()
+		})
 	}
 	time.Sleep(50 * time.Millisecond)
 	close(src.gate)
@@ -142,6 +169,13 @@ func TestObjectsMergeConcurrentMisses(t *testing.T) {
 	if s := o.Stats(); s.ChunkMisses != 1 || s.ChunkShared != clients-1 {
 		t.Fatalf("stats %+v, want 1 miss and %d shared", s, clients-1)
 	}
+	count := map[CacheStatus]int{}
+	for _, s := range statuses {
+		count[s]++
+	}
+	if count[StatusMiss] != 1 || count[StatusShared] != clients-1 {
+		t.Fatalf("statuses %v, want 1 miss and %d shared", count, clients-1)
+	}
 }
 
 func TestObjectsReadRunsAndBridgeShortGaps(t *testing.T) {
@@ -154,6 +188,9 @@ func TestObjectsReadRunsAndBridgeShortGaps(t *testing.T) {
 	}
 	if n := src.reads.Load(); n != 1 {
 		t.Fatalf("%d storage reads for chunks 0-1 and 5-7 around 3 cached ones, want 1", n)
+	}
+	if s := o.Stats(); s.ChunkBridged != 3 || s.ChunkHits != 0 {
+		t.Fatalf("stats %+v, want the 3 chunks read through counted as bridged, not hits", s)
 	}
 
 	o3, src3, key3, data3 := newObjects(t, 40*chunkSize)
@@ -198,7 +235,7 @@ func TestObjectsStorageErrorReachesWaitersAndIsNotKept(t *testing.T) {
 	src.gate = make(chan struct{})
 	errs := make(chan error, 5)
 	for range cap(errs) {
-		go func() { errs <- o.WriteRange(soon(t), io.Discard, key, size, 0, 10, true) }()
+		go func() { errs <- o.WriteRange(soon(t), io.Discard, key, size, 0, 10, true, nil) }()
 	}
 	time.Sleep(50 * time.Millisecond)
 	close(src.gate)
@@ -235,14 +272,20 @@ func TestImmutableKeys(t *testing.T) {
 }
 
 func TestObjectHandler(t *testing.T) {
-	o, _, key, data := newObjects(t, 3*chunkSize)
+	o, src, key, data := newObjects(t, 3*chunkSize)
 	server := httptest.NewServer(ObjectHandler(o))
 	t.Cleanup(server.Close)
-	get := func(path, rangeHeader string) (int, string, []byte) {
+	type answer struct {
+		status       int
+		contentRange string
+		cache        string
+		body         []byte
+	}
+	get := func(path string, headers ...string) answer {
 		t.Helper()
 		req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/object/"+path, nil)
-		if rangeHeader != "" {
-			req.Header.Set("Range", rangeHeader)
+		for i := 0; i < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -250,23 +293,53 @@ func TestObjectHandler(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, resp.Header.Get("Content-Range"), body
+		return answer{resp.StatusCode, resp.Header.Get("Content-Range"), resp.Header.Get(HeaderCache), body}
+	}
+	sized := func(headers ...string) []string {
+		return append([]string{HeaderObjectSize, "393216"}, headers...)
 	}
 
-	if status, cr, body := get(key, "bytes=100-199"); status != http.StatusPartialContent || cr != "bytes 100-199/393216" || !bytes.Equal(body, data[100:200]) {
-		t.Fatalf("range: %d %q %d bytes", status, cr, len(body))
+	a := get(key, sized("Range", "bytes=100-199")...)
+	if a.status != http.StatusPartialContent || a.contentRange != "bytes 100-199/393216" || a.cache != "miss" || !bytes.Equal(a.body, data[100:200]) {
+		t.Fatalf("first range: %d %q %q %d bytes", a.status, a.contentRange, a.cache, len(a.body))
 	}
-	if status, _, body := get(key, ""); status != http.StatusOK || !bytes.Equal(body, data) {
-		t.Fatalf("whole object: %d, %d bytes", status, len(body))
+	if a := get(key, sized("Range", "bytes=200-299")...); a.cache != "hit" || !bytes.Equal(a.body, data[200:300]) {
+		t.Fatalf("second range: cache %q, want hit", a.cache)
 	}
-	if status, _, _ := get("db/manifest/CURRENT", ""); status != http.StatusForbidden {
-		t.Fatalf("CURRENT: %d, want 403", status)
+	if n := src.attrs.Load(); n != 0 {
+		t.Fatalf("%d size lookups with the size given, want 0", n)
 	}
-	if status, _, _ := get(blobstore.NewMemory("db").SSTPath("missing.sst"), ""); status != http.StatusNotFound {
-		t.Fatalf("missing object: %d, want 404", status)
+	if a := get(key); a.status != http.StatusOK || !bytes.Equal(a.body, data) {
+		t.Fatalf("whole object without a size: %d, %d bytes", a.status, len(a.body))
 	}
-	if status, cr, _ := get(key, "bytes=393216-"); status != http.StatusRequestedRangeNotSatisfiable || cr != "bytes */393216" {
-		t.Fatalf("range past the end: %d %q, want 416", status, cr)
+	reads := src.reads.Load()
+	head, _ := http.NewRequest(http.MethodHead, server.URL+"/v1/object/"+key, nil)
+	head.Header.Set(HeaderObjectSize, "393216")
+	resp, err := http.DefaultClient.Do(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET" || src.reads.Load() != reads {
+		t.Fatalf("HEAD: status %d, Allow %q, %d storage reads; want 405, GET, none", resp.StatusCode, resp.Header.Get("Allow"), src.reads.Load()-reads)
+	}
+	for _, c := range []struct {
+		name    string
+		path    string
+		headers []string
+		status  int
+	}{
+		{"CURRENT", "db/manifest/CURRENT", nil, http.StatusForbidden},
+		{"missing", blobstore.NewMemory("db").SSTPath("missing.sst"), nil, http.StatusNotFound},
+		{"missing with size", blobstore.NewMemory("db").SSTPath("missing.sst"), []string{HeaderObjectSize, "10"}, http.StatusNotFound},
+		{"bad size", key, []string{HeaderObjectSize, "x"}, http.StatusBadRequest},
+		{"zero size", key, []string{HeaderObjectSize, "0"}, http.StatusBadRequest},
+		{"wrong size", key, []string{HeaderObjectSize, "393215"}, http.StatusBadRequest},
+		{"past the end", key, sized("Range", "bytes=393216-"), http.StatusRequestedRangeNotSatisfiable},
+	} {
+		if a := get(c.path, c.headers...); a.status != c.status {
+			t.Errorf("%s: status %d, want %d", c.name, a.status, c.status)
+		}
 	}
 }
 
@@ -292,5 +365,93 @@ func TestParseRange(t *testing.T) {
 		if off != c.offset || n != c.length || partial != c.partial || ok != c.satisfiable {
 			t.Errorf("parseRange(%q) = %d, %d, %t, %t", c.header, off, n, partial, ok)
 		}
+	}
+}
+
+func TestObjectsWrongSizeIsRefusedAndHarmsNothing(t *testing.T) {
+	o, src, key, data := newObjects(t, 3*chunkSize+100)
+	size := int64(len(data))
+	readSized(t, o, key, size, 0, size, true)
+	for _, wrong := range []int64{size - 1, size + 1, size + 4*chunkSize} {
+		for _, offset := range []int64{0, 3 * chunkSize} {
+			err := o.WriteRange(soon(t), io.Discard, key, wrong, offset, 10, true, nil)
+			if !errors.Is(err, ErrSizeMismatch) {
+				t.Fatalf("size %d at %d: %v, want ErrSizeMismatch", wrong, offset, err)
+			}
+		}
+	}
+	reads := src.reads.Load()
+	if got := readSized(t, o, key, size, 0, size, true); !bytes.Equal(got, data) {
+		t.Fatal("wrong bytes with the right size")
+	}
+	if n := src.reads.Load() - reads; n != 0 {
+		t.Fatalf("%d storage reads with the right size after wrong ones, want 0: the cached chunks are untouched", n)
+	}
+	if n := src.attrs.Load(); n != 0 {
+		t.Fatalf("%d size lookups with the size given, want 0", n)
+	}
+}
+
+func TestObjectsServeFromDiskAfterRestart(t *testing.T) {
+	dir, store := t.TempDir(), blobstore.NewMemory("db")
+	key := store.SSTPath("000001.sst")
+	data := bytes.Repeat([]byte("isle"), (2*chunkSize+500)/4)
+	if _, err := store.Write(context.Background(), key, data); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(len(data))
+	open := func() (*Objects, *countingSource, *diskcache.Cache) {
+		disk, err := diskcache.Open(diskcache.Options{Dir: dir, MaxBytes: 64 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := &countingSource{Store: store}
+		return NewObjects(src, disk), src, disk
+	}
+	o, _, disk := open()
+	readSized(t, o, key, size, 0, size, true)
+	if err := disk.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	o, src, disk := open()
+	defer disk.Close()
+	if got := readSized(t, o, key, size, size-700, 700, true); !bytes.Equal(got, data[size-700:]) {
+		t.Fatal("wrong bytes after restart")
+	}
+	if r, a := src.reads.Load(), src.attrs.Load(); r != 0 || a != 0 {
+		t.Fatalf("%d storage reads and %d size lookups after restart, want none", r, a)
+	}
+}
+
+func TestObjectsSizeLookupOutlivesItsFirstCaller(t *testing.T) {
+	o, src, key, data := newObjects(t, chunkSize)
+	src.attrGate = make(chan struct{})
+	first, cancel := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := o.Size(first, key)
+		firstErr <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // the first caller starts the lookup
+	second := make(chan int64, 1)
+	go func() {
+		size, err := o.Size(soon(t), key)
+		if err != nil {
+			t.Error(err)
+		}
+		second <- size
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first caller: %v, want its own cancellation", err)
+	}
+	close(src.attrGate)
+	if size := <-second; size != int64(len(data)) {
+		t.Fatalf("second caller got size %d, want %d", size, len(data))
+	}
+	if n := src.attrs.Load(); n != 1 {
+		t.Fatalf("%d size lookups, want 1 shared", n)
 	}
 }

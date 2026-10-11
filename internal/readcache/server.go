@@ -30,7 +30,7 @@ const (
 //	                           longPoll, whichever comes first
 //
 // Both answer 200 with CURRENT's bytes and the position and age headers, and
-// 503 before the relay has read CURRENT once. A long poll that times out
+// 503 at once before the relay has read CURRENT once. A long poll that times out
 // answers with the copy as it is, at a position not past N.
 func Handler(relay *Relay, longPoll time.Duration) http.Handler {
 	mux := http.NewServeMux()
@@ -45,9 +45,13 @@ func Handler(relay *Relay, longPoll time.Duration) http.Handler {
 				http.Error(w, "after must be a log position", http.StatusBadRequest)
 				return
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), longPoll)
-			defer cancel()
-			current, ok = relay.Wait(ctx, n)
+			// With no copy yet, there is nothing to wait for: answer at once
+			// so the client retries rather than hold for the whole timeout.
+			if _, loaded := relay.Current(); loaded {
+				ctx, cancel := context.WithTimeout(r.Context(), longPoll)
+				defer cancel()
+				current, ok = relay.Wait(ctx, n)
+			}
 		} else {
 			current, ok = relay.Current()
 		}
@@ -68,33 +72,63 @@ func ceilMillis(d time.Duration) int64 {
 	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
-// HeaderNoCache on a request for an object asks the cache to serve it
-// without keeping what it reads from storage, as a scan does.
-const HeaderNoCache = "Isledb-No-Cache"
+// Request and response headers of GET /v1/object/{key}.
+const (
+	// HeaderObjectSize on a request gives the object's size in bytes, so the
+	// cache need not ask storage for it. Chunks are kept per key and size: a
+	// wrong size reads none of another request's chunks, and a read from
+	// storage rejects it.
+	HeaderObjectSize = "Isledb-Object-Size"
+	// HeaderNoCache on a request asks the cache to serve the object without
+	// keeping what it reads from storage, as a scan does.
+	HeaderNoCache = "Isledb-No-Cache"
+	// HeaderCache on a response says how its first 4 MiB were served: hit,
+	// shared or miss (see CacheStatus).
+	HeaderCache = "Isledb-Cache"
+)
 
 // ObjectHandler serves byte ranges of immutable objects:
 //
 //	GET /v1/object/{key}    with an optional Range: bytes=a-b, a- or -n
 //
-// It answers 206 for a range and 200 for the whole object, 403 for a key
-// that is not immutable, 404 for a missing object and 416 for a range
-// outside it.
+// It answers 206 for a range and 200 for the whole object, 400 for a bad or
+// wrong size, 403 for a key that is not immutable, 404 for a missing object,
+// 405 for HEAD, 416 for a range outside it and 502 when storage fails. See
+// docs/read-cache-api.md.
+//
+// It does not authenticate, and serves any immutable key the cache's
+// storage credentials can read. The server that mounts it must authenticate
+// clients and limit which prefixes they may read.
 func ObjectHandler(objects *Objects) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/object/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		// The GET pattern also matches HEAD, which would read and keep the
+		// object only for its body to be dropped. No client needs it.
+		if r.Method == http.MethodHead {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "use GET", http.StatusMethodNotAllowed)
+			return
+		}
 		key := r.PathValue("key")
 		if !Immutable(key) {
 			http.Error(w, "not an immutable object", http.StatusForbidden)
 			return
 		}
-		size, err := objects.Size(r.Context(), key)
-		if errors.Is(err, blobstore.ErrNotFound) {
-			http.Error(w, "object not found", http.StatusNotFound)
-			return
-		}
-		if err != nil {
-			http.Error(w, "storage: "+err.Error(), http.StatusBadGateway)
-			return
+		var size int64
+		if given := r.Header.Get(HeaderObjectSize); given != "" {
+			n, err := strconv.ParseInt(given, 10, 64)
+			if err != nil || n <= 0 {
+				http.Error(w, HeaderObjectSize+" must be a size in bytes", http.StatusBadRequest)
+				return
+			}
+			size = n
+		} else {
+			n, err := objects.Size(r.Context(), key)
+			if err != nil {
+				objectError(w, r, key, err)
+				return
+			}
+			size = n
 		}
 		offset, length, partial, ok := parseRange(r.Header.Get("Range"), size)
 		if !ok {
@@ -102,20 +136,44 @@ func ObjectHandler(objects *Objects) http.Handler {
 			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		if partial {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, size))
-			w.WriteHeader(http.StatusPartialContent)
+		started := false
+		ready := func(status CacheStatus) {
+			started = true
+			h := w.Header()
+			h.Set("Content-Type", "application/octet-stream")
+			h.Set("Accept-Ranges", "bytes")
+			h.Set("Content-Length", strconv.FormatInt(length, 10))
+			h.Set(HeaderCache, string(status))
+			if partial {
+				h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, size))
+				w.WriteHeader(http.StatusPartialContent)
+			}
 		}
 		fill := r.Header.Get(HeaderNoCache) == ""
-		if err := objects.WriteRange(r.Context(), w, key, size, offset, length, fill); err != nil && r.Context().Err() == nil {
+		err := objects.WriteRange(r.Context(), w, key, size, offset, length, fill, ready)
+		switch {
+		case err == nil:
+		case !started:
+			objectError(w, r, key, err)
+		case r.Context().Err() == nil:
 			// The status is sent; a short body tells the client it failed.
 			slog.Warn("readcache: serve object", "key", key, "error", err)
 		}
 	})
 	return mux
+}
+
+func objectError(w http.ResponseWriter, r *http.Request, key string, err error) {
+	switch {
+	case r.Context().Err() != nil:
+	case errors.Is(err, blobstore.ErrNotFound):
+		http.Error(w, "object not found", http.StatusNotFound)
+	case errors.Is(err, ErrSizeMismatch):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		slog.Warn("readcache: serve object", "key", key, "error", err)
+		http.Error(w, "storage: "+err.Error(), http.StatusBadGateway)
+	}
 }
 
 // parseRange parses a single-range Range header for an object of size.

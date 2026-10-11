@@ -63,6 +63,17 @@ func TestServeCurrentWithPositionAndAge(t *testing.T) {
 	}
 }
 
+func TestLongPollBeforeTheFirstReadAnswersAtOnce(t *testing.T) {
+	_, server := startServer(t, &fakeSource{}, 2*time.Second)
+	start := time.Now()
+	if a := fetch(t, server.URL+"/v1/current?after=1"); a.status != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", a.status)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("answered after %s, want at once rather than at the 2s timeout", took)
+	}
+}
+
 func TestLongPollAnswersOnAdvanceOrTimeout(t *testing.T) {
 	src := &fakeSource{}
 	relay, server := startServer(t, src, 200*time.Millisecond)

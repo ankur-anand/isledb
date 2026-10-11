@@ -3,8 +3,10 @@ package readcache
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
+	"gocloud.dev/blob"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -24,18 +27,37 @@ const (
 	maxKnownSizes   = 1 << 20
 )
 
+// ErrSizeMismatch reports that an object's size in storage is not the size
+// a request gave for it.
+var ErrSizeMismatch = errors.New("readcache: object size mismatch")
+
+// CacheStatus is how a request's first run of chunks was served.
+type CacheStatus string
+
+const (
+	// StatusHit: every chunk came from disk.
+	StatusHit CacheStatus = "hit"
+	// StatusShared: no chunk was read by this request, at least one by
+	// another request in flight.
+	StatusShared CacheStatus = "shared"
+	// StatusMiss: this request read at least one chunk from storage.
+	StatusMiss CacheStatus = "miss"
+)
+
 // ObjectSource reads immutable objects from storage. *blobstore.Store
 // satisfies it.
 type ObjectSource interface {
 	Attributes(ctx context.Context, key string) (blobstore.Attributes, error)
-	ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	ReadRangeStream(ctx context.Context, key string, offset, length int64) (*blob.Reader, error)
 }
 
-// ObjectStats counts chunks served and storage reads made.
+// ObjectStats counts chunks served and storage requests made.
 type ObjectStats struct {
 	ChunkHits    int64 // read from disk
 	ChunkMisses  int64 // read from storage by this request
 	ChunkShared  int64 // read from storage by another request in flight
+	ChunkBridged int64 // on disk, but read again inside a run from storage
+	SizeLookups  int64
 	StorageReads int64
 	StorageBytes int64
 }
@@ -43,8 +65,8 @@ type ObjectStats struct {
 // Objects serves byte ranges of immutable objects from 128 KiB chunks kept
 // on disk, reading missing chunks from storage. Missing chunks next to each
 // other are read in one request, and concurrent requests for the same chunk
-// share one read. Objects only serves keys that are immutable; see
-// Immutable.
+// share one read. Entries are keyed by object key and size, so a request
+// with a wrong size never reads or stores another request's chunks.
 type Objects struct {
 	source ObjectSource
 	disk   *diskcache.Cache
@@ -55,8 +77,8 @@ type Objects struct {
 	sizes    map[string]int64
 	inflight map[diskcache.Key]*chunkFetch
 
-	chunkHits, chunkMisses, chunkShared atomic.Int64
-	storageReads, storageBytes          atomic.Int64
+	chunkHits, chunkMisses, chunkShared, chunkBridged atomic.Int64
+	sizeLookups, storageReads, storageBytes           atomic.Int64
 }
 
 type chunkFetch struct {
@@ -79,6 +101,8 @@ func (o *Objects) Stats() ObjectStats {
 		ChunkHits:    o.chunkHits.Load(),
 		ChunkMisses:  o.chunkMisses.Load(),
 		ChunkShared:  o.chunkShared.Load(),
+		ChunkBridged: o.chunkBridged.Load(),
+		SizeLookups:  o.sizeLookups.Load(),
 		StorageReads: o.storageReads.Load(),
 		StorageBytes: o.storageBytes.Load(),
 	}
@@ -111,7 +135,7 @@ func isLevelDir(s string) bool {
 }
 
 // Size returns the object's size, read from storage once and then
-// remembered.
+// remembered, for requests that do not give it.
 func (o *Objects) Size(ctx context.Context, key string) (int64, error) {
 	o.mu.Lock()
 	size, ok := o.sizes[key]
@@ -119,7 +143,11 @@ func (o *Objects) Size(ctx context.Context, key string) (int64, error) {
 	if ok {
 		return size, nil
 	}
-	v, err, _ := o.sizeCalls.Do(key, func() (any, error) {
+	results := o.sizeCalls.DoChan(key, func() (any, error) {
+		// Not the caller's context: other requests may share this lookup.
+		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+		defer cancel()
+		o.sizeLookups.Add(1)
 		attrs, err := o.source.Attributes(ctx, key)
 		if err != nil {
 			return int64(0), err
@@ -132,31 +160,47 @@ func (o *Objects) Size(ctx context.Context, key string) (int64, error) {
 		o.mu.Unlock()
 		return attrs.Size, nil
 	})
-	if err != nil {
-		return 0, err
+	select {
+	case r := <-results:
+		if r.Err != nil {
+			return 0, r.Err
+		}
+		return r.Val.(int64), nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
-	return v.(int64), nil
 }
 
-// WriteRange writes length bytes of key at offset to w, one run of chunks
-// at a time. size must be the object's size. With fill false, chunks read
-// from storage are served but not kept, as for a scan.
-func (o *Objects) WriteRange(ctx context.Context, w io.Writer, key string, size, offset, length int64, fill bool) error {
+// WriteRange writes length bytes of key at offset to w, up to maxRunChunks
+// chunks at a time. size is the object's size; a read from storage checks it
+// and fails with ErrSizeMismatch if it is wrong. ready, if not nil, is
+// called once before anything is written, with how the first run was
+// served; an error returned before ready means nothing was written. With
+// fill false, chunks read from storage are served but not kept.
+func (o *Objects) WriteRange(ctx context.Context, w io.Writer, key string, size, offset, length int64, fill bool, ready func(CacheStatus)) error {
 	if offset < 0 || length < 0 || offset+length > size {
 		return fmt.Errorf("readcache: range [%d, %d) outside %s of size %d", offset, offset+length, key, size)
 	}
+	if ready == nil {
+		ready = func(CacheStatus) {}
+	}
+	if length == 0 {
+		ready(StatusHit)
+		return nil
+	}
 	end := offset + length
-	object := sha256.Sum256([]byte(key))
+	object := objectID(key, size)
 	for first := offset / chunkSize; first*chunkSize < end; first += maxRunChunks {
 		last := min(first+maxRunChunks, (end+chunkSize-1)/chunkSize) - 1
-		chunks, err := o.chunks(ctx, key, object, size, first, last, fill)
+		pieces, status, err := o.chunks(ctx, key, object, size, first, last, offset, end, fill)
 		if err != nil {
 			return err
 		}
-		for i, data := range chunks {
-			start := (first + int64(i)) * chunkSize
-			lo, hi := max(offset, start)-start, min(end, start+int64(len(data)))-start
-			if _, err := w.Write(data[lo:hi]); err != nil {
+		if first == offset/chunkSize {
+			ready(status)
+		}
+		for _, piece := range pieces {
+			if _, err := w.Write(piece); err != nil {
 				return err
 			}
 		}
@@ -164,8 +208,13 @@ func (o *Objects) WriteRange(ctx context.Context, w io.Writer, key string, size,
 	return nil
 }
 
-// chunks returns chunks first..last of the object.
-func (o *Objects) chunks(ctx context.Context, key string, object [32]byte, size, first, last int64, fill bool) ([][]byte, error) {
+func objectID(key string, size int64) [32]byte {
+	return sha256.Sum256([]byte(key + "\x00" + strconv.FormatInt(size, 10)))
+}
+
+// chunks returns the parts of chunks first..last inside [lo, hi), and how
+// they were served. Any error fails all of them.
+func (o *Objects) chunks(ctx context.Context, key string, object [32]byte, size, first, last, lo, hi int64, fill bool) ([][]byte, CacheStatus, error) {
 	n := int(last - first + 1)
 	keys := make([]diskcache.Key, n)
 	lengths := make([]int64, n)
@@ -193,35 +242,47 @@ func (o *Objects) chunks(ctx context.Context, key string, object [32]byte, size,
 	}
 	o.mu.Unlock()
 
-	out := make([][]byte, n)
-	fetched := o.fetchRuns(key, first, missing, cached, keys, lengths, fill)
+	status := StatusHit
+	if len(missing) > 0 {
+		status = StatusMiss
+	}
+	fetched := o.fetchRuns(key, size, first, missing, cached, keys, lengths, fill)
+	pieces := make([][]byte, n)
 	for i := range n {
+		start := (first + int64(i)) * chunkSize
+		pieceLo, pieceHi := max(lo, start)-start, min(hi, start+lengths[i])-start
 		switch {
 		case fetched[i] != nil:
 			if fetched[i].err != nil {
-				return nil, fetched[i].err
+				return nil, "", fetched[i].err
 			}
-			out[i] = fetched[i].data
+			pieces[i] = fetched[i].data[pieceLo:pieceHi]
 		case shared[i] != nil:
 			select {
 			case <-shared[i].done:
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			}
 			if shared[i].err != nil {
-				return nil, shared[i].err
+				return nil, "", shared[i].err
 			}
 			o.chunkShared.Add(1)
-			out[i] = shared[i].data
-		default:
-			data, err := o.cachedChunk(ctx, key, keys[i], first+int64(i), lengths[i], fill)
-			if err != nil {
-				return nil, err
+			if status == StatusHit {
+				status = StatusShared
 			}
-			out[i] = data
+			pieces[i] = shared[i].data[pieceLo:pieceHi]
+		default:
+			piece, fromStorage, err := o.cachedPiece(ctx, key, size, keys[i], first+int64(i), lengths[i], pieceLo, pieceHi, fill)
+			if err != nil {
+				return nil, "", err
+			}
+			if fromStorage {
+				status = StatusMiss
+			}
+			pieces[i] = piece
 		}
 	}
-	return out, nil
+	return pieces, status, nil
 }
 
 // fetchRuns reads the missing chunks from storage, one request per run of
@@ -229,7 +290,7 @@ func (o *Objects) chunks(ctx context.Context, key string, object [32]byte, size,
 // missing ones, as one request costs less than two. It returns a result for
 // every chunk read, by position, after storing and releasing the ones this
 // request claimed.
-func (o *Objects) fetchRuns(key string, first int64, missing []int, cached []bool, keys []diskcache.Key, lengths []int64, fill bool) []*chunkFetch {
+func (o *Objects) fetchRuns(key string, size, first int64, missing []int, cached []bool, keys []diskcache.Key, lengths []int64, fill bool) []*chunkFetch {
 	results := make([]*chunkFetch, len(keys))
 	if len(missing) == 0 {
 		return results
@@ -242,7 +303,7 @@ func (o *Objects) fetchRuns(key string, first int64, missing []int, cached []boo
 		}
 		run := missing[start : end+1]
 		wg.Go(func() {
-			o.fetchRun(key, first, run, keys, lengths, fill, results)
+			o.fetchRun(key, size, first, run, keys, lengths, fill, results)
 		})
 		start = end + 1
 	}
@@ -264,20 +325,14 @@ func bridgeable(cached []bool, a, b int) bool {
 	return true
 }
 
-func (o *Objects) fetchRun(key string, first int64, run []int, keys []diskcache.Key, lengths []int64, fill bool, results []*chunkFetch) {
+func (o *Objects) fetchRun(key string, size, first int64, run []int, keys []diskcache.Key, lengths []int64, fill bool, results []*chunkFetch) {
 	lo, hi := run[0], run[len(run)-1]
 	// Not the request's context: other requests may be waiting on these
 	// chunks, and they should not fail because this client went away.
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 	offset := (first + int64(lo)) * chunkSize
-	length := (first+int64(hi))*chunkSize + lengths[hi] - offset
-	data, err := o.source.ReadRange(ctx, key, offset, length)
-	o.storageReads.Add(1)
-	o.storageBytes.Add(int64(len(data)))
-	if err == nil && int64(len(data)) != length {
-		err = fmt.Errorf("readcache: read %d bytes of %s at %d, want %d", len(data), key, offset, length)
-	}
+	data, err := o.read(ctx, key, size, offset, (first+int64(hi))*chunkSize+lengths[hi]-offset)
 	for _, i := range run {
 		f := &chunkFetch{err: err}
 		if err == nil {
@@ -298,7 +353,7 @@ func (o *Objects) fetchRun(key string, first int64, run []int, keys []diskcache.
 			if results[i] == nil {
 				start := int64(i-lo) * chunkSize
 				results[i] = &chunkFetch{data: data[start : start+lengths[i] : start+lengths[i]]}
-				o.chunkHits.Add(1)
+				o.chunkBridged.Add(1)
 			}
 		}
 	}
@@ -313,26 +368,43 @@ func (o *Objects) release(k diskcache.Key, result *chunkFetch) {
 	close(f.done)
 }
 
-// cachedChunk reads a chunk from disk, or from storage if it was evicted
-// since it was found.
-func (o *Objects) cachedChunk(ctx context.Context, key string, k diskcache.Key, index, length int64, fill bool) ([]byte, error) {
-	data := make([]byte, length)
-	if o.disk.ReadAt(k, length, data, 0) {
-		o.chunkHits.Add(1)
-		return data, nil
-	}
-	data, err := o.source.ReadRange(ctx, key, index*chunkSize, length)
+// read reads [offset, offset+length) of key from storage, checking that
+// the object is size bytes.
+func (o *Objects) read(ctx context.Context, key string, size, offset, length int64) ([]byte, error) {
 	o.storageReads.Add(1)
-	o.storageBytes.Add(int64(len(data)))
+	r, err := o.source.ReadRangeStream(ctx, key, offset, length)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) != length {
-		return nil, fmt.Errorf("readcache: read %d bytes of %s at %d, want %d", len(data), key, index*chunkSize, length)
+	if r.Size() != size {
+		_ = r.Close()
+		return nil, fmt.Errorf("%w: %s is %d bytes, not %d", ErrSizeMismatch, key, r.Size(), size)
+	}
+	data := make([]byte, length)
+	n, err := io.ReadFull(r, data)
+	o.storageBytes.Add(int64(n))
+	if err = errors.Join(err, r.Close()); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// cachedPiece reads [pieceLo, pieceHi) of a cached chunk from disk, or, if
+// it was evicted since it was found, the whole chunk from storage. It
+// reports whether it went to storage.
+func (o *Objects) cachedPiece(ctx context.Context, key string, size int64, k diskcache.Key, index, length, pieceLo, pieceHi int64, fill bool) ([]byte, bool, error) {
+	piece := make([]byte, pieceHi-pieceLo)
+	if o.disk.ReadAt(k, length, piece, pieceLo) {
+		o.chunkHits.Add(1)
+		return piece, false, nil
+	}
+	data, err := o.read(ctx, key, size, index*chunkSize, length)
+	if err != nil {
+		return nil, true, err
 	}
 	o.chunkMisses.Add(1)
 	if fill {
 		_ = o.disk.Put(k, data)
 	}
-	return data, nil
+	return data[pieceLo:pieceHi], true, nil
 }
