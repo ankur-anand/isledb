@@ -95,8 +95,7 @@ const (
 //
 // It answers 206 for a range and 200 for the whole object, 400 for a bad or
 // wrong size, 403 for a key that is not immutable, 404 for a missing object,
-// 405 for HEAD, 416 for a range outside it and 502 when storage fails. See
-// docs/read-cache-api.md.
+// 405 for HEAD, 416 for a range outside it and 502 when storage fails.
 //
 // It does not authenticate, and serves any immutable key the cache's
 // storage credentials can read. The server that mounts it must authenticate
