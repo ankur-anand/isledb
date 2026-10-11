@@ -40,7 +40,7 @@ func newBenchEnv(b *testing.B, diskBytes int64, delay time.Duration) *benchEnv {
 	b.Cleanup(func() { _ = disk.Close() })
 	src := &countingSource{Store: store, delay: delay}
 	objects := mustObjects(b, src, disk, ObjectsOptions{})
-	server := httptest.NewServer(ObjectHandler(objects))
+	server := httptest.NewServer(mustHandler(b, objects, relaysFor("db"), time.Minute))
 	b.Cleanup(server.Close)
 	transport := &http.Transport{MaxIdleConns: 2048, MaxIdleConnsPerHost: 2048}
 	b.Cleanup(transport.CloseIdleConnections)
@@ -276,7 +276,7 @@ func BenchmarkCurrentFanout(b *testing.B) {
 			if err := relay.Poll(context.Background()); err != nil {
 				b.Fatal(err)
 			}
-			server := httptest.NewServer(Handler(relay, time.Minute))
+			server := httptest.NewServer(mustHandler(b, nil, map[string]*Relay{"db": relay}, time.Minute))
 			b.Cleanup(server.Close)
 			transport := &http.Transport{MaxIdleConns: 2 * waiters, MaxIdleConnsPerHost: 2 * waiters}
 			b.Cleanup(transport.CloseIdleConnections)

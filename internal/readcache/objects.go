@@ -168,26 +168,63 @@ func (o *Objects) Stats() ObjectStats {
 	}
 }
 
-// Immutable reports whether key names an object that is never rewritten:
-// an SST, a change batch, a manifest snapshot or a manifest page.
-func Immutable(key string) bool {
+// Owner returns the prefix of the database whose immutable object key
+// names: an SST, a change batch, a manifest snapshot or a manifest page,
+// each a fixed shape right after its database's prefix. The bucket root's
+// prefix is "". A key of no such shape, or whose prefix is not clean, has no
+// owner. So a database at prod/a owns prod/a/sstable/... but not the objects
+// of another database nested under it, such as prod/a/b/sstable/....
+func Owner(key string) (string, bool) {
 	parts := strings.Split(key, "/")
 	n := len(parts)
 	if n < 3 || parts[n-1] == "" {
-		return false
+		return "", false
 	}
 	name, dir, parent := parts[n-1], parts[n-2], parts[n-3]
+	var shape int
 	switch {
-	case parent == "sstable":
-		return dir == blobstore.SSTBucket(name)
-	case parent == "changes":
-		return dir == blobstore.ChangeBatchBucket(name)
-	case parent == "manifest" && dir == "snapshots":
-		return len(name) > len(".manifest.zst") && strings.HasSuffix(name, ".manifest.zst")
-	case n >= 4 && parts[n-4] == "manifest" && parent == "pages" && isLevelDir(dir):
-		return len(name) > len(".page.zst") && strings.HasSuffix(name, ".page.zst")
+	case parent == "sstable" && dir == blobstore.SSTBucket(name),
+		parent == "changes" && dir == blobstore.ChangeBatchBucket(name),
+		parent == "manifest" && dir == "snapshots" && hasName(name, ".manifest.zst"):
+		shape = 3
+	case n >= 4 && parts[n-4] == "manifest" && parent == "pages" && isLevelDir(dir) && hasName(name, ".page.zst"):
+		shape = 4
+	default:
+		return "", false
 	}
-	return false
+	if n == shape {
+		return "", true
+	}
+	prefix := strings.Join(parts[:n-shape], "/")
+	if clean, err := CleanPrefix(prefix); err != nil || clean != prefix {
+		return "", false
+	}
+	return prefix, true
+}
+
+func hasName(name, suffix string) bool {
+	return len(name) > len(suffix) && strings.HasSuffix(name, suffix)
+}
+
+// CleanPrefix returns a database prefix as its keys spell it: without
+// leading or trailing slashes, and "" for the bucket root, which is written
+// "/". An empty prefix is refused, so that a blank value never names the
+// root, and so is one with an empty, "." or ".." segment: storage paths
+// clean such segments away, so its keys would never match it.
+func CleanPrefix(p string) (string, error) {
+	if p == "/" {
+		return "", nil
+	}
+	trimmed := strings.Trim(p, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("readcache: database prefix %q is empty; write / for the bucket root", p)
+	}
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("readcache: database prefix %q has an empty, . or .. segment", p)
+		}
+	}
+	return trimmed, nil
 }
 
 func isLevelDir(s string) bool {

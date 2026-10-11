@@ -260,30 +260,93 @@ func TestObjectsStorageErrorReachesWaitersAndIsNotKept(t *testing.T) {
 	}
 }
 
-func TestImmutableKeys(t *testing.T) {
-	store := blobstore.NewMemory("sstable")
-	for key, want := range map[string]bool{
-		store.SSTPath("000001.sst"):            true,
-		store.ChangeBatchPath("batch-1"):       true,
-		store.ManifestSnapshotPath("s1"):       true,
-		store.ManifestPagePath(3, "p1"):        true,
-		store.ManifestPath():                   false,
-		store.MaintenanceHeadPath():            false,
-		"sstable/manifest/CURRENT":             false,
-		"db/sstable/000/000001.sst":            false,
-		"db/manifest/snapshots/.manifest.zst":  false,
-		"db/manifest/pages/x1/p1.page.zst":     false,
-		"db/manifest/snapshots/s1.manifest.zs": false,
+func TestOwner(t *testing.T) {
+	root, db := blobstore.NewMemory(""), blobstore.NewMemory("prod/a")
+	sst := root.SSTPath("000001.sst")
+	for key, want := range map[string]string{
+		db.SSTPath("000001.sst"):       "prod/a",
+		db.ChangeBatchPath("batch-1"):  "prod/a",
+		db.ManifestSnapshotPath("s1"):  "prod/a",
+		db.ManifestPagePath(3, "p1"):   "prod/a",
+		sst:                            "",
+		root.ManifestPagePath(0, "p1"): "",
+		"prod/a/b/" + sst:              "prod/a/b",
+		"x/sstable/" + sst:             "x/sstable",
 	} {
-		if got := Immutable(key); got != want {
-			t.Errorf("Immutable(%q) = %t, want %t", key, got, want)
+		if owner, ok := Owner(key); !ok || owner != want {
+			t.Errorf("Owner(%q) = %q, %t; want %q", key, owner, ok, want)
 		}
+	}
+	for _, key := range []string{
+		db.ManifestPath(), db.MaintenanceHeadPath(), root.ManifestPath(),
+		"sstable/manifest/CURRENT",
+		"prod/a/sstable/000/000001.sst",
+		"prod/a/manifest/snapshots/.manifest.zst",
+		"prod/a/manifest/pages/x1/p1.page.zst",
+		"a//b/" + sst,
+		"a/../b/" + sst,
+		"/" + sst,
+	} {
+		if owner, ok := Owner(key); ok {
+			t.Errorf("Owner(%q) = %q; want no owner", key, owner)
+		}
+	}
+}
+
+func TestCleanPrefix(t *testing.T) {
+	for in, want := range map[string]string{"/": "", "prod/a": "prod/a", "/prod/a/": "prod/a"} {
+		if got, err := CleanPrefix(in); err != nil || got != want {
+			t.Errorf("CleanPrefix(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "//", "a//b", "a/../b", "./a", "a/."} {
+		if got, err := CleanPrefix(in); err == nil {
+			t.Errorf("CleanPrefix(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+func TestObjectsOnlyOfDatabasesServed(t *testing.T) {
+	store := blobstore.NewMemory("")
+	keys := map[string]string{
+		"root":   store.SSTPath("000001.sst"),
+		"prod/a": "prod/a/" + store.SSTPath("000001.sst"),
+		"nested": "prod/a/b/" + store.SSTPath("000001.sst"),
+		"prod/b": "prod/b/" + store.SSTPath("000001.sst"),
+	}
+	for _, key := range keys {
+		if _, err := store.Write(context.Background(), key, []byte("isle")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	o := mustObjects(t, &countingSource{Store: store}, disk, ObjectsOptions{})
+	for served, want := range map[string]map[string]int{
+		"prod/a": {"root": 403, "prod/a": 200, "nested": 403, "prod/b": 403},
+		"":       {"root": 200, "prod/a": 403, "nested": 403, "prod/b": 403},
+	} {
+		server := httptest.NewServer(mustHandler(t, o, relaysFor(served), time.Second))
+		for name, key := range keys {
+			resp, err := http.Get(server.URL + "/v1/object/" + key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != want[name] {
+				t.Errorf("serving %q, the %s key: status %d, want %d", served, name, resp.StatusCode, want[name])
+			}
+		}
+		server.Close()
 	}
 }
 
 func TestObjectHandler(t *testing.T) {
 	o, src, key, data := newObjects(t, 3*chunkSize)
-	server := httptest.NewServer(ObjectHandler(o))
+	server := httptest.NewServer(mustHandler(t, o, relaysFor("db"), time.Second))
 	t.Cleanup(server.Close)
 	type answer struct {
 		status       int
@@ -349,6 +412,7 @@ func TestObjectHandler(t *testing.T) {
 		status  int
 	}{
 		{"CURRENT", "db/manifest/CURRENT", nil, http.StatusForbidden},
+		{"another database", blobstore.NewMemory("other").SSTPath("000001.sst"), nil, http.StatusForbidden},
 		{"missing", blobstore.NewMemory("db").SSTPath("missing.sst"), nil, http.StatusNotFound},
 		{"missing with size", blobstore.NewMemory("db").SSTPath("missing.sst"), []string{HeaderObjectSize, "10"}, http.StatusNotFound},
 		{"bad size", key, []string{HeaderObjectSize, "x"}, http.StatusBadRequest},

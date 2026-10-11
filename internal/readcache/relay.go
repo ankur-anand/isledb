@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/manifest"
@@ -50,19 +51,43 @@ type Relay struct {
 	position  uint64
 	fetchedAt time.Time // carries a monotonic reading, so Age ignores clock changes
 	changed   chan struct{}
+
+	pollErrors atomic.Int64
 }
 
 func NewRelay(source CurrentSource, interval time.Duration) *Relay {
 	return &Relay{source: source, interval: interval, changed: make(chan struct{})}
 }
 
-// Run polls storage until ctx ends.
-func (r *Relay) Run(ctx context.Context) {
+// failureLogEvery is how often Run repeats that storage is still failing.
+const failureLogEvery = 30 * time.Second
+
+// Run polls storage until ctx ends, logging to log, or slog's default when
+// nil. A run of failed polls logs once when it starts, then every
+// failureLogEvery, and once more when a poll succeeds again.
+func (r *Relay) Run(ctx context.Context, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
+	var failingSince, logged time.Time
 	for {
-		if err := r.Poll(ctx); err != nil && ctx.Err() == nil {
-			slog.Warn("readcache: read CURRENT", "error", err)
+		err := r.Poll(ctx)
+		now := time.Now()
+		switch {
+		case ctx.Err() != nil:
+		case err != nil && failingSince.IsZero():
+			failingSince, logged = now, now
+			log.Warn("readcache: read CURRENT", "error", err)
+		case err != nil && now.Sub(logged) >= failureLogEvery:
+			logged = now
+			kept, _ := r.Current()
+			log.Warn("readcache: still failing to read CURRENT", "error", err,
+				"for", now.Sub(failingSince).Round(time.Second), "copy_age", kept.Age.Round(time.Millisecond))
+		case err == nil && !failingSince.IsZero():
+			log.Info("readcache: reading CURRENT again", "after", now.Sub(failingSince).Round(time.Second))
+			failingSince = time.Time{}
 		}
 		select {
 		case <-ctx.Done():
@@ -72,11 +97,22 @@ func (r *Relay) Run(ctx context.Context) {
 	}
 }
 
+// PollErrors is how many polls have failed.
+func (r *Relay) PollErrors() int64 { return r.pollErrors.Load() }
+
 // Poll reads CURRENT from storage once and takes it. A CURRENT at the same
 // position with other bytes, as a checkpoint writes, replaces the copy.
 // Storage reads are strongly consistent, so a CURRENT behind the copy means
 // the store went back; Poll keeps the copy and returns an error.
 func (r *Relay) Poll(ctx context.Context) error {
+	err := r.poll(ctx)
+	if err != nil {
+		r.pollErrors.Add(1)
+	}
+	return err
+}
+
+func (r *Relay) poll(ctx context.Context) error {
 	r.pollMu.Lock()
 	defer r.pollMu.Unlock()
 	// Taken before the read: storage answered at some moment during it, so

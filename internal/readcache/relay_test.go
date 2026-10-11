@@ -101,6 +101,9 @@ func TestRelayKeepsCopyAndAgesWhenStorageFails(t *testing.T) {
 	if !ok || c.Position != 7 || c.Age < 20*time.Millisecond {
 		t.Fatalf("copy %+v, want position 7 with an age of at least 20ms", c)
 	}
+	if n := r.PollErrors(); n != 1 {
+		t.Fatalf("%d poll errors, want 1", n)
+	}
 
 	src.set(currentBytes(t, 7, 1), nil) // a successful read of the same CURRENT renews it
 	if err := r.Poll(context.Background()); err != nil {
@@ -156,7 +159,7 @@ func TestRelayRunPollsUntilStopped(t *testing.T) {
 	r := NewRelay(src, 10*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { r.Run(ctx); close(done) }()
+	go func() { r.Run(ctx, nil); close(done) }()
 	src.set(currentBytes(t, 4, 1), nil)
 	if c, _ := r.Wait(soon(t), 3); c.Position != 4 {
 		t.Fatalf("position %d, want Run to pick up 4", c.Position)

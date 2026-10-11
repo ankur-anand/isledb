@@ -10,10 +10,28 @@ import (
 	"time"
 )
 
+func mustHandler(t testing.TB, objects *Objects, relays map[string]*Relay, longPoll time.Duration) *Handler {
+	t.Helper()
+	h, err := NewHandler(objects, relays, longPoll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// relaysFor names databases with relays that are never polled.
+func relaysFor(prefixes ...string) map[string]*Relay {
+	relays := map[string]*Relay{}
+	for _, p := range prefixes {
+		relays[p] = NewRelay(&fakeSource{}, time.Hour)
+	}
+	return relays
+}
+
 func startServer(t *testing.T, src *fakeSource, longPoll time.Duration) (*Relay, *httptest.Server) {
 	t.Helper()
 	relay := NewRelay(src, time.Hour)
-	server := httptest.NewServer(Handler(relay, longPoll))
+	server := httptest.NewServer(mustHandler(t, nil, map[string]*Relay{"db": relay}, longPoll))
 	t.Cleanup(server.Close)
 	return relay, server
 }
@@ -123,5 +141,79 @@ func TestCeilMillisRoundsUp(t *testing.T) {
 		if got := ceilMillis(d); got != want {
 			t.Errorf("ceilMillis(%s) = %d, want %d", d, got, want)
 		}
+	}
+}
+
+func TestCurrentPicksTheDatabase(t *testing.T) {
+	relays := map[string]*Relay{}
+	for name, position := range map[string]uint64{"prod/a": 5, "prod/b": 9} {
+		src := &fakeSource{}
+		src.set(currentBytes(t, position, 1), nil)
+		relays[name] = NewRelay(src, time.Hour)
+		if err := relays[name].Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(mustHandler(t, nil, relays, time.Second))
+	t.Cleanup(server.Close)
+	if a := fetch(t, server.URL+"/v1/current?db=prod/b"); a.status != http.StatusOK || a.position != 9 {
+		t.Fatalf("db=prod/b: %+v, want position 9", a)
+	}
+	if a := fetch(t, server.URL+"/v1/current"); a.status != http.StatusBadRequest {
+		t.Fatalf("no db with two databases: status %d, want 400", a.status)
+	}
+	if a := fetch(t, server.URL+"/v1/current?db=prod/c"); a.status != http.StatusNotFound {
+		t.Fatalf("unknown db: status %d, want 404", a.status)
+	}
+}
+
+func TestStopLongPollsAnswersHeldAndLaterOnes(t *testing.T) {
+	src := &fakeSource{}
+	src.set(currentBytes(t, 3, 1), nil)
+	relay := NewRelay(src, time.Hour)
+	if err := relay.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h := mustHandler(t, nil, map[string]*Relay{"db": relay}, time.Minute)
+	server := httptest.NewServer(h)
+	t.Cleanup(server.Close)
+
+	got := make(chan answer, 1)
+	go func() { got <- fetch(t, server.URL+"/v1/current?after=3") }()
+	for deadline := time.Now().Add(time.Second); h.LongPollsHeld() != 1; {
+		if time.Now().After(deadline) {
+			t.Fatal("the long poll was never held")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.StopLongPolls()
+	select {
+	case a := <-got:
+		if a.status != http.StatusOK || a.position != 3 {
+			t.Fatalf("held long poll: %+v, want position 3", a)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a held long poll was not answered when long polls stopped")
+	}
+	start := time.Now()
+	if a := fetch(t, server.URL+"/v1/current?after=3"); a.position != 3 || time.Since(start) > time.Second {
+		t.Fatalf("long poll after stop: %+v after %s, want an answer at once", a, time.Since(start))
+	}
+	if n := h.LongPollsHeld(); n != 0 {
+		t.Fatalf("%d long polls held after all answered, want 0", n)
+	}
+}
+
+func TestNewHandlerRefusesPrefixesThatAreNotClean(t *testing.T) {
+	for _, prefix := range []string{"a/", "/a", "a//b", "a/../b", "./a"} {
+		if _, err := NewHandler(nil, relaysFor(prefix), time.Second); err == nil {
+			t.Errorf("NewHandler accepted the prefix %q", prefix)
+		}
+	}
+	if _, err := NewHandler(nil, relaysFor("", "prod/a"), time.Second); err != nil {
+		t.Errorf("NewHandler refused the root and prod/a: %v", err)
+	}
+	if _, err := NewHandler(nil, nil, time.Second); err == nil {
+		t.Error("NewHandler accepted no databases")
 	}
 }
