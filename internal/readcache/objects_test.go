@@ -481,12 +481,12 @@ func TestObjectsSizeLookupOutlivesItsFirstCaller(t *testing.T) {
 	}
 }
 
-func TestObjectsReadLimitQueuesStorageReadsNotHits(t *testing.T) {
+func limitedObjects(t *testing.T, opts ObjectsOptions) (*Objects, *countingSource, []string) {
+	t.Helper()
 	store := blobstore.NewMemory("db")
 	keys := []string{store.SSTPath("000001.sst"), store.SSTPath("000002.sst"), store.SSTPath("000003.sst")}
-	const size = maxRunChunks * chunkSize
 	for _, key := range keys {
-		if _, err := store.Write(context.Background(), key, bytes.Repeat([]byte{7}, size)); err != nil {
+		if _, err := store.Write(context.Background(), key, bytes.Repeat([]byte{7}, maxRunChunks*chunkSize)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -496,7 +496,12 @@ func TestObjectsReadLimitQueuesStorageReadsNotHits(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = disk.Close() })
 	src := &countingSource{Store: store}
-	o := mustObjects(t, src, disk, ObjectsOptions{MaxReadBytes: size})
+	return mustObjects(t, src, disk, opts), src, keys
+}
+
+func TestObjectsReadLimitQueuesStorageReadsNotHits(t *testing.T) {
+	const size = maxRunChunks * chunkSize
+	o, src, keys := limitedObjects(t, ObjectsOptions{MaxReadBytes: size})
 	readSized(t, o, keys[2], size, 0, size, true)
 
 	src.reads.Store(0)
@@ -535,5 +540,40 @@ func TestObjectsReadLimitBelowTheLargestReadIsRefused(t *testing.T) {
 	src := &countingSource{Store: blobstore.NewMemory("db")}
 	if _, err := NewObjects(src, disk, ObjectsOptions{MaxReadBytes: maxRunChunks*chunkSize - 1}); err == nil {
 		t.Fatal("NewObjects accepted a limit below the largest single read")
+	}
+	if _, err := NewObjects(src, disk, ObjectsOptions{MaxReadWait: -time.Second}); err == nil {
+		t.Fatal("NewObjects accepted a negative wait")
+	}
+}
+
+// holdBudget takes all of o's read budget until the returned func is called.
+func holdBudget(t *testing.T, o *Objects) func() {
+	t.Helper()
+	if err := o.reads.Acquire(soon(t), maxRunChunks*chunkSize); err != nil {
+		t.Fatal(err)
+	}
+	return func() { o.reads.Release(maxRunChunks * chunkSize) }
+}
+
+func TestObjectsWaitForBudgetDoesNotShortenTheRead(t *testing.T) {
+	old := fetchTimeout
+	fetchTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { fetchTimeout = old })
+	o, src, keys := limitedObjects(t, ObjectsOptions{MaxReadBytes: maxRunChunks * chunkSize, MaxReadWait: 2 * time.Second})
+	src.delay = 100 * time.Millisecond
+	time.AfterFunc(300*time.Millisecond, holdBudget(t, o))
+	if err := o.WriteRange(soon(t), io.Discard, keys[0], maxRunChunks*chunkSize, 0, 1, true, nil); err != nil {
+		t.Fatalf("a read that waited 300ms for budget, then took 100ms, failed with a 200ms read timeout: %v", err)
+	}
+}
+
+func TestObjectsWaitForBudgetIsBounded(t *testing.T) {
+	o, _, keys := limitedObjects(t, ObjectsOptions{MaxReadBytes: maxRunChunks * chunkSize, MaxReadWait: 100 * time.Millisecond})
+	release := holdBudget(t, o)
+	time.AfterFunc(2*time.Second, release)
+	start := time.Now()
+	err := o.WriteRange(soon(t), io.Discard, keys[0], maxRunChunks*chunkSize, 0, 1, true, nil)
+	if err == nil || time.Since(start) > time.Second {
+		t.Fatalf("queued read: %v after %s, want an error after about 100ms", err, time.Since(start))
 	}
 }

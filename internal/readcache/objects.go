@@ -24,12 +24,18 @@ const (
 	chunkSize       = 128 << 10
 	maxRunChunks    = 32
 	maxBridgeChunks = 8
-	fetchTimeout    = 30 * time.Second
 	maxKnownSizes   = 1 << 20
 )
 
-// DefaultMaxReadBytes is ObjectsOptions.MaxReadBytes when it is zero.
-const DefaultMaxReadBytes int64 = 256 << 20
+// fetchTimeout bounds one storage request, from when it has its share of
+// the read budget. A variable for tests.
+var fetchTimeout = 30 * time.Second
+
+// Defaults of ObjectsOptions fields left zero.
+const (
+	DefaultMaxReadBytes int64 = 256 << 20
+	DefaultMaxReadWait        = 2 * time.Minute
+)
 
 // ObjectsOptions configures Objects.
 type ObjectsOptions struct {
@@ -39,6 +45,14 @@ type ObjectsOptions struct {
 	// Hits and requests waiting on another's read are not counted. At least
 	// 4 MiB, the largest single read; zero means DefaultMaxReadBytes.
 	MaxReadBytes int64
+	// MaxReadWait caps how long a storage read waits for MaxReadBytes; past
+	// it the read fails, and with it every request waiting on its chunks.
+	// The wait does not count against the storage request's own timeout, so
+	// a busy cache answers later rather than failing. A reader's timeout to
+	// the cache should allow for it. Set it near the readers' timeout plus a
+	// margin: a wait much longer than the readers' timeout spends budget on
+	// fetches whose requesters have left. Zero means DefaultMaxReadWait.
+	MaxReadWait time.Duration
 }
 
 // MaxObjectSize is the largest object served: 5 TiB, the most S3 and GCS
@@ -93,6 +107,7 @@ type Objects struct {
 	source ObjectSource
 	disk   *diskcache.Cache
 	reads  *semaphore.Weighted
+	wait   time.Duration
 
 	sizeCalls singleflight.Group
 
@@ -119,10 +134,17 @@ func NewObjects(source ObjectSource, disk *diskcache.Cache, opts ObjectsOptions)
 		return nil, fmt.Errorf("readcache: MaxReadBytes %d is below %d, the largest single read",
 			opts.MaxReadBytes, maxRunChunks*chunkSize)
 	}
+	if opts.MaxReadWait == 0 {
+		opts.MaxReadWait = DefaultMaxReadWait
+	}
+	if opts.MaxReadWait < 0 {
+		return nil, fmt.Errorf("readcache: MaxReadWait %s is negative", opts.MaxReadWait)
+	}
 	return &Objects{
 		source:   source,
 		disk:     disk,
 		reads:    semaphore.NewWeighted(opts.MaxReadBytes),
+		wait:     opts.MaxReadWait,
 		sizes:    make(map[string]int64),
 		inflight: make(map[diskcache.Key]*chunkFetch),
 	}, nil
@@ -365,12 +387,10 @@ func bridgeable(cached []bool, a, b int) bool {
 
 func (o *Objects) fetchRun(key string, size, first int64, run []int, keys []diskcache.Key, lengths []int64, fill bool, results []*chunkFetch) {
 	lo, hi := run[0], run[len(run)-1]
+	offset := (first + int64(lo)) * chunkSize
 	// Not the request's context: other requests may be waiting on these
 	// chunks, and they should not fail because this client went away.
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-	defer cancel()
-	offset := (first + int64(lo)) * chunkSize
-	data, err := o.read(ctx, key, size, offset, (first+int64(hi))*chunkSize+lengths[hi]-offset)
+	data, err := o.read(context.Background(), key, size, offset, (first+int64(hi))*chunkSize+lengths[hi]-offset)
 	for _, i := range run {
 		f := &chunkFetch{err: err}
 		if err == nil {
@@ -407,17 +427,23 @@ func (o *Objects) release(k diskcache.Key, result *chunkFetch) {
 }
 
 // read reads [offset, offset+length) of key from storage, checking that
-// the object is size bytes. It waits while MaxReadBytes are being read.
+// the object is size bytes. It first waits, up to MaxReadWait, for its share
+// of MaxReadBytes; the storage request then has fetchTimeout.
 func (o *Objects) read(ctx context.Context, key string, size, offset, length int64) ([]byte, error) {
 	if !o.reads.TryAcquire(length) {
 		o.storageQueued.Add(1)
-		if err := o.reads.Acquire(ctx, length); err != nil {
-			return nil, err
+		waitCtx, cancel := context.WithTimeout(ctx, o.wait)
+		err := o.reads.Acquire(waitCtx, length)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("readcache: wait for read budget: %w", err)
 		}
 	}
 	defer o.reads.Release(length)
 	o.storageBytesReading.Add(length)
 	defer o.storageBytesReading.Add(-length)
+	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
 	o.storageReads.Add(1)
 	r, err := o.source.ReadRangeStream(ctx, key, offset, length)
 	if err != nil {
