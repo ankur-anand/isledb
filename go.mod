@@ -18,6 +18,7 @@ require (
 	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3
 	github.com/klauspost/compress v1.18.3
 	github.com/prometheus/client_golang v1.23.2
+	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sync v0.19.0
 	google.golang.org/api v0.264.0
 	google.golang.org/grpc v1.78.0
