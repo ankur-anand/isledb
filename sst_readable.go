@@ -6,14 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
-	"github.com/ankur-anand/isledb/internal/cacheclient"
 	"github.com/ankur-anand/isledb/internal/checksum"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/cockroachdb/pebble/v2/objstorage"
@@ -113,11 +110,9 @@ func fillsCaches(ctx context.Context) bool {
 // reads of the same part share one request.
 type sstFetcher struct {
 	store *blobstore.Store
-	cache *cacheclient.Client // nil: storage only
-	// warned is when a misconfigured cache was last logged, in Unix nanoseconds.
-	warned atomic.Int64
-	disk   *diskcache.Cache // nil: nothing is cached on disk
-	m      *ReaderMetrics
+	cache *readThroughCache // nil: storage only
+	disk  *diskcache.Cache  // nil: nothing is cached on disk
+	m     *ReaderMetrics
 	// smallLimit is the largest SST fetched whole; tests lower it to read
 	// small fixtures in chunks.
 	smallLimit int64
@@ -160,7 +155,7 @@ func (f *sstFetcher) object(meta sstMetadata) sstObject {
 func (f *sstFetcher) close() {
 	f.loads.Close(ErrReaderClosed)
 	if f.cache != nil {
-		f.cache.Close()
+		f.cache.close()
 	}
 }
 
@@ -238,36 +233,11 @@ func damaged(err error) bool {
 // cache is asked not to keep what it reads, as for a private scan.
 func (f *sstFetcher) readRange(ctx context.Context, o sstObject, off, length int64, fill bool) ([]byte, error) {
 	if f.cache != nil {
-		data, err := f.cache.ReadRange(ctx, o.path, o.objectSize, off, length, fill)
-		if err == nil {
-			f.m.ObserveReadCache("")
-			return data, nil
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		var cacheErr *cacheclient.Error
-		reason := cacheclient.ReasonInvalid
-		if errors.As(err, &cacheErr) {
-			reason = cacheErr.Reason
-		}
-		f.m.ObserveReadCache(reason)
-		if reason == cacheclient.ReasonRefused || reason == cacheclient.ReasonSizeMismatch || reason == cacheclient.ReasonInvalid {
-			f.warnCache(err)
+		if data, ok, err := f.cache.read(ctx, o.path, o.objectSize, off, length, fill); ok || err != nil {
+			return data, err
 		}
 	}
 	return f.readStorage(ctx, o.path, off, length)
-}
-
-// warnCache logs a cache failure that points at misconfiguration, at most
-// once a minute.
-func (f *sstFetcher) warnCache(err error) {
-	now := time.Now().UnixNano()
-	last := f.warned.Load()
-	if now-last < int64(time.Minute) || !f.warned.CompareAndSwap(last, now) {
-		return
-	}
-	slog.Warn("isledb: read cache refused a read; reading storage instead", "error", err)
 }
 
 func (f *sstFetcher) readStorage(ctx context.Context, path string, off, length int64) ([]byte, error) {

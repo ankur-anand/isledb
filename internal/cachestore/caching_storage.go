@@ -108,6 +108,33 @@ func (s *CachingStorage) ReadPage(ctx context.Context, path string) ([]byte, err
 	return data, nil
 }
 
+// ReadSnapshotSized reads through the wrapped storage's sized read, when it
+// has one.
+func (s *CachingStorage) ReadSnapshotSized(ctx context.Context, path string, size uint64) ([]byte, error) {
+	if sized, ok := s.storage.(manifest.SizedReader); ok {
+		return sized.ReadSnapshotSized(ctx, path, size)
+	}
+	return s.storage.ReadSnapshot(ctx, path)
+}
+
+// ReadPageSized is ReadPage, reading a page missing from the cache through
+// the wrapped storage's sized read, when it has one.
+func (s *CachingStorage) ReadPageSized(ctx context.Context, path string, size uint64) ([]byte, error) {
+	if data, ok := s.pageCache.Get(path); ok {
+		return data, nil
+	}
+	sized, ok := s.storage.(manifest.SizedReader)
+	if !ok {
+		return s.ReadPage(ctx, path)
+	}
+	data, err := sized.ReadPageSized(ctx, path, size)
+	if err != nil {
+		return nil, err
+	}
+	s.pageCache.Set(path, data)
+	return data, nil
+}
+
 func (s *CachingStorage) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
 	pages, ok := s.storage.(manifest.PageStorage)
 	if !ok {

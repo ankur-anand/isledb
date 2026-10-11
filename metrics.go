@@ -238,10 +238,11 @@ type ReaderMetrics struct {
 	SSTRangeReadLatency prometheus.Histogram
 	SSTRangeReadBytes   prometheus.Counter
 
-	// ReadCacheReads counts SST reads the read cache answered; the
-	// SSTRangeRead metrics count only reads from storage.
+	// ReadCacheReads counts reads of SSTs and manifest pages and snapshots
+	// the read cache answered; the SSTRangeRead metrics count only SST reads
+	// from storage.
 	ReadCacheReads prometheus.Counter
-	// ReadCacheFallbacks counts SST reads that went to storage because the
+	// ReadCacheFallbacks counts those reads that went to storage because the
 	// read cache failed, by reason: timeout, unavailable, not_found,
 	// size_mismatch, refused or invalid; or bypassed, sent straight to
 	// storage because the cache had stopped answering.
@@ -628,14 +629,14 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Namespace:   "isledb",
 			Subsystem:   "reader",
 			Name:        "read_cache_reads_total",
-			Help:        "SST reads the read cache answered.",
+			Help:        "Reads of SSTs and manifest pages and snapshots the read cache answered.",
 			ConstLabels: constLabels,
 		}),
 		ReadCacheFallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace:   "isledb",
 			Subsystem:   "reader",
 			Name:        "read_cache_fallbacks_total",
-			Help:        "SST reads that went to storage because the read cache failed, by reason.",
+			Help:        "Reads of SSTs and manifest pages and snapshots that went to storage because the read cache failed, by reason.",
 			ConstLabels: constLabels,
 		}, []string{"reason"}),
 	}

@@ -94,8 +94,9 @@ type ReaderOpenOptions struct {
 	// loaded from the manifest and cannot be extended by a reader.
 	Views ReaderViewPolicy
 
-	// ReadCache sends SST reads through a regional read cache (isledb
-	// cache) before storage. Leave URL empty to read storage directly.
+	// ReadCache sends reads of SSTs and manifest pages and snapshots through
+	// a regional read cache (isledb cache) before storage. Leave URL empty to
+	// read storage directly.
 	ReadCache ReadCacheOptions
 
 	Metrics *ReaderMetrics
@@ -154,15 +155,16 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	if err != nil {
 		return readerOptions{}, err
 	}
-	var readCache *cacheclient.Client
+	var readCache *readThroughCache
 	if opts.ReadCache.URL != "" {
-		readCache, err = cacheclient.New(cacheclient.Options{
+		client, err := cacheclient.New(cacheclient.Options{
 			URL: opts.ReadCache.URL, Token: opts.ReadCache.Token,
 			HTTPClient: opts.ReadCache.HTTPClient, Timeout: opts.ReadCache.Timeout,
 		})
 		if err != nil {
 			return readerOptions{}, fmt.Errorf("%w: read_cache: %v", ErrInvalidReaderOptions, err)
 		}
+		readCache = &readThroughCache{client: client, m: opts.Metrics}
 	}
 	return readerOptions{
 		CacheDir:       opts.CacheDir,

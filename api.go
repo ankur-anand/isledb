@@ -23,6 +23,9 @@ func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) ma
 
 func resolveManifestStorageWithCache(store *blobstore.Store, storage manifest.Storage, opts *readerOptions) manifest.Storage {
 	base := resolveManifestStorage(store, storage)
+	if opts != nil && opts.ReadCache != nil {
+		base = newManifestThroughCache(base, opts.ReadCache)
+	}
 	if opts != nil && opts.DisableManifestPageCache {
 		return base
 	}

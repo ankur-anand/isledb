@@ -25,3 +25,24 @@ type PageStorage interface {
 	WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error)
 	PagePath(level uint8, id string) string
 }
+
+// SizedReader is a Storage that reads snapshots and pages better when told
+// their size, the EncodedBytes of their reference.
+type SizedReader interface {
+	ReadSnapshotSized(ctx context.Context, path string, size uint64) ([]byte, error)
+	ReadPageSized(ctx context.Context, path string, size uint64) ([]byte, error)
+}
+
+func readSnapshot(ctx context.Context, storage Storage, ref ObjectRef) ([]byte, error) {
+	if sized, ok := storage.(SizedReader); ok && ref.EncodedBytes > 0 {
+		return sized.ReadSnapshotSized(ctx, ref.Path, ref.EncodedBytes)
+	}
+	return storage.ReadSnapshot(ctx, ref.Path)
+}
+
+func readPage(ctx context.Context, storage Storage, pages PageStorage, ref ObjectRef) ([]byte, error) {
+	if sized, ok := storage.(SizedReader); ok && ref.EncodedBytes > 0 {
+		return sized.ReadPageSized(ctx, ref.Path, ref.EncodedBytes)
+	}
+	return pages.ReadPage(ctx, ref.Path)
+}

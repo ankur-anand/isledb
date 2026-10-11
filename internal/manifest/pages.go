@@ -122,7 +122,7 @@ func (s *Store) pageReachableFrom(ctx context.Context, ref, candidate PageRef) (
 	if !ok {
 		return false, 0, fmt.Errorf("manifest page storage unsupported")
 	}
-	data, err := pages.ReadPage(ctx, ref.Path)
+	data, err := readPage(ctx, s.storage, pages, ref.ObjectRef)
 	if err != nil {
 		return false, 1, err
 	}

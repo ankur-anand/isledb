@@ -260,7 +260,9 @@ $ curl -s -H "Authorization: Bearer $TOKEN" http://cache:8090/v1/object/db/sstab
     -H 'Isledb-No-Cache: 1'
 ```
 
-## Not built yet
+## Reader support
 
-- The reader-side client: reading through the cache, the rules above, and
-  fallback.
+Readers read SSTs and manifest pages and snapshots through the cache, with
+fallback to storage, when configured with a read cache. Reading `CURRENT`
+through the relay, with the client rules above and the long poll, and the
+change feed through the cache, are not built yet.

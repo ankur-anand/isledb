@@ -3,7 +3,6 @@ package isledb
 import (
 	"time"
 
-	"github.com/ankur-anand/isledb/internal/cacheclient"
 	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
@@ -146,8 +145,9 @@ type readerOptions struct {
 
 	ViewPolicy ReaderViewPolicy
 
-	// ReadCache, when not nil, is tried for SST reads before storage.
-	ReadCache *cacheclient.Client
+	// ReadCache, when not nil, is tried for SST reads and manifest snapshots
+	// and pages before storage.
+	ReadCache *readThroughCache
 
 	Metrics *ReaderMetrics
 }
