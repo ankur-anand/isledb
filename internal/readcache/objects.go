@@ -27,6 +27,10 @@ const (
 	maxKnownSizes   = 1 << 20
 )
 
+// MaxObjectSize is the largest object served: 5 TiB, the most S3 and GCS
+// store in one object. It keeps chunk arithmetic far from overflowing.
+const MaxObjectSize int64 = 5 << 40
+
 // ErrSizeMismatch reports that an object's size in storage is not the size
 // a request gave for it.
 var ErrSizeMismatch = errors.New("readcache: object size mismatch")
@@ -178,6 +182,9 @@ func (o *Objects) Size(ctx context.Context, key string) (int64, error) {
 // served; an error returned before ready means nothing was written. With
 // fill false, chunks read from storage are served but not kept.
 func (o *Objects) WriteRange(ctx context.Context, w io.Writer, key string, size, offset, length int64, fill bool, ready func(CacheStatus)) error {
+	if size > MaxObjectSize {
+		return fmt.Errorf("readcache: size %d of %s is above %d", size, key, MaxObjectSize)
+	}
 	if offset < 0 || length < 0 || offset+length > size {
 		return fmt.Errorf("readcache: range [%d, %d) outside %s of size %d", offset, offset+length, key, size)
 	}

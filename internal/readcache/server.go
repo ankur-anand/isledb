@@ -117,8 +117,8 @@ func ObjectHandler(objects *Objects) http.Handler {
 		var size int64
 		if given := r.Header.Get(HeaderObjectSize); given != "" {
 			n, err := strconv.ParseInt(given, 10, 64)
-			if err != nil || n <= 0 {
-				http.Error(w, HeaderObjectSize+" must be a size in bytes", http.StatusBadRequest)
+			if err != nil || n <= 0 || n > MaxObjectSize {
+				http.Error(w, HeaderObjectSize+" must be a size in bytes, at most 5 TiB", http.StatusBadRequest)
 				return
 			}
 			size = n

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
@@ -334,6 +335,9 @@ func TestObjectHandler(t *testing.T) {
 		{"missing with size", blobstore.NewMemory("db").SSTPath("missing.sst"), []string{HeaderObjectSize, "10"}, http.StatusNotFound},
 		{"bad size", key, []string{HeaderObjectSize, "x"}, http.StatusBadRequest},
 		{"zero size", key, []string{HeaderObjectSize, "0"}, http.StatusBadRequest},
+		{"size above 5 TiB", key, []string{HeaderObjectSize, "5497558138881"}, http.StatusBadRequest},
+		{"largest int64", key, []string{HeaderObjectSize, "9223372036854775807"}, http.StatusBadRequest},
+		{"largest int64, last byte", key, []string{HeaderObjectSize, "9223372036854775807", "Range", "bytes=-1"}, http.StatusBadRequest},
 		{"wrong size", key, []string{HeaderObjectSize, "393215"}, http.StatusBadRequest},
 		{"past the end", key, sized("Range", "bytes=393216-"), http.StatusRequestedRangeNotSatisfiable},
 	} {
@@ -389,6 +393,18 @@ func TestObjectsWrongSizeIsRefusedAndHarmsNothing(t *testing.T) {
 	}
 	if n := src.attrs.Load(); n != 0 {
 		t.Fatalf("%d size lookups with the size given, want 0", n)
+	}
+}
+
+func TestObjectsRefuseSizesAboveTheLimit(t *testing.T) {
+	o, src, key, _ := newObjects(t, chunkSize)
+	for _, c := range [][2]int64{{MaxObjectSize + 1, 0}, {math.MaxInt64, 0}, {math.MaxInt64, math.MaxInt64 - 1}} {
+		if err := o.WriteRange(soon(t), io.Discard, key, c[0], c[1], 1, true, nil); err == nil {
+			t.Fatalf("size %d at %d: no error", c[0], c[1])
+		}
+	}
+	if n := src.reads.Load(); n != 0 {
+		t.Fatalf("%d storage reads for sizes above the limit, want 0", n)
 	}
 }
 
