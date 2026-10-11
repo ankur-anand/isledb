@@ -19,10 +19,11 @@ func startServer(t *testing.T, src *fakeSource, longPoll time.Duration) (*Relay,
 }
 
 type answer struct {
-	status   int
-	position uint64
-	age      time.Duration
-	body     string
+	status    int
+	position  uint64
+	age       time.Duration
+	ageHeader bool
+	body      string
 }
 
 func fetch(t *testing.T, url string) answer {
@@ -38,6 +39,7 @@ func fetch(t *testing.T, url string) answer {
 		a.position, _ = strconv.ParseUint(resp.Header.Get(HeaderPosition), 10, 64)
 		ms, _ := strconv.ParseInt(resp.Header.Get(HeaderAgeMillis), 10, 64)
 		a.age = time.Duration(ms) * time.Millisecond
+		a.ageHeader = resp.Header.Get(HeaderAgeMillis) != ""
 	}
 	return a
 }
@@ -83,8 +85,8 @@ func TestLongPollAnswersOnAdvanceOrTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	if a := fetch(t, server.URL+"/v1/current?after=3"); a.status != http.StatusOK || a.position != 3 {
-		t.Fatalf("timed-out long poll: %+v, want the copy at position 3", a)
+	if a := fetch(t, server.URL+"/v1/current?after=3"); a.status != http.StatusOK || a.position != 3 || a.body != "" {
+		t.Fatalf("timed-out long poll: %+v, want position 3 and no body", a)
 	}
 	if took := time.Since(start); took < 200*time.Millisecond {
 		t.Fatalf("long poll answered after %s, want it held for the 200ms timeout", took)
@@ -99,8 +101,8 @@ func TestLongPollAnswersOnAdvanceOrTimeout(t *testing.T) {
 	}
 	select {
 	case a := <-got:
-		if a.position != 4 {
-			t.Fatalf("long poll answered position %d, want 4", a.position)
+		if a.position != 4 || a.body != "" || a.ageHeader {
+			t.Fatalf("long poll answered %+v, want position 4 only", a)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("long poll did not answer when the position advanced")

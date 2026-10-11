@@ -127,6 +127,9 @@ type chunkFetch struct {
 }
 
 func NewObjects(source ObjectSource, disk *diskcache.Cache, opts ObjectsOptions) (*Objects, error) {
+	if source == nil || disk == nil {
+		return nil, errors.New("readcache: NewObjects needs a source and a disk cache")
+	}
 	if opts.MaxReadBytes == 0 {
 		opts.MaxReadBytes = DefaultMaxReadBytes
 	}

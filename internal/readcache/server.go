@@ -25,44 +25,46 @@ const (
 
 // Handler serves the relay's copy of CURRENT:
 //
-//	GET /v1/current            the copy now
-//	GET /v1/current?after=N    the copy once its position passes N, or after
-//	                           longPoll, whichever comes first
+//	GET /v1/current            the copy, with its position and age
+//	GET /v1/current?after=N    its position only, once the position passes N
+//	                           or after longPoll, whichever comes first
 //
-// Both answer 200 with CURRENT's bytes and the position and age headers, and
-// 503 at once before the relay has read CURRENT once. A long poll that times out
-// answers with the copy as it is, at a position not past N.
+// A long poll is a doorbell: a client that sees a new position reads CURRENT
+// with a plain GET, so CURRENT reaches readers by one path. Both answer 503
+// at once before the relay has read CURRENT once. A long poll that times out
+// answers with a position not past N.
 func Handler(relay *Relay, longPoll time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/current", func(w http.ResponseWriter, r *http.Request) {
-		var (
-			current Current
-			ok      bool
-		)
-		if after := r.URL.Query().Get("after"); after != "" {
-			n, err := strconv.ParseUint(after, 10, 64)
-			if err != nil {
-				http.Error(w, "after must be a log position", http.StatusBadRequest)
+		after := r.URL.Query().Get("after")
+		if after == "" {
+			current, ok := relay.Current()
+			if !ok {
+				http.Error(w, "CURRENT not read yet", http.StatusServiceUnavailable)
 				return
 			}
-			// With no copy yet, there is nothing to wait for: answer at once
-			// so the client retries rather than hold for the whole timeout.
-			if _, loaded := relay.Current(); loaded {
-				ctx, cancel := context.WithTimeout(r.Context(), longPoll)
-				defer cancel()
-				current, ok = relay.Wait(ctx, n)
-			}
-		} else {
-			current, ok = relay.Current()
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set(HeaderPosition, strconv.FormatUint(current.Position, 10))
+			w.Header().Set(HeaderAgeMillis, strconv.FormatInt(ceilMillis(current.Age), 10))
+			_, _ = w.Write(current.Data)
+			return
 		}
-		if !ok {
+		n, err := strconv.ParseUint(after, 10, 64)
+		if err != nil {
+			http.Error(w, "after must be a log position", http.StatusBadRequest)
+			return
+		}
+		// With no copy yet, there is nothing to wait for: answer at once so
+		// the client retries rather than hold for the whole timeout.
+		if _, loaded := relay.Current(); !loaded {
 			http.Error(w, "CURRENT not read yet", http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		ctx, cancel := context.WithTimeout(r.Context(), longPoll)
+		defer cancel()
+		current, _ := relay.Wait(ctx, n)
 		w.Header().Set(HeaderPosition, strconv.FormatUint(current.Position, 10))
-		w.Header().Set(HeaderAgeMillis, strconv.FormatInt(ceilMillis(current.Age), 10))
-		_, _ = w.Write(current.Data)
+		w.WriteHeader(http.StatusOK)
 	})
 	return mux
 }
@@ -171,8 +173,9 @@ func objectError(w http.ResponseWriter, r *http.Request, key string, err error) 
 	case errors.Is(err, ErrSizeMismatch):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
+		// The details stay in the log: they can name buckets and providers.
 		slog.Warn("readcache: serve object", "key", key, "error", err)
-		http.Error(w, "storage: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "storage error", http.StatusBadGateway)
 	}
 }
 

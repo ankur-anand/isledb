@@ -322,6 +322,15 @@ func TestObjectHandler(t *testing.T) {
 	if a := get(key); a.status != http.StatusOK || !bytes.Equal(a.body, data) {
 		t.Fatalf("whole object without a size: %d, %d bytes", a.status, len(a.body))
 	}
+	cold := src.SSTPath("000002.sst")
+	if _, err := src.Write(context.Background(), cold, data); err != nil {
+		t.Fatal(err)
+	}
+	src.fail.Store(true)
+	if a := get(cold, sized()...); a.status != http.StatusBadGateway || string(a.body) != "storage error\n" {
+		t.Fatalf("storage failure: %d %q, want 502 without the storage error's details", a.status, a.body)
+	}
+	src.fail.Store(false)
 	reads := src.reads.Load()
 	head, _ := http.NewRequest(http.MethodHead, server.URL+"/v1/object/"+key, nil)
 	head.Header.Set(HeaderObjectSize, "393216")
@@ -531,7 +540,7 @@ func TestObjectsReadLimitQueuesStorageReadsNotHits(t *testing.T) {
 	}
 }
 
-func TestObjectsReadLimitBelowTheLargestReadIsRefused(t *testing.T) {
+func TestNewObjectsRefusesBadArguments(t *testing.T) {
 	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
 	if err != nil {
 		t.Fatal(err)
@@ -543,6 +552,12 @@ func TestObjectsReadLimitBelowTheLargestReadIsRefused(t *testing.T) {
 	}
 	if _, err := NewObjects(src, disk, ObjectsOptions{MaxReadWait: -time.Second}); err == nil {
 		t.Fatal("NewObjects accepted a negative wait")
+	}
+	if _, err := NewObjects(src, nil, ObjectsOptions{}); err == nil {
+		t.Fatal("NewObjects accepted no disk cache")
+	}
+	if _, err := NewObjects(nil, disk, ObjectsOptions{}); err == nil {
+		t.Fatal("NewObjects accepted no source")
 	}
 }
 
