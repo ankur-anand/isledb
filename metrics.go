@@ -237,6 +237,15 @@ type ReaderMetrics struct {
 	SSTRangeReadErrors  prometheus.Counter
 	SSTRangeReadLatency prometheus.Histogram
 	SSTRangeReadBytes   prometheus.Counter
+
+	// ReadCacheReads counts SST reads the read cache answered; the
+	// SSTRangeRead metrics count only reads from storage.
+	ReadCacheReads prometheus.Counter
+	// ReadCacheFallbacks counts SST reads that went to storage because the
+	// read cache failed, by reason: timeout, unavailable, not_found,
+	// size_mismatch, refused or invalid; or bypassed, sent straight to
+	// storage because the cache had stopped answering.
+	ReadCacheFallbacks *prometheus.CounterVec
 }
 
 func (m *ReaderMetrics) incCounter(counter prometheus.Counter) {
@@ -399,6 +408,21 @@ func (m *ReaderMetrics) ObserveSSTRangeRead(d time.Duration, sizeBytes int64, er
 	}
 	if sizeBytes > 0 {
 		m.addCounter(m.SSTRangeReadBytes, float64(sizeBytes))
+	}
+}
+
+// ObserveReadCache records an SST read sent to the read cache: answered
+// when reason is empty, else fallen back to storage for reason.
+func (m *ReaderMetrics) ObserveReadCache(reason string) {
+	if m == nil {
+		return
+	}
+	if reason == "" {
+		m.incCounter(m.ReadCacheReads)
+		return
+	}
+	if m.ReadCacheFallbacks != nil {
+		m.ReadCacheFallbacks.WithLabelValues(reason).Inc()
 	}
 }
 
@@ -600,5 +624,19 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Help:        "Total number of SST bytes fetched through range-read requests.",
 			ConstLabels: constLabels,
 		}),
+		ReadCacheReads: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "read_cache_reads_total",
+			Help:        "SST reads the read cache answered.",
+			ConstLabels: constLabels,
+		}),
+		ReadCacheFallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "read_cache_fallbacks_total",
+			Help:        "SST reads that went to storage because the read cache failed, by reason.",
+			ConstLabels: constLabels,
+		}, []string{"reason"}),
 	}
 }

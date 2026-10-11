@@ -160,6 +160,7 @@ else, including `manifest/CURRENT` and `maintenance/HEAD`, answers 403.
 |---|---|
 | `Content-Range` | On 206: `bytes a-b/size`. On 416: `bytes */size`. |
 | `Content-Length` | Bytes in the body |
+| `Isledb-Error` | On an error response, its kind where the status alone does not say: `size-mismatch` on a 400 |
 | `Isledb-Cache` | How the first 4 MiB of the response were served: `hit` (all from disk), `shared` (read from storage by another request in flight, none by this one), `miss` (this request read from storage) |
 | `Accept-Ranges` | `bytes` |
 | `Content-Type` | `application/octet-stream` |
@@ -170,7 +171,7 @@ else, including `manifest/CURRENT` and `maintenance/HEAD`, answers 403.
 |---|---|---|
 | 200 | Whole object | Use it |
 | 206 | The range asked for | Use it |
-| 400 | `Isledb-Object-Size` is not a positive number up to 5 TiB, or is not the object's size in storage | Read storage directly; report a bug |
+| 400 | `Isledb-Object-Size` is not a positive number up to 5 TiB, or is not the object's size in storage; the latter carries `Isledb-Error: size-mismatch` | Read storage directly; report a bug |
 | 401 | No valid credentials | Fix the token or certificate; read storage directly meanwhile |
 | 403 | Not an immutable object of a database the cache serves | Read storage directly; report a bug |
 | 404 | The object is not in storage | Retry storage directly once, then report not found |
@@ -185,9 +186,10 @@ alone.
 
 **The size**
 
-- The size must be the object's full stored length. For an SST that is
-  `max(Size, BloomOffset+BloomLength)`, because the Bloom sidecar is stored
-  after the SST's `Size`. For a change batch it is the batch's `Size`.
+- The size must be the object's full stored length. For an SST with a Bloom
+  sidecar that is `BloomOffset + BloomLength + 16`: the sidecar follows the
+  SST's `Size`, and a 16-byte trailer follows the sidecar. Without one, it is
+  `Size`. For a change batch it is the batch's `Size`.
 - Chunks are kept per key and size. A request with a wrong size never reads
   or replaces chunks kept for the right one.
 - Every read from storage checks the size against the size storage reports,

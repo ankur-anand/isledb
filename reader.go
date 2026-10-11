@@ -187,6 +187,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:       opts.CacheDir,
 		metrics:        opts.Metrics,
 	}
+	reader.fetcher.cache = opts.ReadCache
 	reader.endRead = reader.lifecycleMu.RUnlock
 	reader.nextReady = make(chan struct{})
 	if reader.diskCache != nil {

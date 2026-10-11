@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal/cacheclient"
 	"github.com/ankur-anand/isledb/internal/checksum"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/cockroachdb/pebble/v2/objstorage"
@@ -44,6 +47,9 @@ type sstObject struct {
 	checksum      string
 	bloomChecksum string
 	key           [32]byte
+	// objectSize is the stored object's length: the SST, then any Bloom
+	// sidecar, whatever its format, and the sidecar's trailer.
+	objectSize int64
 	// whole reports that the SST is fetched and cached whole: it is small, or
 	// its metadata offset is unknown (an SST from before offsets were recorded).
 	whole bool
@@ -58,6 +64,10 @@ func newSSTObject(store *blobstore.Store, meta sstMetadata, smallLimit int64) ss
 		checksum:   meta.Checksum,
 		key: sha256.Sum256([]byte(meta.ID + "\x00" + meta.Checksum + "\x00" +
 			strconv.FormatInt(meta.Size, 10))),
+	}
+	o.objectSize = meta.Size
+	if meta.Bloom.Length > 0 {
+		o.objectSize = meta.Bloom.Offset + meta.Bloom.Length + bloomTrailerLen
 	}
 	if hasUsableBloom(meta) {
 		o.bloomOffset, o.bloomLength, o.bloomChecksum = meta.Bloom.Offset, meta.Bloom.Length, meta.Bloom.Checksum
@@ -103,8 +113,11 @@ func fillsCaches(ctx context.Context) bool {
 // reads of the same part share one request.
 type sstFetcher struct {
 	store *blobstore.Store
-	disk  *diskcache.Cache // nil: nothing is cached on disk
-	m     *ReaderMetrics
+	cache *cacheclient.Client // nil: storage only
+	// warned is when a misconfigured cache was last logged, in Unix nanoseconds.
+	warned atomic.Int64
+	disk   *diskcache.Cache // nil: nothing is cached on disk
+	m      *ReaderMetrics
 	// smallLimit is the largest SST fetched whole; tests lower it to read
 	// small fixtures in chunks.
 	smallLimit int64
@@ -144,7 +157,12 @@ func (f *sstFetcher) object(meta sstMetadata) sstObject {
 	return newSSTObject(f.store, meta, f.smallLimit)
 }
 
-func (f *sstFetcher) close() { f.loads.Close(ErrReaderClosed) }
+func (f *sstFetcher) close() {
+	f.loads.Close(ErrReaderClosed)
+	if f.cache != nil {
+		f.cache.Close()
+	}
+}
 
 func (f *sstFetcher) diskRead(k diskcache.Key, size int64, p []byte, off int64) bool {
 	return f.disk != nil && f.disk.ReadAt(k, size, p, off)
@@ -215,7 +233,44 @@ func damaged(err error) bool {
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-func (f *sstFetcher) readRange(ctx context.Context, path string, off, length int64) ([]byte, error) {
+// readRange reads [off, off+length) of o: through the read cache when there
+// is one, else, or when the cache fails, from storage. With fill false the
+// cache is asked not to keep what it reads, as for a private scan.
+func (f *sstFetcher) readRange(ctx context.Context, o sstObject, off, length int64, fill bool) ([]byte, error) {
+	if f.cache != nil {
+		data, err := f.cache.ReadRange(ctx, o.path, o.objectSize, off, length, fill)
+		if err == nil {
+			f.m.ObserveReadCache("")
+			return data, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var cacheErr *cacheclient.Error
+		reason := cacheclient.ReasonInvalid
+		if errors.As(err, &cacheErr) {
+			reason = cacheErr.Reason
+		}
+		f.m.ObserveReadCache(reason)
+		if reason == cacheclient.ReasonRefused || reason == cacheclient.ReasonSizeMismatch || reason == cacheclient.ReasonInvalid {
+			f.warnCache(err)
+		}
+	}
+	return f.readStorage(ctx, o.path, off, length)
+}
+
+// warnCache logs a cache failure that points at misconfiguration, at most
+// once a minute.
+func (f *sstFetcher) warnCache(err error) {
+	now := time.Now().UnixNano()
+	last := f.warned.Load()
+	if now-last < int64(time.Minute) || !f.warned.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("isledb: read cache refused a read; reading storage instead", "error", err)
+}
+
+func (f *sstFetcher) readStorage(ctx context.Context, path string, off, length int64) ([]byte, error) {
 	start := time.Now()
 	reader, err := f.store.ReadRangeStream(ctx, path, off, length)
 	if err != nil {
@@ -250,7 +305,7 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 		if o.bloomLength > 0 && o.bloomOffset >= o.size {
 			end = o.bloomOffset + o.bloomLength
 		}
-		data, err := f.readRange(ctx, o.path, 0, end)
+		data, err := f.readRange(ctx, o, 0, end, true)
 		if err != nil {
 			return nil, fmt.Errorf("read sst %s: %w", o.id, err)
 		}
@@ -275,7 +330,7 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 // one request and stored.
 func (f *sstFetcher) meta(ctx context.Context, o sstObject) ([]byte, error) {
 	return f.load(ctx, o.entry(diskcache.KindMeta, 0), func(ctx context.Context) ([]byte, error) {
-		data, err := f.readRange(ctx, o.path, o.metaOffset, o.size-o.metaOffset)
+		data, err := f.readRange(ctx, o, o.metaOffset, o.size-o.metaOffset, true)
 		if err != nil {
 			return nil, fmt.Errorf("read sst %s metadata: %w", o.id, err)
 		}
@@ -307,7 +362,7 @@ func (f *sstFetcher) bloom(ctx context.Context, o sstObject) ([]byte, error) {
 	} else {
 		var err error
 		data, err = f.load(ctx, k, func(ctx context.Context) ([]byte, error) {
-			data, err := f.readRange(ctx, o.path, o.bloomOffset, o.bloomLength)
+			data, err := f.readRange(ctx, o, o.bloomOffset, o.bloomLength, true)
 			if err == nil && validateBloomChecksum(o.bloomChecksum, data) == nil {
 				f.diskStore(k, data)
 			}
@@ -472,7 +527,7 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 		}
 		f.mu.Unlock()
 
-		fl.data, fl.err = f.readRange(ctx, o.path, start, stop-start)
+		fl.data, fl.err = f.readRange(ctx, o, start, stop-start, store)
 		if fl.err == nil && store {
 			// Stored before the request leaves inflight, so a reader that
 			// no longer finds it in flight finds it on disk.

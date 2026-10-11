@@ -446,6 +446,7 @@ type ReaderOpenOptions struct {
     BlockCacheSize int64
     BloomCacheSize int64
     Views          ReaderViewPolicy
+    ReadCache      ReadCacheOptions
     Metrics        *ReaderMetrics
 }
 
@@ -453,6 +454,13 @@ type ReaderViewPolicy struct {
     RefreshAfter time.Duration
     Manual       bool
     MaxLag       time.Duration
+}
+
+type ReadCacheOptions struct {
+    URL        string
+    Token      string
+    HTTPClient *http.Client
+    Timeout    time.Duration
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
@@ -469,7 +477,31 @@ sizes select the defaults; negative sizes are rejected.
 | `Views.RefreshAfter` | 1 minute | How often the view is refreshed in the background (at least 1 second) |
 | `Views.Manual` | `false` | Leave publishing newer views to the application; see [Prepare views before reads switch to them](#prepare-views-before-reads-switch-to-them) |
 | `Views.MaxLag` | 5 minutes, or a quarter of `MaxPinnedViewAge` if shorter | In manual mode, how long the published view may stay outdated before the reader publishes the newest view itself. A value set explicitly must be below half the store's `MaxPinnedViewAge`, or open fails with `ErrInvalidReaderOptions`; if the store's first writer later sets a shorter age, half of it is used and a warning logged once |
+| `ReadCache.URL` | empty | A regional read cache (`isledb cache`) to read SSTs through before storage; empty reads storage directly |
+| `ReadCache.Token` | empty | Sent as `Authorization: Bearer <token>` |
+| `ReadCache.HTTPClient` | `nil` | For TLS, client certificates or a custom transport; `nil` selects a client with connection reuse |
+| `ReadCache.Timeout` | 10 seconds | How long a read waits for the cache before reading storage instead |
 | `Metrics` | `nil` | Optional Prometheus observations |
+
+With a read cache, every SST read is sent to it first: a read the cache
+cannot answer, for any reason (down, slow, refused, missing object), is read
+from storage instead, and everything read is verified as it is from storage,
+so the cache can make reads slower but never wrong. A scan's reads past the
+first 64 KiB of each SST ask the cache not to keep what it reads.
+A cache that stops answering costs a few reads one timeout each, then is
+bypassed: after 3 timeouts or connection failures in a row, reads go
+straight to storage for 5 seconds, then one read tries the cache again, and
+the first answer from it ends the bypass. Refusals and size mismatches do
+not cause a bypass; the cache is answering, and the next read would fail the
+same way.
+
+`ReaderMetrics.ReadCacheReads` counts reads the cache answered and
+`ReadCacheFallbacks` those that went to storage, by reason: `timeout`,
+`unavailable`, `not_found`, `size_mismatch`, `refused`, `invalid`, or
+`bypassed` while the cache is skipped. A refused read or a size mismatch
+points at a misconfiguration and is also logged, at most once a minute; the
+start and end of a bypass are logged too. A bad URL fails `OpenReader` with
+`ErrInvalidReaderOptions`. Manifest reads and `CURRENT` still go to storage.
 
 ```go
 func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error)
