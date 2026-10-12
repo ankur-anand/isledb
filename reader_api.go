@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/http"
@@ -94,9 +95,10 @@ type ReaderOpenOptions struct {
 	// loaded from the manifest and cannot be extended by a reader.
 	Views ReaderViewPolicy
 
-	// ReadCache sends reads of SSTs and manifest pages and snapshots through
-	// a regional read cache (isledb cache) before storage. Leave URL empty to
-	// read storage directly.
+	// ReadCache sends reads of SSTs and manifest pages and snapshots, and
+	// refreshes' reads of CURRENT, through a regional read cache (isledb
+	// cache) before storage, and refreshes as soon as the cache sees a new
+	// commit. Leave URL empty to read storage directly.
 	ReadCache ReadCacheOptions
 
 	Metrics *ReaderMetrics
@@ -120,6 +122,10 @@ type ReadCacheOptions struct {
 	// instead. Zero selects 10 seconds. The cache's own wait for read budget
 	// should be near it.
 	Timeout time.Duration
+	// MaxCurrentAge is the oldest copy of CURRENT a refresh takes from the
+	// cache; an older one, from a cache that cannot reach storage, is read
+	// from storage instead. Zero selects 5 seconds.
+	MaxCurrentAge time.Duration
 }
 
 // DefaultReaderOpenOptions returns default reader options using cacheDir for
@@ -156,6 +162,9 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		return readerOptions{}, err
 	}
 	var readCache *readThroughCache
+	if opts.ReadCache.MaxCurrentAge < 0 {
+		return readerOptions{}, fmt.Errorf("%w: read_cache.max_current_age=%s", ErrInvalidReaderOptions, opts.ReadCache.MaxCurrentAge)
+	}
 	if opts.ReadCache.URL != "" {
 		client, err := cacheclient.New(cacheclient.Options{
 			URL: opts.ReadCache.URL, Token: opts.ReadCache.Token,
@@ -164,7 +173,8 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 		if err != nil {
 			return readerOptions{}, fmt.Errorf("%w: read_cache: %v", ErrInvalidReaderOptions, err)
 		}
-		readCache = &readThroughCache{client: client, m: opts.Metrics}
+		readCache = &readThroughCache{client: client, m: opts.Metrics,
+			maxCurrentAge: cmp.Or(opts.ReadCache.MaxCurrentAge, defaultMaxCurrentAge)}
 	}
 	return readerOptions{
 		CacheDir:       opts.CacheDir,

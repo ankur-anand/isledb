@@ -98,7 +98,7 @@ func TestManifestSnapshotsThroughTheReadCache(t *testing.T) {
 			t.Fatal(err)
 		}
 		metrics := DefaultReaderMetrics(nil)
-		storage := newManifestThroughCache(manifest.NewBlobStoreBackend(store), &readThroughCache{client: client, m: metrics})
+		storage := newManifestThroughCache(manifest.NewBlobStoreBackend(store), &readThroughCache{client: client, m: metrics}, store.Prefix())
 		data, err := storage.(manifest.RefReader).ReadSnapshotRef(ctx, ref)
 		if err != nil {
 			t.Fatal(err)

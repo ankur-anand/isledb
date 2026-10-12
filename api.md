@@ -457,10 +457,11 @@ type ReaderViewPolicy struct {
 }
 
 type ReadCacheOptions struct {
-    URL        string
-    Token      string
-    HTTPClient *http.Client
-    Timeout    time.Duration
+    URL           string
+    Token         string
+    HTTPClient    *http.Client
+    Timeout       time.Duration
+    MaxCurrentAge time.Duration
 }
 
 func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
@@ -481,6 +482,7 @@ sizes select the defaults; negative sizes are rejected.
 | `ReadCache.Token` | empty | Sent as `Authorization: Bearer <token>` |
 | `ReadCache.HTTPClient` | `nil` | For TLS, client certificates or a custom transport; `nil` selects a client with connection reuse |
 | `ReadCache.Timeout` | 10 seconds | How long a read waits for the cache before reading storage instead |
+| `ReadCache.MaxCurrentAge` | 5 seconds | The oldest copy of `CURRENT` a refresh takes from the cache |
 | `Metrics` | `nil` | Optional Prometheus observations |
 
 With a read cache, every read of an SST, a manifest page or a manifest
@@ -508,10 +510,33 @@ for the next ten minutes, and its retry succeeds.
 `bypassed` while the cache is skipped, `checksum_mismatch` for bytes from
 the cache that failed their checksum, or `after_damage` for reads of an SST
 found damaged recently. A steady count of the last two points at damaged
-chunks on the cache's disk. A refused read or a size mismatch
+chunks on the cache's disk. `ReadCacheCurrent` counts refreshes that asked
+the cache for `CURRENT`, by outcome: `relayed`, or `too_old`, `behind` or
+`failed`, which read storage instead; `ReadCacheCurrentAge` is the age of the
+last copy the cache gave; `ReadCacheDoorbells` counts long-poll answers:
+`rang`, `quiet` or `error`. A refused read or a size mismatch
 points at a misconfiguration and is also logged, at most once a minute; the
 start and end of a bypass are logged too. A bad URL fails `OpenReader` with
-`ErrInvalidReaderOptions`. `CURRENT` still goes to storage.
+`ErrInvalidReaderOptions`.
+
+**Refreshes through the cache.** A refresh reads `CURRENT` from the cache's
+copy, which the cache reads from storage twice a second. The copy comes with
+its age, and the view's lifetime is counted from when the cache read it from
+storage, never from when the reader got it. A copy older than
+`MaxCurrentAge`, from a cache that cannot reach storage, or behind the view
+the reader already has, is not taken: the refresh reads storage instead.
+`Refresh` always reads storage, so it sees every commit made before it was
+called. Opening a reader reads storage too. Because the age is subtracted, a reader that
+refreshes through the cache shows a view loaded a little earlier, by the
+copy's age, than one that reads storage: `view_loaded_timestamp` sits behind on cached
+readers by the copy's age, normally under a second, by design.
+
+The reader also holds a long poll on the cache, which answers as soon as the
+cache sees a new commit; the reader then refreshes as `RequestRefresh` does.
+New commits reach readers within about half a second, with `RefreshAfter`
+left as a safety net that can be set long. If the long poll fails, the
+reader retries it after a random wait of up to a few seconds, growing to 30
+seconds while it keeps failing; refreshes on `RefreshAfter` go on regardless.
 
 ```go
 func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error)

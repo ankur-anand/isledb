@@ -96,9 +96,10 @@ body is empty.
    storage directly.
 2. **Load time = the time the request was sent (own clock) − the age.** This
    is when the view's `MaxPinnedViewAge` starts.
-3. **Older means nothing new.** A `CURRENT` from the cache at a position
-   below the reader's published view means "no change", not "the store went
-   back".
+3. **Older means read storage.** A `CURRENT` from the cache at a position
+   below the reader's published view, as a lagging replica can give, is not
+   replayed: the refresh reads `CURRENT` from storage instead, which also
+   renews the view.
 4. **`Refresh` reads storage directly.** The relay can be up to one poll
    interval behind.
 5. **Long poll.** Ask with `after=<published position>`; on an answer above
@@ -262,7 +263,7 @@ $ curl -s -H "Authorization: Bearer $TOKEN" http://cache:8090/v1/object/db/sstab
 
 ## Reader support
 
-Readers read SSTs and manifest pages and snapshots through the cache, with
-fallback to storage, when configured with a read cache. Reading `CURRENT`
-through the relay, with the client rules above and the long poll, and the
-change feed through the cache, are not built yet.
+Readers configured with a read cache read SSTs, manifest pages and snapshots
+through it, with fallback to storage, and refresh through the relay with the
+client rules above and the long poll. The change feed does not use the
+cache yet.

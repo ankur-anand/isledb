@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/cacheclient"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
+
+// defaultMaxCurrentAge is ReadCacheOptions.MaxCurrentAge when it is zero.
+const defaultMaxCurrentAge = 5 * time.Second
 
 // Fallback reasons of the Reader's own, beside the read cache client's.
 const (
@@ -24,8 +29,9 @@ const (
 // readThroughCache sends a Reader's immutable reads to the read cache before
 // storage, and counts what happens.
 type readThroughCache struct {
-	client *cacheclient.Client
-	m      *ReaderMetrics
+	client        *cacheclient.Client
+	m             *ReaderMetrics
+	maxCurrentAge time.Duration
 	// warned is when a misconfigured cache was last logged, in Unix
 	// nanoseconds.
 	warned atomic.Int64
@@ -75,6 +81,7 @@ func (c *readThroughCache) close() { c.client.Close() }
 type manifestThroughCache struct {
 	manifest.Storage
 	cache *readThroughCache
+	db    string // the database's prefix as the cache names it
 }
 
 // manifestPagesThroughCache is manifestThroughCache over a storage with
@@ -84,8 +91,8 @@ type manifestPagesThroughCache struct {
 	manifest.PageStorage
 }
 
-func newManifestThroughCache(base manifest.Storage, cache *readThroughCache) manifest.Storage {
-	s := &manifestThroughCache{Storage: base, cache: cache}
+func newManifestThroughCache(base manifest.Storage, cache *readThroughCache, prefix string) manifest.Storage {
+	s := &manifestThroughCache{Storage: base, cache: cache, db: cacheDB(prefix)}
 	if pages, ok := base.(manifest.PageStorage); ok {
 		return &manifestPagesThroughCache{manifestThroughCache: s, PageStorage: pages}
 	}
@@ -120,4 +127,114 @@ func (s *manifestThroughCache) readRef(ctx context.Context, ref manifest.ObjectR
 	}
 	s.cache.m.ObserveReadCache(reasonChecksumMismatch)
 	return nil, false, nil
+}
+
+// cacheDB is how the read cache names the database at prefix.
+func cacheDB(prefix string) string {
+	if prefix = strings.Trim(prefix, "/"); prefix == "" {
+		return "/"
+	}
+	return prefix
+}
+
+// currentRead is a refresh's request for CURRENT, carried in its context: a
+// read without one, or with direct set, goes to storage. A copy from the
+// cache is taken only if it is younger than the limit and not behind the
+// published view, at minPosition; age reports the copy's age when it is.
+type currentRead struct {
+	direct      bool
+	minPosition uint64
+	age         time.Duration
+}
+
+type currentReadKey struct{}
+
+// ReadCurrent reads CURRENT from the cache for a refresh that asks for it,
+// and from storage otherwise, or when the cache's copy cannot be taken.
+func (s *manifestThroughCache) ReadCurrent(ctx context.Context) ([]byte, string, error) {
+	read, _ := ctx.Value(currentReadKey{}).(*currentRead)
+	if read == nil || read.direct {
+		return s.Storage.ReadCurrent(ctx)
+	}
+	current, err := s.cache.client.ReadCurrent(ctx, s.db)
+	outcome := "relayed"
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return nil, "", ctx.Err()
+	case err != nil:
+		outcome = "failed"
+	case current.Age > s.cache.maxCurrentAge:
+		outcome = "too_old"
+	case current.Position < read.minPosition:
+		outcome = "behind"
+	}
+	s.cache.m.ObserveReadCacheCurrent(outcome, current.Age)
+	if outcome != "relayed" {
+		return s.Storage.ReadCurrent(ctx)
+	}
+	read.age = current.Age
+	return current.Data, "", nil
+}
+
+// runDoorbell holds a long poll on the cache for a position past the
+// newest view the Reader has loaded, published or held, and requests a
+// refresh when one comes, until ctx ends. It polls past what the Reader has,
+// not what the cache said: with replicas, the refresh can read a replica
+// still behind the one that rang, and must be rung again.
+func (r *Reader) runDoorbell(ctx context.Context, cache *readThroughCache, db string) {
+	failures := 0
+	for {
+		loaded := r.loadedPosition()
+		position, err := cache.client.WaitCurrent(ctx, db, loaded)
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case err != nil:
+			r.metrics.ObserveReadCacheDoorbell("error")
+			failures++
+			// Random, so readers whose cache restarted do not return together.
+			wait := time.Duration(rand.Int64N(int64(min(30*time.Second, time.Second<<min(failures, 5)))))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+			continue
+		case position > loaded:
+			r.metrics.ObserveReadCacheDoorbell("rang")
+			r.RequestRefresh()
+			// A cache ahead of the refresh's answer rings again at once:
+			// wait for the refresh, at most as long as refresh requests are
+			// spaced.
+			r.awaitLoaded(ctx, loaded, requestRefreshGap)
+		default:
+			r.metrics.ObserveReadCacheDoorbell("quiet")
+		}
+		failures = 0
+	}
+}
+
+// loadedPosition is the position of the newest view loaded: the published
+// one, or the one Manual mode holds.
+func (r *Reader) loadedPosition() uint64 {
+	position := r.position.Load()
+	r.mu.RLock()
+	if r.nextView != nil {
+		position = max(position, currentNextSeq(r.nextView.current))
+	}
+	r.mu.RUnlock()
+	return position
+}
+
+// awaitLoaded waits until a view past from is loaded, for at most d.
+func (r *Reader) awaitLoaded(ctx context.Context, from uint64, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for r.loadedPosition() <= from && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }

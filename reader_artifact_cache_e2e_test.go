@@ -50,6 +50,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 			t.Fatalf("initial scan rows=%v err=%v", rows, err)
 		}
 		assertArtifactCacheHealthyStats(t, reader, 1, 1)
+		reader.bloomBackground.Wait() // the lookup loads the filter in the background
 		if stats := reader.BloomCacheStats(); stats.EntryCount != 1 || stats.Bytes > stats.MaxBytes {
 			t.Fatalf("primed decoded Bloom L1 stats=%+v", stats)
 		}
@@ -178,7 +179,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		if disk.Meta.Bytes+stats.Bytes > stats.MaxBytes || stats.Failures != 0 || stats.Bypasses == 0 {
 			t.Fatalf("oversized SST data tier stats=%+v", stats)
 		}
-		assertArtifactCacheIncomingEmpty(t, cacheDir)
+		assertArtifactCacheIncomingEmpty(t, reader, cacheDir)
 	})
 
 	t.Run("evicted SST is fetched again", func(t *testing.T) {
@@ -211,7 +212,7 @@ func TestReaderArtifactCacheLifecycle(t *testing.T) {
 		reader.openSSTs.clear()
 		reader.blockCache.clear()
 		assertArtifactCacheTestValue(t, ctx, reader, "a", "first")
-		assertArtifactCacheIncomingEmpty(t, cacheDir)
+		assertArtifactCacheIncomingEmpty(t, reader, cacheDir)
 	})
 }
 
@@ -333,8 +334,12 @@ func assertArtifactCacheHealthyStats(
 	}
 }
 
-func assertArtifactCacheIncomingEmpty(t *testing.T, cacheDir string) {
+// assertArtifactCacheIncomingEmpty checks that no cache write is left
+// unfinished, once the reader's background Bloom loads, which write to the
+// cache, are done.
+func assertArtifactCacheIncomingEmpty(t *testing.T, reader *Reader, cacheDir string) {
 	t.Helper()
+	reader.bloomBackground.Wait()
 	entries, err := os.ReadDir(filepath.Join(cacheDir, "artifacts", "v4", "incoming"))
 	if err != nil {
 		t.Fatalf("read incoming cache directory: %v", err)

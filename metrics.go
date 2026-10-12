@@ -250,6 +250,18 @@ type ReaderMetrics struct {
 	// or after_damage, a read of an SST found damaged in the last ten
 	// minutes, sent to storage.
 	ReadCacheFallbacks *prometheus.CounterVec
+	// ReadCacheCurrent counts refreshes that asked the read cache for
+	// CURRENT, by outcome: relayed, its copy used; too_old or behind, its
+	// copy older than MaxCurrentAge or behind the published view; or failed,
+	// no answer. All but relayed read CURRENT from storage instead.
+	ReadCacheCurrent *prometheus.CounterVec
+	// ReadCacheCurrentAge is the age, in seconds, of the last copy of
+	// CURRENT the read cache gave.
+	ReadCacheCurrentAge prometheus.Gauge
+	// ReadCacheDoorbells counts answers to the long poll on the read cache,
+	// by result: rang, a newer position, for which a refresh was requested;
+	// quiet, none before the cache's timeout; or error.
+	ReadCacheDoorbells *prometheus.CounterVec
 }
 
 func (m *ReaderMetrics) incCounter(counter prometheus.Counter) {
@@ -427,6 +439,28 @@ func (m *ReaderMetrics) ObserveReadCache(reason string) {
 	}
 	if m.ReadCacheFallbacks != nil {
 		m.ReadCacheFallbacks.WithLabelValues(reason).Inc()
+	}
+}
+
+// ObserveReadCacheCurrent records a refresh's request for CURRENT to the
+// read cache, and the age of the copy it gave unless it failed.
+func (m *ReaderMetrics) ObserveReadCacheCurrent(outcome string, age time.Duration) {
+	if m == nil {
+		return
+	}
+	if m.ReadCacheCurrent != nil {
+		m.ReadCacheCurrent.WithLabelValues(outcome).Inc()
+	}
+	if outcome != "failed" && m.ReadCacheCurrentAge != nil {
+		m.ReadCacheCurrentAge.Set(age.Seconds())
+	}
+}
+
+// ObserveReadCacheDoorbell records an answer to the long poll on the read
+// cache.
+func (m *ReaderMetrics) ObserveReadCacheDoorbell(result string) {
+	if m != nil && m.ReadCacheDoorbells != nil {
+		m.ReadCacheDoorbells.WithLabelValues(result).Inc()
 	}
 }
 
@@ -642,5 +676,26 @@ func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics {
 			Help:        "Reads of SSTs and manifest pages and snapshots that went to storage because the read cache failed, by reason.",
 			ConstLabels: constLabels,
 		}, []string{"reason"}),
+		ReadCacheCurrent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "read_cache_current_total",
+			Help:        "Refreshes that asked the read cache for CURRENT, by outcome: relayed, too_old, behind or failed.",
+			ConstLabels: constLabels,
+		}, []string{"outcome"}),
+		ReadCacheCurrentAge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "read_cache_current_age_seconds",
+			Help:        "Age of the last copy of CURRENT the read cache gave.",
+			ConstLabels: constLabels,
+		}),
+		ReadCacheDoorbells: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "reader",
+			Name:        "read_cache_doorbells_total",
+			Help:        "Answers to the long poll on the read cache, by result: rang, quiet or error.",
+			ConstLabels: constLabels,
+		}, []string{"result"}),
 	}
 }

@@ -159,6 +159,11 @@ func statusError(resp *http.Response) error {
 	if resp.StatusCode == http.StatusPartialContent {
 		return nil
 	}
+	return errorFor(resp)
+}
+
+// errorFor classifies an answer that is not what was asked for.
+func errorFor(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	err := fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	switch {
@@ -195,4 +200,87 @@ func escapeKey(key string) string {
 		parts[i] = url.PathEscape(p)
 	}
 	return strings.Join(parts, "/")
+}
+
+// Current is the cache's copy of a database's CURRENT.
+type Current struct {
+	Data     []byte
+	Position uint64
+	// Age is how long before answering the cache read it from storage.
+	Age time.Duration
+}
+
+// ReadCurrent reads db's CURRENT from the cache's relay; db is the
+// database's prefix, "/" for the bucket root. Failures are as ReadRange's.
+func (c *Client) ReadCurrent(ctx context.Context, db string) (Current, error) {
+	ok, probe := c.breaker.allow(time.Now())
+	if !ok {
+		return Current{}, &Error{ReasonBypassed, errBypassed}
+	}
+	current, err := c.readCurrent(ctx, db)
+	c.breaker.record(time.Now(), probe, err)
+	return current, err
+}
+
+func (c *Client) readCurrent(ctx context.Context, db string) (Current, error) {
+	readCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	resp, err := c.getCurrent(readCtx, url.Values{"db": {db}})
+	if err != nil {
+		return Current{}, c.transportError(ctx, readCtx, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return Current{}, errorFor(resp)
+	}
+	position, perr := strconv.ParseUint(resp.Header.Get(readcache.HeaderPosition), 10, 64)
+	ageMs, aerr := strconv.ParseInt(resp.Header.Get(readcache.HeaderAgeMillis), 10, 64)
+	if perr != nil || aerr != nil || ageMs < 0 {
+		return Current{}, &Error{ReasonInvalid, fmt.Errorf("position %q, age %q", resp.Header.Get(readcache.HeaderPosition), resp.Header.Get(readcache.HeaderAgeMillis))}
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCurrentBytes+1))
+	if err != nil {
+		return Current{}, c.transportError(ctx, readCtx, err)
+	}
+	if len(data) > maxCurrentBytes {
+		return Current{}, &Error{ReasonInvalid, fmt.Errorf("CURRENT above %d bytes", maxCurrentBytes)}
+	}
+	return Current{Data: data, Position: position, Age: time.Duration(ageMs) * time.Millisecond}, nil
+}
+
+// maxCurrentBytes bounds a CURRENT read from the cache; storage holds it
+// far smaller.
+const maxCurrentBytes = 16 << 20
+
+// WaitCurrent waits on the cache for db's CURRENT to pass position after,
+// returning the position it has when it answers: past after, or not when the
+// cache's long poll timed out. Only ctx bounds the wait.
+func (c *Client) WaitCurrent(ctx context.Context, db string, after uint64) (uint64, error) {
+	resp, err := c.getCurrent(ctx, url.Values{"db": {db}, "after": {strconv.FormatUint(after, 10)}})
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return 0, &Error{ReasonUnavailable, err}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, errorFor(resp)
+	}
+	position, err := strconv.ParseUint(resp.Header.Get(readcache.HeaderPosition), 10, 64)
+	if err != nil {
+		return 0, &Error{ReasonInvalid, fmt.Errorf("position %q", resp.Header.Get(readcache.HeaderPosition))}
+	}
+	return position, nil
+}
+
+func (c *Client) getCurrent(ctx context.Context, query url.Values) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/current?"+query.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return c.http.Do(req)
 }
