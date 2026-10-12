@@ -496,10 +496,19 @@ the first answer from it ends the bypass. Refusals and size mismatches do
 not cause a bypass; the cache is answering, and the next read would fail the
 same way.
 
+Damaged bytes from the cache do not fail reads. A manifest page or snapshot,
+a small SST read whole, or a Bloom filter that fails its checksum is read
+again from storage. Any other part of an SST is checked later, by its block
+checksums; when that finds damage, the reader reads that SST from storage
+for the next ten minutes, and its retry succeeds.
+
 `ReaderMetrics.ReadCacheReads` counts reads the cache answered and
 `ReadCacheFallbacks` those that went to storage, by reason: `timeout`,
-`unavailable`, `not_found`, `size_mismatch`, `refused`, `invalid`, or
-`bypassed` while the cache is skipped. A refused read or a size mismatch
+`unavailable`, `not_found`, `size_mismatch`, `refused`, `invalid`,
+`bypassed` while the cache is skipped, `checksum_mismatch` for bytes from
+the cache that failed their checksum, or `after_damage` for reads of an SST
+found damaged recently. A steady count of the last two points at damaged
+chunks on the cache's disk. A refused read or a size mismatch
 points at a misconfiguration and is also logged, at most once a minute; the
 start and end of a bypass are logged too. A bad URL fails `OpenReader` with
 `ErrInvalidReaderOptions`. `CURRENT` still goes to storage.

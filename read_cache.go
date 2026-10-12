@@ -11,6 +11,16 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
+// Fallback reasons of the Reader's own, beside the read cache client's.
+const (
+	// reasonChecksumMismatch: bytes from the cache failed the object's
+	// checksum, and were read again from storage.
+	reasonChecksumMismatch = "checksum_mismatch"
+	// reasonAfterDamage: a read of an SST found damaged recently, sent to
+	// storage rather than the cache.
+	reasonAfterDamage = "after_damage"
+)
+
 // readThroughCache sends a Reader's immutable reads to the read cache before
 // storage, and counts what happens.
 type readThroughCache struct {
@@ -59,44 +69,55 @@ func (c *readThroughCache) warn(err error) {
 func (c *readThroughCache) close() { c.client.Close() }
 
 // manifestThroughCache reads manifest snapshots and pages through the read
-// cache when their size is known, and everything else from the storage it
-// wraps.
+// cache when their reference is known, and everything else from the storage
+// it wraps. Bytes from the cache that do not match the reference are read
+// again from storage.
 type manifestThroughCache struct {
 	manifest.Storage
-	pages manifest.PageStorage
 	cache *readThroughCache
 }
 
+// manifestPagesThroughCache is manifestThroughCache over a storage with
+// pages, which it passes through.
+type manifestPagesThroughCache struct {
+	*manifestThroughCache
+	manifest.PageStorage
+}
+
 func newManifestThroughCache(base manifest.Storage, cache *readThroughCache) manifest.Storage {
-	pages, ok := base.(manifest.PageStorage)
+	s := &manifestThroughCache{Storage: base, cache: cache}
+	if pages, ok := base.(manifest.PageStorage); ok {
+		return &manifestPagesThroughCache{manifestThroughCache: s, PageStorage: pages}
+	}
+	return s
+}
+
+func (s *manifestThroughCache) ReadSnapshotRef(ctx context.Context, ref manifest.ObjectRef) ([]byte, error) {
+	if data, ok, err := s.readRef(ctx, ref); ok || err != nil {
+		return data, err
+	}
+	return s.ReadSnapshot(ctx, ref.Path)
+}
+
+func (s *manifestThroughCache) ReadPageRef(ctx context.Context, ref manifest.ObjectRef) ([]byte, error) {
+	if data, ok, err := s.readRef(ctx, ref); ok || err != nil {
+		return data, err
+	}
+	pages, ok := s.Storage.(manifest.PageStorage)
 	if !ok {
-		return base
+		return nil, manifest.ErrNotFound
 	}
-	return &manifestThroughCache{Storage: base, pages: pages, cache: cache}
+	return pages.ReadPage(ctx, ref.Path)
 }
 
-func (s *manifestThroughCache) ReadSnapshotSized(ctx context.Context, path string, size uint64) ([]byte, error) {
-	if data, ok, err := s.cache.read(ctx, path, int64(size), 0, int64(size), true); ok || err != nil {
-		return data, err
+// readRef reads ref's object through the cache: ok reports bytes that match
+// it; otherwise err is the caller's context ending, or nil to read storage.
+func (s *manifestThroughCache) readRef(ctx context.Context, ref manifest.ObjectRef) ([]byte, bool, error) {
+	size := int64(ref.EncodedBytes)
+	data, ok, err := s.cache.read(ctx, ref.Path, size, 0, size, true)
+	if !ok || ref.Matches(data) {
+		return data, ok, err
 	}
-	return s.ReadSnapshot(ctx, path)
-}
-
-func (s *manifestThroughCache) ReadPageSized(ctx context.Context, path string, size uint64) ([]byte, error) {
-	if data, ok, err := s.cache.read(ctx, path, int64(size), 0, int64(size), true); ok || err != nil {
-		return data, err
-	}
-	return s.pages.ReadPage(ctx, path)
-}
-
-func (s *manifestThroughCache) ReadPage(ctx context.Context, path string) ([]byte, error) {
-	return s.pages.ReadPage(ctx, path)
-}
-
-func (s *manifestThroughCache) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
-	return s.pages.WritePage(ctx, level, id, data)
-}
-
-func (s *manifestThroughCache) PagePath(level uint8, id string) string {
-	return s.pages.PagePath(level, id)
+	s.cache.m.ObserveReadCache(reasonChecksumMismatch)
+	return nil, false, nil
 }

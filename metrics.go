@@ -244,8 +244,11 @@ type ReaderMetrics struct {
 	ReadCacheReads prometheus.Counter
 	// ReadCacheFallbacks counts those reads that went to storage because the
 	// read cache failed, by reason: timeout, unavailable, not_found,
-	// size_mismatch, refused or invalid; or bypassed, sent straight to
-	// storage because the cache had stopped answering.
+	// size_mismatch, refused or invalid; bypassed, sent straight to storage
+	// because the cache had stopped answering; checksum_mismatch, bytes from
+	// the cache that failed their checksum and were read again from storage;
+	// or after_damage, a read of an SST found damaged in the last ten
+	// minutes, sent to storage.
 	ReadCacheFallbacks *prometheus.CounterVec
 }
 

@@ -24,6 +24,24 @@ type cacheServer struct {
 	*httptest.Server
 	objects        *readcache.Objects
 	noCache, pages atomic.Int32
+	// damage, when set, picks requests whose answer has a byte flipped.
+	damage atomic.Pointer[func(*http.Request) bool]
+}
+
+// flipFirst flips the first byte written, as a damaged chunk would read.
+type flipFirst struct {
+	http.ResponseWriter
+	done bool
+}
+
+func (w *flipFirst) Write(p []byte) (int, error) {
+	if !w.done && len(p) > 0 {
+		w.done = true
+		q := append([]byte(nil), p...)
+		q[0] ^= 0xff
+		return w.ResponseWriter.Write(q)
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 // readCacheServer serves store's database prefix through a read cache and
@@ -53,6 +71,9 @@ func readCacheServer(t *testing.T, store *blobstore.Store) *cacheServer {
 		if strings.Contains(r.URL.Path, "/manifest/pages/") {
 			s.pages.Add(1)
 		}
+		if damage := s.damage.Load(); damage != nil && (*damage)(r) {
+			w = &flipFirst{ResponseWriter: w}
+		}
 		h.ServeHTTP(w, r)
 	}))
 	t.Cleanup(s.Close)
@@ -62,7 +83,8 @@ func readCacheServer(t *testing.T, store *blobstore.Store) *cacheServer {
 func fallbacks(m *ReaderMetrics) float64 {
 	var n float64
 	for _, reason := range []string{cacheclient.ReasonTimeout, cacheclient.ReasonUnavailable, cacheclient.ReasonNotFound,
-		cacheclient.ReasonSizeMismatch, cacheclient.ReasonRefused, cacheclient.ReasonInvalid, cacheclient.ReasonBypassed} {
+		cacheclient.ReasonSizeMismatch, cacheclient.ReasonRefused, cacheclient.ReasonInvalid, cacheclient.ReasonBypassed,
+		reasonChecksumMismatch, reasonAfterDamage} {
 		n += testutil.ToFloat64(m.ReadCacheFallbacks.WithLabelValues(reason))
 	}
 	return n
