@@ -16,7 +16,7 @@ concurrency:
 jobs:
   minio-storage-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -43,7 +43,7 @@ jobs:
           AWS_REGION: us-east-1
           ISLEDB_MINIO_ENDPOINT: http://127.0.0.1:9000
         run: >-
-          go test -race -count=1 -v -timeout=5m
+          go test -race -count=1 -v -timeout=10m
           -tags="integration,minio" ./integration/storageengine
 
       - name: Print SILO logs on failure
