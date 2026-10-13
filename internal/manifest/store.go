@@ -1522,6 +1522,13 @@ type ChangeFeedView struct {
 	expiresAt time.Time
 }
 
+// Backdate moves the view's expiry back by d: for a view built from a copy
+// of CURRENT that was read from storage d before it was given, so the view
+// lives no longer than storage keeps what it names.
+func (v *ChangeFeedView) Backdate(d time.Duration) {
+	v.expiresAt = v.expiresAt.Add(-d)
+}
+
 func (v *ChangeFeedView) Enabled() bool {
 	return v != nil && v.current != nil && v.current.ChangeFeedEnabled
 }

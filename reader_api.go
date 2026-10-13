@@ -1,13 +1,10 @@
 package isledb
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
-
-	"github.com/ankur-anand/isledb/internal/cacheclient"
 )
 
 var ErrInvalidReaderOptions = errors.New("invalid reader options")
@@ -161,20 +158,9 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	if err != nil {
 		return readerOptions{}, err
 	}
-	var readCache *readThroughCache
-	if opts.ReadCache.MaxCurrentAge < 0 {
-		return readerOptions{}, fmt.Errorf("%w: read_cache.max_current_age=%s", ErrInvalidReaderOptions, opts.ReadCache.MaxCurrentAge)
-	}
-	if opts.ReadCache.URL != "" {
-		client, err := cacheclient.New(cacheclient.Options{
-			URL: opts.ReadCache.URL, Token: opts.ReadCache.Token,
-			HTTPClient: opts.ReadCache.HTTPClient, Timeout: opts.ReadCache.Timeout,
-		})
-		if err != nil {
-			return readerOptions{}, fmt.Errorf("%w: read_cache: %v", ErrInvalidReaderOptions, err)
-		}
-		readCache = &readThroughCache{client: client, m: opts.Metrics,
-			maxCurrentAge: cmp.Or(opts.ReadCache.MaxCurrentAge, defaultMaxCurrentAge)}
+	readCache, err := newReadThroughCache(opts.ReadCache, opts.Metrics)
+	if err != nil {
+		return readerOptions{}, fmt.Errorf("%w: %v", ErrInvalidReaderOptions, err)
 	}
 	return readerOptions{
 		CacheDir:       opts.CacheDir,

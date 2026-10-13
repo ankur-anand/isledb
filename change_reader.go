@@ -183,7 +183,12 @@ func (p ChangePage) CaughtUp() bool {
 // ChangeReader reads the durable mutation feed. It is safe for concurrent use;
 // each caller owns and persists its own cursor.
 type ChangeReader struct {
-	store       *blobstore.Store
+	store   *blobstore.Store
+	cache   *readThroughCache // nil: storage only
+	cacheDB string            // the database as the cache names it
+	// closing ends when the reader closes, releasing WaitForChanges.
+	closing     context.Context
+	closeAll    context.CancelFunc
 	manifestLog *manifest.Store
 	closed      atomic.Bool
 	releaseOnce sync.Once
@@ -249,7 +254,7 @@ func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error) {
 	if err := r.checkOpen(ctx); err != nil {
 		return ChangeBounds{}, err
 	}
-	view, err := r.refreshView(ctx)
+	view, err := r.refreshView(ctx, false)
 	if err != nil {
 		return ChangeBounds{}, err
 	}
@@ -278,7 +283,7 @@ func (r *ChangeReader) Read(
 		return ChangePage{}, err
 	}
 
-	page, err := r.readPage(ctx, from, opts)
+	page, err := r.readPage(ctx, from, opts, false)
 	if !errors.Is(err, blobstore.ErrNotFound) {
 		return page, err
 	}
@@ -286,10 +291,11 @@ func (r *ChangeReader) Read(
 	// A missing immutable batch can mean that retention advanced after the
 	// view used by the first attempt. Drop only the view association, then
 	// replay the complete logical page once from the caller's original cursor.
-	// The retry reloads CURRENT and therefore classifies an expired cursor
-	// before touching the object again.
+	// The retry reloads CURRENT, rather than read on with the view the
+	// reader holds, and therefore classifies an expired cursor before
+	// touching the object again.
 	r.clearBatchView()
-	page, retryErr := r.readPage(ctx, from, opts)
+	page, retryErr := r.readPage(ctx, from, opts, true)
 	if !errors.Is(retryErr, blobstore.ErrNotFound) {
 		return page, retryErr
 	}
@@ -298,18 +304,26 @@ func (r *ChangeReader) Read(
 		ErrCorruptChangeFeed, from.String(), retryErr)
 }
 
+// readPage reads one page from from. With fresh, it reads CURRENT again,
+// from storage, rather than read on with the view the reader holds.
 func (r *ChangeReader) readPage(
 	ctx context.Context,
 	from ChangeCursor,
 	opts ChangeReadOptions,
+	fresh bool,
 ) (ChangePage, error) {
 	var err error
 
 	view, entries, continuationBatch, ok := r.cachedContinuation(from)
 	if !ok {
-		view, err = r.refreshView(ctx)
-		if err != nil {
-			return ChangePage{}, err
+		if !fresh {
+			view = r.heldView(from)
+		}
+		if view == nil {
+			view, err = r.refreshView(ctx, fresh)
+			if err != nil {
+				return ChangePage{}, err
+			}
 		}
 		entries, err = r.manifestLog.ReadChangeEntriesFromView(
 			ctx, view, from.entry, !from.set, maxChangeManifestEntries)
@@ -446,6 +460,23 @@ func (r *ChangeReader) clearBatchView() {
 	r.batchMu.Unlock()
 }
 
+// heldView returns the view the reader holds when it still serves a read
+// from: not expired, and from before its head. A reader behind the head needs
+// no newer CURRENT to read on; only one that has caught up, or whose view has
+// expired, reads CURRENT again.
+func (r *ChangeReader) heldView(from ChangeCursor) *manifest.ChangeFeedView {
+	if !from.set {
+		return nil
+	}
+	r.viewMu.RLock()
+	view := r.view
+	r.viewMu.RUnlock()
+	if view == nil || view.ExpiredAt(time.Now()) || from.entry >= view.Head() {
+		return nil
+	}
+	return view
+}
+
 func (r *ChangeReader) cachedContinuation(
 	from ChangeCursor,
 ) (*manifest.ChangeFeedView, []*manifest.ManifestLogEntry, *changeBatchIndex, bool) {
@@ -485,22 +516,47 @@ func (r *ChangeReader) rememberBatchView(
 	}
 }
 
-func (r *ChangeReader) refreshView(ctx context.Context) (*manifest.ChangeFeedView, error) {
-	value, err := r.viewLoad.Do(ctx, "current", func(loadCtx context.Context) (any, error) {
+// refreshView loads the feed's view. With a read cache, CURRENT may come from
+// the cache's copy, under a Reader's rules (see loadManifestView): younger
+// than the limit, not behind the view held, and the view's expiry moved back
+// by the copy's age. With direct it is read from storage.
+func (r *ChangeReader) refreshView(ctx context.Context, direct bool) (*manifest.ChangeFeedView, error) {
+	key := "current"
+	if direct {
+		key = "current-direct"
+	}
+	value, err := r.viewLoad.Do(ctx, key, func(loadCtx context.Context) (any, error) {
+		read := &currentRead{direct: direct}
+		var startHead uint64
+		r.viewMu.RLock()
+		if r.view != nil {
+			startHead = r.view.Head()
+		}
+		r.viewMu.RUnlock()
+		if r.cache != nil {
+			read.minPosition = startHead
+			loadCtx = context.WithValue(loadCtx, currentReadKey{}, read)
+		}
 		view, err := r.manifestLog.LoadChangeFeedView(loadCtx)
 		if err != nil {
 			return nil, err
 		}
+		view.Backdate(read.age)
 		if r.closed.Load() {
 			return nil, ErrChangeReaderClosed
 		}
 		r.viewMu.Lock()
 		if r.view != nil && view.Head() < r.view.Head() {
-			oldHead := r.view.Head()
+			held := r.view
 			r.viewMu.Unlock()
+			// A load that ran beside one that set a newer view returns that
+			// view: its older CURRENT is stale, not the store going back.
+			if held.Head() != startHead {
+				return held, nil
+			}
 			return nil, fmt.Errorf(
 				"%w: manifest head moved backward from=%d to=%d",
-				ErrCorruptChangeFeed, oldHead, view.Head())
+				ErrCorruptChangeFeed, held.Head(), view.Head())
 		}
 		r.view = view
 		r.viewMu.Unlock()
@@ -598,12 +654,12 @@ func validateChangeBatchMeta(meta *manifest.ChangeBatchMeta) error {
 
 func (r *ChangeReader) loadBatchIndex(ctx context.Context, meta *manifest.ChangeBatchMeta) (*changeBatchIndex, error) {
 	suffixSize := int64(meta.BlockCount)*changeBatchIndexEntrySize + changeBatchTrailerSize
-	data, err := r.store.ReadRange(ctx, meta.Path, meta.Size-suffixSize, suffixSize)
-	if err != nil {
-		return nil, err
-	}
-	r.work.rangeGETs.Add(1)
-	r.work.downloadedBytes.Add(uint64(len(data)))
+	return readBatchRange(r, ctx, meta, meta.Size-suffixSize, suffixSize, func(data []byte) (*changeBatchIndex, error) {
+		return parseBatchIndex(data, meta, suffixSize)
+	})
+}
+
+func parseBatchIndex(data []byte, meta *manifest.ChangeBatchMeta, suffixSize int64) (*changeBatchIndex, error) {
 	if int64(len(data)) != suffixSize {
 		return nil, fmt.Errorf(
 			"%w: index_and_trailer_bytes=%d want=%d", ErrCorruptChangeBatch, len(data), suffixSize)
@@ -625,6 +681,36 @@ func (r *ChangeReader) loadBatchIndex(ctx context.Context, meta *manifest.Change
 		return nil, fmt.Errorf("%w: metadata mismatch", ErrCorruptChangeBatch)
 	}
 	return index, nil
+}
+
+// readBatchRange reads [offset, offset+length) of meta's batch and parses
+// it: through the read cache when there is one. Bytes from the cache that do
+// not parse, which checks every checksum, are counted and read again from
+// storage, whose bytes are parsed as they always were.
+func readBatchRange[T any](r *ChangeReader, ctx context.Context, meta *manifest.ChangeBatchMeta, offset, length int64,
+	parse func([]byte) (T, error)) (T, error) {
+	var zero T
+	if r.cache != nil {
+		data, ok, err := r.cache.read(ctx, meta.Path, meta.Size, offset, length, true)
+		if err != nil {
+			return zero, err
+		}
+		if ok {
+			r.work.rangeGETs.Add(1)
+			r.work.downloadedBytes.Add(uint64(len(data)))
+			if value, err := parse(data); err == nil {
+				return value, nil
+			}
+			r.cache.m.ObserveReadCache(reasonChecksumMismatch)
+		}
+	}
+	data, err := r.store.ReadRange(ctx, meta.Path, offset, length)
+	if err != nil {
+		return zero, err
+	}
+	r.work.rangeGETs.Add(1)
+	r.work.downloadedBytes.Add(uint64(len(data)))
+	return parse(data)
 }
 
 func changeBatchBlockForRecord(index *changeBatchIndex, record uint64) (int, changeBatchBlock, bool) {
@@ -739,31 +825,34 @@ func (r *ChangeReader) loadBlockSpan(
 	if endOffset < first.Offset || endOffset-first.Offset > uint64(maxInt()) {
 		return nil, fmt.Errorf("%w: block span too large", ErrCorruptChangeBatch)
 	}
-	data, err := r.store.ReadRange(ctx, meta.Path, int64(first.Offset), int64(endOffset-first.Offset))
+	result, err := readBatchRange(r, ctx, meta, int64(first.Offset), int64(endOffset-first.Offset),
+		func(data []byte) ([][]changeRecord, error) {
+			if uint64(len(data)) != endOffset-first.Offset {
+				return nil, fmt.Errorf("%w: short block span", ErrCorruptChangeBatch)
+			}
+			result := make([][]changeRecord, 0, endOrdinal-startOrdinal)
+			for ordinal := startOrdinal; ordinal < endOrdinal; ordinal++ {
+				block := index.Blocks[ordinal]
+				lo := block.Offset - first.Offset
+				hi := lo + uint64(block.CompressedSize)
+				changes, err := decodeChangeBatchBlock(data[lo:hi], block, index.Payload)
+				if err != nil {
+					return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
+				}
+				if err := validateDecodedChangeBlock(index, ordinal, changes); err != nil {
+					return nil, err
+				}
+				result = append(result, changes)
+			}
+			return result, nil
+		})
 	if err != nil {
 		return nil, err
 	}
-	r.work.rangeGETs.Add(1)
-	r.work.downloadedBytes.Add(uint64(len(data)))
-	if uint64(len(data)) != endOffset-first.Offset {
-		return nil, fmt.Errorf("%w: short block span", ErrCorruptChangeBatch)
-	}
-
-	result := make([][]changeRecord, 0, endOrdinal-startOrdinal)
-	for ordinal := startOrdinal; ordinal < endOrdinal; ordinal++ {
-		block := index.Blocks[ordinal]
-		lo := block.Offset - first.Offset
-		hi := lo + uint64(block.CompressedSize)
-		changes, err := decodeChangeBatchBlock(data[lo:hi], block, index.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
-		}
-		if err := validateDecodedChangeBlock(index, ordinal, changes); err != nil {
-			return nil, err
-		}
+	for i, changes := range result {
+		block := index.Blocks[startOrdinal+i]
 		r.work.decompressedBytes.Add(uint64(block.RawSize))
-		result = append(result, changes)
-		r.cacheBlock(meta, ordinal, uint64(block.RawSize), changes)
+		r.cacheBlock(meta, startOrdinal+i, uint64(block.RawSize), changes)
 	}
 	if r.closed.Load() {
 		return nil, ErrChangeReaderClosed
@@ -884,20 +973,21 @@ func (r *ChangeReader) loadBlock(
 	ordinal int,
 ) ([]changeRecord, error) {
 	block := index.Blocks[ordinal]
-	data, err := r.store.ReadRange(ctx, meta.Path, int64(block.Offset), int64(block.CompressedSize))
+	changes, err := readBatchRange(r, ctx, meta, int64(block.Offset), int64(block.CompressedSize),
+		func(data []byte) ([]changeRecord, error) {
+			changes, err := decodeChangeBatchBlock(data, block, index.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
+			}
+			if err := validateDecodedChangeBlock(index, ordinal, changes); err != nil {
+				return nil, err
+			}
+			return changes, nil
+		})
 	if err != nil {
 		return nil, err
-	}
-	r.work.rangeGETs.Add(1)
-	r.work.downloadedBytes.Add(uint64(len(data)))
-	changes, err := decodeChangeBatchBlock(data, block, index.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: block=%d: %v", ErrCorruptChangeBatch, ordinal, err)
 	}
 	r.work.decompressedBytes.Add(uint64(block.RawSize))
-	if err := validateDecodedChangeBlock(index, ordinal, changes); err != nil {
-		return nil, err
-	}
 	return changes, nil
 }
 
@@ -995,6 +1085,9 @@ func (r *ChangeReader) Close() error {
 	if r == nil || !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	if r.closeAll != nil {
+		r.closeAll()
+	}
 	r.viewLoad.Close(ErrChangeReaderClosed)
 	r.batchLoad.Close(ErrChangeReaderClosed)
 	r.blockLoad.Close(ErrChangeReaderClosed)
@@ -1015,9 +1108,81 @@ func (r *ChangeReader) Close() error {
 	r.viewMu.Lock()
 	r.view = nil
 	r.viewMu.Unlock()
+	if r.cache != nil {
+		r.cache.close()
+	}
 	return nil
 }
 
 func (r *ChangeReader) closeDB() error {
 	return r.Close()
+}
+
+// changeWaitPoll is how often WaitForChanges reads CURRENT when it cannot
+// wait on a read cache.
+const changeWaitPoll = time.Second
+
+// WaitForChanges returns once the feed may hold changes past from: the view
+// a Read would use has its head past from's position. With a read cache it
+// waits on the cache's long poll, which answers as soon as a commit lands,
+// then checks that view; without a cache, or while the cache does not
+// answer, or while the view lags the long poll, it reads CURRENT every
+// second. Its head also
+// moves for commits without user changes, so a Read after it may return an
+// empty page. It returns ctx's error when ctx ends first,
+// ErrChangeReaderClosed when the reader closes, and the error of a view it
+// could not load, as when storage fails while the cache does not answer;
+// call it again to keep waiting.
+func (r *ChangeReader) WaitForChanges(ctx context.Context, from ChangeCursor) error {
+	if err := r.checkOpen(ctx); err != nil {
+		return err
+	}
+	if !from.set || r.heldView(from) != nil {
+		// The view held already has changes past from.
+		return nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if r.closing != nil {
+		defer context.AfterFunc(r.closing, cancel)()
+	}
+	ended := func(err error) error {
+		if r.closed.Load() {
+			return ErrChangeReaderClosed
+		}
+		return err
+	}
+	for {
+		if r.cache != nil {
+			started := time.Now()
+			position, err := r.cache.client.WaitCurrent(ctx, r.cacheDB, from.entry)
+			switch {
+			case ctx.Err() != nil:
+				return ended(ctx.Err())
+			case err == nil && position <= from.entry:
+				r.cache.m.ObserveReadCacheDoorbell("quiet")
+				paceLongPoll(ctx, started)
+				continue
+			case err == nil:
+				// Return only once the view a Read would use has moved:
+				// with replicas, it can come from one still behind the
+				// one that rang.
+				r.cache.m.ObserveReadCacheDoorbell("rang")
+			default:
+				r.cache.m.ObserveReadCacheDoorbell("error")
+			}
+		}
+		view, err := r.refreshView(ctx, false)
+		if err != nil {
+			return ended(err)
+		}
+		if view.Head() > from.entry {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ended(ctx.Err())
+		case <-time.After(changeWaitPoll):
+		}
+	}
 }

@@ -423,6 +423,15 @@ func TestChangeReaderDetectsExpiredCursor(t *testing.T) {
 		t.Fatalf("advance change feed floor: %v", err)
 	}
 
+	// The reader reads on with the view it holds, whose changes stay in
+	// storage for its lifetime; the advanced floor shows once it reloads its
+	// view, as Bounds does.
+	if _, err := reader.Read(ctx, bounds.Oldest, ChangeReadOptions{}); err != nil {
+		t.Fatalf("read within the held view: %v", err)
+	}
+	if _, err := reader.Bounds(ctx); err != nil {
+		t.Fatalf("bounds: %v", err)
+	}
 	_, err = reader.Read(ctx, bounds.Oldest, ChangeReadOptions{})
 	if !errors.Is(err, ErrChangeCursorExpired) {
 		t.Fatalf("read expired cursor error=%v want=%v", err, ErrChangeCursorExpired)

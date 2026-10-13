@@ -176,7 +176,7 @@ type StorePolicy struct {
 ```go
 func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, error)
 func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
-func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error)
+func (db *DB) OpenChangeReader(ctx context.Context, opts ...ChangeReaderOptions) (*ChangeReader, error)
 func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)
 func (db *DB) Close() error
 ```
@@ -1023,6 +1023,7 @@ func DefaultChangeReadOptions() ChangeReadOptions
 
 func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error)
 func (r *ChangeReader) Read(ctx context.Context, from ChangeCursor, opts ChangeReadOptions) (ChangePage, error)
+func (r *ChangeReader) WaitForChanges(ctx context.Context, from ChangeCursor) error
 func (r *ChangeReader) Close() error
 ```
 
@@ -1037,7 +1038,60 @@ func (r *ChangeReader) Close() error
   sequence.
 - `Read` does not wait for new writes. A page may be empty yet still move the
   cursor past manifest entries with no user writes. Keep reading until
-  `CaughtUp()` is true, then poll at your own interval.
+  `CaughtUp()` is true, then call `WaitForChanges` with the page's `Next`
+  cursor, or poll at your own interval.
+- `WaitForChanges` returns once the view a `Read` would use has its head
+  past the cursor. With a read cache it waits on the cache's long poll and
+  returns within about half a second of a commit; with cache replicas that
+  lag one another it waits, checking once a second, until the replica
+  serving `CURRENT` has the commit too. Without a cache, or while the cache
+  does not answer, it reads `CURRENT` every second. A cursor behind the view
+  the reader holds returns at once, without a request. If a view cannot be
+  loaded (storage failing while the cache does not answer), it returns that
+  error; call it again to keep waiting. The head also moves for commits
+  without user changes, so the next `Read` may return an empty page. It
+  returns the context's error when the context ends, and
+  `ErrChangeReaderClosed` when the reader closes.
+- `Read` reads `CURRENT` only when the cursor has reached the head of the
+  view the reader holds, or that view has expired (`MaxPinnedViewAge`
+  after it was read). Catching up through a backlog reads it about once; a
+  caught-up reader reads it on each `Read`, to see new commits. Retention
+  that advances meanwhile shows at the next view reload, as `Bounds` does;
+  the changes the held view names stay in storage until it expires.
+
+### Read the feed through a read cache
+
+```go
+type ChangeReaderOptions struct {
+    ReadCache ReadCacheOptions
+    Metrics   *ReaderMetrics
+}
+```
+
+`OpenChangeReader` takes at most one `ChangeReaderOptions`. With
+`ReadCache.URL` set, a change reader reads through the regional read cache
+(see `ReadCacheOptions` under [Read data](#read-data)) before storage:
+
+- The change batches a page needs, their indexes and blocks. Many readers
+  tailing the feed read the same recent batches, which the cache keeps once
+  for all of them. Every index and block has a checksum: bytes from the
+  cache that fail it are read again from storage.
+- The feed's view, `CURRENT`, under a Reader's rules: a copy older than
+  `MaxCurrentAge`, or behind the view the reader holds, is read from storage
+  instead, and the view's lifetime is counted from when the cache read it
+  from storage. A retry after a missing batch reads storage.
+- The manifest pages holding older change entries, checked against their
+  reference.
+- `WaitForChanges`, through the cache's long poll.
+
+Any read the cache cannot answer is read from storage, so the feed returns
+the same changes either way. `Metrics` counts the cache's reads and
+fallbacks (`ReadCacheReads`, `ReadCacheFallbacks`), its `CURRENT` copies
+(`ReadCacheCurrent`, `ReadCacheCurrentAge`) and the long poll's answers
+(`ReadCacheDoorbells`). A bad URL fails `OpenChangeReader` with
+`ErrInvalidReaderOptions`. Each change reader with a read cache keeps its
+own in-memory cache of manifest pages, of up to 1,024 pages, as each Reader
+does.
 - Change batches are split into compressed, checksummed blocks; a read fetches
   only the blocks its page needs and reuses decoded blocks from a bounded
   cache.

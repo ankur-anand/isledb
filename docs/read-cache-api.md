@@ -265,5 +265,7 @@ $ curl -s -H "Authorization: Bearer $TOKEN" http://cache:8090/v1/object/db/sstab
 
 Readers configured with a read cache read SSTs, manifest pages and snapshots
 through it, with fallback to storage, and refresh through the relay with the
-client rules above and the long poll. The change feed does not use the
-cache yet.
+client rules above and the long poll. Change readers configured with a read
+cache read change batch indexes and blocks, the feed's view and its manifest
+pages through it, with the same rules and fallback, and wait for changes
+with the long poll.

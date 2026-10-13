@@ -1,8 +1,10 @@
 package isledb
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"strings"
@@ -73,6 +75,25 @@ func (c *readThroughCache) warn(err error) {
 }
 
 func (c *readThroughCache) close() { c.client.Close() }
+
+// newReadThroughCache returns the read cache opts describes, or nil when its
+// URL is empty.
+func newReadThroughCache(opts ReadCacheOptions, metrics *ReaderMetrics) (*readThroughCache, error) {
+	if opts.MaxCurrentAge < 0 {
+		return nil, fmt.Errorf("read_cache.max_current_age=%s", opts.MaxCurrentAge)
+	}
+	if opts.URL == "" {
+		return nil, nil
+	}
+	client, err := cacheclient.New(cacheclient.Options{
+		URL: opts.URL, Token: opts.Token, HTTPClient: opts.HTTPClient, Timeout: opts.Timeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read_cache: %w", err)
+	}
+	return &readThroughCache{client: client, m: metrics,
+		maxCurrentAge: cmp.Or(opts.MaxCurrentAge, defaultMaxCurrentAge)}, nil
+}
 
 // manifestThroughCache reads manifest snapshots and pages through the read
 // cache when their reference is known, and everything else from the storage
@@ -176,6 +197,22 @@ func (s *manifestThroughCache) ReadCurrent(ctx context.Context) ([]byte, string,
 	return current.Data, "", nil
 }
 
+// minLongPollGap is the least time between the starts of two long polls: a
+// cache whose long poll times out sooner than this, misconfigured, is not
+// polled faster.
+const minLongPollGap = 100 * time.Millisecond
+
+// paceLongPoll waits, after a long poll that started at started and ended
+// quiet, until minLongPollGap has passed since it started.
+func paceLongPoll(ctx context.Context, started time.Time) {
+	if wait := minLongPollGap - time.Since(started); wait > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
+}
+
 // runDoorbell holds a long poll on the cache for a position past the
 // newest view the Reader has loaded, published or held, and requests a
 // refresh when one comes, until ctx ends. It polls past what the Reader has,
@@ -185,6 +222,7 @@ func (r *Reader) runDoorbell(ctx context.Context, cache *readThroughCache, db st
 	failures := 0
 	for {
 		loaded := r.loadedPosition()
+		started := time.Now()
 		position, err := cache.client.WaitCurrent(ctx, db, loaded)
 		if ctx.Err() != nil {
 			return
@@ -210,6 +248,7 @@ func (r *Reader) runDoorbell(ctx context.Context, cache *readThroughCache, db st
 			r.awaitLoaded(ctx, loaded, requestRefreshGap)
 		default:
 			r.metrics.ObserveReadCacheDoorbell("quiet")
+			paceLongPoll(ctx, started)
 		}
 		failures = 0
 	}

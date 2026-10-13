@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
@@ -497,9 +498,29 @@ func (db *DB) releaseReader(reader *Reader) {
 
 // OpenChangeReader opens an independent cursor-based reader over the durable
 // mutation feed. Change readers do not reserve the DB's shared KV reader slot.
-func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error) {
+// ChangeReaderOptions configures a ChangeReader.
+type ChangeReaderOptions struct {
+	// ReadCache sends reads of change batches, their indexes and blocks,
+	// through a regional read cache before storage, as a Reader's SST reads
+	// are. The feed's view and manifest entries are read from storage.
+	ReadCache ReadCacheOptions
+	// Metrics counts the read cache's reads and fallbacks, in
+	// ReadCacheReads and ReadCacheFallbacks.
+	Metrics *ReaderMetrics
+}
+
+// OpenChangeReader opens a reader of the change feed. At most one opts may
+// be given.
+func (db *DB) OpenChangeReader(ctx context.Context, opts ...ChangeReaderOptions) (*ChangeReader, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
+	}
+	if len(opts) > 1 {
+		return nil, errors.New("OpenChangeReader takes at most one ChangeReaderOptions")
+	}
+	var options ChangeReaderOptions
+	if len(opts) == 1 {
+		options = opts[0]
 	}
 	if db.closed.Load() {
 		return nil, errors.New("db closed")
@@ -511,11 +532,25 @@ func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error) {
 	if !view.Enabled() {
 		return nil, ErrChangeFeedDisabled
 	}
+	cache, err := newReadThroughCache(options.ReadCache, options.Metrics)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidReaderOptions, err)
+	}
 
 	reader := &ChangeReader{
 		store:       db.store,
 		manifestLog: db.manifestStore,
 		view:        view,
+		cache:       cache,
+		cacheDB:     cacheDB(db.store.Prefix()),
+	}
+	reader.closing, reader.closeAll = context.WithCancel(context.Background())
+	if cache != nil {
+		// A store of the reader's own, reading CURRENT and pages through the
+		// cache: the database's store is the writer's, which reads storage.
+		reader.manifestLog = manifest.NewStoreWithStorage(cachestore.NewCachingStorage(
+			newManifestThroughCache(db.manifestStore.Storage(), cache, db.store.Prefix()),
+			cachestore.CachingStorageOptions{}))
 	}
 	reader.release = func() {
 		db.mu.Lock()
@@ -523,6 +558,9 @@ func (db *DB) OpenChangeReader(ctx context.Context) (*ChangeReader, error) {
 		db.mu.Unlock()
 	}
 	if err := db.registerCloser(reader); err != nil {
+		if cache != nil {
+			cache.close()
+		}
 		return nil, err
 	}
 	return reader, nil

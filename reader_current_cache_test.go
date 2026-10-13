@@ -24,6 +24,10 @@ type fakeRelay struct {
 	position uint64
 	age      time.Duration
 	changed  chan struct{}
+	// hold is how long a long poll waits for a position; zero is 2s, and
+	// below zero answers at once.
+	hold      time.Duration
+	longPolls atomic.Int64
 }
 
 func (f *fakeRelay) set(t *testing.T, data []byte, age time.Duration) {
@@ -47,8 +51,15 @@ func (f *fakeRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if after := r.URL.Query().Get("after"); after != "" {
+		f.longPolls.Add(1)
 		n, _ := strconv.ParseUint(after, 10, 64)
-		timeout := time.After(2 * time.Second)
+		hold := 2 * time.Second
+		f.mu.Lock()
+		if f.hold != 0 {
+			hold = max(f.hold, 0)
+		}
+		f.mu.Unlock()
+		timeout := time.After(hold)
 		for {
 			f.mu.Lock()
 			position, changed := f.position, f.changed
@@ -321,5 +332,23 @@ func TestCloseStopsTheDoorbellBeforeTakingTheLifecycleLock(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close deadlocked with the doorbell")
+	}
+}
+
+// quickRelay makes the fake relay answer long polls at once, as a cache
+// misconfigured with a tiny long-poll timeout does.
+func quickRelay(f *fakeRelay) {
+	f.mu.Lock()
+	f.hold = -1
+	f.mu.Unlock()
+}
+
+func TestDoorbellPacesQuietAnswers(t *testing.T) {
+	f := newRelayFixture(t)
+	quickRelay(f.relay)
+	before := f.relay.longPolls.Load()
+	time.Sleep(time.Second)
+	if n := f.relay.longPolls.Load() - before; n > 12 {
+		t.Fatalf("%d long polls in 1s against a cache answering at once, want at most about 10", n)
 	}
 }
