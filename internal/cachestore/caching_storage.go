@@ -108,6 +108,33 @@ func (s *CachingStorage) ReadPage(ctx context.Context, path string) ([]byte, err
 	return data, nil
 }
 
+// ReadSnapshotRef reads through the wrapped storage's read by reference,
+// when it has one.
+func (s *CachingStorage) ReadSnapshotRef(ctx context.Context, ref manifest.ObjectRef) ([]byte, error) {
+	if byRef, ok := s.storage.(manifest.RefReader); ok {
+		return byRef.ReadSnapshotRef(ctx, ref)
+	}
+	return s.storage.ReadSnapshot(ctx, ref.Path)
+}
+
+// ReadPageRef is ReadPage, reading a page missing from the cache through the
+// wrapped storage's read by reference, when it has one.
+func (s *CachingStorage) ReadPageRef(ctx context.Context, ref manifest.ObjectRef) ([]byte, error) {
+	if data, ok := s.pageCache.Get(ref.Path); ok {
+		return data, nil
+	}
+	byRef, ok := s.storage.(manifest.RefReader)
+	if !ok {
+		return s.ReadPage(ctx, ref.Path)
+	}
+	data, err := byRef.ReadPageRef(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	s.pageCache.Set(ref.Path, data)
+	return data, nil
+}
+
 func (s *CachingStorage) WritePage(ctx context.Context, level uint8, id string, data []byte) (string, error) {
 	pages, ok := s.storage.(manifest.PageStorage)
 	if !ok {

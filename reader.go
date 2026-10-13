@@ -49,7 +49,11 @@ type Reader struct {
 	refreshing       atomic.Bool
 	refreshRequested atomic.Bool
 	background       sync.WaitGroup
-	refreshTimeout   time.Duration
+	// doorbellStop ends the long poll on the read cache, doorbellDone waits
+	// for it; nil without a read cache.
+	doorbellStop   context.CancelFunc
+	doorbellDone   sync.WaitGroup
+	refreshTimeout time.Duration
 
 	ownsDiskCache bool
 	cacheDir      string
@@ -187,12 +191,18 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		cacheDir:       opts.CacheDir,
 		metrics:        opts.Metrics,
 	}
+	reader.fetcher.cache = opts.ReadCache
 	reader.endRead = reader.lifecycleMu.RUnlock
 	reader.nextReady = make(chan struct{})
 	if reader.diskCache != nil {
 		reader.dead.start(reader)
 	}
 	reader.position.Store(reader.viewSeq)
+	if opts.ReadCache != nil {
+		ctx, stop := context.WithCancel(context.Background())
+		reader.doorbellStop = stop
+		reader.doorbellDone.Go(func() { reader.runDoorbell(ctx, opts.ReadCache, cacheDB(store.Prefix())) })
+	}
 	reader.armViewTimer(viewRefreshAt, viewExpiresAt)
 	opts.Metrics.ObserveViewLoaded(viewLoadedAt)
 	cleanupDiskCache = false
@@ -403,13 +413,19 @@ func (r *Reader) publishHeldIfDue() bool {
 // reload that started after it.
 func (r *Reader) refreshManifest(ctx context.Context, force bool) error {
 	called := r.reloads.Load()
+	key := "manifest"
+	if force && r.fetcher.cache != nil {
+		// A forced refresh reads CURRENT from storage, so it must not share
+		// a load that may have read it from the read cache.
+		key = "manifest-forced"
+	}
 	for {
-		value, err := r.manifestLoads.Do(ctx, "manifest", func(loadCtx context.Context) (any, error) {
+		value, err := r.manifestLoads.Do(ctx, key, func(loadCtx context.Context) (any, error) {
 			if !force && !r.manifestViewDue() {
 				return reloadResult{}, nil
 			}
 			started := r.reloads.Add(1)
-			view, err := r.reloadManifest(loadCtx)
+			view, err := r.reloadManifest(loadCtx, force)
 			return reloadResult{started: started, view: view}, err
 		})
 		if err != nil {
@@ -475,13 +491,13 @@ type reloadResult struct {
 // reloadManifest loads the current view for publishing. It returns no view
 // when every caller waiting for it gave up, or when loading failed, which it
 // records.
-func (r *Reader) reloadManifest(ctx context.Context) (view *loadedView, err error) {
+func (r *Reader) reloadManifest(ctx context.Context, force bool) (view *loadedView, err error) {
 	start := time.Now()
 	defer func() {
 		r.metrics.ObserveRefresh(time.Since(start), err)
 	}()
 
-	loaded, err := r.loadManifestView(ctx, start)
+	loaded, err := r.loadManifestView(ctx, start, force)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -505,12 +521,22 @@ type loadedView struct {
 // publishing it. The manifest and the CURRENT it was built from stay
 // together: reading CURRENT again could observe an overlapping reload's
 // generation.
-func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time) (loadedView, error) {
+//
+// With a read cache, CURRENT may come from the cache's copy, read from
+// storage age before the cache answered. The view's load time is then moved
+// back by that age: storage keeps what a CURRENT names for its pinned age
+// from when it was read there, and loadedAt, taken before the request, minus
+// the age is never later than that read. A forced refresh reads storage.
+func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time, force bool) (loadedView, error) {
 	r.mu.RLock()
 	fromSeq := r.viewSeq
 	r.mu.RUnlock()
+	read := &currentRead{direct: force, minPosition: fromSeq}
+	if r.fetcher.cache != nil {
+		ctx = context.WithValue(ctx, currentReadKey{}, read)
+	}
 	m, current, err := r.manifestStore.ReplayWithCurrentValidated(ctx)
-	return loadedView{manifest: m, current: current, loadedAt: loadedAt, fromSeq: fromSeq}, err
+	return loadedView{manifest: m, current: current, loadedAt: loadedAt.Add(-read.age), fromSeq: fromSeq}, err
 }
 
 // publishLoadedView publishes view, one caller at a time:
@@ -855,6 +881,12 @@ func (r *Reader) stopViewTimer() {
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
+	}
+	// Before the lifecycle lock: the doorbell requests refreshes, which take
+	// it for reading.
+	if r.doorbellStop != nil {
+		r.doorbellStop()
+		r.doorbellDone.Wait()
 	}
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()

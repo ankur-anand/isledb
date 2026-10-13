@@ -165,7 +165,14 @@ const (
 	// HeaderCache on a response says how its first 4 MiB were served: hit,
 	// shared or miss (see CacheStatus).
 	HeaderCache = "Isledb-Cache"
+	// HeaderError on an error response names its kind for clients, where
+	// the status alone does not: ErrorSizeMismatch on a 400.
+	HeaderError = "Isledb-Error"
 )
+
+// ErrorSizeMismatch is HeaderError's value when Isledb-Object-Size is not
+// the object's size in storage.
+const ErrorSizeMismatch = "size-mismatch"
 
 func (h *Handler) serveObject(w http.ResponseWriter, r *http.Request) {
 	objects := h.objects
@@ -234,6 +241,7 @@ func objectError(w http.ResponseWriter, r *http.Request, key string, err error) 
 	case errors.Is(err, blobstore.ErrNotFound):
 		http.Error(w, "object not found", http.StatusNotFound)
 	case errors.Is(err, ErrSizeMismatch):
+		w.Header().Set(HeaderError, ErrorSizeMismatch)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
 		// The details stay in the log: they can name buckets and providers.

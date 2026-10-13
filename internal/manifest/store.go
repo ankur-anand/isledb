@@ -1300,7 +1300,7 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 		if err := validateManifestObjectRef(*current.Snapshot, manifestObjectKindSnapshot); err != nil {
 			return nil, err
 		}
-		data, err := s.storage.ReadSnapshot(ctx, current.Snapshot.Path)
+		data, err := readSnapshot(ctx, s.storage, *current.Snapshot)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return nil, fmt.Errorf("read snapshot %q: %w", current.Snapshot.Path, err)
@@ -1520,6 +1520,13 @@ func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload)
 type ChangeFeedView struct {
 	current   *Current
 	expiresAt time.Time
+}
+
+// Backdate moves the view's expiry back by d: for a view built from a copy
+// of CURRENT that was read from storage d before it was given, so the view
+// lives no longer than storage keeps what it names.
+func (v *ChangeFeedView) Backdate(d time.Duration) {
+	v.expiresAt = v.expiresAt.Add(-d)
 }
 
 func (v *ChangeFeedView) Enabled() bool {
@@ -1837,7 +1844,7 @@ func (s *Store) entriesFromPageRef(ctx context.Context, ref PageRef, start, end 
 	if err := validatePageRef(ref); err != nil {
 		return nil, err
 	}
-	data, err := pages.ReadPage(ctx, ref.Path)
+	data, err := readPage(ctx, s.storage, pages, ref.ObjectRef)
 	if err != nil {
 		return nil, err
 	}

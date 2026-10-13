@@ -145,6 +145,10 @@ type readerOptions struct {
 
 	ViewPolicy ReaderViewPolicy
 
+	// ReadCache, when not nil, is tried for SST reads and manifest snapshots
+	// and pages before storage.
+	ReadCache *readThroughCache
+
 	Metrics *ReaderMetrics
 }
 

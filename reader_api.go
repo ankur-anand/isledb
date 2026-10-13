@@ -3,6 +3,7 @@ package isledb
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -91,7 +92,37 @@ type ReaderOpenOptions struct {
 	// loaded from the manifest and cannot be extended by a reader.
 	Views ReaderViewPolicy
 
+	// ReadCache sends reads of SSTs and manifest pages and snapshots, and
+	// refreshes' reads of CURRENT, through a regional read cache (isledb
+	// cache) before storage, and refreshes as soon as the cache sees a new
+	// commit. Leave URL empty to read storage directly.
+	ReadCache ReadCacheOptions
+
 	Metrics *ReaderMetrics
+}
+
+// ReadCacheOptions points a Reader at a regional read cache. A read the
+// cache cannot answer, for any reason, is read from storage instead; the
+// Reader verifies what it gets as it does from storage, so the cache can make
+// reads slower but not wrong. ReaderMetrics.ReadCacheFallbacks counts reads
+// that fell back, by reason.
+type ReadCacheOptions struct {
+	// URL is the cache's API, such as https://isledb-cache:8090.
+	URL string
+	// Token is sent as "Authorization: Bearer <token>". Leave it empty when
+	// HTTPClient authenticates with a client certificate.
+	Token string
+	// HTTPClient carries the requests, for TLS or a custom transport. Nil
+	// selects one with connection reuse suited to many concurrent reads.
+	HTTPClient *http.Client
+	// Timeout is how long a read waits for the cache before reading storage
+	// instead. Zero selects 10 seconds. The cache's own wait for read budget
+	// should be near it.
+	Timeout time.Duration
+	// MaxCurrentAge is the oldest copy of CURRENT a refresh takes from the
+	// cache; an older one, from a cache that cannot reach storage, is read
+	// from storage instead. Zero selects 5 seconds.
+	MaxCurrentAge time.Duration
 }
 
 // DefaultReaderOpenOptions returns default reader options using cacheDir for
@@ -127,12 +158,17 @@ func readerOptionsFromPublic(opts ReaderOpenOptions) (readerOptions, error) {
 	if err != nil {
 		return readerOptions{}, err
 	}
+	readCache, err := newReadThroughCache(opts.ReadCache, opts.Metrics)
+	if err != nil {
+		return readerOptions{}, fmt.Errorf("%w: %v", ErrInvalidReaderOptions, err)
+	}
 	return readerOptions{
 		CacheDir:       opts.CacheDir,
 		DiskCacheSize:  opts.DiskCacheSize,
 		BlockCacheSize: opts.BlockCacheSize,
 		BloomCacheSize: opts.BloomCacheSize,
 		ViewPolicy:     views,
+		ReadCache:      readCache,
 		Metrics:        opts.Metrics,
 	}, nil
 }

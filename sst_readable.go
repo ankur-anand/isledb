@@ -44,6 +44,9 @@ type sstObject struct {
 	checksum      string
 	bloomChecksum string
 	key           [32]byte
+	// objectSize is the stored object's length: the SST, then any Bloom
+	// sidecar, whatever its format, and the sidecar's trailer.
+	objectSize int64
 	// whole reports that the SST is fetched and cached whole: it is small, or
 	// its metadata offset is unknown (an SST from before offsets were recorded).
 	whole bool
@@ -58,6 +61,10 @@ func newSSTObject(store *blobstore.Store, meta sstMetadata, smallLimit int64) ss
 		checksum:   meta.Checksum,
 		key: sha256.Sum256([]byte(meta.ID + "\x00" + meta.Checksum + "\x00" +
 			strconv.FormatInt(meta.Size, 10))),
+	}
+	o.objectSize = meta.Size
+	if meta.Bloom.Length > 0 {
+		o.objectSize = meta.Bloom.Offset + meta.Bloom.Length + bloomTrailerLen
 	}
 	if hasUsableBloom(meta) {
 		o.bloomOffset, o.bloomLength, o.bloomChecksum = meta.Bloom.Offset, meta.Bloom.Length, meta.Bloom.Checksum
@@ -103,8 +110,14 @@ func fillsCaches(ctx context.Context) bool {
 // reads of the same part share one request.
 type sstFetcher struct {
 	store *blobstore.Store
-	disk  *diskcache.Cache // nil: nothing is cached on disk
-	m     *ReaderMetrics
+	cache *readThroughCache // nil: storage only
+	// damagedUntil holds SSTs found damaged recently, by object, with when
+	// their reads may use the read cache again: the bytes it served may be
+	// what was damaged, and a retry must not read them again.
+	damagedMu    sync.Mutex
+	damagedUntil map[[32]byte]time.Time
+	disk         *diskcache.Cache // nil: nothing is cached on disk
+	m            *ReaderMetrics
 	// smallLimit is the largest SST fetched whole; tests lower it to read
 	// small fixtures in chunks.
 	smallLimit int64
@@ -144,7 +157,12 @@ func (f *sstFetcher) object(meta sstMetadata) sstObject {
 	return newSSTObject(f.store, meta, f.smallLimit)
 }
 
-func (f *sstFetcher) close() { f.loads.Close(ErrReaderClosed) }
+func (f *sstFetcher) close() {
+	f.loads.Close(ErrReaderClosed)
+	if f.cache != nil {
+		f.cache.close()
+	}
+}
 
 func (f *sstFetcher) diskRead(k diskcache.Key, size int64, p []byte, off int64) bool {
 	return f.disk != nil && f.disk.ReadAt(k, size, p, off)
@@ -165,6 +183,7 @@ func (f *sstFetcher) diskStore(k diskcache.Key, data []byte) {
 // dropObject removes every cached part of a damaged SST, so the next read
 // fetches it again. The Bloom sidecar stays: it is checksummed on every load.
 func (f *sstFetcher) dropObject(o sstObject) {
+	f.markDamaged(o)
 	if f.disk == nil {
 		return
 	}
@@ -215,7 +234,77 @@ func damaged(err error) bool {
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-func (f *sstFetcher) readRange(ctx context.Context, path string, off, length int64) ([]byte, error) {
+// Reads kept from the read cache after damage: reads of an SST found
+// damaged go to storage for damagedSkip, and at most damagedMax SSTs are
+// remembered.
+const (
+	damagedSkip = 10 * time.Minute
+	damagedMax  = 4096
+)
+
+// readRange reads [off, off+length) of o: through the read cache when there
+// is one, else, or when the cache fails, from storage. With fill false the
+// cache is asked not to keep what it reads, as for a private scan. fromCache
+// reports that the bytes came from the cache.
+func (f *sstFetcher) readRange(ctx context.Context, o sstObject, off, length int64, fill bool) (data []byte, fromCache bool, err error) {
+	if f.cache != nil {
+		if f.recentlyDamaged(o) {
+			f.m.ObserveReadCache(reasonAfterDamage)
+		} else if data, ok, err := f.cache.read(ctx, o.path, o.objectSize, off, length, fill); ok || err != nil {
+			return data, ok, err
+		}
+	}
+	data, err = f.readStorage(ctx, o.path, off, length)
+	return data, false, err
+}
+
+// readVerified is readRange for parts with a checksum, which valid checks:
+// bytes from the read cache that fail it are counted and read again from
+// storage, whose bytes are returned for the caller to judge.
+func (f *sstFetcher) readVerified(ctx context.Context, o sstObject, off, length int64, valid func([]byte) bool) ([]byte, error) {
+	data, fromCache, err := f.readRange(ctx, o, off, length, true)
+	if err != nil || !fromCache || valid(data) {
+		return data, err
+	}
+	f.m.ObserveReadCache(reasonChecksumMismatch)
+	return f.readStorage(ctx, o.path, off, length)
+}
+
+// markDamaged sends o's reads to storage for damagedSkip.
+func (f *sstFetcher) markDamaged(o sstObject) {
+	if f.cache == nil {
+		return
+	}
+	now := time.Now()
+	f.damagedMu.Lock()
+	defer f.damagedMu.Unlock()
+	if f.damagedUntil == nil {
+		f.damagedUntil = make(map[[32]byte]time.Time)
+	}
+	if len(f.damagedUntil) >= damagedMax {
+		for k, until := range f.damagedUntil {
+			if !now.Before(until) {
+				delete(f.damagedUntil, k)
+			}
+		}
+	}
+	if len(f.damagedUntil) < damagedMax {
+		f.damagedUntil[o.key] = now.Add(damagedSkip)
+	}
+}
+
+func (f *sstFetcher) recentlyDamaged(o sstObject) bool {
+	f.damagedMu.Lock()
+	defer f.damagedMu.Unlock()
+	until, ok := f.damagedUntil[o.key]
+	if ok && !time.Now().Before(until) {
+		delete(f.damagedUntil, o.key)
+		return false
+	}
+	return ok
+}
+
+func (f *sstFetcher) readStorage(ctx context.Context, path string, off, length int64) ([]byte, error) {
 	start := time.Now()
 	reader, err := f.store.ReadRangeStream(ctx, path, off, length)
 	if err != nil {
@@ -250,16 +339,22 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 		if o.bloomLength > 0 && o.bloomOffset >= o.size {
 			end = o.bloomOffset + o.bloomLength
 		}
-		data, err := f.readRange(ctx, o.path, 0, end)
+		sstValid := func(data []byte) bool {
+			if o.checksum == "" {
+				return true
+			}
+			want, err := checksum.ParseSHA256(o.checksum)
+			return err == nil && sha256.Sum256(data[:o.size]) == want
+		}
+		data, err := f.readVerified(ctx, o, 0, end, func(data []byte) bool {
+			return sstValid(data) && (end == o.size || validateBloomChecksum(o.bloomChecksum, data[o.bloomOffset:end]) == nil)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("read sst %s: %w", o.id, err)
 		}
-		if o.checksum != "" {
-			want, err := checksum.ParseSHA256(o.checksum)
-			if err != nil || sha256.Sum256(data[:o.size]) != want {
-				// Checked before anything is stored: the object itself is bad.
-				return nil, &fetchError{fmt.Errorf("validate sst %s: checksum mismatch", o.id)}
-			}
+		if !sstValid(data) {
+			// Checked before anything is stored: the object itself is bad.
+			return nil, &fetchError{fmt.Errorf("validate sst %s: checksum mismatch", o.id)}
 		}
 		f.diskStore(o.entry(diskcache.KindWhole, 0), data[:o.size])
 		if end > o.size {
@@ -275,7 +370,7 @@ func (f *sstFetcher) whole(ctx context.Context, o sstObject) ([]byte, error) {
 // one request and stored.
 func (f *sstFetcher) meta(ctx context.Context, o sstObject) ([]byte, error) {
 	return f.load(ctx, o.entry(diskcache.KindMeta, 0), func(ctx context.Context) ([]byte, error) {
-		data, err := f.readRange(ctx, o.path, o.metaOffset, o.size-o.metaOffset)
+		data, _, err := f.readRange(ctx, o, o.metaOffset, o.size-o.metaOffset, true)
 		if err != nil {
 			return nil, fmt.Errorf("read sst %s metadata: %w", o.id, err)
 		}
@@ -307,7 +402,9 @@ func (f *sstFetcher) bloom(ctx context.Context, o sstObject) ([]byte, error) {
 	} else {
 		var err error
 		data, err = f.load(ctx, k, func(ctx context.Context) ([]byte, error) {
-			data, err := f.readRange(ctx, o.path, o.bloomOffset, o.bloomLength)
+			data, err := f.readVerified(ctx, o, o.bloomOffset, o.bloomLength, func(data []byte) bool {
+				return validateBloomChecksum(o.bloomChecksum, data) == nil
+			})
 			if err == nil && validateBloomChecksum(o.bloomChecksum, data) == nil {
 				f.diskStore(k, data)
 			}
@@ -472,7 +569,7 @@ func (f *sstFetcher) fetchChunks(ctx context.Context, o sstObject, first, last, 
 		}
 		f.mu.Unlock()
 
-		fl.data, fl.err = f.readRange(ctx, o.path, start, stop-start)
+		fl.data, _, fl.err = f.readRange(ctx, o, start, stop-start, store)
 		if fl.err == nil && store {
 			// Stored before the request leaves inflight, so a reader that
 			// no longer finds it in flight finds it on disk.
