@@ -197,6 +197,14 @@ func (s *manifestThroughCache) ReadCurrent(ctx context.Context) ([]byte, string,
 	return current.Data, "", nil
 }
 
+// The doorbell's wait after a failed long poll is random, up to
+// doorbellBackoffUnit doubled for each failure in a row, at most
+// doorbellMaxBackoff. Variables for tests.
+var (
+	doorbellBackoffUnit = time.Second
+	doorbellMaxBackoff  = 30 * time.Second
+)
+
 // minLongPollGap is the least time between the starts of two long polls: a
 // cache whose long poll times out sooner than this, misconfigured, is not
 // polled faster.
@@ -232,7 +240,7 @@ func (r *Reader) runDoorbell(ctx context.Context, cache *readThroughCache, db st
 			r.metrics.ObserveReadCacheDoorbell("error")
 			failures++
 			// Random, so readers whose cache restarted do not return together.
-			wait := time.Duration(rand.Int64N(int64(min(30*time.Second, time.Second<<min(failures, 5)))))
+			wait := time.Duration(rand.Int64N(int64(min(doorbellMaxBackoff, doorbellBackoffUnit<<min(failures, 5)))))
 			select {
 			case <-ctx.Done():
 				return
