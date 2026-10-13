@@ -25,6 +25,21 @@ const (
 )
 
 func TestMinIOStorageEngineProcesses(t *testing.T) {
+	bucketURL := newMinIOBucket(t)
+	for _, payload := range []isledb.ChangeFeedPayload{
+		isledb.ChangeFeedKeysOnly,
+		isledb.ChangeFeedFullValues,
+	} {
+		t.Run(payload.String(), func(t *testing.T) {
+			runStorageEngineProcessWorkflow(t, bucketURL, payload)
+		})
+	}
+}
+
+// newMinIOBucket creates a bucket for the test and returns its URL, with
+// the credentials in the environment for the test and processes it starts.
+func newMinIOBucket(t *testing.T) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -60,14 +75,7 @@ func TestMinIOStorageEngineProcesses(t *testing.T) {
 	query.Set("region", region)
 	query.Set("use_path_style", "true")
 	bucketURL.RawQuery = query.Encode()
-	for _, payload := range []isledb.ChangeFeedPayload{
-		isledb.ChangeFeedKeysOnly,
-		isledb.ChangeFeedFullValues,
-	} {
-		t.Run(payload.String(), func(t *testing.T) {
-			runStorageEngineProcessWorkflow(t, bucketURL.String(), payload)
-		})
-	}
+	return bucketURL.String()
 }
 
 func waitForMinIOBucket(ctx context.Context, client *s3.Client, endpoint, bucket string) error {
