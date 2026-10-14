@@ -24,6 +24,11 @@ IsleDB provides:
 - compaction and storage cleanup that can run in a separate process or
   scheduled job.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img src="docs/architecture-light.svg" width="100%" alt="IsleDB architecture: one writer commits to object storage; maintenance compacts it; reader processes read through their local cache, then an optional shared read cache, then object storage; the shared cache tells readers about new commits.">
+</picture>
+
 ## Install
 
 ```bash

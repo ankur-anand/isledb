@@ -1,0 +1,91 @@
+<svg width="1040" height="530" viewBox="-20 -14 1040 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="IsleDB architecture: one writer commits to object storage; maintenance compacts it; reader processes read through their local cache, then an optional shared read cache, then object storage; the shared cache tells readers about new commits.">
+  <style>
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #9aa7a0; }
+    .eyebrow { font-size: 11px; letter-spacing: .1em; }
+    .title { font-size: 21px; font-weight: 600; }
+    .sub { font-size: 14px; fill: #9aa7a0; }
+    .edge { font-size: 12px; }
+    .box { fill: none; stroke: #3b4741; stroke-width: 1.2; }
+    .store { fill: #16231c; stroke: #7fb08f; stroke-width: 1.4; }
+    .opt { fill: none; stroke: #3b4741; stroke-width: 1.2; stroke-dasharray: 5 4; }
+    .stack { fill: none; stroke: #3b4741; stroke-width: 1; opacity: .7; }
+    .line { fill: none; stroke: #7fa58b; stroke-width: 1.4; }
+    .notice { fill: none; stroke: #8cc09c; stroke-width: 1.4; stroke-dasharray: 5 4; }
+    .head { fill: none; stroke: #7fa58b; stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+    .head-n { fill: none; stroke: #8cc09c; stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+  </style>
+
+  <rect id="panel" x="-20" y="-14" width="1040" height="530" rx="10" fill="#0d1117"/>
+  <!-- Writer -->
+  <rect class="box" x="20" y="30" width="220" height="110" rx="6"/>
+  <text class="m eyebrow" x="40" y="58">WRITE</text>
+  <text class="t title" x="40" y="88">One writer</text>
+  <text class="t sub" x="40" y="114">Put → Flush</text>
+
+  <!-- Object storage -->
+  <rect class="store" x="390" y="30" width="260" height="110" rx="6"/>
+  <text class="m eyebrow" x="410" y="58">DURABLE STATE</text>
+  <text class="t title" x="410" y="88">Object storage</text>
+  <text class="t sub" x="410" y="114">SSTs · manifests · CURRENT</text>
+
+  <!-- Maintenance -->
+  <rect class="box" x="780" y="30" width="200" height="110" rx="6"/>
+  <text class="m eyebrow" x="800" y="58">SEPARATE COMPUTE</text>
+  <text class="t title" x="800" y="88">Maintenance</text>
+  <text class="t sub" x="800" y="114">Compaction + cleanup</text>
+
+  <!-- Reader processes, stacked -->
+  <rect class="stack" x="32" y="292" width="300" height="170" rx="6"/>
+  <rect class="stack" x="26" y="286" width="300" height="170" rx="6"/>
+  <rect class="box" x="20" y="280" width="300" height="170" rx="6" style="fill: #0d1117"/>
+  <text class="m eyebrow" x="40" y="308">READER PROCESS · ×N</text>
+  <text class="t title" x="40" y="338">Get / Scan</text>
+  <rect class="box" x="40" y="356" width="260" height="74" rx="5"/>
+  <text class="m eyebrow" x="56" y="381">LOCAL CACHE</text>
+  <text class="t sub" x="56" y="410">Disk + memory</text>
+
+  <!-- Shared read cache -->
+  <rect class="opt" x="680" y="280" width="300" height="170" rx="6"/>
+  <text class="m eyebrow" x="700" y="308">OPTIONAL · ISLEDB CACHE</text>
+  <text class="t title" x="700" y="338">Shared read cache</text>
+  <text class="t sub" x="700" y="370">Object chunks on local disk</text>
+  <text class="t sub" x="700" y="394">Relays CURRENT to readers</text>
+
+  <!-- commit -->
+  <line class="line" x1="240" y1="85" x2="386" y2="85"/>
+  <polyline class="head" points="378,80 386,85 378,90"/>
+  <text class="m edge" x="313" y="74" text-anchor="middle">commit</text>
+
+  <!-- compaction -->
+  <line class="line" x1="654" y1="85" x2="776" y2="85"/>
+  <polyline class="head" points="662,80 654,85 662,90"/>
+  <polyline class="head" points="768,80 776,85 768,90"/>
+  <text class="m edge" x="715" y="74" text-anchor="middle">compaction</text>
+
+  <!-- reader direct to storage -->
+  <polyline class="line" points="240,280 240,215 470,215 470,144"/>
+  <polyline class="head" points="465,152 470,144 475,152"/>
+  <text class="m edge" x="355" y="205" text-anchor="middle">no cache, or cache down</text>
+
+  <!-- cache to storage -->
+  <polyline class="line" points="800,280 800,235 570,235 570,144"/>
+  <polyline class="head" points="565,152 570,144 575,152"/>
+  <text class="m edge" x="685" y="226" text-anchor="middle">cache miss · polls CURRENT</text>
+
+  <!-- reader to cache -->
+  <line class="line" x1="320" y1="340" x2="676" y2="340"/>
+  <polyline class="head" points="668,335 676,340 668,345"/>
+  <text class="m edge" x="498" y="330" text-anchor="middle">local miss</text>
+
+  <!-- commit notice -->
+  <line class="notice" x1="680" y1="410" x2="324" y2="410"/>
+  <polyline class="head-n" points="332,405 324,410 332,415"/>
+  <text class="m edge" x="502" y="400" text-anchor="middle" style="fill: #8cc09c">new commits · long poll</text>
+
+  <!-- legend -->
+  <line class="line" x1="20" y1="486" x2="48" y2="486"/>
+  <text class="m edge" x="56" y="490">request</text>
+  <line class="notice" x1="140" y1="486" x2="168" y2="486"/>
+  <text class="m edge" x="176" y="490" style="fill: #8cc09c">commit notice</text>
+</svg>
