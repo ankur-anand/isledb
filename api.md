@@ -16,6 +16,7 @@ import "github.com/ankur-anand/isledb"
 - [Open and close a database](#open-and-close-a-database)
 - [Write data](#write-data)
   - [Is my write durable?](#is-my-write-durable)
+  - [Did it commit after a failover?](#did-it-commit-after-a-failover)
   - [Writer lifecycle](#writer-lifecycle)
   - [Failures and retries](#failures-and-retries)
   - [Shutting down](#shutting-down)
@@ -197,6 +198,8 @@ func (w *Writer) Flush(ctx context.Context) error
 func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error
 func (w *Writer) CommittedSequence() uint64
 func (w *Writer) AcceptedSequence() uint64
+func (w *Writer) Epoch() uint64
+func (w *Writer) CommitStatus(epoch, seq uint64) (CommitStatus, error)
 func (w *Writer) State() WriterState
 func (w *Writer) StopWrites()
 func (w *Writer) Drain(ctx context.Context) error
@@ -210,6 +213,8 @@ func (w *Writer) Close(ctx context.Context) error
 | `WaitCommitted` | Wait until a given sequence is committed |
 | `CommittedSequence` | The highest committed sequence, without waiting |
 | `AcceptedSequence` | The highest sequence handed out, committed or not |
+| `Epoch` | The writer's fence epoch, one above the writer before it |
+| `CommitStatus` | Whether a write, named by epoch and sequence, was committed |
 | `State` | One consistent snapshot of the writer, for probes and dashboards |
 | `StopWrites` | Refuse new writes from now on; keep committing the ones accepted |
 | `Drain` | `StopWrites`, then commit everything accepted, retrying until ctx ends |
@@ -218,8 +223,10 @@ func (w *Writer) Close(ctx context.Context) error
 Every method is safe to call from any goroutine.
 
 **Sequences.** Each write gets the next sequence number, in the order writes
-are accepted. Sequences continue across writers, and a change-feed consumer
-sees the same number as `Change.Sequence`.
+are accepted. Sequences continue across writers from the highest committed
+one, and a change-feed consumer sees the same number as `Change.Sequence`. A
+writer taking over reuses the sequences its predecessor accepted but did not
+commit, so a sequence names a write only together with the writer's `Epoch`.
 
 **Validation.** An empty or oversized key, an oversized value, or a negative
 TTL returns an error wrapping `ErrInvalidMutation`, so you know not to retry
@@ -253,12 +260,43 @@ Without a flush interval, call `Flush`.
 | `WaitCommitted` returns | The write |
 |---|---|
 | `nil` | is committed |
-| `ErrFenced` | was not committed and never will be: another writer took over |
+| `ErrFenced` | was not committed and never will be: another writer took over (if more than two took over before this one learned of it, ask the current writer's `CommitStatus`) |
 | a context error | is not known yet: it is still being retried and may land |
 | `ErrWriterClosed` | is not known: `Close` finished the writer before confirming it, and its last attempt may have landed |
 
 Treat an unknown write as unknown, not lost, and make retries idempotent (for
 example, `Put` the same key and value again).
+
+### Did it commit after a failover?
+
+A client whose wait ended without an answer can ask the writer that holds
+the database now. Keep the epoch with each sequence handed out:
+
+```go
+seq, err := writer.Put(ctx, key, value)
+token := WriteToken{Epoch: writer.Epoch(), Seq: seq} // your type
+
+// Later, on whichever writer is current:
+status, err := current.CommitStatus(token.Epoch, token.Seq)
+```
+
+Each writer's fence records where the writer before it stopped, and where
+the one before that did, so `CommitStatus` answers exactly for this writer
+and the two before it:
+
+| Write of | `CommitStatus` returns |
+|---|---|
+| this writer | `CommitDone` or `CommitPending`; once fenced, `CommitDone` or `CommitNever` |
+| one or two takeovers back | `CommitDone` or `CommitNever` |
+| three or more takeovers back | `CommitNever` above the highest sequence committed when this writer took over; `CommitUnknown` at or below it, since a writer in between may have reused it |
+| a later writer | `ErrFenced`: ask that one |
+
+`CommitStatus` does no I/O, so an HTTP endpoint on the writer can answer
+from memory. A fenced writer learns where its commits ended from the fence
+that replaced it, a commit whose response was lost included, and
+`WaitCommitted` returns `nil` for those writes rather than `ErrFenced`. Where
+every write's outcome must stay knowable across any number of takeovers,
+store a request ID in the value written, and read it back after `Refresh`.
 
 ### Writer lifecycle
 

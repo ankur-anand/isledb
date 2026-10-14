@@ -33,8 +33,9 @@ var ErrChangeFeedPayloadMismatch = manifest.ErrChangeFeedPayloadMismatch
 var ErrCommitIndeterminate = manifest.ErrCommitIndeterminate
 
 // ErrFenced is returned once another writer has taken over the writer fence:
-// the fenced Writer commits nothing more, so a write WaitCommitted reports
-// ErrFenced for was not committed and never will be.
+// the fenced Writer commits nothing more. WaitCommitted reports it for a write
+// that was not committed and never will be; when more than two writers took
+// over before this one learned of it, ask the current Writer's CommitStatus.
 var ErrFenced = manifest.ErrFenced
 
 // ErrManifestUnavailable is returned when a database that has already been
@@ -174,6 +175,64 @@ func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error {
 // storage. Every mutation with a sequence at or below it is durable.
 func (w *Writer) CommittedSequence() uint64 {
 	return w.w.committed.Load()
+}
+
+// Epoch is the Writer's fence epoch, one above the Writer's that held the
+// database before it. A sequence names a write only with the epoch of the
+// Writer that accepted it: a Writer taking over reuses the sequences its
+// predecessor accepted but did not commit.
+func (w *Writer) Epoch() uint64 {
+	return w.w.fenceToken.Epoch
+}
+
+// CommitStatus is whether a write was committed, as one Writer can tell.
+type CommitStatus int
+
+const (
+	// CommitUnknown: this Writer cannot tell.
+	CommitUnknown CommitStatus = iota
+	// CommitPending: accepted by this Writer, not committed yet.
+	CommitPending
+	// CommitDone: in object storage.
+	CommitDone
+	// CommitNever: not committed, and never will be.
+	CommitNever
+)
+
+func (s CommitStatus) String() string {
+	switch s {
+	case CommitPending:
+		return "pending"
+	case CommitDone:
+		return "committed"
+	case CommitNever:
+		return "not_committed"
+	default:
+		return "unknown"
+	}
+}
+
+// CommitStatus reports whether the write that the Writer of epoch accepted
+// with sequence seq was committed, with no I/O. Each Writer's fence records
+// where the Writer before it stopped, and where the one before that did, so:
+//   - this Writer's own writes are CommitDone or CommitPending; once it is
+//     fenced, the fence that replaced it settles them as CommitDone or
+//     CommitNever, a commit whose response was lost included;
+//   - writes of the two Writers before this one are CommitDone or
+//     CommitNever;
+//   - older writes are CommitNever above the highest sequence committed
+//     when this Writer took over, and CommitUnknown at or below it, since a
+//     Writer in between may have reused seq for another write.
+//
+// epoch must be the one seq was issued under, as Epoch reported it: the
+// answer is about that pair, and a wrong epoch can give a wrong answer.
+//
+// After Close, an uncommitted own write is CommitUnknown. An epoch above this
+// Writer's returns ErrFenced: a later Writer has taken over and can answer. A
+// sequence of this Writer's own epoch that it did not assign returns an
+// error.
+func (w *Writer) CommitStatus(epoch, seq uint64) (CommitStatus, error) {
+	return w.w.commitStatus(epoch, seq)
 }
 
 // StopWrites makes Put, PutWithTTL and Delete return ErrWritesStopped from now
