@@ -68,7 +68,7 @@ func (c *Config) Settings() []service.Setting {
 		service.Setting{Flag: "max-read-bytes", Path: "reads.max_bytes", Usage: "bytes read from storage at once, e.g. 256MiB", Set: c.Reads.MaxBytes.Parse},
 		service.Setting{Flag: "max-read-wait", Path: "reads.max_wait", Usage: "longest a storage read waits for max-read-bytes", Set: c.Reads.MaxWait.Parse},
 		service.Setting{Flag: "current-poll", Path: "current.poll", Usage: "how often CURRENT is read from storage", Set: c.Current.Poll.Parse},
-		service.Setting{Flag: "long-poll", Path: "current.long_poll", Usage: "longest a long poll is held", Set: c.Current.LongPoll.Parse},
+		service.Setting{Flag: "long-poll", Path: "current.long_poll", Usage: "longest a long poll is held, at most 30s", Set: c.Current.LongPoll.Parse},
 	)
 }
 
@@ -125,6 +125,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Current.Poll <= 0 || c.Current.LongPoll <= 0 {
 		fail("current.poll and current.long_poll must be positive")
+	}
+	if time.Duration(c.Current.LongPoll) > readcache.MaxLongPoll {
+		fail("current.long_poll is above %s: readers give up on a long poll not answered by then", readcache.MaxLongPoll)
 	}
 	return errors.Join(append(errs, c.Server.Validate())...)
 }

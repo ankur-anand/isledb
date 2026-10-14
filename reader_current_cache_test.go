@@ -105,6 +105,13 @@ type relayFixture struct {
 // CURRENT, and a Reader through the relay that refreshes only when asked.
 func newRelayFixture(t *testing.T) *relayFixture {
 	t.Helper()
+	return newRelayFixtureRefreshing(t, time.Hour)
+}
+
+// newRelayFixtureRefreshing is newRelayFixture with a Reader that refreshes
+// every refreshAfter.
+func newRelayFixtureRefreshing(t *testing.T, refreshAfter time.Duration) *relayFixture {
+	t.Helper()
 	ctx := context.Background()
 	f := &relayFixture{ctx: ctx, store: blobstore.NewMemory("db-relay"), relay: &fakeRelay{}}
 	t.Cleanup(func() { _ = f.store.Close() })
@@ -130,7 +137,7 @@ func newRelayFixture(t *testing.T) *relayFixture {
 
 	f.metrics = DefaultReaderMetrics(nil)
 	opts := DefaultReaderOpenOptions(t.TempDir())
-	opts.Views.RefreshAfter = time.Hour
+	opts.Views.RefreshAfter = refreshAfter
 	opts.ReadCache = ReadCacheOptions{URL: server.URL, Timeout: time.Second}
 	opts.Metrics = f.metrics
 	if f.reader, err = f.db.OpenReader(ctx, opts); err != nil {
@@ -350,5 +357,28 @@ func TestDoorbellPacesQuietAnswers(t *testing.T) {
 	time.Sleep(time.Second)
 	if n := f.relay.longPolls.Load() - before; n > 12 {
 		t.Fatalf("%d long polls in 1s against a cache answering at once, want at most about 10", n)
+	}
+}
+
+func TestRefreshesContinueWhenTheCacheCopyIsNoNewer(t *testing.T) {
+	f := newRelayFixtureRefreshing(t, time.Second)
+	// The view came from storage at open; the relay's copy of the same
+	// CURRENT is 3s old, so each refresh through it loads a view dated
+	// before the published one.
+	f.relay.set(t, f.storageCurrent(t), 3*time.Second)
+	relayed := func() float64 { return testutil.ToFloat64(f.metrics.ReadCacheCurrent.WithLabelValues("relayed")) }
+	time.Sleep(3500 * time.Millisecond)
+	if n := relayed(); n < 2 {
+		t.Fatalf("%v refreshes through the cache in 3.5s at one a second, want at least 2", n)
+	}
+
+	// A newer copy, also 3s old, is published dated 3s back: the next
+	// refresh is still a period away, not at once and again.
+	f.commit(t, "b")
+	f.relay.set(t, f.storageCurrent(t), 3*time.Second)
+	before := relayed()
+	time.Sleep(3500 * time.Millisecond)
+	if n := relayed() - before; n < 2 || n > 5 {
+		t.Fatalf("%v refreshes through the cache in 3.5s at one a second, want 2 to 5", n)
 	}
 }

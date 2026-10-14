@@ -545,6 +545,8 @@ func (r *Reader) loadManifestView(ctx context.Context, loadedAt time.Time, force
 //     refresh and expiry times, as every successful refresh must, or an idle
 //     reader's view would expire;
 //   - already published by another caller sharing the load: nothing;
+//   - the same log position, loaded no later, as from a cache's older copy:
+//     it schedules the next refresh;
 //   - older, after another reload published a newer view since this load
 //     started: nothing, the reader is ahead;
 //   - older, with nothing published since: the store went back, a failure.
@@ -561,6 +563,7 @@ func (r *Reader) publishLoaded(view loadedView, force bool) {
 	defer r.publishMu.Unlock()
 	r.mu.RLock()
 	published, publishedAt, expiresAt := r.viewSeq, r.viewLoadedAt, r.viewExpiresAt
+	sharedLoad := r.manifest == view.manifest
 	r.mu.RUnlock()
 	seq := currentNextSeq(view.current)
 	switch {
@@ -570,7 +573,17 @@ func (r *Reader) publishLoaded(view loadedView, force bool) {
 				seq, published))
 		}
 		return
+	case sharedLoad:
+		return
 	case seq == published && !view.loadedAt.After(publishedAt):
+		// Nothing newer, as from a cache's copy dated no later than the
+		// view: the refresh still succeeded, and the next is a period away.
+		r.mu.Lock()
+		r.viewRefreshAt = r.nextOnGrid(time.Now(), r.viewPolicy.RefreshAfter)
+		refreshAt := r.viewRefreshAt
+		r.mu.Unlock()
+		r.armViewTimer(refreshAt, expiresAt)
+		r.refreshSucceeded()
 		return
 	}
 	if seq > published && r.viewPolicy.Manual && !force && time.Now().Before(expiresAt) {
@@ -607,7 +620,7 @@ func (r *Reader) keepNextView(view loadedView) (loadedView, bool) {
 	outdatedSince := r.outdatedSince
 	next := *r.nextView
 	due := !time.Now().Before(r.outdatedSince.Add(r.maxLag(view.current)))
-	refreshAt := r.nextOnGrid(view.loadedAt, r.viewPolicy.RefreshAfter)
+	refreshAt := r.nextOnGrid(time.Now(), r.viewPolicy.RefreshAfter)
 	if !due {
 		r.viewRefreshAt = refreshAt
 	}
@@ -733,7 +746,9 @@ func (r *Reader) publishManifestView(
 	viewLoadedAt time.Time,
 ) (bool, uint64) {
 	changeFeed, changeHead := readerChangeFeedState(current)
-	refreshAt := r.nextOnGrid(viewLoadedAt, r.viewPolicy.RefreshAfter)
+	// The next refresh is a period from now: viewLoadedAt can be dated back
+	// by a cache's copy, and a period from it may already have passed.
+	refreshAt := r.nextOnGrid(time.Now(), r.viewPolicy.RefreshAfter)
 	expiresAt := viewLoadedAt.Add(current.PinnedViewAge())
 
 	// Reloads can finish in any order; an older view is dropped, so reads
