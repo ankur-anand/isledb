@@ -78,6 +78,7 @@ func (f *fakeRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		w.Header().Set(readcache.HeaderPosition, strconv.FormatUint(f.position, 10))
+		w.Header().Set(readcache.HeaderAgeMillis, strconv.FormatInt(f.age.Milliseconds(), 10))
 		f.mu.Unlock()
 		return
 	}

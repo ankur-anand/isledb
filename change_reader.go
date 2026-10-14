@@ -1155,10 +1155,14 @@ func (r *ChangeReader) WaitForChanges(ctx context.Context, from ChangeCursor) er
 	for {
 		if r.cache != nil {
 			started := time.Now()
-			position, err := r.cache.client.WaitCurrent(ctx, r.cacheDB, from.entry)
+			position, age, err := r.cache.client.WaitCurrent(ctx, r.cacheDB, from.entry)
 			switch {
 			case ctx.Err() != nil:
 				return ended(ctx.Err())
+			case err == nil && position <= from.entry && age > r.cache.maxCurrentAge:
+				// The cache cannot read storage, so it would stay quiet
+				// through commits: read CURRENT, which goes to storage.
+				r.cache.m.ObserveReadCacheDoorbell("quiet")
 			case err == nil && position <= from.entry:
 				r.cache.m.ObserveReadCacheDoorbell("quiet")
 				paceLongPoll(ctx, started)

@@ -258,31 +258,36 @@ const maxCurrentBytes = 16 << 20
 var longPollDeadline = readcache.MaxLongPoll + 15*time.Second
 
 // WaitCurrent waits on the cache for db's CURRENT to pass position after,
-// returning the position it has when it answers: past after, or not when the
-// cache's long poll timed out. No answer within longPollDeadline is a
-// timeout.
-func (c *Client) WaitCurrent(ctx context.Context, db string, after uint64) (uint64, error) {
+// returning the position and age of its copy when it answers: past after, or
+// not when the cache's long poll timed out. The age is zero from a cache that
+// does not send it. No answer within longPollDeadline is a timeout.
+func (c *Client) WaitCurrent(ctx context.Context, db string, after uint64) (uint64, time.Duration, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, longPollDeadline)
 	defer cancel()
 	resp, err := c.getCurrent(waitCtx, url.Values{"db": {db}, "after": {strconv.FormatUint(after, 10)}})
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
-			return 0, ctx.Err()
+			return 0, 0, ctx.Err()
 		case waitCtx.Err() != nil:
-			return 0, &Error{ReasonTimeout, fmt.Errorf("no answer to a long poll in %s", longPollDeadline)}
+			return 0, 0, &Error{ReasonTimeout, fmt.Errorf("no answer to a long poll in %s", longPollDeadline)}
 		}
-		return 0, &Error{ReasonUnavailable, err}
+		return 0, 0, &Error{ReasonUnavailable, err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, errorFor(resp)
+		return 0, 0, errorFor(resp)
 	}
-	position, err := strconv.ParseUint(resp.Header.Get(readcache.HeaderPosition), 10, 64)
-	if err != nil {
-		return 0, &Error{ReasonInvalid, fmt.Errorf("position %q", resp.Header.Get(readcache.HeaderPosition))}
+	position, perr := strconv.ParseUint(resp.Header.Get(readcache.HeaderPosition), 10, 64)
+	var ageMs int64
+	var aerr error
+	if age := resp.Header.Get(readcache.HeaderAgeMillis); age != "" {
+		ageMs, aerr = strconv.ParseInt(age, 10, 64)
 	}
-	return position, nil
+	if perr != nil || aerr != nil || ageMs < 0 {
+		return 0, 0, &Error{ReasonInvalid, fmt.Errorf("position %q, age %q", resp.Header.Get(readcache.HeaderPosition), resp.Header.Get(readcache.HeaderAgeMillis))}
+	}
+	return position, time.Duration(ageMs) * time.Millisecond, nil
 }
 
 func (c *Client) getCurrent(ctx context.Context, query url.Values) (*http.Response, error) {

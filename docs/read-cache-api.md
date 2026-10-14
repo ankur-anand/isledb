@@ -63,7 +63,7 @@ entry and keep the position, such as folding the log into a new snapshot.
 | Header | Without `after` | With `after` |
 |---|---|---|
 | `Isledb-Position` | Log position of the `CURRENT` returned: its `next_seq` | The copy's log position |
-| `Isledb-Age-Ms` | Milliseconds since the cache read this `CURRENT` from storage, rounded up. Measured on the cache's monotonic clock; not a timestamp. | – |
+| `Isledb-Age-Ms` | Milliseconds since the cache read this `CURRENT` from storage, rounded up. Measured on the cache's monotonic clock; not a timestamp. | The copy's age, the same way |
 | `Content-Type` | `application/json` | – |
 
 Without `after`, the body is `CURRENT`'s bytes as stored. With `after`, the
@@ -105,8 +105,11 @@ body is empty.
 5. **Long poll.** Ask with `after=<published position>`; on an answer above
    it, call `RequestRefresh` and ask again. `RequestRefresh` reads `CURRENT`
    with a plain `GET`, where rules 1 to 3 apply. Give up on a long poll
-   unanswered after 45 seconds: the connection is dead. After a timeout or
-   error, wait a random 0 to 1 second before asking again.
+   unanswered after 45 seconds: the connection is dead. An answer not above
+   it whose age is past the limit of rule 1 means the cache cannot read
+   storage and will not ring for new commits: read `CURRENT`, which then
+   goes to storage. After a timeout or error, wait a random 0 to 1 second
+   before asking again.
 6. **Fallback.** On a connection error, a timeout or a 5xx, read storage
    directly.
 
@@ -115,6 +118,7 @@ body is empty.
 ```
 $ curl -si -H "Authorization: Bearer $TOKEN" 'http://cache:8090/v1/current?db=prod/policy&after=41'
 HTTP/1.1 200 OK
+Isledb-Age-Ms: 3
 Isledb-Position: 42
 Content-Length: 0
 

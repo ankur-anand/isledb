@@ -231,7 +231,7 @@ func (r *Reader) runDoorbell(ctx context.Context, cache *readThroughCache, db st
 	for {
 		loaded := r.loadedPosition()
 		started := time.Now()
-		position, err := cache.client.WaitCurrent(ctx, db, loaded)
+		position, _, err := cache.client.WaitCurrent(ctx, db, loaded)
 		if ctx.Err() != nil {
 			return
 		}
