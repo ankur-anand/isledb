@@ -197,6 +197,46 @@ func TestFencedWriterLearnsItsLostCommitLanded(t *testing.T) {
 	}
 }
 
+// TestReconciledCommitAfterTakeoverSettlesLaterWrites: the retry of a commit
+// whose response was lost finds it landed, after a successor took the fence.
+// The writer records it and learns where its commits ended, so a later write
+// it never committed is CommitNever, not CommitUnknown.
+func TestReconciledCommitAfterTakeoverSettlesLaterWrites(t *testing.T) {
+	ctx := context.Background()
+	opts := testWriterOptions(1<<20, 16)
+	opts.Flush.Interval = 0
+	w, storage, _, _ := newHangingCommitWriter(t, opts, 200*time.Millisecond)
+	w.committerCancel()
+	<-w.committerDone
+	landed, err := w.put(ctx, []byte("a"), []byte("1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage.applyFirst.Store(true)
+	storage.hang.Store(true)
+	if err := w.commitPass(ctx, false); err == nil {
+		t.Fatal("a commit with its response lost succeeded")
+	}
+	storage.hang.Store(false)
+	later, err := w.put(ctx, []byte("b"), []byte("2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.NewStoreWithStorage(storage.Storage).ClaimWriter(ctx, "successor"); err != nil {
+		t.Fatal(err)
+	}
+	// The retry reconciles the landed commit, then the next one fails on the fence.
+	if err := w.commitPass(ctx, false); !errors.Is(err, ErrFenced) {
+		t.Fatalf("pass after takeover: %v, want ErrFenced", err)
+	}
+	if err := w.waitCommitted(ctx, landed); err != nil {
+		t.Fatalf("WaitCommitted on the reconciled write: %v, want nil", err)
+	}
+	if got, err := w.commitStatus(w.fenceToken.Epoch, later); err != nil || got != CommitNever {
+		t.Fatalf("CommitStatus of a later write: %v, %v; want never", got, err)
+	}
+}
+
 func TestWriterStartsAboveTheLastCommitRecorded(t *testing.T) {
 	f := newCommitStatusFixture(t)
 	a := f.writer(t)

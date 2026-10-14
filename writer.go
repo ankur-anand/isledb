@@ -798,7 +798,14 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 			// slot free, the oldest-uncommitted gauge advanced and any failure
 			// run over, so a Put right after WaitCommitted is not refused for
 			// space the commit has already freed.
-			w.transition(pending.sstable.SeqHi, status)
+			if status == writerFenced {
+				// A commit reconciled after a successor took the fence: record
+				// it, then fence, learning where this writer's commits ended.
+				w.transition(pending.sstable.SeqHi, writerOpen)
+				w.markFenced()
+			} else {
+				w.transition(pending.sstable.SeqHi, status)
+			}
 		}
 	}
 }
