@@ -18,10 +18,16 @@ IsleDB provides:
 
 - point reads, range scans, iterators, snapshots, TTLs, and deletes;
 - one fenced writer with any number of independent reader processes;
-- configurable local caching for readers;
+- configurable local caching for readers, and an optional shared read cache
+  per region (`isledb cache`);
 - optional keys-only or full-value change feeds;
 - compaction and storage cleanup that can run in a separate process or
   scheduled job.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img src="docs/architecture-light.svg" width="100%" alt="IsleDB architecture: one writer commits to object storage; maintenance compacts it; reader processes read through their local cache, then an optional shared read cache, then object storage; the shared cache tells readers about new commits.">
+</picture>
 
 ## Install
 
@@ -227,6 +233,52 @@ func runMaintenance(ctx context.Context, bucketURL string) error {
 The active writer publishes maintenance results, while cleanup proceeds at its
 own bounded pace. Use `RunOnce` instead of `Run` for a scheduled job.
 
+## Shared read cache
+
+`isledb cache` is an optional service that sits between readers and object
+storage, typically one per region. It serves immutable objects (SSTs,
+manifest pages, change batches) from chunks on its local disk, and relays
+`CURRENT` so readers learn of new commits through a long poll instead of
+polling storage.
+
+**Storage cost:** object reads from storage grow with the number of caches,
+not the number of readers: each object is fetched about once per cache while
+it stays on the cache's disk.
+
+Run it next to the readers:
+
+```bash
+go install github.com/ankur-anand/isledb/cmd/isledb@latest
+
+isledb cache \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --db prod/accounts \
+  --disk-dir /var/cache/isledb --disk-bytes 200GiB \
+  --auth-token-file /etc/isledb/tokens
+```
+
+Point readers and change-feed consumers at it:
+
+```go
+opts := isledb.DefaultReaderOpenOptions(cacheDir)
+opts.ReadCache = isledb.ReadCacheOptions{
+	URL:   "http://isledb-cache:8090",
+	Token: token,
+}
+reader, err := db.OpenReader(ctx, opts)
+
+feed, err := db.OpenChangeReader(ctx, isledb.ChangeReaderOptions{
+	ReadCache: isledb.ReadCacheOptions{URL: "http://isledb-cache:8090", Token: token},
+})
+```
+
+The cache only makes reads faster and cheaper; it never decides what readers
+see. Readers check what it returns against checksums, reject a copy of
+`CURRENT` that is too old, and read storage directly whenever the cache is
+slow, down, or wrong.
+See [Running `isledb cache`](docs/isledb-cache.md) and the
+[read cache HTTP API](docs/read-cache-api.md).
+
 ## When IsleDB fits
 
 IsleDB is a good fit when:
@@ -249,6 +301,7 @@ Choose a different database when you need:
 - [Go API guide](api.md)
 - [Go package reference](https://pkg.go.dev/github.com/ankur-anand/isledb)
 - [Object-store layout and operations](docs/object-store-schema.md)
+- [Running the shared read cache](docs/isledb-cache.md)
 - [Local quickstart](examples/quickstart)
 - [Separate writer, reader, and maintenance services with MinIO](examples/minio-services)
 - [Restartable change-feed consumer with Azurite](examples/changefeed-azurite)
