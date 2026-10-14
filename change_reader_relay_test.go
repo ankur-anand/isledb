@@ -283,3 +283,44 @@ func TestWaitForChangesPacesQuietAnswers(t *testing.T) {
 		t.Fatalf("%d long polls in 1s against a cache answering at once, want at most about 10", n)
 	}
 }
+
+func TestWaitForChangesReadsStorageBehindAFrozenRelay(t *testing.T) {
+	f := newChangeRelayFixture(t)
+	f.relay.mu.Lock()
+	f.relay.hold = 200 * time.Millisecond
+	f.relay.mu.Unlock()
+	// The relay cannot read storage: its copy stays at the head the reader
+	// holds and ages past the limit, while a commit lands in storage.
+	f.relay.set(t, f.storageCurrent(t), 10*time.Second)
+	f.commit(t, "b")
+	waited := make(chan error, 1)
+	go func() { waited <- f.reader.WaitForChanges(f.ctx, f.head) }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("did not return within 3s of a commit behind a frozen relay")
+	}
+	if f.outcome("too_old") == 0 {
+		t.Fatal("the frozen copy was not refused as too old")
+	}
+}
+
+func TestWaitForChangesTrustsAYoungQuietRelay(t *testing.T) {
+	f := newChangeRelayFixture(t)
+	f.relay.mu.Lock()
+	f.relay.hold = 100 * time.Millisecond
+	f.relay.mu.Unlock()
+	reads := func() float64 { return f.outcome("relayed") + f.outcome("too_old") }
+	before := reads()
+	ctx, cancel := context.WithTimeout(f.ctx, time.Second)
+	defer cancel()
+	if err := f.reader.WaitForChanges(ctx, f.head); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("no commit: %v, want the deadline", err)
+	}
+	if n := reads() - before; n != 0 {
+		t.Fatalf("%v reads of CURRENT while a young relay answered quiet, want none", n)
+	}
+}

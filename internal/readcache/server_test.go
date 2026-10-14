@@ -103,8 +103,9 @@ func TestLongPollAnswersOnAdvanceOrTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	if a := fetch(t, server.URL+"/v1/current?after=3"); a.status != http.StatusOK || a.position != 3 || a.body != "" {
-		t.Fatalf("timed-out long poll: %+v, want position 3 and no body", a)
+	if a := fetch(t, server.URL+"/v1/current?after=3"); a.status != http.StatusOK || a.position != 3 || a.body != "" ||
+		!a.ageHeader || a.age < 200*time.Millisecond {
+		t.Fatalf("timed-out long poll: %+v, want position 3, the copy's age past the 200ms held and no body", a)
 	}
 	if took := time.Since(start); took < 200*time.Millisecond {
 		t.Fatalf("long poll answered after %s, want it held for the 200ms timeout", took)
@@ -119,8 +120,8 @@ func TestLongPollAnswersOnAdvanceOrTimeout(t *testing.T) {
 	}
 	select {
 	case a := <-got:
-		if a.position != 4 || a.body != "" || a.ageHeader {
-			t.Fatalf("long poll answered %+v, want position 4 only", a)
+		if a.position != 4 || a.body != "" || !a.ageHeader || a.age > 100*time.Millisecond {
+			t.Fatalf("long poll answered %+v, want position 4 and the new copy's age", a)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("long poll did not answer when the position advanced")

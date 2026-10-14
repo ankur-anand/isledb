@@ -29,8 +29,9 @@ const (
 //
 //	GET /v1/current?db=P            the copy of P's CURRENT, with its
 //	                                position and age
-//	GET /v1/current?db=P&after=N    its position only, once the position
-//	                                passes N or after the long-poll timeout
+//	GET /v1/current?db=P&after=N    its position and age only, once the
+//	                                position passes N or after the long-poll
+//	                                timeout
 //	GET /v1/object/{key}            bytes of an immutable object of a
 //	                                database served, by optional Range
 //
@@ -152,6 +153,7 @@ func (h *Handler) serveCurrent(w http.ResponseWriter, r *http.Request) {
 	current, _ := relay.Wait(ctx, n)
 	h.held.Add(-1)
 	w.Header().Set(HeaderPosition, strconv.FormatUint(current.Position, 10))
+	w.Header().Set(HeaderAgeMillis, strconv.FormatInt(ceilMillis(current.Age), 10))
 	w.WriteHeader(http.StatusOK)
 }
 

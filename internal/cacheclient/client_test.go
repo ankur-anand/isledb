@@ -221,7 +221,7 @@ func TestWaitCurrentGivesUpOnAnUnansweredLongPoll(t *testing.T) {
 	c := client(t, Options{URL: server.URL})
 
 	start := time.Now()
-	_, err := c.WaitCurrent(context.Background(), "db", 1)
+	_, _, err := c.WaitCurrent(context.Background(), "db", 1)
 	var cacheErr *Error
 	if !errors.As(err, &cacheErr) || cacheErr.Reason != ReasonTimeout {
 		t.Fatalf("unanswered long poll: %v, want a timeout", err)
@@ -232,7 +232,7 @@ func TestWaitCurrentGivesUpOnAnUnansweredLongPoll(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := c.WaitCurrent(ctx, "db", 1); !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &cacheErr) {
+	if _, _, err := c.WaitCurrent(ctx, "db", 1); !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &cacheErr) {
 		t.Fatalf("caller's deadline first: %v, want the caller's own context error", err)
 	}
 }
