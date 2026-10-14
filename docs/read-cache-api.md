@@ -56,7 +56,7 @@ entry and keep the position, such as folding the log into a new snapshot.
 
 | Parameter | Meaning |
 |---|---|
-| `after=N` | Optional. Long poll: hold the request until the copy's log position is above `N`, or until the server's long-poll timeout, then answer with the position only. `N` is a log position. |
+| `after=N` | Optional. Long poll: hold the request until the copy's log position is above `N`, or until the server's long-poll timeout, at most 30 seconds, then answer with the position only. `N` is a log position. |
 
 **Response headers**
 
@@ -104,8 +104,9 @@ body is empty.
    interval behind.
 5. **Long poll.** Ask with `after=<published position>`; on an answer above
    it, call `RequestRefresh` and ask again. `RequestRefresh` reads `CURRENT`
-   with a plain `GET`, where rules 1 to 3 apply. After a timeout or error,
-   wait a random 0 to 1 second before asking again.
+   with a plain `GET`, where rules 1 to 3 apply. Give up on a long poll
+   unanswered after 45 seconds: the connection is dead. After a timeout or
+   error, wait a random 0 to 1 second before asking again.
 6. **Fallback.** On a connection error, a timeout or a 5xx, read storage
    directly.
 

@@ -207,3 +207,32 @@ func TestCloseClosesOnlyItsOwnConnections(t *testing.T) {
 	waitClosed(1)
 	shared.CloseIdleConnections()
 }
+
+func TestWaitCurrentGivesUpOnAnUnansweredLongPoll(t *testing.T) {
+	deadline := longPollDeadline
+	longPollDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { longPollDeadline = deadline })
+	// A cache that takes the long poll and never answers, as one behind a
+	// dropped connection would seem.
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	c := client(t, Options{URL: server.URL})
+
+	start := time.Now()
+	_, err := c.WaitCurrent(context.Background(), "db", 1)
+	var cacheErr *Error
+	if !errors.As(err, &cacheErr) || cacheErr.Reason != ReasonTimeout {
+		t.Fatalf("unanswered long poll: %v, want a timeout", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("gave up after %s, want about %s", took, longPollDeadline)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := c.WaitCurrent(ctx, "db", 1); !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &cacheErr) {
+		t.Fatalf("caller's deadline first: %v, want the caller's own context error", err)
+	}
+}

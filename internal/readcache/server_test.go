@@ -174,7 +174,7 @@ func TestStopLongPollsAnswersHeldAndLaterOnes(t *testing.T) {
 	if err := relay.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	h := mustHandler(t, nil, map[string]*Relay{"db": relay}, time.Minute)
+	h := mustHandler(t, nil, map[string]*Relay{"db": relay}, MaxLongPoll)
 	server := httptest.NewServer(h)
 	t.Cleanup(server.Close)
 
@@ -212,6 +212,11 @@ func TestNewHandlerRefusesPrefixesThatAreNotClean(t *testing.T) {
 	}
 	if _, err := NewHandler(nil, relaysFor("", "prod/a"), time.Second); err != nil {
 		t.Errorf("NewHandler refused the root and prod/a: %v", err)
+	}
+	for _, longPoll := range []time.Duration{0, MaxLongPoll + time.Second} {
+		if _, err := NewHandler(nil, relaysFor("db"), longPoll); err == nil {
+			t.Errorf("long poll %s accepted", longPoll)
+		}
 	}
 	if _, err := NewHandler(nil, nil, time.Second); err == nil {
 		t.Error("NewHandler accepted no databases")

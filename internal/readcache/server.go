@@ -56,10 +56,18 @@ type Handler struct {
 	held     atomic.Int64
 }
 
+// MaxLongPoll is the longest a long poll may be held. Clients give up on
+// one that goes unanswered well past it, as on a dead connection.
+const MaxLongPoll = 30 * time.Second
+
 // NewHandler serves the databases relays names, by clean prefix (see
 // CleanPrefix; "" for the root), and their objects from objects. Without
-// objects, only CURRENT is served.
+// objects, only CURRENT is served. Long polls are held up to longPoll, at
+// most MaxLongPoll.
 func NewHandler(objects *Objects, relays map[string]*Relay, longPoll time.Duration) (*Handler, error) {
+	if longPoll <= 0 || longPoll > MaxLongPoll {
+		return nil, fmt.Errorf("readcache: long poll %s, want above 0 and at most %s", longPoll, MaxLongPoll)
+	}
 	if len(relays) == 0 {
 		return nil, errors.New("readcache: no databases")
 	}

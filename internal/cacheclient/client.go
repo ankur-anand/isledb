@@ -252,14 +252,25 @@ func (c *Client) readCurrent(ctx context.Context, db string) (Current, error) {
 // far smaller.
 const maxCurrentBytes = 16 << 20
 
+// longPollDeadline is how long WaitCurrent waits for an answer: the cache
+// answers within readcache.MaxLongPoll, so none by then means the connection
+// is dead without either side having been told.
+var longPollDeadline = readcache.MaxLongPoll + 15*time.Second
+
 // WaitCurrent waits on the cache for db's CURRENT to pass position after,
 // returning the position it has when it answers: past after, or not when the
-// cache's long poll timed out. Only ctx bounds the wait.
+// cache's long poll timed out. No answer within longPollDeadline is a
+// timeout.
 func (c *Client) WaitCurrent(ctx context.Context, db string, after uint64) (uint64, error) {
-	resp, err := c.getCurrent(ctx, url.Values{"db": {db}, "after": {strconv.FormatUint(after, 10)}})
+	waitCtx, cancel := context.WithTimeout(ctx, longPollDeadline)
+	defer cancel()
+	resp, err := c.getCurrent(waitCtx, url.Values{"db": {db}, "after": {strconv.FormatUint(after, 10)}})
 	if err != nil {
-		if ctx.Err() != nil {
+		switch {
+		case ctx.Err() != nil:
 			return 0, ctx.Err()
+		case waitCtx.Err() != nil:
+			return 0, &Error{ReasonTimeout, fmt.Errorf("no answer to a long poll in %s", longPollDeadline)}
 		}
 		return 0, &Error{ReasonUnavailable, err}
 	}

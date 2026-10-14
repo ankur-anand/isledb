@@ -49,6 +49,7 @@ func TestConfigRefusesMistakes(t *testing.T) {
 		{"no authentication", []string{"-bucket-url", "file:///b", "-disk-dir", "/d", "-disk-bytes", "1GiB", "-db", "a"}, "no authentication"},
 		{"key without certificate", append(base, "-db", "a", "-tls-key", "k.pem"), "tls.cert and tls.key"},
 		{"read budget below one read", append(base, "-db", "a", "-max-read-bytes", "1MiB"), "max_bytes"},
+		{"long poll above the readers' wait", append(base, "-db", "a", "-long-poll", "31s"), "long_poll"},
 		{"no bucket", []string{"-disk-dir", "/d", "-disk-bytes", "1GiB", "-insecure", "-db", "a"}, "bucket_url"},
 	} {
 		if _, err := load(c.args, nil); err == nil || !strings.Contains(err.Error(), c.want) {

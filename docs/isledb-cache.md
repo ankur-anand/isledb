@@ -103,7 +103,7 @@ listener off.
 | `cache.reads.max_bytes` | `--max-read-bytes` | `ISLEDB_CACHE_READS_MAX_BYTES` | `256MiB` | Bytes read from storage at once; at least `4MiB` |
 | `cache.reads.max_wait` | `--max-read-wait` | `ISLEDB_CACHE_READS_MAX_WAIT` | `2m` | Longest a storage read waits for budget |
 | `cache.current.poll` | `--current-poll` | `ISLEDB_CACHE_CURRENT_POLL` | `500ms` | How often `CURRENT` is read |
-| `cache.current.long_poll` | `--long-poll` | `ISLEDB_CACHE_CURRENT_LONG_POLL` | `30s` | Longest a long poll is held |
+| `cache.current.long_poll` | `--long-poll` | `ISLEDB_CACHE_CURRENT_LONG_POLL` | `30s` | Longest a long poll is held, at most `30s` |
 | `cache.auth.token_file` | `--auth-token-file` | `ISLEDB_CACHE_AUTH_TOKEN_FILE` | | Bearer tokens, one per line |
 | `cache.auth.insecure` | `--insecure` | `ISLEDB_CACHE_AUTH_INSECURE` | `false` | No authentication, for development |
 | `cache.tls.cert`, `cache.tls.key` | `--tls-cert`, `--tls-key` | `ISLEDB_CACHE_TLS_CERT`, `ISLEDB_CACHE_TLS_KEY` | | Serve TLS |
