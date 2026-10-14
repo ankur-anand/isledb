@@ -24,6 +24,18 @@ type FenceToken struct {
 	Epoch     uint64    `json:"epoch"`
 	Owner     string    `json:"owner"`
 	ClaimedAt time.Time `json:"claimed_at"`
+	// BaseSeq, on a writer fence, is the highest sequence committed when it
+	// was claimed: where the writer before it stopped for good.
+	BaseSeq uint64 `json:"base_seq,omitempty"`
+	// Prev is the writer fence this one replaced, so where the writer two
+	// back stopped is known too.
+	Prev *PrevFence `json:"prev,omitempty"`
+}
+
+// PrevFence is the epoch and BaseSeq of a replaced writer fence.
+type PrevFence struct {
+	Epoch   uint64 `json:"epoch"`
+	BaseSeq uint64 `json:"base_seq,omitempty"`
 }
 
 // Level is one non-overlapping, key-sorted level. Number starts at 1; L0 is

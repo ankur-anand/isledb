@@ -33,6 +33,10 @@ func (f *FenceToken) Clone() *FenceToken {
 		return nil
 	}
 	clone := *f
+	if f.Prev != nil {
+		prev := *f.Prev
+		clone.Prev = &prev
+	}
 	return &clone
 }
 

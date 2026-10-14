@@ -65,6 +65,13 @@ type writer struct {
 	pendingBytes int64
 	seq          uint64
 	epoch        uint64
+	// baseSeq is the highest sequence committed when this writer took over:
+	// final for every earlier writer, which can commit nothing after the
+	// claim.
+	baseSeq uint64
+	// fencedEndKnown reports, once fenced, that the successor's fence told
+	// where this writer's commits ended, and committed was set to it.
+	fencedEndKnown bool
 	// activeSince and pendingSince (oldest first) date the first mutation of
 	// the active and each uncommitted frozen memtable; zero while empty.
 	activeSince  time.Time
@@ -211,6 +218,16 @@ func newWriterWithMaintenanceWake(
 		return nil, fmt.Errorf("replay manifest after writer fence claim: %w", err)
 	}
 
+	// The SSTs' highest sequence is where numbering continues. The last
+	// commit recorded with the claim is a second account of it: never start
+	// below it, or committed sequences would be handed out again.
+	startSeq := m.MaxSeqNum()
+	if token.BaseSeq > startSeq {
+		slog.Warn("isledb: last commit recorded is above every SST's sequences; numbering continues above it",
+			"component", "writer", "sst_max_seq", startSeq, "last_commit_seq", token.BaseSeq)
+		startSeq = token.BaseSeq
+	}
+
 	writerCtx, cancel := context.WithCancel(context.Background())
 
 	w := &writer{
@@ -221,7 +238,8 @@ func newWriterWithMaintenanceWake(
 		ctx:             writerCtx,
 		cancel:          cancel,
 		memtable:        internal.NewMemtable(defaultMemtableArenaBytes(opts.Memtable.TargetBytes, opts.Values)),
-		seq:             m.MaxSeqNum(),
+		seq:             startSeq,
+		baseSeq:         startSeq,
 		epoch:           m.NextEpoch,
 		maintenanceWake: maintenanceWake,
 		stopCh:          make(chan struct{}),
@@ -901,7 +919,7 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 		w.reportRecovery(&w.maintenanceFailures)
 		return nil
 	case isFenceError(err):
-		w.transition(0, writerFenced)
+		w.markFenced()
 		return fmt.Errorf("apply maintenance command: %w", err)
 	case ctx.Err() != nil:
 		// The caller's own cancellation or deadline, not a storage failure.
@@ -1092,7 +1110,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 	fenced := !w.manifestLog.WriterFenceObservedActive(w.fenceToken)
 	if appendErr != nil {
 		if fenced || isFenceError(appendErr) {
-			w.transition(0, writerFenced)
+			w.markFenced()
 		}
 		return 0, fmt.Errorf("update manifest: %w", appendErr)
 	}
@@ -1175,7 +1193,7 @@ func (w *writer) commitLoop(ctx context.Context, done chan struct{}) {
 		case isFenceError(err):
 			slog.Error("isledb: writer fenced, stopping commits",
 				"component", "writer", "epoch", w.epoch)
-			w.transition(0, writerFenced)
+			w.markFenced()
 			return
 		case pass:
 			w.reportFailure(&w.commitFailures, err)
@@ -1306,6 +1324,69 @@ func (w *writer) waitCommitted(ctx context.Context, seq uint64) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// markFenced ends the writer on losing its fence. The successor's fence
+// tells where this writer's commits ended, when it is the next writer's or
+// the one after's: writes up to there are committed, a commit whose response
+// was lost included, and the rest never will be.
+func (w *writer) markFenced() {
+	end, known := uint64(0), false
+	own := w.fenceToken.Epoch
+	if next := w.manifestLog.SuccessorWriterFence(); next != nil {
+		switch {
+		case next.Epoch == own+1:
+			end, known = next.BaseSeq, true
+		case next.Prev != nil && next.Prev.Epoch == own+1:
+			end, known = next.Prev.BaseSeq, true
+		}
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state.status.final() {
+		return
+	}
+	w.fencedEndKnown = known
+	w.transitionLocked(min(end, w.seq), writerFenced)
+}
+
+func (w *writer) commitStatus(epoch, seq uint64) (CommitStatus, error) {
+	own := w.fenceToken.Epoch
+	switch {
+	case epoch == 0:
+		return CommitUnknown, errors.New("isledb: epoch 0 names no writer")
+	case epoch > own:
+		return CommitUnknown, manifest.ErrFenced
+	case epoch < own && seq > w.baseSeq:
+		// Nothing above baseSeq was committed before this writer took over,
+		// and no earlier writer commits after.
+		return CommitNever, nil
+	case epoch == own-1:
+		return CommitDone, nil
+	case epoch == own-2 && w.fenceToken.Prev != nil && w.fenceToken.Prev.Epoch == own-1:
+		// Writer own-2 stopped where own-1 started.
+		if seq <= w.fenceToken.Prev.BaseSeq {
+			return CommitDone, nil
+		}
+		return CommitNever, nil
+	case epoch < own:
+		return CommitUnknown, nil
+	}
+	w.mu.Lock()
+	state, assigned, endKnown := w.state, w.seq, w.fencedEndKnown
+	w.mu.Unlock()
+	switch {
+	case seq <= w.baseSeq || seq > assigned:
+		return CommitUnknown, fmt.Errorf("isledb: sequence %d was not assigned by this writer, which assigned %d to %d",
+			seq, w.baseSeq+1, assigned)
+	case seq <= state.committed:
+		return CommitDone, nil
+	case state.status == writerFenced && endKnown:
+		return CommitNever, nil
+	case state.status.final():
+		return CommitUnknown, nil
+	}
+	return CommitPending, nil
 }
 
 func (w *writer) closeWithTimeout(timeout time.Duration) error {
