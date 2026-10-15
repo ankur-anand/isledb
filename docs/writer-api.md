@@ -46,7 +46,8 @@ Without a valid token, the writer answers `401`.
   letter, digit, `-`, `_`, `.` or `~`. For example, the key `user/42` is
   written `user%2F42`. Any byte can be part of a key.
 - **A value can be any bytes**, including nothing at all.
-- **In a batch**, keys and values are base64-encoded.
+- **In a batch**, keys and values are text (`key`, `value`) or base64 bytes
+  (`key_base64`, `value_base64`).
 
 ## Write a key
 
@@ -107,9 +108,9 @@ POST /v1/kv
 Content-Type: application/json
 
 {"ops":[
-  {"op":"put","key":"b3JkZXIvNDI=","value":"eyJ0b3RhbCI6OX0=","ttl":"24h"},
-  {"op":"put","key":"c3RvY2svNw==","value":"MTI="},
-  {"op":"delete","key":"Y2FydC80Mg=="}
+  {"op":"put","key":"order/42","value":"{\"total\":9}","ttl":"24h"},
+  {"op":"put","key":"stock/7","value_base64":"MTI="},
+  {"op":"delete","key":"cart/42"}
 ]}
 ```
 ```
@@ -119,9 +120,14 @@ Content-Type: application/json
 ```
 
 - `op` is `put` or `delete`.
-- `key` and `value` are base64-encoded.
+- Give the key as `key`, text, or as `key_base64`, base64 bytes; not both.
+  Text is stored as its UTF-8 bytes, so for any other bytes use base64. A
+  body that is not valid UTF-8 is refused with `400`; text must also be valid
+  Unicode (no lone `\uD800`–`\uDFFF` escapes).
+- A `put`'s value works the same way: `value` or `value_base64`, not both.
+  Without either, the value is empty.
 - `ttl` is optional on a `put`.
-- A `delete` has only a `key`.
+- A `delete` has only a key.
 - If the same key appears twice, the last operation wins.
 
 Batches are much faster than one request per key when you write a lot of

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -203,9 +204,9 @@ func TestBatchAppliesAtomically(t *testing.T) {
 	f := newFixture(t, 10*time.Millisecond, Options{})
 	do(t, f.server, http.MethodPut, kvPathFor("gone"), []byte("x"))
 	body, _ := json.Marshal(map[string]any{"ops": []map[string]any{
-		{"op": "put", "key": []byte("order/1"), "value": []byte("o")},
-		{"op": "put", "key": []byte("stock/7"), "value": []byte("s"), "ttl": "1h"},
-		{"op": "delete", "key": []byte("gone")},
+		{"op": "put", "key_base64": []byte("order/1"), "value_base64": []byte("o")},
+		{"op": "put", "key": "stock/7", "value": "s", "ttl": "1h"},
+		{"op": "delete", "key_base64": []byte("gone")},
 	}})
 	r := do(t, f.server, http.MethodPost, "/v1/kv", body)
 	if r.status != http.StatusOK {
@@ -230,14 +231,21 @@ func TestBadRequestsAreRefused(t *testing.T) {
 		{"not JSON", `nope`, ErrorBadRequest},
 		{"unknown field", `{"ops":[],"extra":1}`, ErrorBadRequest},
 		{"two objects", `{"ops":[]}{"ops":[]}`, ErrorBadRequest},
-		{"trailing ]", `{"ops":[{"op":"put","key":"aw=="}]}]`, ErrorBadRequest},
-		{"trailing }", `{"ops":[{"op":"put","key":"aw=="}]}}`, ErrorBadRequest},
-		{"unknown op", `{"ops":[{"op":"merge","key":"aw=="}]}`, ErrorBadRequest},
-		{"delete with value", `{"ops":[{"op":"delete","key":"aw==","value":"dg=="}]}`, ErrorBadRequest},
-		{"garbled ttl", `{"ops":[{"op":"put","key":"aw==","ttl":"soon"}]}`, ErrorBadRequest},
+		{"trailing ]", `{"ops":[{"op":"put","key_base64":"aw=="}]}]`, ErrorBadRequest},
+		{"trailing }", `{"ops":[{"op":"put","key_base64":"aw=="}]}}`, ErrorBadRequest},
+		{"unknown op", `{"ops":[{"op":"merge","key_base64":"aw=="}]}`, ErrorBadRequest},
+		{"delete with value", `{"ops":[{"op":"delete","key_base64":"aw==","value_base64":"dg=="}]}`, ErrorBadRequest},
+		{"garbled ttl", `{"ops":[{"op":"put","key_base64":"aw==","ttl":"soon"}]}`, ErrorBadRequest},
 		{"empty batch", `{"ops":[]}`, ErrorInvalidMutation},
-		{"empty key", `{"ops":[{"op":"put","value":"dg=="}]}`, ErrorInvalidMutation},
-		{"negative ttl", `{"ops":[{"op":"put","key":"aw==","ttl":"-1s"}]}`, ErrorInvalidMutation},
+		{"no key", `{"ops":[{"op":"put","value_base64":"dg=="}]}`, ErrorBadRequest},
+		{"empty key", `{"ops":[{"op":"put","key":""}]}`, ErrorInvalidMutation},
+		{"key and key_base64", `{"ops":[{"op":"put","key":"k","key_base64":"aw=="}]}`, ErrorBadRequest},
+		{"value and value_base64", `{"ops":[{"op":"put","key":"k","value":"v","value_base64":"dg=="}]}`, ErrorBadRequest},
+		{"delete with value_base64", `{"ops":[{"op":"delete","key":"k","value_base64":"dg=="}]}`, ErrorBadRequest},
+		{"ops twice", `{"ops":[],"ops":[]}`, ErrorBadRequest},
+		{"ops not a list", `{"ops":{}}`, ErrorBadRequest},
+		{"no ops", `{}`, ErrorBadRequest},
+		{"negative ttl", `{"ops":[{"op":"put","key_base64":"aw==","ttl":"-1s"}]}`, ErrorInvalidMutation},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			do(t, f.server, http.MethodPost, "/v1/kv", []byte(c.body)).want(t, http.StatusBadRequest, c.code)
@@ -354,7 +362,7 @@ func TestTooLargeIs413(t *testing.T) {
 	})
 	var ops []map[string]any
 	for i := range 2000 {
-		ops = append(ops, map[string]any{"op": "put", "key": fmt.Appendf(nil, "k%05d", i), "value": []byte("v")})
+		ops = append(ops, map[string]any{"op": "put", "key": fmt.Sprintf("k%05d", i), "value": "v"})
 	}
 	body, _ := json.Marshal(map[string]any{"ops": ops})
 	do(t, f.server, http.MethodPost, "/v1/kv", body).want(t, http.StatusRequestEntityTooLarge, ErrorTooLarge)
@@ -653,9 +661,9 @@ func TestTTLAndWriteIDEdges(t *testing.T) {
 	if !strings.Contains(r.body["message"], "empty") {
 		t.Fatalf("empty ttl: %q", r.body["message"])
 	}
-	do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"put","key":"aw==","value":"dg==","ttl":""}]}`)).
+	do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"put","key_base64":"aw==","value_base64":"dg==","ttl":""}]}`)).
 		want(t, http.StatusBadRequest, ErrorBadRequest)
-	do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"delete","key":"aw==","ttl":null}]}`)).
+	do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"delete","key_base64":"aw==","ttl":null}]}`)).
 		want(t, http.StatusOK, "")
 
 	// A write id is URL-decoded like a key.
@@ -677,10 +685,10 @@ func TestTTLAndWriteIDEdges(t *testing.T) {
 func TestBatchErrorsSayWhatIsWrong(t *testing.T) {
 	f := newFixture(t, 10*time.Millisecond, Options{})
 	for body, want := range map[string]string{
-		`{"ops":[{"op":"put","key":"!!","value":"dg=="}]}`: "base64",
-		`{"ops":[{"op":"put","key":1}]}`:                   "key",
-		`{"ops":[],"extra":1}`:                             "extra",
-		`{"ops":[]}]`:                                      "data after",
+		`{"ops":[{"op":"put","key_base64":"!!","value_base64":"dg=="}]}`: "base64",
+		`{"ops":[{"op":"put","key":1}]}`:                                 "key",
+		`{"ops":[],"extra":1}`:                                           "extra",
+		`{"ops":[]}]`:                                                    "data after",
 	} {
 		r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(body))
 		r.want(t, http.StatusBadRequest, ErrorBadRequest)
@@ -773,5 +781,45 @@ func TestReplacedWriterSendsUnknownElsewhere(t *testing.T) {
 	}
 	if s := do(t, latest, http.MethodGet, "/v1/writes/"+id, nil); s.status != http.StatusOK || s.body["status"] != "not_committed" {
 		t.Fatalf("the writer holding the database on %s: %d %v", id, s.status, s.body)
+	}
+}
+
+func TestBatchTakesTextAndBase64(t *testing.T) {
+	f := newFixture(t, 10*time.Millisecond, Options{})
+	binary := []byte{0xff, 0x00, 0xfe}
+	body := fmt.Sprintf(`{"ops":[
+		{"op":"put","key":"café/1","value":"naïve ✓"},
+		{"op":"put","key_base64":%q,"value_base64":%q},
+		{"op":"put","key":"empty"}
+	]}`, base64.StdEncoding.EncodeToString(binary), base64.StdEncoding.EncodeToString(binary))
+	if r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(body)); r.status != http.StatusOK {
+		t.Fatalf("mixed batch: %d %v", r.status, r.body)
+	}
+	reader := f.reader(t)
+	for key, want := range map[string][]byte{"café/1": []byte("naïve ✓"), string(binary): binary, "empty": {}} {
+		got, found, err := reader.Get(f.ctx, []byte(key))
+		if err != nil || !found || !bytes.Equal(got, want) {
+			t.Fatalf("%q = %q, %t, %v; want %q", key, got, found, err, want)
+		}
+	}
+}
+
+// TestBatchRefusesInvalidUTF8Text: the JSON decoder would store "caf\xe9" as
+// "caf\uFFFD"; the body is refused, and the same bytes go in as base64.
+func TestBatchRefusesInvalidUTF8Text(t *testing.T) {
+	f := newFixture(t, 10*time.Millisecond, Options{})
+	raw := []byte("caf\xe9")
+	r := do(t, f.server, http.MethodPost, "/v1/kv", append(append([]byte(`{"ops":[{"op":"put","key":"`), raw...), `"}]}`...))
+	r.want(t, http.StatusBadRequest, ErrorBadRequest)
+	if !strings.Contains(r.body["message"], "UTF-8") || !strings.Contains(r.body["message"], "key_base64") {
+		t.Fatalf("message %q, want it to say UTF-8 and point to key_base64", r.body["message"])
+	}
+	body := fmt.Sprintf(`{"ops":[{"op":"put","key_base64":%q,"value_base64":%q}]}`,
+		base64.StdEncoding.EncodeToString(raw), base64.StdEncoding.EncodeToString(raw))
+	if r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(body)); r.status != http.StatusOK {
+		t.Fatalf("the same bytes as base64: %d %v", r.status, r.body)
+	}
+	if got, found, err := f.reader(t).Get(f.ctx, raw); err != nil || !found || !bytes.Equal(got, raw) {
+		t.Fatalf("key %q = %q, %t, %v; want the exact bytes", raw, got, found, err)
 	}
 }

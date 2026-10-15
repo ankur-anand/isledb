@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ankur-anand/isledb"
 )
@@ -273,15 +274,16 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request, key []byte, t
 	})
 }
 
-type batchRequest struct {
-	Ops []batchOp `json:"ops"`
-}
-
+// batchOp is one operation of a batch. A key is given as text (key) or as
+// base64 bytes (key_base64), never both; a put's value likewise, and a
+// value left out is empty. Text is UTF-8; any other bytes need base64.
 type batchOp struct {
-	Op    string  `json:"op"`
-	Key   []byte  `json:"key"`
-	Value []byte  `json:"value"`
-	TTL   *string `json:"ttl"`
+	Op          string  `json:"op"`
+	Key         *string `json:"key"`
+	KeyBase64   []byte  `json:"key_base64"`
+	Value       *string `json:"value"`
+	ValueBase64 []byte  `json:"value_base64"`
+	TTL         *string `json:"ttl"`
 }
 
 // parseTTL reads a TTL given as a duration such as 10s. Absent means none;
@@ -312,51 +314,128 @@ func (h *Handler) serveBatch(w http.ResponseWriter, r *http.Request) {
 			release()
 		}
 	}()
-	var req batchRequest
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, ErrorBadRequest, "want one JSON object {\"ops\":[...]}: "+err.Error(), "")
+	b, err := decodeBatch(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, ErrorBadRequest, err.Error(), "")
 		return
-	}
-	// The second Decode must find nothing: More alone misses a trailing ]
-	// or }.
-	if dec.Decode(&struct{}{}) != io.EOF {
-		writeError(w, http.StatusBadRequest, ErrorBadRequest, "data after the JSON object", "")
-		return
-	}
-	b := isledb.NewBatch()
-	size := 0
-	for _, op := range req.Ops {
-		size += len(op.Key) + len(op.Value)
-	}
-	b.Grow(size)
-	for i, op := range req.Ops {
-		switch op.Op {
-		case "put":
-			ttl, err := parseTTL(op.TTL)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, ErrorBadRequest, fmt.Sprintf("op %d: ttl: %v", i, err), "")
-				return
-			}
-			b.PutWithTTL(op.Key, op.Value, ttl)
-		case "delete":
-			if op.Value != nil || op.TTL != nil {
-				writeError(w, http.StatusBadRequest, ErrorBadRequest,
-					fmt.Sprintf("op %d: a delete has no value or ttl", i), "")
-				return
-			}
-			b.Delete(op.Key)
-		default:
-			writeError(w, http.StatusBadRequest, ErrorBadRequest,
-				fmt.Sprintf("op %d: op %q, want put or delete", i, op.Op), "")
-			return
-		}
 	}
 	applied = true
 	h.write(w, r, release, func(ctx context.Context) (uint64, error) {
 		return h.writer.Apply(ctx, b)
 	})
+}
+
+// decodeBatch reads {"ops":[...]} into a Batch one operation at a time, so
+// the decoded operations are never all held at once.
+func decodeBatch(body []byte) (*isledb.Batch, error) {
+	malformed := func(err error) error {
+		return fmt.Errorf("want one JSON object {\"ops\":[...]}: %v", err)
+	}
+	// The JSON decoder would replace invalid UTF-8 in a text key or value
+	// with U+FFFD and say nothing, storing a key other than the one sent.
+	// Base64 is ASCII, so a valid request never fails this.
+	if !utf8.Valid(body) {
+		return nil, errors.New("the body is not valid UTF-8: send keys and values that are not UTF-8 text as key_base64 or value_base64")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := expectDelim(dec, '{'); err != nil {
+		return nil, malformed(err)
+	}
+	b := isledb.NewBatch()
+	// Keys and values decode to no more bytes than the JSON that holds them.
+	b.Grow(len(body))
+	seen := false
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, malformed(err)
+		}
+		if name, _ := tok.(string); name != "ops" {
+			return nil, malformed(fmt.Errorf("unknown field %v", tok))
+		}
+		if seen {
+			return nil, malformed(errors.New(`"ops" given twice`))
+		}
+		seen = true
+		if err := expectDelim(dec, '['); err != nil {
+			return nil, malformed(fmt.Errorf(`"ops": %v`, err))
+		}
+		for i := 0; dec.More(); i++ {
+			var op batchOp // fresh each time: Decode keeps fields a value leaves out
+			if err := dec.Decode(&op); err != nil {
+				return nil, fmt.Errorf("op %d: %v", i, err)
+			}
+			if err := addOp(b, &op); err != nil {
+				return nil, fmt.Errorf("op %d: %v", i, err)
+			}
+		}
+		if err := expectDelim(dec, ']'); err != nil {
+			return nil, malformed(err)
+		}
+	}
+	if err := expectDelim(dec, '}'); err != nil {
+		return nil, malformed(err)
+	}
+	if !seen {
+		return nil, malformed(errors.New(`no "ops"`))
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("data after the JSON object")
+	}
+	return b, nil
+}
+
+func expectDelim(dec *json.Decoder, want json.Delim) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok != want {
+		return fmt.Errorf("found %v, want %v", tok, want)
+	}
+	return nil
+}
+
+// addOp adds op to b, checking its fields.
+func addOp(b *isledb.Batch, op *batchOp) error {
+	var key []byte
+	switch {
+	case op.Key != nil && op.KeyBase64 != nil:
+		return errors.New("give key or key_base64, not both")
+	case op.Key != nil:
+		key = []byte(*op.Key)
+	case op.KeyBase64 != nil:
+		key = op.KeyBase64
+	default:
+		return errors.New("no key or key_base64")
+	}
+	hasValue := op.Value != nil || op.ValueBase64 != nil
+	switch op.Op {
+	case "put":
+		var value []byte
+		switch {
+		case op.Value != nil && op.ValueBase64 != nil:
+			return errors.New("give value or value_base64, not both")
+		case op.Value != nil:
+			value = []byte(*op.Value)
+		default:
+			value = op.ValueBase64
+		}
+		ttl, err := parseTTL(op.TTL)
+		if err != nil {
+			return fmt.Errorf("ttl: %v", err)
+		}
+		b.PutWithTTL(key, value, ttl)
+	case "delete":
+		if hasValue || op.TTL != nil {
+			return errors.New("a delete has no value or ttl")
+		}
+		b.Delete(key)
+	default:
+		return fmt.Errorf("op %q, want put or delete", op.Op)
+	}
+	return nil
 }
 
 // readBody reads r's body after reserving factor times its Content-Length in
