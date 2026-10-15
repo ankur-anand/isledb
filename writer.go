@@ -33,6 +33,10 @@ var (
 	// are retried. It is not the caller's context deadline, and does not wrap
 	// context.DeadlineExceeded.
 	ErrCommitTimeout = errors.New("commit attempt timed out")
+	// ErrBatchTooLarge is returned by Apply for a batch whose mutations are
+	// each valid but together do not fit one memtable. Applied in smaller
+	// batches, they would succeed.
+	ErrBatchTooLarge = errors.New("batch too large for one memtable")
 )
 
 const (
@@ -672,6 +676,12 @@ func (w *writer) ensureCapacityLocked() error {
 	if memtableBytes < w.opts.Memtable.TargetBytes && changeBytes < w.opts.Memtable.TargetBytes {
 		return nil
 	}
+	return w.rotateLocked()
+}
+
+// rotateLocked freezes the active memtable for commit and starts a new one,
+// or returns ErrBackpressure when MaxPendingMemtables are already waiting.
+func (w *writer) rotateLocked() error {
 	if w.pendingMemtables >= w.opts.Memtable.MaxPendingMemtables {
 		w.metrics.ObserveBackpressure()
 		return ErrBackpressure
@@ -682,6 +692,124 @@ func (w *writer) ensureCapacityLocked() error {
 		w.memtable = w.newMemtable()
 	}
 	return nil
+}
+
+// apply buffers every mutation in b in one memtable under one lock, so they
+// commit together, and returns the last one's sequence. Everything that could
+// fail is checked before anything is applied.
+func (w *writer) apply(ctx context.Context, b *Batch) (uint64, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	if err := w.ensureWritable(); err != nil {
+		return 0, err
+	}
+	if b == nil || b.Len() == 0 {
+		return 0, fmt.Errorf("%w: empty batch", ErrInvalidMutation)
+	}
+	var arenaBytes, changeBytes int64
+	for i, e := range b.entries {
+		switch {
+		case e.keyLen == 0:
+			return 0, fmt.Errorf("%w: mutation %d: empty key", ErrInvalidMutation, i)
+		case e.keyLen > w.opts.Values.MaxKeyBytes:
+			return 0, fmt.Errorf("%w: mutation %d: key size %d exceeds max %d",
+				ErrInvalidMutation, i, e.keyLen, w.opts.Values.MaxKeyBytes)
+		case int64(e.valueLen) > w.opts.Values.MaxValueBytes:
+			return 0, fmt.Errorf("%w: mutation %d: value size %d exceeds max %d",
+				ErrInvalidMutation, i, e.valueLen, w.opts.Values.MaxValueBytes)
+		case e.ttl < 0:
+			return 0, fmt.Errorf("%w: mutation %d: negative TTL %s", ErrInvalidMutation, i, e.ttl)
+		}
+		arenaBytes += internal.EntryArenaBytes(e.keyLen, e.valueLen, e.ttl > 0)
+		if w.changeFeedPayload != 0 {
+			changeBytes += changeRecordHeaderSize + int64(e.keyLen)
+			if !e.delete && w.changeFeedPayload == ChangeFeedFullValues {
+				changeBytes += int64(e.valueLen)
+			}
+		}
+	}
+	// The cap is in arena bytes: the memtable's arena has a fixed size, and a
+	// batch of many small entries takes far more of it than its data. It is
+	// the target, or the largest single write if that is bigger, so a
+	// one-entry batch takes anything Put does; the arena's headroom holds one
+	// such write on top of the target.
+	memoryLimit, changeLimit := w.batchLimits()
+	if arenaBytes > memoryLimit || changeBytes > changeLimit {
+		return 0, fmt.Errorf("%w: %d mutations take %d memtable bytes (limit %d) and %d change-feed bytes (limit %d)",
+			ErrBatchTooLarge, b.Len(), arenaBytes, memoryLimit, changeBytes, changeLimit)
+	}
+	now := time.Now()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.ensureWritable(); err != nil {
+		return 0, err
+	}
+	// Make room first, never part way: the batch goes in whole.
+	buffered := int64(0)
+	if w.changeBuffer != nil {
+		buffered = w.changeBuffer.bodySize
+	}
+	target := w.opts.Memtable.TargetBytes
+	if !w.memtable.Empty() &&
+		(w.memtable.ApproxSize()+arenaBytes > target || buffered+changeBytes > target) {
+		if err := w.rotateLocked(); err != nil {
+			return 0, err
+		}
+	}
+	first := w.seq + 1
+	if w.changeFeedPayload != 0 {
+		if w.changeBuffer == nil {
+			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
+		}
+		for i, e := range b.entries {
+			seq := first + uint64(i)
+			var err error
+			if e.delete {
+				err = w.changeBuffer.appendDelete(seq, b.key(e))
+			} else {
+				err = w.changeBuffer.appendPutForPayload(seq, b.key(e), b.value(e), expireAt(now, e.ttl), w.changeFeedPayload)
+			}
+			if err != nil {
+				// Every cause was checked above; reaching here is a bug.
+				return 0, fmt.Errorf("isledb: change feed rejected mutation %d of a checked batch: %w", i, err)
+			}
+		}
+	}
+	for i, e := range b.entries {
+		seq := first + uint64(i)
+		if e.delete {
+			w.memtable.Delete(b.key(e), seq)
+			w.metrics.ObserveDelete()
+		} else {
+			w.memtable.PutWithTTL(b.key(e), b.value(e), seq, expireAt(now, e.ttl))
+			w.metrics.ObservePut(nil)
+		}
+	}
+	w.noteAcceptedLocked()
+	w.seq = first + uint64(b.Len()) - 1
+	return w.seq, nil
+}
+
+// batchLimits returns the largest batch Apply takes, in memtable arena bytes
+// and in change-feed bytes: the memtable target, or the largest single write
+// if that is bigger.
+func (w *writer) batchLimits() (memory, change int64) {
+	target := w.opts.Memtable.TargetBytes
+	values := w.opts.Values
+	memory = max(target, internal.EntryArenaBytes(values.MaxKeyBytes, int(values.MaxValueBytes), true))
+	change = max(target, changeRecordHeaderSize+int64(values.MaxKeyBytes)+values.MaxValueBytes)
+	return memory, change
+}
+
+// expireAt is the expiry, in Unix milliseconds, of a write made at now with
+// ttl; zero for none.
+func expireAt(now time.Time, ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return now.Add(ttl).UnixMilli()
 }
 
 // flush asks the committer for a pass and waits for it; ctx bounds only the
