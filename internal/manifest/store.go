@@ -99,8 +99,9 @@ type Store struct {
 	writerFence    *FenceToken
 	compactorFence *FenceToken
 	// successorWriterFence is the writer fence first seen replacing this
-	// Store's own.
+	// Store's own, and successorNextSeq CURRENT's NextSeq in that read.
 	successorWriterFence *FenceToken
+	successorNextSeq     uint64
 
 	// pendingWriterCommit records the exact immutable manifest position used
 	// by a writer CAS whose outcome was not acknowledged. commitMu protects it.
@@ -379,19 +380,21 @@ func (s *Store) WriterEpoch() uint64 {
 }
 
 // noteSuccessorLocked keeps the first writer fence seen after local, this
-// Store's own.
-func (s *Store) noteSuccessorLocked(local, remote *FenceToken) {
+// Store's own, with the NextSeq of the CURRENT it was read from.
+func (s *Store) noteSuccessorLocked(local, remote *FenceToken, nextSeq uint64) {
 	if s.successorWriterFence == nil && local != nil && remote != nil && remote.Epoch > local.Epoch {
 		s.successorWriterFence = remote.Clone()
+		s.successorNextSeq = nextSeq
 	}
 }
 
 // SuccessorWriterFence returns the writer fence this Store has seen replace
-// its own, or nil. It performs no I/O.
-func (s *Store) SuccessorWriterFence() *FenceToken {
+// its own, or nil, and the NextSeq of the CURRENT it was seen in: every
+// commit before the takeover is at a lower log position. It performs no I/O.
+func (s *Store) SuccessorWriterFence() (*FenceToken, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.successorWriterFence.Clone()
+	return s.successorWriterFence.Clone(), s.successorNextSeq
 }
 
 // WriterFenceObservedActive reports whether token still matches the writer
@@ -2218,7 +2221,7 @@ func (s *Store) observeFenceWithCurrent(role FenceRole, current *Current) bool {
 	}
 	switch role {
 	case FenceRoleWriter:
-		s.noteSuccessorLocked(localFence, remoteFence)
+		s.noteSuccessorLocked(localFence, remoteFence, current.NextSeq)
 		s.writerFence = nil
 	case FenceRoleCompactor:
 		s.compactorFence = nil

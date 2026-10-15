@@ -167,8 +167,14 @@ func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error) {
 // is not yet known: a failed commit is retried, and seq may still commit.
 // Without a background flush interval, committing is the caller's Flush or
 // Close.
-func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error {
-	return w.w.waitCommitted(ctx, seq)
+//
+// Once committed, it returns a view position at which seq is visible: a
+// Reader whose ViewPosition is at or past it sees the write, so the
+// position works as a read-your-writes token. Unlike sequences, positions
+// are never reused by a later Writer.
+func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) (ViewPosition, error) {
+	position, err := w.w.waitCommittedAt(ctx, seq)
+	return ViewPosition(position), err
 }
 
 // CommittedSequence returns the highest sequence committed to object
@@ -276,6 +282,8 @@ func (s WriterStatus) String() string {
 // dashboards and drain progress. It can be out of date as soon as it is
 // returned while writes and commits go on.
 type WriterState struct {
+	// Epoch is the Writer's fence epoch (see Writer.Epoch).
+	Epoch  uint64
 	Status WriterStatus
 	// Accepted is the highest sequence handed to a write; Committed the
 	// highest one in object storage. Accepted - Committed writes are pending.

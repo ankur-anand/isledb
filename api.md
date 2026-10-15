@@ -195,7 +195,7 @@ func (w *Writer) Put(ctx context.Context, key, value []byte) (uint64, error)
 func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (uint64, error)
 func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
 func (w *Writer) Flush(ctx context.Context) error
-func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) error
+func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) (ViewPosition, error)
 func (w *Writer) CommittedSequence() uint64
 func (w *Writer) AcceptedSequence() uint64
 func (w *Writer) Epoch() uint64
@@ -245,10 +245,11 @@ seq, err := writer.Put(ctx, key, value)
 if err != nil {
     return err
 }
-if err := writer.WaitCommitted(ctx, seq); err != nil {
+position, err := writer.WaitCommitted(ctx, seq)
+if err != nil {
     return err // see the table below
 }
-// The write is in object storage; a reader's Refresh now returns it.
+// The write is in object storage, visible to any reader at or past position.
 ```
 
 `WaitCommitted(ctx, seq)` waits until that write, and every one before it, is
@@ -259,13 +260,20 @@ Without a flush interval, call `Flush`.
 
 | `WaitCommitted` returns | The write |
 |---|---|
-| `nil` | is committed |
+| a position, `nil` | is committed, and visible at that view position |
 | `ErrFenced` | was not committed and never will be: another writer took over (if more than two took over before this one learned of it, ask the current writer's `CommitStatus`) |
 | a context error | is not known yet: it is still being retried and may land |
 | `ErrWriterClosed` | is not known: `Close` finished the writer before confirming it, and its last attempt may have landed |
 
 Treat an unknown write as unknown, not lost, and make retries idempotent (for
 example, `Put` the same key and value again).
+
+**Read your own writes.** The position `WaitCommitted` returns is a
+manifest log position: a `Reader` whose `ViewPosition()` is at or past it sees
+the write. Hand it to the client with the write's acknowledgement; a read
+that carries it is served once the reader's view has caught up, after a
+`Refresh` or the read cache's next ring. Unlike sequences, positions are never
+reused by a later writer.
 
 ### Did it commit after a failover?
 
@@ -316,6 +324,7 @@ Storage errors never end a writer; only `Close` and losing the fence do.
 
 ```go
 type WriterState struct {
+    Epoch             uint64       // the writer's fence epoch, as Epoch returns
     Status            WriterStatus // WriterOpen, WriterStopped, WriterClosed, WriterFenced
     Accepted          uint64       // highest sequence handed out
     Committed         uint64       // highest sequence in object storage
