@@ -1529,6 +1529,8 @@ func (w *writer) commitStatus(epoch, seq uint64) (CommitStatus, error) {
 	state, assigned, endKnown := w.state, w.seq, w.fencedEndKnown
 	w.mu.Unlock()
 	switch {
+	case assigned == w.baseSeq:
+		return CommitUnknown, fmt.Errorf("isledb: sequence %d was not assigned by this writer, which has assigned none yet", seq)
 	case seq <= w.baseSeq || seq > assigned:
 		return CommitUnknown, fmt.Errorf("isledb: sequence %d was not assigned by this writer, which assigned %d to %d",
 			seq, w.baseSeq+1, assigned)

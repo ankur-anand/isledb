@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -180,7 +181,45 @@ func Main(roles []Role, args []string, stdout io.Writer) error {
 // /readyz reports not ready, the drain passes, OnShutdown runs, requests in
 // flight finish, and the role closes. started, if not nil, gets the
 // addresses served once listening; either may be nil.
-func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.Logger, started func(api, admin net.Addr)) error {
+func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.Logger, started func(api, admin net.Addr)) (err error) {
+	sc := cfg.ServerConfig()
+
+	// Everything that can fail on its own, credentials and addresses, is
+	// ready before Start: a role such as the writer takes over its database
+	// in Start, and must not do so only to fail here afterwards.
+	var (
+		tlsConf        *tls.Config
+		tokens         *TokenAuth
+		apiLn, adminLn net.Listener
+	)
+	defer func() {
+		if err != nil {
+			for _, ln := range []net.Listener{apiLn, adminLn} {
+				if ln != nil {
+					_ = ln.Close()
+				}
+			}
+		}
+	}()
+	if sc.Listen != "" {
+		if tlsConf, err = serverTLS(sc.TLS); err != nil {
+			return err
+		}
+		if sc.Auth.TokenFile != "" {
+			if tokens, err = NewTokenAuth(sc.Auth.TokenFile); err != nil {
+				return err
+			}
+		}
+		if apiLn, err = net.Listen("tcp", sc.Listen); err != nil {
+			return err
+		}
+	}
+	if sc.AdminListen != "" {
+		if adminLn, err = net.Listen("tcp", sc.AdminListen); err != nil {
+			return err
+		}
+	}
+
 	svc, err := cfg.Start(ctx, common, log)
 	if err != nil {
 		return err
@@ -192,7 +231,6 @@ func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.
 			}
 		}()
 	}
-	sc := cfg.ServerConfig()
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -204,11 +242,7 @@ func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.
 	var servers []*http.Server
 	var addrs [2]net.Addr
 	serveErr := make(chan error, 2)
-	listen := func(i int, addr string, srv *http.Server, tlsCerts bool) error {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return err
-		}
+	serve := func(i int, ln net.Listener, srv *http.Server, tlsCerts bool) {
 		addrs[i] = ln.Addr()
 		servers = append(servers, srv)
 		go func() {
@@ -218,7 +252,6 @@ func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.
 				serveErr <- srv.Serve(ln)
 			}
 		}()
-		return nil
 	}
 	shutdown := func() error {
 		stopCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -230,37 +263,27 @@ func Serve(ctx context.Context, role Role, cfg Config, common Common, log *slog.
 		return errors.Join(errs...)
 	}
 
-	if sc.Listen != "" && svc.API != nil {
-		tlsConf, err := serverTLS(sc.TLS)
-		if err != nil {
-			return err
-		}
+	if apiLn != nil && svc.API == nil {
+		_ = apiLn.Close()
+		apiLn = nil
+	}
+	if apiLn != nil {
 		handler := svc.API
-		if sc.Auth.TokenFile != "" {
-			tokens, err := NewTokenAuth(sc.Auth.TokenFile)
-			if err != nil {
-				return err
-			}
+		if tokens != nil {
 			go reloadOnHangup(ctx, tokens, log)
 			handler = tokens.Wrap(handler)
 		}
 		handler = newHTTPMetrics(registry, role.Name, svc.Route).wrap(handler)
-		srv := &http.Server{
+		serve(0, apiLn, &http.Server{
 			Handler:           handler,
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       2 * time.Minute,
 			TLSConfig:         tlsConf,
 			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-		}
-		if err := listen(0, sc.Listen, srv, tlsConf != nil); err != nil {
-			return err
-		}
+		}, tlsConf != nil)
 	}
-	if sc.AdminListen != "" {
-		srv := &http.Server{Handler: adminHandler(registry, ready), ReadHeaderTimeout: 10 * time.Second}
-		if err := listen(1, sc.AdminListen, srv, false); err != nil {
-			return errors.Join(err, shutdown())
-		}
+	if adminLn != nil {
+		serve(1, adminLn, &http.Server{Handler: adminHandler(registry, ready), ReadHeaderTimeout: 10 * time.Second}, false)
 	}
 	log.Info("isledb: serving", "role", role.Name, "listen", addrs[0], "admin", addrs[1])
 	if started != nil {

@@ -332,3 +332,15 @@ func TestApplyBatchAtTheCapReadsBack(t *testing.T) {
 		}
 	}
 }
+
+func TestBatchGrowAvoidsReallocating(t *testing.T) {
+	b := NewBatch()
+	b.Grow(1 << 10)
+	before := cap(b.data)
+	for i := range 10 {
+		b.Put(fmt.Appendf(nil, "key-%d", i), make([]byte, 90))
+	}
+	if cap(b.data) != before || before < 1<<10 {
+		t.Fatalf("capacity %d after Grow, %d after adding what fits; want it unchanged", before, cap(b.data))
+	}
+}

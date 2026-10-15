@@ -1,6 +1,9 @@
 package isledb
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // Batch is a list of mutations for Writer.Apply, which buffers them so that
 // they commit together. The zero value is an empty batch. Adding copies the
@@ -32,6 +35,14 @@ func (b *Batch) PutWithTTL(key, value []byte, ttl time.Duration) { b.add(key, va
 
 // Delete adds a deletion of key.
 func (b *Batch) Delete(key []byte) { b.add(key, nil, true, 0) }
+
+// Grow makes room for n more bytes of keys and values, so adding them does
+// not reallocate the batch's buffer.
+func (b *Batch) Grow(n int) {
+	if n > 0 {
+		b.data = slices.Grow(b.data, n)
+	}
+}
 
 // Len is the number of mutations added.
 func (b *Batch) Len() int { return len(b.entries) }

@@ -10,13 +10,14 @@ import (
 
 	"github.com/ankur-anand/isledb/cmd/isledb/internal/cacherole"
 	"github.com/ankur-anand/isledb/cmd/isledb/internal/service"
+	"github.com/ankur-anand/isledb/cmd/isledb/internal/writerrole"
 	_ "gocloud.dev/blob/azureblob"
 	_ "gocloud.dev/blob/fileblob"
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/s3blob"
 )
 
-var roles = []service.Role{cacherole.Role}
+var roles = []service.Role{cacherole.Role, writerrole.Role}
 
 func main() {
 	err := service.Main(roles, os.Args[1:], os.Stdout)
