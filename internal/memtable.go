@@ -92,6 +92,18 @@ func (m *Memtable) Delete(key []byte, seq uint64) {
 	m.sl.Put(ikey, y.ValueStruct{Value: encoded})
 }
 
+// EntryArenaBytes bounds the arena bytes one entry takes: a skiplist node at
+// full height with its alignment, the key with its 8-byte version, and the
+// encoded value (2 header bytes, 8 more with a TTL) with the arena's value
+// metadata. The arena has a fixed size, and running past it ends the process.
+func EntryArenaBytes(keyLen, valueLen int, ttl bool) int64 {
+	encoded := 2 + valueLen
+	if ttl {
+		encoded += 8
+	}
+	return int64(skl.MaxNodeSize + 8 + keyLen + 8 + encoded + 2 + binary.MaxVarintLen64)
+}
+
 func (m *Memtable) ApproxSize() int64 {
 	return m.sl.MemSize()
 }

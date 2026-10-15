@@ -15,6 +15,7 @@ import "github.com/ankur-anand/isledb"
 - [Quick start](#quick-start)
 - [Open and close a database](#open-and-close-a-database)
 - [Write data](#write-data)
+  - [Write several keys atomically](#write-several-keys-atomically)
   - [Is my write durable?](#is-my-write-durable)
   - [Did it commit after a failover?](#did-it-commit-after-a-failover)
   - [Writer lifecycle](#writer-lifecycle)
@@ -194,6 +195,7 @@ in flight, run `Drain` and `Writer.Close` first; see
 func (w *Writer) Put(ctx context.Context, key, value []byte) (uint64, error)
 func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (uint64, error)
 func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
+func (w *Writer) Apply(ctx context.Context, b *Batch) (uint64, error)
 func (w *Writer) Flush(ctx context.Context) error
 func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) (ViewPosition, error)
 func (w *Writer) CommittedSequence() uint64
@@ -209,6 +211,7 @@ func (w *Writer) Close(ctx context.Context) error
 | Method | What it does |
 |---|---|
 | `Put`, `PutWithTTL`, `Delete` | Buffer the write in memory and return its sequence number |
+| `Apply` | Buffer a batch of writes so they commit together; return the last sequence |
 | `Flush` | Commit everything buffered so far, and wait for it |
 | `WaitCommitted` | Wait until a given sequence is committed |
 | `CommittedSequence` | The highest committed sequence, without waiting |
@@ -234,6 +237,46 @@ it. A TTL of zero means no expiration.
 
 **TTLs.** Readers hide expired values. Expiry does not delete anything
 immediately; compaction removes expired data later.
+
+### Write several keys atomically
+
+`Put` and `Delete` each commit on their own: between two of them the writer
+can start a new memtable, so a reader may see the first without the second.
+`Apply` buffers a whole batch under one lock and in one memtable, so readers
+see all of it or none of it, and the change feed publishes it all at once, in
+one change batch. A feed consumer that reads with a limit may still receive
+the batch over several pages; the feed does not mark where a batch ends.
+
+```go
+b := isledb.NewBatch() // or: var b isledb.Batch
+b.Put([]byte("order/42"), order)
+b.Put([]byte("stock/7"), stock)
+b.Delete([]byte("cart/42"))
+
+last, err := writer.Apply(ctx, b)
+if err != nil {
+    return err // nothing was applied; see below
+}
+position, err := writer.WaitCommitted(ctx, last) // durable, all of it
+```
+
+- **It does not flush.** Like `Put`, the batch commits with the next
+  background flush, `Flush`, `Drain` or `Close`; wait with `WaitCommitted` on
+  the last sequence. Mutation `i` has sequence `last - b.Len() + 1 + i`.
+- **Whole or nothing.** On any error nothing was applied and the same batch
+  can be retried: `ErrInvalidMutation` names the first bad mutation (or an
+  empty batch), `ErrBackpressure` means wait for commits, and
+  `ErrBatchTooLarge` means it does not fit one memtable: split it.
+- **Not a transaction.** There are no reads or conditions, and a later write
+  can overwrite any key in it. A key written twice in one batch keeps its
+  last write.
+- **Size.** A batch must fit in `Memtable.TargetBytes`, or in the largest
+  single write if that is bigger, so a one-entry batch takes anything `Put`
+  does. Each entry's memtable overhead counts, so many tiny entries reach the
+  limit sooner than their bytes suggest.
+- **The `Batch`.** Adding copies keys and values; `Apply` does not change the
+  batch or keep its memory, so drop it or `Reset` it for reuse. A `Batch` is
+  for one goroutine.
 
 ### Is my write durable?
 
@@ -1511,7 +1554,8 @@ error.
 | Error | Meaning |
 |---|---|
 | `ErrBackpressure` | Too many memtables waiting to commit; the write was not accepted |
-| `ErrInvalidMutation` | Empty or oversized key, oversized value, or negative TTL |
+| `ErrInvalidMutation` | Empty or oversized key, oversized value, negative TTL, or an empty batch |
+| `ErrBatchTooLarge` | `Apply`: every mutation is valid but the batch does not fit one memtable; split it |
 | `ErrInvalidWriterOptions` | Invalid limits, interval, identity, or memory settings |
 | `ErrWritesStopped` | A write after `StopWrites`, `Drain` or while `Close` runs; accepted writes are still committing |
 | `ErrWriterClosed` | The writer was closed |

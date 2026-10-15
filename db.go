@@ -156,6 +156,23 @@ func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error) {
 	return w.w.delete(ctx, key)
 }
 
+// Apply buffers every mutation in b under one lock and in one memtable, so
+// they commit together: readers see all of them or none, and the change feed
+// publishes them at once, in one change batch (a consumer reading with a
+// limit may still receive them over several pages).
+// It returns the last mutation's sequence; mutation i has sequence
+// last - b.Len() + 1 + i, and WaitCommitted on last waits for the whole
+// batch. Like Put, it does not flush.
+//
+// A batch is applied whole or not at all: on any error nothing was applied
+// and b can be retried. ErrInvalidMutation names the first invalid mutation,
+// or an empty batch; ErrBatchTooLarge means the batch does not fit one
+// memtable and must be split. Apply does not modify b, and keeps no
+// reference to its memory.
+func (w *Writer) Apply(ctx context.Context, b *Batch) (uint64, error) {
+	return w.w.apply(ctx, b)
+}
+
 // WaitCommitted waits until the mutation with sequence seq, as returned by
 // Put, PutWithTTL or Delete, and every mutation before it are committed to
 // object storage, where readers that refresh see them.
