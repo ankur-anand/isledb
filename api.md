@@ -274,9 +274,10 @@ position, err := writer.WaitCommitted(ctx, last) // durable, all of it
   single write if that is bigger, so a one-entry batch takes anything `Put`
   does. Each entry's memtable overhead counts, so many tiny entries reach the
   limit sooner than their bytes suggest.
-- **The `Batch`.** Adding copies keys and values; `Apply` does not change the
-  batch or keep its memory, so drop it or `Reset` it for reuse. A `Batch` is
-  for one goroutine.
+- **The `Batch`.** Adding copies keys and values; `Grow(n)` makes room for
+  `n` bytes of them first, when you know the total. `Apply` does not change
+  the batch or keep its memory, so drop it or `Reset` it for reuse. A `Batch`
+  is for one goroutine.
 
 ### Is my write durable?
 

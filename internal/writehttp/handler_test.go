@@ -440,7 +440,7 @@ func TestParsePrefer(t *testing.T) {
 }
 
 func TestNewHandlerRefusesBadOptions(t *testing.T) {
-	good := Options{CommitWait: time.Second, MaxValueBytes: 1, MaxBodyBytes: 1, MaxInflightBytes: 1, BodyReadTimeout: time.Second}
+	good := Options{CommitWait: time.Second, MaxValueBytes: 1, MaxBodyBytes: 1, MaxInflightBytes: BatchReserveFactor, BodyReadTimeout: time.Second}
 	if _, err := NewHandler(nil, good); err == nil {
 		t.Fatal("nil writer accepted")
 	}
@@ -466,8 +466,14 @@ func TestNewHandlerRefusesBadOptions(t *testing.T) {
 // Content-Length.
 func stalledPut(t *testing.T, server *httptest.Server, path string, length int64, first []byte) (finish func(rest []byte), reply <-chan *http.Response) {
 	t.Helper()
+	return stalledRequest(t, server, http.MethodPut, path, length, first)
+}
+
+// stalledRequest is stalledPut for any method.
+func stalledRequest(t *testing.T, server *httptest.Server, method, path string, length int64, first []byte) (finish func(rest []byte), reply <-chan *http.Response) {
+	t.Helper()
 	pr, pw := io.Pipe()
-	req, err := http.NewRequest(http.MethodPut, server.URL+path, pr)
+	req, err := http.NewRequest(method, server.URL+path, pr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +502,7 @@ func stalledPut(t *testing.T, server *httptest.Server, path string, length int64
 func TestBodiesInFlightAreBounded(t *testing.T) {
 	// One PUT of the whole value limit takes the whole budget.
 	const limit = 1 << 10
-	f := newFixture(t, 10*time.Millisecond, Options{MaxValueBytes: limit, MaxBodyBytes: limit, MaxInflightBytes: limit})
+	f := newFixture(t, 10*time.Millisecond, Options{MaxValueBytes: limit, MaxBodyBytes: limit / BatchReserveFactor, MaxInflightBytes: limit})
 	handler := f.server.Config.Handler.(*Handler)
 	value := bytes.Repeat([]byte("v"), limit)
 	finish, reply := stalledPut(t, f.server, kvPathFor("slow"), limit, value[:10])
@@ -718,5 +724,54 @@ func TestRouteNamesEveryEndpoint(t *testing.T) {
 		if got := Route(r); got != c.want {
 			t.Errorf("%s %s: %q, want %q", c.method, c.path, got, c.want)
 		}
+	}
+}
+
+func TestBatchReservesForItsDecodedCopies(t *testing.T) {
+	const body = 256
+	f := newFixture(t, 10*time.Millisecond, Options{MaxValueBytes: 1 << 10, MaxBodyBytes: body, MaxInflightBytes: BatchReserveFactor * body})
+	handler := f.server.Config.Handler.(*Handler)
+	finish, reply := stalledRequest(t, f.server, http.MethodPost, "/v1/kv", body, []byte("{"))
+	deadline := time.Now().Add(5 * time.Second)
+	for handler.InflightBytes() != BatchReserveFactor*body {
+		if time.Now().After(deadline) {
+			t.Fatalf("a batch body of %d reserved %d bytes, want %d", body, handler.InflightBytes(), BatchReserveFactor*body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	do(t, f.server, http.MethodPut, kvPathFor("k"), []byte("v")).want(t, http.StatusServiceUnavailable, ErrorBackpressure)
+	finish(bytes.Repeat([]byte(" "), body-1))
+	if resp := <-reply; resp != nil {
+		_ = resp.Body.Close()
+	}
+	if n := handler.InflightBytes(); n != 0 {
+		t.Fatalf("%d bytes still reserved after the batch", n)
+	}
+}
+
+// TestReplacedWriterSendsUnknownElsewhere: a writer replaced three times over
+// before it noticed cannot tell where its commits ended, but the writer that
+// holds the database can. Its own "unknown" is a 503, so clients ask again.
+func TestReplacedWriterSendsUnknownElsewhere(t *testing.T) {
+	f := newFixture(t, 0, Options{})
+	r := do(t, f.server, http.MethodPut, kvPathFor("k"), []byte("v"), "Prefer", "respond-async")
+	if r.status != http.StatusAccepted {
+		t.Fatalf("async PUT: %d %v", r.status, r.body)
+	}
+	id := r.body["write_id"]
+	var latest *httptest.Server
+	for range 3 {
+		_, latest = f.serve(t, 10*time.Millisecond, Options{})
+	}
+	if err := f.writer.Flush(f.ctx); err == nil {
+		t.Fatal("Flush after the takeovers succeeded")
+	}
+	s := do(t, f.server, http.MethodGet, "/v1/writes/"+id, nil)
+	s.want(t, http.StatusServiceUnavailable, ErrorUnavailable)
+	if s.header.Get("Retry-After") == "" {
+		t.Fatal("503 without Retry-After")
+	}
+	if s := do(t, latest, http.MethodGet, "/v1/writes/"+id, nil); s.status != http.StatusOK || s.body["status"] != "not_committed" {
+		t.Fatalf("the writer holding the database on %s: %d %v", id, s.status, s.body)
 	}
 }

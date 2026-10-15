@@ -48,14 +48,21 @@ type Options struct {
 	// MaxValueBytes caps a PUT body; MaxBodyBytes a POST body.
 	MaxValueBytes int64
 	MaxBodyBytes  int64
-	// MaxInflightBytes bounds the request bodies held at once; a request
-	// past it is answered 503 before its body is read. At least both body
-	// limits.
+	// MaxInflightBytes bounds the memory of requests being read and
+	// applied; a request past it is answered 503 before its body is read. A
+	// PUT counts its body, a batch BatchReserveFactor times its body, for its
+	// decoded copy and the batch built from it. At least MaxValueBytes and
+	// BatchReserveFactor times MaxBodyBytes.
 	MaxInflightBytes int64
 	// BodyReadTimeout is how long a request has to send its body; past it,
 	// the request is answered 408.
 	BodyReadTimeout time.Duration
 }
+
+// BatchReserveFactor is how many times its body a batch request reserves of
+// the in-flight budget: the body, the JSON decoder's copy of it, the decoded
+// keys and values, and the batch built from them.
+const BatchReserveFactor = 4
 
 // Handler serves the write API:
 //
@@ -89,9 +96,9 @@ func NewHandler(writer *isledb.Writer, opts Options) (*Handler, error) {
 		return nil, fmt.Errorf("writehttp: commit wait %s, want above 0", opts.CommitWait)
 	case opts.MaxValueBytes <= 0 || opts.MaxBodyBytes <= 0:
 		return nil, fmt.Errorf("writehttp: body limits %d and %d, want above 0", opts.MaxValueBytes, opts.MaxBodyBytes)
-	case opts.MaxInflightBytes < max(opts.MaxValueBytes, opts.MaxBodyBytes):
-		return nil, fmt.Errorf("writehttp: in-flight limit %d is below a body limit (%d, %d): such a body could never be read",
-			opts.MaxInflightBytes, opts.MaxValueBytes, opts.MaxBodyBytes)
+	case opts.MaxInflightBytes < max(opts.MaxValueBytes, BatchReserveFactor*opts.MaxBodyBytes):
+		return nil, fmt.Errorf("writehttp: in-flight limit %d is below the value limit %d or %d times the body limit %d: such a request could never be read",
+			opts.MaxInflightBytes, opts.MaxValueBytes, BatchReserveFactor, opts.MaxBodyBytes)
 	case opts.BodyReadTimeout <= 0:
 		return nil, fmt.Errorf("writehttp: body read timeout %s, want above 0", opts.BodyReadTimeout)
 	}
@@ -257,7 +264,7 @@ func query(w http.ResponseWriter, r *http.Request, allowed ...string) (url.Value
 }
 
 func (h *Handler) servePut(w http.ResponseWriter, r *http.Request, key []byte, ttl time.Duration) {
-	value, release, ok := h.readBody(w, r, h.maxValueBytes)
+	value, release, ok := h.readBody(w, r, h.maxValueBytes, 1)
 	if !ok {
 		return
 	}
@@ -295,7 +302,7 @@ func parseTTL(raw *string) (time.Duration, error) {
 }
 
 func (h *Handler) serveBatch(w http.ResponseWriter, r *http.Request) {
-	body, release, ok := h.readBody(w, r, h.maxBodyBytes)
+	body, release, ok := h.readBody(w, r, h.maxBodyBytes, BatchReserveFactor)
 	if !ok {
 		return
 	}
@@ -319,6 +326,11 @@ func (h *Handler) serveBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b := isledb.NewBatch()
+	size := 0
+	for _, op := range req.Ops {
+		size += len(op.Key) + len(op.Value)
+	}
+	b.Grow(size)
 	for i, op := range req.Ops {
 		switch op.Op {
 		case "put":
@@ -347,9 +359,9 @@ func (h *Handler) serveBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// readBody reads r's body after reserving its Content-Length in the
-// in-flight budget. The caller calls release once done with the body.
-func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, limit int64) (body []byte, release func(), ok bool) {
+// readBody reads r's body after reserving factor times its Content-Length in
+// the in-flight budget. The caller calls release once done with the body.
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, limit, factor int64) (body []byte, release func(), ok bool) {
 	size := r.ContentLength
 	switch {
 	case size < 0:
@@ -358,12 +370,12 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, limit int64) 
 	case size > limit:
 		writeError(w, http.StatusRequestEntityTooLarge, ErrorTooLarge, fmt.Sprintf("body above %d bytes", limit), "")
 		return nil, nil, false
-	case !h.reserve(size):
+	case !h.reserve(factor * size):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, ErrorBackpressure, "too many request bodies in flight; retry", "")
 		return nil, nil, false
 	}
-	release = func() { h.release(size) }
+	release = func() { h.release(factor * size) }
 	body = make([]byte, size)
 	_, err := io.ReadFull(r.Body, body)
 	switch {
@@ -451,9 +463,6 @@ func (h *Handler) outcomeUnknown(w http.ResponseWriter, id string) {
 // handler that returns without one is sent as an empty 200.
 func (h *Handler) applyError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case r.Context().Err() != nil:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "the request ended before the write was accepted; retry", "")
 	case errors.Is(err, isledb.ErrInvalidMutation):
 		writeError(w, http.StatusBadRequest, ErrorInvalidMutation, err.Error(), "")
 	case errors.Is(err, isledb.ErrBatchTooLarge):
@@ -464,6 +473,9 @@ func (h *Handler) applyError(w http.ResponseWriter, r *http.Request, err error) 
 	case errors.Is(err, isledb.ErrWritesStopped), errors.Is(err, isledb.ErrWriterClosed), errors.Is(err, isledb.ErrFenced):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "this writer takes no writes now; retry", "")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "the request ended before the write was accepted; retry", "")
 	default:
 		slog.Warn("writehttp: apply", "error", err)
 		writeError(w, http.StatusInternalServerError, ErrorInternal, "the write was not accepted", "")
@@ -489,6 +501,13 @@ func (h *Handler) serveStatus(w http.ResponseWriter, raw string) {
 		return
 	case err != nil:
 		writeError(w, http.StatusBadRequest, ErrorBadWriteID, err.Error(), "")
+		return
+	}
+	if status == isledb.CommitUnknown && epoch == h.writer.Epoch() {
+		// This writer stopped without learning where its commits ended; the
+		// writer that replaced it can tell.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "this writer was replaced and the one that replaced it can answer; retry", "")
 		return
 	}
 	resp := statusResponse{Status: status.String()}

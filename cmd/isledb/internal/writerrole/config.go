@@ -12,6 +12,7 @@ import (
 	"github.com/ankur-anand/isledb"
 	"github.com/ankur-anand/isledb/cmd/isledb/internal/service"
 	"github.com/ankur-anand/isledb/internal/readcache"
+	"github.com/ankur-anand/isledb/internal/writehttp"
 )
 
 // Config is the writer's section of the configuration.
@@ -202,8 +203,9 @@ func (c *Config) Validate() error {
 	if c.Writes.MaxRequestBytes < 1<<20 {
 		fail("writes.max_request_bytes is below 1MiB")
 	}
-	if c.Writes.MaxInflightBytes < max(c.Writes.MaxRequestBytes, c.Values.MaxValueBytes) {
-		fail("writes.max_inflight_bytes is below writes.max_request_bytes or values.max_value_bytes: such a request could never be read")
+	if int64(c.Writes.MaxInflightBytes) < max(writehttp.BatchReserveFactor*int64(c.Writes.MaxRequestBytes), int64(c.Values.MaxValueBytes)) {
+		fail("writes.max_inflight_bytes is below %d times writes.max_request_bytes, or values.max_value_bytes: such a request could never be read",
+			writehttp.BatchReserveFactor)
 	}
 	if c.Writes.BodyReadTimeout <= 0 {
 		fail("writes.body_read_timeout must be positive")

@@ -169,6 +169,10 @@ GET /v1/writes/7.10442
 | `not_committed` | The write was not saved and never will be. It's safe to send it again. |
 | `unknown` | The writer can't tell, because the write is too old. |
 
+A writer that was replaced, and can't tell what happened to its own write,
+answers `503 unavailable` instead of `unknown`: the writer now holding the
+database can answer. Ask again after `Retry-After` seconds.
+
 ## Sending a request body
 
 `PUT` and `POST` requests must include a `Content-Length` header. Most HTTP
@@ -199,7 +203,7 @@ Retry-After: 1
 | 411 | `length_required` | The request has no `Content-Length` header. | Send `Content-Length`. |
 | 413 | `too_large` | The value or batch is too large. | Send a smaller value, or split the batch. |
 | 503 | `backpressure` | The writer is busy. Nothing was written. | Retry after `Retry-After` seconds. |
-| 503 | `unavailable` | The writer isn't taking writes right now, for example while restarting. Nothing was written. | Retry after `Retry-After` seconds. |
+| 503 | `unavailable` | The writer isn't taking writes right now, for example while restarting; nothing was written. On `GET /v1/writes/…`, this writer was replaced and another can answer. | Retry after `Retry-After` seconds. |
 | 503 | `not_committed` | The write was accepted but will never be saved. The body includes its `write_id`. | Send it again. |
 | 504 | `outcome_unknown` | The write was accepted but not confirmed in time. It may still be saved. The body includes its `write_id`. | Check it at `GET /v1/writes/{write_id}` before sending it again. |
 

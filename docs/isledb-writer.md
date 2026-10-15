@@ -121,7 +121,7 @@ It prints every setting with its final value, or the problems it found.
 | `writer.writes.max_request_bytes` | `--max-request-bytes` | `ISLEDB_WRITER_WRITES_MAX_REQUEST_BYTES` | `32MiB` | Largest batch request. At least `1MiB`. |
 | `writer.memtable.target_bytes` | `--memtable-bytes` | `ISLEDB_WRITER_MEMTABLE_TARGET_BYTES` | `16MiB` | How much data the writer buffers before saving it in a separate group. Also the largest batch. |
 | `writer.memtable.max_pending` | `--max-pending-memtables` | `ISLEDB_WRITER_MEMTABLE_MAX_PENDING` | `4` | How many full groups can wait to be saved before new writes get `503`. |
-| `writer.writes.max_inflight_bytes` | `--max-inflight-bytes` | `ISLEDB_WRITER_WRITES_MAX_INFLIGHT_BYTES` | `256MiB` | Total size of requests the writer reads at once. Past it, new writes get `503` until earlier ones finish. At least `max_request_bytes` and `max_value_bytes`. |
+| `writer.writes.max_inflight_bytes` | `--max-inflight-bytes` | `ISLEDB_WRITER_WRITES_MAX_INFLIGHT_BYTES` | `256MiB` | Memory for requests being read and applied at once. A `PUT` counts its body; a batch counts 4 times its body, for its decoded copy and the batch built from it. Past it, new writes get `503` until earlier ones finish. At least 4 × `max_request_bytes`, and `max_value_bytes`. |
 | `writer.writes.body_read_timeout` | `--body-read-timeout` | `ISLEDB_WRITER_WRITES_BODY_READ_TIMEOUT` | `1m` | How long a client has to send its request body. Past it, the client gets `408`. |
 | `writer.change_feed.payload` | `--change-feed` | `ISLEDB_WRITER_CHANGE_FEED_PAYLOAD` | empty | Turns on the database's change feed: `keys` or `values`. See below. |
 | `writer.policy.max_pinned_view_age` | `--max-pinned-view-age` | `ISLEDB_WRITER_POLICY_MAX_PINNED_VIEW_AGE` | `1h` | Must match the database's setting. See below. |
@@ -149,7 +149,9 @@ the default.
 ## Memory
 
 Plan for about 720 MiB of memory with the default settings. Most of it is
-data waiting to be saved, and requests being read. If you raise
+data waiting to be saved, and requests being read and applied, which
+`writes.max_inflight_bytes` bounds: a batch is counted at 4 times its body,
+for the copies made while decoding and applying it. If you raise
 `writes.max_inflight_bytes` or `memtable.target_bytes`, raise the memory
 limit too.
 
