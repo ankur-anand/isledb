@@ -1015,10 +1015,18 @@ func (r *Reader) currentManifestState() (*manifestState, Version, time.Time) {
 	return r.manifest, r.version, r.viewExpiresAt
 }
 
-func (r *Reader) currentBootstrapState() (*manifestState, Version, ChangeCursor, bool, time.Time) {
+func (r *Reader) currentBootstrapState() (*manifestState, Version, ViewPosition, ChangeCursor, bool, time.Time) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.manifest, r.version, r.changeHead, r.changeFeed, r.viewExpiresAt
+	return r.manifest, r.version, ViewPosition(r.viewSeq), r.changeHead, r.changeFeed, r.viewExpiresAt
+}
+
+// currentSnapshotState is currentManifestState with the view's position,
+// read under the same lock.
+func (r *Reader) currentSnapshotState() (*manifestState, Version, ViewPosition, time.Time) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.manifest, r.version, ViewPosition(r.viewSeq), r.viewExpiresAt
 }
 
 // Snapshot returns an immutable read handle over a fresh manifest state. The
@@ -1033,14 +1041,14 @@ func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
-	m, version, expiresAt := r.currentManifestState()
+	m, version, position, expiresAt := r.currentSnapshotState()
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
 	if !time.Now().Before(expiresAt) {
 		return nil, ErrReadViewExpired
 	}
-	return newSnapshot(r, m, version, expiresAt), nil
+	return newSnapshot(r, m, version, position, expiresAt), nil
 }
 
 // BootstrapView returns an immutable KV snapshot and the first change-feed
@@ -1062,7 +1070,7 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error) {
 	if err := r.checkManifestView(ctx); err != nil {
 		return nil, err
 	}
-	m, version, cursor, changeFeed, expiresAt := r.currentBootstrapState()
+	m, version, position, cursor, changeFeed, expiresAt := r.currentBootstrapState()
 	if m == nil {
 		return nil, errors.New("manifest not loaded")
 	}
@@ -1072,7 +1080,7 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error) {
 	if !time.Now().Before(expiresAt) {
 		return nil, ErrReadViewExpired
 	}
-	snapshot := newSnapshot(r, m, version, expiresAt)
+	snapshot := newSnapshot(r, m, version, position, expiresAt)
 	return &BootstrapView{
 		Snapshot: snapshot,
 		Cursor:   cursor,

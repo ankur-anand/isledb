@@ -149,7 +149,7 @@ func (v *NextView) Snapshot() (*Snapshot, error) {
 	if !time.Now().Before(expiresAt) {
 		return nil, ErrNextViewExpired
 	}
-	return newSnapshot(v.r, v.view.manifest, v.Version(), expiresAt), nil
+	return newSnapshot(v.r, v.view.manifest, v.Version(), v.Next(), expiresAt), nil
 }
 
 // Prefetch caches the Added SSTs on local disk, as Reader.Prefetch does for
