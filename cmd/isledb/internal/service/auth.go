@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // TokenAuth checks bearer tokens against a file of them, which Reload
@@ -66,6 +67,12 @@ func (a *TokenAuth) Allows(r *http.Request) bool {
 func (a *TokenAuth) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.Allows(r) {
+			if r.ProtoMajor == 1 && r.ContentLength != 0 {
+				// The body will not be read: answer and drop the connection,
+				// rather than wait for a body a stalled client never sends.
+				w.Header().Set("Connection", "close")
+				_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+			}
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return

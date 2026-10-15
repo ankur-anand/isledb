@@ -17,7 +17,8 @@ your application processes.
 IsleDB provides:
 
 - point reads, range scans, iterators, snapshots, TTLs, and deletes;
-- one fenced writer with any number of independent reader processes;
+- one fenced writer with any number of independent reader processes, usable
+  from any language through an optional HTTP write service (`isledb writer`);
 - configurable local caching for readers, and an optional shared read cache
   per region (`isledb cache`);
 - optional keys-only or full-value change feeds;
@@ -279,6 +280,29 @@ slow, down, or wrong.
 See [Running `isledb cache`](docs/isledb-cache.md) and the
 [read cache HTTP API](docs/read-cache-api.md).
 
+## Writer service
+
+`isledb writer` holds the writer for one database and serves writes over
+HTTP, so services in any language can write:
+
+```bash
+isledb writer \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts \
+  --auth-token-file /etc/isledb/tokens
+```
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  --data '{"name":"a"}' 'http://isledb-writer:8070/v1/kv/user%2F42?ttl=24h'
+# {"write_id":"1.1","revision":"2"}
+```
+
+A write is answered once it is durable in object storage; batches of puts and
+deletes go to `POST /v1/kv` and apply atomically. Run one writer per
+database. See [Running `isledb writer`](docs/isledb-writer.md) and the
+[writer HTTP API](docs/writer-api.md).
+
 ## When IsleDB fits
 
 IsleDB is a good fit when:
@@ -302,6 +326,7 @@ Choose a different database when you need:
 - [Go package reference](https://pkg.go.dev/github.com/ankur-anand/isledb)
 - [Object-store layout and operations](docs/object-store-schema.md)
 - [Running the shared read cache](docs/isledb-cache.md)
+- [Running the writer service](docs/isledb-writer.md) and its [HTTP API](docs/writer-api.md)
 - [Local quickstart](examples/quickstart)
 - [Separate writer, reader, and maintenance services with MinIO](examples/minio-services)
 - [Restartable change-feed consumer with Azurite](examples/changefeed-azurite)
