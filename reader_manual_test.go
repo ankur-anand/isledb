@@ -24,13 +24,21 @@ func newManualTestReader(t *testing.T) (context.Context, *Reader, *pausingManife
 	storage := &pausingManifestStorage{pagedManifestStorage: manifest.NewBlobStoreBackend(store)}
 	reader, err := newReader(ctx, store, readerOptions{
 		CacheDir: t.TempDir(), ManifestStorage: storage, DisableManifestPageCache: true,
-		ViewPolicy: ReaderViewPolicy{Manual: true, MaxLag: time.Minute},
+		ViewPolicy: ReaderViewPolicy{Manual: true, MaxLag: time.Minute, RefreshAfter: time.Hour},
 		Metrics:    DefaultReaderMetrics(nil),
 	})
 	if err != nil {
 		t.Fatalf("newReader: %v", err)
 	}
 	t.Cleanup(func() { _ = reader.Close() })
+	// Tests load views with fireViewTimer: put every scheduled refresh half
+	// an hour out, so none lands in the middle of a test.
+	reader.mu.Lock()
+	reader.refreshGrid = time.Now().Add(30 * time.Minute)
+	reader.viewRefreshAt = reader.refreshGrid
+	refreshAt, expiresAt := reader.viewRefreshAt, reader.viewExpiresAt
+	reader.mu.Unlock()
+	reader.armViewTimer(refreshAt, expiresAt)
 	return ctx, reader, storage, store, ms
 }
 
