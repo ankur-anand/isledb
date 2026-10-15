@@ -717,11 +717,17 @@ func (v Version) String() string
 func (v Version) IsZero() bool
 
 func (s *Snapshot) Version() Version
+func (s *Snapshot) ViewPosition() ViewPosition
 func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error)
 func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
 func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
 func (s *Snapshot) Close() error
 ```
+
+`ViewPosition` is the position of the view the snapshot reads, fixed when it
+was taken, unlike `Reader.ViewPosition`, which moves with refreshes. Report
+it beside a read to say exactly which view answered: a write whose
+`WaitCommitted` position is at or below it is included.
 
 A snapshot and its iterators share the view's fixed deadline
 (`MaxPinnedViewAge` after it was loaded); opening another handle does not

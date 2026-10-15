@@ -37,6 +37,7 @@ type Snapshot struct {
 	reader    *Reader
 	manifest  *manifestState
 	version   Version
+	position  ViewPosition
 	expiresAt time.Time
 	closed    atomic.Bool
 }
@@ -52,13 +53,23 @@ type BootstrapView struct {
 	Version  Version
 }
 
-func newSnapshot(reader *Reader, m *manifestState, version Version, expiresAt time.Time) *Snapshot {
+func newSnapshot(reader *Reader, m *manifestState, version Version, position ViewPosition, expiresAt time.Time) *Snapshot {
 	return &Snapshot{
 		reader:    reader,
 		manifest:  m,
 		version:   version,
+		position:  position,
 		expiresAt: expiresAt,
 	}
+}
+
+// ViewPosition is the position of the view this snapshot reads: every read
+// through it sees exactly the writes committed below it.
+func (s *Snapshot) ViewPosition() ViewPosition {
+	if s == nil {
+		return 0
+	}
+	return s.position
 }
 
 func (s *Snapshot) Version() Version {
