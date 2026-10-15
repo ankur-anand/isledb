@@ -189,8 +189,21 @@ func TestFencedWriterLearnsItsLostCommitLanded(t *testing.T) {
 	if err := w.commitPass(ctx, false); !errors.Is(err, ErrFenced) {
 		t.Fatalf("pass after takeover: %v, want ErrFenced from the maintenance apply", err)
 	}
-	if err := w.waitCommitted(ctx, seq); err != nil {
+	position, err := w.waitCommittedAt(ctx, seq)
+	if err != nil {
 		t.Fatalf("WaitCommitted on the landed write: %v, want nil", err)
+	}
+	// From the CURRENT that showed the takeover: past the landed commit.
+	data, _, err := storage.Storage.ReadCurrent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := manifest.DecodeCurrent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position < 2 || position > current.NextSeq {
+		t.Fatalf("position %d for a write settled by the successor's fence, want in [2, %d]", position, current.NextSeq)
 	}
 	if got, err := w.commitStatus(w.fenceToken.Epoch, seq); err != nil || got != CommitDone {
 		t.Fatalf("CommitStatus: %v, %v; want committed", got, err)

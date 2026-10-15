@@ -150,7 +150,10 @@ func (s writerStatus) final() bool { return s >= writerClosed }
 type writerState struct {
 	status    writerStatus
 	committed uint64
-	changed   chan struct{}
+	// position is the view position from which every committed write is
+	// visible to readers.
+	position uint64
+	changed  chan struct{}
 }
 
 // pendingFlush owns one logical memtable publication. Uploaded objects and the
@@ -257,7 +260,7 @@ func newWriterWithMaintenanceWake(
 
 	// What the manifest holds is committed: report it before the first
 	// commit, so a writer taking over continues the series.
-	w.state = writerState{status: writerOpen, committed: w.seq, changed: make(chan struct{})}
+	w.state = writerState{status: writerOpen, committed: w.seq, position: m.LogSeq + 1, changed: make(chan struct{})}
 	w.committed.Store(w.seq)
 	w.metrics.ObserveCommittedSequence(w.seq)
 
@@ -451,6 +454,7 @@ func (w *writer) snapshot() WriterState {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	state := WriterState{
+		Epoch:            w.fenceToken.Epoch,
 		Status:           publicStatus(w.state.status),
 		Accepted:         w.seq,
 		Committed:        w.state.committed,
@@ -769,7 +773,7 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 			start := time.Now()
 			timeout := w.commitAttemptTimeout(pending)
 			attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-			status, err := w.flushPending(attemptCtx, pending)
+			status, position, err := w.flushPending(attemptCtx, pending)
 			// Whether the attempt ran out of time is read from its context,
 			// not its error, which each storage client wraps its own way.
 			timedOut := ctx.Err() == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
@@ -789,6 +793,7 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 			}
 			w.attemptTimeouts = 0
 			w.mu.Lock()
+			w.state.position = max(w.state.position, position)
 			w.pendingMemtables--
 			w.pendingBytes -= pending.bytes
 			w.noteMemtableCommittedLocked()
@@ -1031,7 +1036,9 @@ func (w *writer) takeFlushBatchLocked(throughSeq uint64) []*pendingFlush {
 // status the commit leaves the writer in, open or, for a commit reconciled
 // after a successor took the fence, fenced; the caller records it, with the
 // commit, once its own bookkeeping is done.
-func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (writerStatus, error) {
+// flushPending also returns the view position from which the commit is
+// visible.
+func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (writerStatus, uint64, error) {
 	sstOpts := sstWriterOptions{
 		BloomBitsPerKey: w.sstOutput.BloomBitsPerKey,
 		BlockSize:       w.sstOutput.BlockBytes,
@@ -1089,27 +1096,27 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 			pending.changes = nil
 		}
 		if groupErr != nil {
-			return 0, groupErr
+			return 0, 0, groupErr
 		}
 	} else {
 		if needSST {
 			result, err := buildSST(ctx)
 			if err != nil {
-				return 0, err
+				return 0, 0, err
 			}
 			pending.sstable = &result.Meta
 		}
 		if needChangeBatch {
 			result, err := buildChangeBatch(ctx)
 			if err != nil {
-				return 0, err
+				return 0, 0, err
 			}
 			pending.changeBatch = &result.Meta
 			pending.changes = nil
 		}
 	}
 
-	_, appendErr := w.manifestLog.AppendWriterCommit(ctx, manifest.WriterCommit{
+	entry, appendErr := w.manifestLog.AppendWriterCommit(ctx, manifest.WriterCommit{
 		ID:          pending.commitID,
 		SSTable:     *pending.sstable,
 		ChangeBatch: pending.changeBatch,
@@ -1119,7 +1126,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 		if fenced || isFenceError(appendErr) {
 			w.markFenced()
 		}
-		return 0, fmt.Errorf("update manifest: %w", appendErr)
+		return 0, 0, fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
 	// Record this memtable's last sequence, not the writer's counter. A commit
@@ -1132,7 +1139,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 
 	slog.Debug("isledb: memtable flushed", "component", "writer", "sst_id", pending.sstable.ID,
 		"commit_id", pending.commitID, "size", pending.sstable.Size, "epoch", pending.epoch)
-	return status, nil
+	return status, entry.Seq + 1, nil
 }
 
 func writePendingChangeBatch(
@@ -1309,26 +1316,33 @@ func (w *writer) finished() bool {
 // final status without committing it. It reads one consistent snapshot of the
 // writer's state at a time.
 func (w *writer) waitCommitted(ctx context.Context, seq uint64) error {
+	_, err := w.waitCommittedAt(ctx, seq)
+	return err
+}
+
+// waitCommittedAt is waitCommitted that also returns a view position at which
+// seq is visible: the latest commit's, which can be past seq's own.
+func (w *writer) waitCommittedAt(ctx context.Context, seq uint64) (uint64, error) {
 	if err := checkContext(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	for {
 		w.mu.Lock()
 		state, assigned := w.state, w.seq
 		w.mu.Unlock()
 		if seq > assigned {
-			return fmt.Errorf("isledb: sequence %d has not been assigned; the writer is at %d", seq, assigned)
+			return 0, fmt.Errorf("isledb: sequence %d has not been assigned; the writer is at %d", seq, assigned)
 		}
 		if state.committed >= seq {
-			return nil
+			return state.position, nil
 		}
 		if state.status.final() {
-			return w.statusError(state.status)
+			return 0, w.statusError(state.status)
 		}
 		select {
 		case <-state.changed:
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -1340,7 +1354,8 @@ func (w *writer) waitCommitted(ctx context.Context, seq uint64) error {
 func (w *writer) markFenced() {
 	end, known := uint64(0), false
 	own := w.fenceToken.Epoch
-	if next := w.manifestLog.SuccessorWriterFence(); next != nil {
+	next, seenAt := w.manifestLog.SuccessorWriterFence()
+	if next != nil {
 		switch {
 		case next.Epoch == own+1:
 			end, known = next.BaseSeq, true
@@ -1354,6 +1369,9 @@ func (w *writer) markFenced() {
 		return
 	}
 	w.fencedEndKnown = known
+	if known {
+		w.state.position = max(w.state.position, seenAt)
+	}
 	w.transitionLocked(min(end, w.seq), writerFenced)
 }
 
