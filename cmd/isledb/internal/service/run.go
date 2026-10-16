@@ -42,6 +42,13 @@ type Config interface {
 	Start(ctx context.Context, common Common, log *slog.Logger) (*Service, error)
 }
 
+// CommonDefaults is a Config with defaults that depend on the common
+// settings, such as the bucket: Load calls ApplyCommon once every source is
+// read, before Validate.
+type CommonDefaults interface {
+	ApplyCommon(common Common)
+}
+
 // Service is what a started role serves.
 type Service struct {
 	// API is served on the API listener; nil for a role without one.

@@ -16,6 +16,12 @@ func load(args []string, vars map[string]string) (*Config, error) {
 	return cfg, err
 }
 
+// every returns d as a flush interval.
+func every(d time.Duration) *service.Duration {
+	v := service.Duration(d)
+	return &v
+}
+
 var base = []string{"-bucket-url", "file:///b", "-prefix", "prod/a", "-insecure"}
 
 func TestConfigDefaultsAndOverrides(t *testing.T) {
@@ -23,7 +29,7 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.prefix() != "prod/a" || cfg.changeFeed() != nil || time.Duration(cfg.Flush.Interval) != 250*time.Millisecond {
+	if cfg.prefix() != "prod/a" || cfg.changeFeed() != nil || cfg.flushInterval() != 250*time.Millisecond {
 		t.Fatalf("defaults: %+v", cfg)
 	}
 	cfg, err = load(append(base, "-prefix", "/", "-change-feed", "values", "-max-pending-memtables", "2"),
@@ -34,6 +40,29 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.prefix() != "" || cfg.changeFeed().Payload != isledb.ChangeFeedFullValues ||
 		cfg.Memtable.MaxPending != 2 || time.Duration(cfg.Writes.CommitWait) != 5*time.Second {
 		t.Fatalf("overrides: %+v", cfg)
+	}
+}
+
+func TestFlushIntervalOnGCS(t *testing.T) {
+	gcs := []string{"-bucket-url", "gs://b", "-prefix", "prod/a", "-insecure"}
+	cfg, err := load(gcs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.flushInterval(); got != time.Second {
+		t.Fatalf("default flush interval on gs:// is %s, want 1s", got)
+	}
+	if cfg, err = load(append(gcs, "-flush-interval", "2s"), nil); err != nil || cfg.flushInterval() != 2*time.Second {
+		t.Fatalf("2s on gs://: %v, %v", cfg.flushInterval(), err)
+	}
+	for _, flush := range []string{"999ms", "250ms"} {
+		_, err := load(append(gcs, "-flush-interval", flush), nil)
+		if err == nil || !strings.Contains(err.Error(), "Google Cloud Storage") {
+			t.Fatalf("flush interval %s on gs://: error %v, want one naming Google Cloud Storage", flush, err)
+		}
+	}
+	if cfg, err = load(append(base, "-flush-interval", "250ms"), nil); err != nil || cfg.flushInterval() != 250*time.Millisecond {
+		t.Fatalf("250ms on file://: %v, %v", cfg.flushInterval(), err)
 	}
 }
 

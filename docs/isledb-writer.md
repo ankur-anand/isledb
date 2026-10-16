@@ -46,7 +46,8 @@ don't want.
 ## Choose the flush interval
 
 The writer saves writes in groups, once every `flush.interval` (250 ms by
-default). A write is answered once its group is saved.
+default, 1 s on Google Cloud Storage). A write is answered once its group is
+saved.
 
 This one setting decides two things:
 
@@ -71,6 +72,11 @@ no writes arrive, the writer makes no storage requests.
 - **More throughput:** send more requests at once, or use batches. Writes that
   arrive together are saved together, so throughput doesn't depend on the
   interval.
+
+**On Google Cloud Storage** (`gs://` buckets), the interval defaults to 1 s
+and can't be set lower: Cloud Storage allows only about one update per second
+to the object each save writes, so the writer refuses to start with a shorter
+interval. Writes take about 1 s or more.
 
 ## Configuration
 
@@ -114,7 +120,7 @@ It prints every setting with its final value, or the problems it found.
 | `writer.prefix` | `--prefix` | `ISLEDB_WRITER_PREFIX` | required | The database's path in the bucket. Use `/` for a database at the root of the bucket. |
 | `log_level` | `--log-level` | `ISLEDB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 | `writer.owner_id` | `--owner-id` | `ISLEDB_WRITER_OWNER_ID` | host name | A name for this writer, shown in logs and storage. In Kubernetes, use the pod name. |
-| `writer.flush.interval` | `--flush-interval` | `ISLEDB_WRITER_FLUSH_INTERVAL` | `250ms` | How often writes are saved. See [Choose the flush interval](#choose-the-flush-interval). |
+| `writer.flush.interval` | `--flush-interval` | `ISLEDB_WRITER_FLUSH_INTERVAL` | `250ms`; `1s` on `gs://` | How often writes are saved. At least `1s` on Google Cloud Storage. See [Choose the flush interval](#choose-the-flush-interval). |
 | `writer.writes.commit_wait` | `--commit-wait` | `ISLEDB_WRITER_WRITES_COMMIT_WAIT` | `10s` | How long a write waits to be saved before the client gets `504`. Must be longer than `flush.interval`, and at most `20s`. |
 | `writer.values.max_key_bytes` | `--max-key-bytes` | `ISLEDB_WRITER_VALUES_MAX_KEY_BYTES` | `65527` | Largest key accepted, in bytes. At most `65527`. |
 | `writer.values.max_value_bytes` | `--max-value-bytes` | `ISLEDB_WRITER_VALUES_MAX_VALUE_BYTES` | `16MiB` | Largest value accepted. |

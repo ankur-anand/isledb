@@ -65,7 +65,7 @@ func (c *Config) Start(ctx context.Context, common service.Common, log *slog.Log
 	metrics, collectors := newWriterMetrics()
 	opts := isledb.DefaultWriterOptions()
 	opts.OwnerID = owner
-	opts.Flush.Interval = time.Duration(c.Flush.Interval)
+	opts.Flush.Interval = c.flushInterval()
 	opts.Memtable.TargetBytes = int64(c.Memtable.TargetBytes)
 	opts.Memtable.MaxPendingMemtables = c.Memtable.MaxPending
 	opts.Values.MaxKeyBytes = c.Values.MaxKeyBytes
