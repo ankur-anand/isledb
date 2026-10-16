@@ -27,6 +27,10 @@ import (
 // tuning knob.
 const maxCompactionSSTsPerJob = manifest.MaxRetiredObjectsPerEntry
 
+// maxCompactionOutputOvershoot is how far past its target a compaction output
+// can run on its last entry: the largest value a writer accepts by default.
+const maxCompactionOutputOvershoot = defaultMaxValueBytes
+
 var errCompactorClosed = errors.New("compactor closed")
 
 type compactionJob struct {
@@ -943,9 +947,12 @@ func (c *compactor) writeCompactedSSTs(
 
 	adapter := &mergeIteratorAdapter{iter: iter, nowMs: expiryCutoffMillis}
 
+	// An output ends at the first entry past the target, so it can exceed it
+	// by that entry, its index and its Bloom filter.
+	upload := blobstore.UploadInOneRequest(c.opts.Output.TargetSSTBytes*5/4 + maxCompactionOutputOvershoot)
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
 		sstPath := c.store.SSTPath(sstID)
-		_, err := c.store.WriteReader(ctx, sstPath, r, nil)
+		_, err := c.store.WriteReader(ctx, sstPath, r, upload)
 		return err
 	}
 

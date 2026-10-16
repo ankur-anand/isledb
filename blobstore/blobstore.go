@@ -395,6 +395,24 @@ func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes,
 	}, nil
 }
 
+// minUploadBufferBytes is the smallest part S3 accepts in an upload.
+const minUploadBufferBytes = 5 << 20
+
+// UploadInOneRequest returns WriteReader options that send an object of up to
+// size bytes in one request on S3 and GCS, and in one block and its commit on
+// Azure. Without them each driver uploads in parts of 5 MiB (S3), 8 MiB
+// (Azure) or 16 MiB (GCS), each a billed request. A larger object is sent in
+// parts of about size bytes. An upload holds a buffer of about size bytes
+// while it runs.
+func UploadInOneRequest(size int64) *blob.WriterOptions {
+	return &blob.WriterOptions{
+		ContentType: "application/octet-stream",
+		// One byte more: S3 sends one request only if its first read of a
+		// buffer's length reaches the end of the object.
+		BufferSize: int(max(size+1, minUploadBufferBytes)),
+	}
+}
+
 func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *blob.WriterOptions) (Attributes, error) {
 	if opts == nil {
 		opts = &blob.WriterOptions{

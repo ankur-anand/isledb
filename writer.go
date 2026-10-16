@@ -1173,9 +1173,13 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 		Compression:     w.sstOutput.Compression,
 	}
 
+	// The SST and change batch hold no more than the memtable's data, plus an
+	// index and Bloom filter. Sizing the upload buffer from it sends each in
+	// one request without a full-memtable buffer for every small save.
+	upload := blobstore.UploadInOneRequest(pending.bytes + pending.bytes/8 + 1<<20)
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
 		sstPath := w.store.SSTPath(sstID)
-		_, err := w.store.WriteReader(ctx, sstPath, r, nil)
+		_, err := w.store.WriteReader(ctx, sstPath, r, upload)
 		return err
 	}
 
@@ -1190,7 +1194,7 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 	buildChangeBatch := func(uploadCtx context.Context) (changeBatchStreamResult, error) {
 		result, err := writePendingChangeBatch(uploadCtx, pending,
 			func(ctx context.Context, id string, reader io.Reader) error {
-				_, err := w.store.WriteReader(ctx, w.store.ChangeBatchPath(id), reader, nil)
+				_, err := w.store.WriteReader(ctx, w.store.ChangeBatchPath(id), reader, upload)
 				return err
 			})
 		if err != nil {
