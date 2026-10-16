@@ -5,6 +5,7 @@ package writerrole
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -29,12 +30,15 @@ type Config struct {
 	ChangeFeed ChangeFeed `yaml:"change_feed"`
 	Policy     Policy     `yaml:"policy"`
 	Writes     Writes     `yaml:"writes"`
+
+	onGCS bool // the bucket is on Google Cloud Storage; set by ApplyCommon
 }
 
 type Flush struct {
 	// Interval is how often buffered writes commit: a synchronous write
-	// waits about this long, and each commit is a write to storage.
-	Interval service.Duration `yaml:"interval"`
+	// waits about this long, and each commit is a write to storage. Unset, it
+	// is 1s on Google Cloud Storage and 250ms elsewhere.
+	Interval *service.Duration `yaml:"interval"`
 }
 
 type Memtable struct {
@@ -81,13 +85,17 @@ const (
 	// The library's limits, checked here so --check catches them too.
 	maxKeyBytes     = 1<<16 - 1 - 8 // the memtable appends an 8-byte sequence
 	maxOwnerIDBytes = 256
+
+	defaultFlushInterval = 250 * time.Millisecond
+	// minGCSFlushInterval: Google Cloud Storage allows about one update per
+	// second to an object, and every commit updates CURRENT.
+	minGCSFlushInterval = time.Second
 )
 
 func NewConfig() service.Config {
 	defaults := isledb.DefaultWriterOptions()
 	return &Config{
 		Server: service.DefaultServer(":8070", "127.0.0.1:8071"),
-		Flush:  Flush{Interval: service.Duration(250 * time.Millisecond)},
 		Memtable: Memtable{
 			TargetBytes: service.ByteSize(defaults.Memtable.TargetBytes),
 			MaxPending:  defaults.Memtable.MaxPendingMemtables,
@@ -115,7 +123,15 @@ func (c *Config) Settings() []service.Setting {
 			Set: func(v string) error { c.Prefix = v; return nil }},
 		service.Setting{Flag: "owner-id", Path: "owner_id", Usage: "name of this writer in the fence; default the host name",
 			Set: func(v string) error { c.OwnerID = v; return nil }},
-		service.Setting{Flag: "flush-interval", Path: "flush.interval", Usage: "how often buffered writes commit; synchronous writes wait about this long", Set: c.Flush.Interval.Parse},
+		service.Setting{Flag: "flush-interval", Path: "flush.interval", Usage: "how often buffered writes commit; synchronous writes wait about this long; default 250ms, 1s on gs:// and at least 1s there",
+			Set: func(v string) error {
+				d := new(service.Duration)
+				if err := d.Parse(v); err != nil {
+					return err
+				}
+				c.Flush.Interval = d
+				return nil
+			}},
 		service.Setting{Flag: "memtable-bytes", Path: "memtable.target_bytes", Usage: "memtable size that starts a new one, e.g. 16MiB", Set: c.Memtable.TargetBytes.Parse},
 		service.Setting{Flag: "max-pending-memtables", Path: "memtable.max_pending", Usage: "memtables waiting to commit before writes get 503",
 			Set: func(v string) error { return parseInt(v, &c.Memtable.MaxPending) }},
@@ -130,6 +146,27 @@ func (c *Config) Settings() []service.Setting {
 		service.Setting{Flag: "max-inflight-bytes", Path: "writes.max_inflight_bytes", Usage: "request bodies held at once before writes get 503, e.g. 256MiB", Set: c.Writes.MaxInflightBytes.Parse},
 		service.Setting{Flag: "body-read-timeout", Path: "writes.body_read_timeout", Usage: "how long a request has to send its body", Set: c.Writes.BodyReadTimeout.Parse},
 	)
+}
+
+// ApplyCommon sets the defaults that depend on the bucket.
+func (c *Config) ApplyCommon(common service.Common) {
+	u, err := url.Parse(common.BucketURL)
+	c.onGCS = err == nil && u.Scheme == "gs"
+	if c.Flush.Interval == nil {
+		d := service.Duration(defaultFlushInterval)
+		if c.onGCS {
+			d = service.Duration(minGCSFlushInterval)
+		}
+		c.Flush.Interval = &d
+	}
+}
+
+// flushInterval returns the configured interval. ApplyCommon has set it.
+func (c *Config) flushInterval() time.Duration {
+	if c.Flush.Interval == nil {
+		return defaultFlushInterval
+	}
+	return time.Duration(*c.Flush.Interval)
 }
 
 func parseInt(v string, into *int) error {
@@ -170,12 +207,15 @@ func (c *Config) Validate() error {
 	if _, err := readcache.CleanPrefix(c.Prefix); err != nil || strings.TrimSpace(c.Prefix) != c.Prefix {
 		fail("prefix %q: want a prefix such as prod/policy, or \"/\" for the bucket root", c.Prefix)
 	}
-	if c.Flush.Interval <= 0 {
+	switch flush := c.flushInterval(); {
+	case flush <= 0:
 		fail("flush.interval must be positive: writes wait for a commit")
-	}
-	if c.Writes.CommitWait > 0 && c.Flush.Interval >= c.Writes.CommitWait {
+	case c.onGCS && flush < minGCSFlushInterval:
+		fail("flush.interval %s is below %s, which Google Cloud Storage does not support: it allows about one update per second to the object each commit writes",
+			flush, minGCSFlushInterval)
+	case c.Writes.CommitWait > 0 && flush >= time.Duration(c.Writes.CommitWait):
 		fail("flush.interval (%s) must be below writes.commit_wait (%s), or writes are answered 504 before their commit",
-			time.Duration(c.Flush.Interval), time.Duration(c.Writes.CommitWait))
+			flush, time.Duration(c.Writes.CommitWait))
 	}
 	if len(c.OwnerID) > maxOwnerIDBytes {
 		fail("owner_id is above %d bytes", maxOwnerIDBytes)

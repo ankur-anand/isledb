@@ -154,6 +154,9 @@ func Load(role string, roles []string, cfg Config, args []string, lookupEnv func
 			return common, false, fmt.Errorf("-%s: %w", g.st.Flag, err)
 		}
 	}
+	if d, ok := cfg.(CommonDefaults); ok {
+		d.ApplyCommon(common)
+	}
 	return common, check, errors.Join(common.validate(), cfg.Validate())
 }
 

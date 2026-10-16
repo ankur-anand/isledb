@@ -45,7 +45,7 @@ func TestWriterRoleServesAndCommitsOnShutdown(t *testing.T) {
 	cfg.Prefix = "prod/a"
 	// Commits come rarely, so the last write below is still waiting when
 	// shutdown starts.
-	cfg.Flush.Interval = service.Duration(15 * time.Second)
+	cfg.Flush.Interval = every(15 * time.Second)
 	cfg.Writes.CommitWait = service.Duration(20 * time.Second)
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestFailedReplacementLeavesTheWriterRunning(t *testing.T) {
 		cfg.Server.Auth.Insecure = true
 		cfg.Server.ShutdownDrain = 0
 		cfg.Prefix = "app"
-		cfg.Flush.Interval = service.Duration(20 * time.Millisecond)
+		cfg.Flush.Interval = every(20 * time.Millisecond)
 		return cfg
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))

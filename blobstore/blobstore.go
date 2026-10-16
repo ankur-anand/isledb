@@ -72,6 +72,8 @@ type Store struct {
 	prefix           string
 	scratchNamespace string
 	owns             bool
+	// pacer spaces conditional writes of one object, on GCS; nil elsewhere.
+	pacer *overwritePacer
 }
 
 func Open(ctx context.Context, bucketURL, prefix string) (*Store, error) {
@@ -92,13 +94,13 @@ func Open(ctx context.Context, bucketURL, prefix string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open bucket %q: %w", bucketURL, err)
 	}
-	return &Store{
+	return withPacer(&Store{
 		bucket:           bkt,
 		bucketName:       bucketName,
 		prefix:           strings.TrimSuffix(prefix, "/"),
 		scratchNamespace: localScratchNamespace(bucketURL, prefix),
 		owns:             true,
-	}, nil
+	}), nil
 }
 
 // New wraps an existing bucket. For cloud providers, bucketName is required
@@ -112,13 +114,22 @@ func New(bkt *blob.Bucket, bucketName, prefix string) *Store {
 		// name or construct the store with Open.
 		identity = fmt.Sprintf("%T:%p", bkt, bkt)
 	}
-	return &Store{
+	return withPacer(&Store{
 		bucket:           bkt,
 		bucketName:       bucketName,
 		prefix:           strings.TrimSuffix(prefix, "/"),
 		scratchNamespace: localScratchNamespace(identity, prefix),
 		owns:             false,
+	})
+}
+
+// withPacer spaces s's conditional writes of one object GCSOverwriteGap
+// apart when s is on GCS.
+func withPacer(s *Store) *Store {
+	if s.providerKind() == providerGCS {
+		s.pacer = newOverwritePacer(GCSOverwriteGap)
 	}
+	return s
 }
 
 func localScratchNamespace(storageIdentity, prefix string) string {
@@ -410,7 +421,22 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 	}, nil
 }
 
+// WriteIfMatch writes key if its current version is ifMatch, or, with an
+// empty ifMatch, if it does not exist. On GCS, writes of one key wait until
+// GCSOverwriteGap has passed since the last one ended.
 func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
+	if s.pacer == nil {
+		return s.writeIfMatch(ctx, key, data, ifMatch)
+	}
+	var attrs Attributes
+	err := s.pacer.do(ctx, key, func() (err error) {
+		attrs, err = s.writeIfMatch(ctx, key, data, ifMatch)
+		return err
+	})
+	return attrs, err
+}
+
+func (s *Store) writeIfMatch(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
 	if ifMatch == "" {
 		return s.WriteIfNotExist(ctx, key, data)
 	}
