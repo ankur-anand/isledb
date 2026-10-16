@@ -63,7 +63,8 @@ This one setting decides two things:
 | 1s | about 1 s | about 2 |
 
 These numbers were measured against S3-compatible storage 15–40 ms away. When
-no writes arrive, the writer makes no storage requests.
+no writes arrive, the writer makes one small read a second, to check for work
+from maintenance.
 
 - **Lower latency:** reduce the interval, but not below the time a save takes.
   You can see that time in the `isledb_writer_commit_seconds` metric. Below
