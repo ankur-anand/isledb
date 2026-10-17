@@ -13,12 +13,12 @@ Every path starts with `/v1/`. Every response body is JSON.
 ```bash
 # Write a value
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  --data '{"name":"a"}' 'http://isledb-writer:8070/v1/kv/user%2F42'
+  --data '{"name":"a"}' 'http://isledb-writer:8070/v1/kv/user/42'
 # {"write_id":"7.10442","revision":"1042"}
 
 # Delete it
 curl -X DELETE -H "Authorization: Bearer $TOKEN" \
-  'http://isledb-writer:8070/v1/kv/user%2F42'
+  'http://isledb-writer:8070/v1/kv/user/42'
 ```
 
 ## Authentication
@@ -42,9 +42,13 @@ Without a valid token, the writer answers `401`.
 
 ## Keys and values
 
-- **Keys in the URL are URL-encoded.** Encode every character that is not a
-  letter, digit, `-`, `_`, `.` or `~`. For example, the key `user/42` is
-  written `user%2F42`. Any byte can be part of a key.
+- **Keys go in the URL path.** A key like `user/42` can be sent as it is:
+  `/v1/kv/user/42`. URL-encode a key (`%XX`) when it holds `%`, `?`, `#`, a
+  space or anything other than printable ASCII, or when it has an empty, `.`
+  or `..` part between slashes, like `a//b` or `../x`: clients and proxies
+  change those before the request arrives. Encoding every character that is
+  not a letter, digit, `-`, `_`, `.` or `~` is always safe, so `user/42` may
+  also be written `user%2F42`. Any byte can be part of a key.
 - **A value can be any bytes**, including nothing at all.
 - **In a batch**, keys and values are text (`key`, `value`) or base64 bytes
   (`key_base64`, `value_base64`).
@@ -52,7 +56,7 @@ Without a valid token, the writer answers `401`.
 ## Write a key
 
 ```
-PUT /v1/kv/user%2F42
+PUT /v1/kv/user/42
 Content-Type: application/json
 
 {"name":"a"}
@@ -78,7 +82,7 @@ The response has two fields:
 **Expiring values.** Add `?ttl=` to make the value expire after a while:
 
 ```
-PUT /v1/kv/session%2Fabc?ttl=24h
+PUT /v1/kv/session/abc?ttl=24h
 ```
 
 Durations look like `500ms`, `30s`, `10m` or `24h`. Without `ttl`, the value
@@ -88,7 +92,7 @@ doesn't silently store a key forever.
 ## Delete a key
 
 ```
-DELETE /v1/kv/user%2F42
+DELETE /v1/kv/user/42
 ```
 ```
 200 OK
