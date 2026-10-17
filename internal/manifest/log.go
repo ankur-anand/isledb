@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/segmentio/ksuid"
@@ -123,8 +124,14 @@ func ApplyLogEntry(m *Manifest, entry *ManifestLogEntry) (*Manifest, error) {
 	case LogOpCompaction:
 		if entry.Compaction != nil {
 			c := entry.Compaction
-			m.RemoveCompactionInputs(c.SourceLevel, c.DestinationLevel, c.RemoveSSTableIDs)
-			m.AddLevelSSTs(c.DestinationLevel, c.AddSSTables)
+			if c.SourceLevel == 0 && c.DestinationLevel == 0 {
+				if err := m.ReplaceL0Run(c.RemoveSSTableIDs, c.AddSSTables); err != nil {
+					return m, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+				}
+			} else {
+				m.RemoveCompactionInputs(c.SourceLevel, c.DestinationLevel, c.RemoveSSTableIDs)
+				m.AddLevelSSTs(c.DestinationLevel, c.AddSSTables)
+			}
 			for _, sst := range c.AddSSTables {
 				if sst.Epoch >= m.NextEpoch {
 					m.NextEpoch = sst.Epoch + 1

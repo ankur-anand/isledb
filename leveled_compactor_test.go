@@ -49,7 +49,8 @@ func TestLevelPlannerPromotesWideL0Directly(t *testing.T) {
 	for i := 0; i < c.opts.Trigger.L0SSTCount; i++ {
 		sst := plannerSST(0, 0, 100)
 		sst.ID = fmt.Sprintf("l0-wide-%03d", i)
-		sst.Size = 1 << 20
+		// Together as large as the L1 they overlap, so worth rewriting it.
+		sst.Size = 8 << 20
 		m.AddL0SST(sst)
 	}
 	destination := plannerSST(1, 0, 100)

@@ -112,6 +112,64 @@ func (m *Manifest) RemoveSSTables(ids []string) {
 	m.removeEmptyLevels()
 }
 
+// ReplaceL0Run replaces the L0 SSTs ids, which must be adjacent in L0, with
+// outputs, at most one, placed where they were. Every L0 SST newer than the
+// run stays ahead of the output and every older one behind it, so lookups
+// still find the newest version of each key first. The output's sequence
+// range must lie within the run's.
+func (m *Manifest) ReplaceL0Run(ids []string, outputs []SSTMeta) error {
+	if len(ids) == 0 {
+		return fmt.Errorf("L0 merge has no inputs")
+	}
+	if len(outputs) > 1 {
+		return fmt.Errorf("L0 merge has %d outputs, want at most 1", len(outputs))
+	}
+	want := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	start, found := -1, 0
+	for i, sst := range m.L0SSTs {
+		if _, ok := want[sst.ID]; ok {
+			if start < 0 {
+				start = i
+			}
+			found++
+		}
+	}
+	if found != len(want) || len(want) != len(ids) {
+		return fmt.Errorf("L0 merge inputs are not all in L0")
+	}
+	run := m.L0SSTs[start : start+len(ids)]
+	seqLo, seqHi := run[0].SeqLo, run[0].SeqHi
+	for _, sst := range run {
+		if _, ok := want[sst.ID]; !ok {
+			return fmt.Errorf("L0 merge inputs are not adjacent in L0: %q sits between them", sst.ID)
+		}
+		seqLo, seqHi = min(seqLo, sst.SeqLo), max(seqHi, sst.SeqHi)
+	}
+	replacement := make([]SSTMeta, 0, len(outputs))
+	for _, out := range outputs {
+		if out.SeqLo < seqLo || out.SeqHi > seqHi {
+			return fmt.Errorf("L0 merge output %q has sequences %d..%d, outside its inputs' %d..%d",
+				out.ID, out.SeqLo, out.SeqHi, seqLo, seqHi)
+		}
+		out.Level = 0
+		replacement = append(replacement, out)
+	}
+	merged := make([]SSTMeta, 0, len(m.L0SSTs)-len(ids)+len(replacement))
+	merged = append(merged, m.L0SSTs[:start]...)
+	merged = append(merged, replacement...)
+	merged = append(merged, m.L0SSTs[start+len(ids):]...)
+	for i := range replacement {
+		if err := checkL0Placement(merged, start+i); err != nil {
+			return err
+		}
+	}
+	m.L0SSTs = merged
+	return nil
+}
+
 func (m *Manifest) RemoveCompactionInputs(sourceLevel, destinationLevel uint32, ids []string) {
 	if len(ids) == 0 {
 		return
@@ -304,6 +362,29 @@ func (m *Manifest) validateLevels(validateArtifacts bool) error {
 					return fmt.Errorf("validate L%d SST %q: %v", level.Number, sst.ID, err)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// checkL0Placement checks that the SST at l0[at], newest first, sits behind
+// every SST it overlaps with newer data, and ahead of every one with older
+// data: a lookup takes the first match in L0, so an SST out of place would
+// hide newer values behind older ones.
+func checkL0Placement(l0 []SSTMeta, at int) error {
+	placed := &l0[at]
+	for i := range l0 {
+		other := &l0[i]
+		if i == at || bytes.Compare(placed.MaxKey, other.MinKey) < 0 || bytes.Compare(other.MaxKey, placed.MinKey) < 0 {
+			continue
+		}
+		ahead, behind := other, placed
+		if i > at {
+			ahead, behind = placed, other
+		}
+		if ahead.SeqHi < behind.SeqHi {
+			return fmt.Errorf("L0 SST %q (sequences %d..%d) would sit ahead of %q (%d..%d), which it overlaps and which holds newer data",
+				ahead.ID, ahead.SeqLo, ahead.SeqHi, behind.ID, behind.SeqLo, behind.SeqHi)
 		}
 	}
 	return nil

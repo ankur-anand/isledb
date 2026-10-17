@@ -499,6 +499,12 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if err := s.checkFenceWithCurrent(role, current); err != nil {
 			return err
 		}
+		if err := s.admitL0Merge(ctx, current, entry); err != nil {
+			if errors.Is(err, errL0MergeDoesNotFit) {
+				return fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+			}
+			return err
+		}
 
 		nextEntry := *entry
 		nextEntry.Seq = current.NextSeq
@@ -833,11 +839,37 @@ func (s *Store) AppendCompactionWithFence(ctx context.Context, payload Compactio
 	return entry, nil
 }
 
+var errL0MergeDoesNotFit = errors.New("L0 merge does not fit L0")
+
+// admitL0Merge checks, before entry is appended to current, that an L0 merge
+// applies to L0 as committed. Every reader replays the entry strictly, so one
+// that doesn't fit must be refused now, never appended. It also moves current
+// to LayoutVersionL0Merge, which earlier releases refuse. Other entries pass.
+func (s *Store) admitL0Merge(ctx context.Context, current *Current, entry *ManifestLogEntry) error {
+	c := entry.Compaction
+	if entry.Op != LogOpCompaction || c == nil || c.SourceLevel != 0 || c.DestinationLevel != 0 {
+		return nil
+	}
+	m, err := s.replayCurrent(ctx, current, false)
+	if err != nil {
+		return err
+	}
+	if err := m.ReplaceL0Run(c.RemoveSSTableIDs, c.AddSSTables); err != nil {
+		return fmt.Errorf("%w: %v", errL0MergeDoesNotFit, err)
+	}
+	current.LayoutVersion = max(current.LayoutVersion, LayoutVersionL0Merge)
+	return nil
+}
+
 func validateCompactionPayload(payload CompactionLogPayload) error {
 	adjacent := payload.SourceLevel != ^uint32(0) && payload.DestinationLevel == payload.SourceLevel+1
-	if !adjacent {
-		return fmt.Errorf("%w: compaction source=L%d destination=L%d must target the adjacent level",
+	l0Merge := payload.SourceLevel == 0 && payload.DestinationLevel == 0
+	if !adjacent && !l0Merge {
+		return fmt.Errorf("%w: compaction source=L%d destination=L%d must target the adjacent level, or merge within L0",
 			ErrInvalidManifest, payload.SourceLevel, payload.DestinationLevel)
+	}
+	if l0Merge && len(payload.AddSSTables) > 1 {
+		return fmt.Errorf("%w: L0 merge has %d outputs, want at most 1", ErrInvalidManifest, len(payload.AddSSTables))
 	}
 	if len(payload.RemoveSSTableIDs) == 0 {
 		return fmt.Errorf("%w: compaction has no inputs", ErrInvalidManifest)
@@ -1324,9 +1356,17 @@ func (s *Store) tryIncrementalReplay(ctx context.Context, current *Current) (*Ma
 // fullReplay performs the original full manifest replay from snapshot + all log
 // entries. It updates the replay cache on success.
 func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, error) {
-	var m *Manifest
-	var err error
+	snap, err := s.loadSnapshot(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	return s.replayFromSnapshot(ctx, current, snap)
+}
 
+// loadSnapshot reads, verifies and decodes the snapshot CURRENT points at, or
+// returns nil when it points at none.
+func (s *Store) loadSnapshot(ctx context.Context, current *Current) (*Manifest, error) {
+	var m *Manifest
 	if current != nil && current.Snapshot != nil {
 		if err := validateManifestObjectRef(*current.Snapshot, manifestObjectKindSnapshot); err != nil {
 			return nil, err
@@ -1355,6 +1395,15 @@ func (s *Store) fullReplay(ctx context.Context, current *Current) (*Manifest, er
 			return nil, fmt.Errorf("snapshot %q is empty", current.Snapshot.Path)
 		}
 	}
+	return m, nil
+}
+
+// replayFromSnapshot applies every log entry CURRENT retains to snap, the
+// decoded snapshot CURRENT points at (nil for none), which it takes ownership
+// of. It updates the replay cache on success.
+func (s *Store) replayFromSnapshot(ctx context.Context, current *Current, snap *Manifest) (*Manifest, error) {
+	m := snap
+	var err error
 	if m == nil {
 		m = &Manifest{Version: 2, NextEpoch: 1}
 	}

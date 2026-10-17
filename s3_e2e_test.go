@@ -621,6 +621,7 @@ func driveMaintenanceToIdle(t testing.TB, ctx context.Context, maintenance *Main
 		total.SSTCompaction.InputSSTs += stats.SSTCompaction.InputSSTs
 		total.SSTCompaction.OutputSSTs += stats.SSTCompaction.OutputSSTs
 		total.SSTCompaction.OutputBytes += stats.SSTCompaction.OutputBytes
+		total.SSTCompaction.L0Merges += stats.SSTCompaction.L0Merges
 		total.ManifestCheckpoint.Staged = total.ManifestCheckpoint.Staged || stats.ManifestCheckpoint.Staged
 
 		head, _, err := maintenance.manifestLog.ReadMaintenanceHead(ctx)

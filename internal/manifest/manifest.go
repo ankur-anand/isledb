@@ -71,6 +71,11 @@ type SSTMeta struct {
 	Bloom     BloomMeta `json:"bloom"`
 	CreatedAt time.Time `json:"created_at"`
 
+	// OldestDataAt is when the oldest data in the SST was written: CreatedAt
+	// for a writer's SST, and the earliest of its inputs' for an L0 merge,
+	// whose CreatedAt is the time of the merge. Zero means CreatedAt.
+	OldestDataAt time.Time `json:"oldest_data_at,omitzero"`
+
 	// MetaOffset is where the SST's trailing metadata begins: the filter,
 	// index, properties, metaindex and footer all live in [MetaOffset, Size).
 	// Readers use it to fetch that region in one request. Zero means unknown.
@@ -79,6 +84,14 @@ type SSTMeta struct {
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
 	Level uint32 `json:"level"`
+}
+
+// OldestData returns when the oldest data in the SST was written.
+func (s SSTMeta) OldestData() time.Time {
+	if !s.OldestDataAt.IsZero() {
+		return s.OldestDataAt
+	}
+	return s.CreatedAt
 }
 
 // ChangeFeedPayload identifies which PUT payload is retained in committed
@@ -267,7 +280,7 @@ func DecodeCurrent(data []byte) (*Current, error) {
 }
 
 func validateCurrentFormat(c *Current) error {
-	if c == nil || c.LayoutVersion != LayoutVersion || c.Format != CurrentFormat {
+	if c == nil || c.LayoutVersion < LayoutVersion || c.LayoutVersion > LayoutVersionL0Merge || c.Format != CurrentFormat {
 		if c == nil {
 			return fmt.Errorf("%w: nil CURRENT", ErrInvalidManifest)
 		}

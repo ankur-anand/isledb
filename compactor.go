@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -136,6 +137,15 @@ func normalizeCompactorOptions(opts compactorOptions) compactorOptions {
 	}
 	if opts.Trigger.LevelSizeMultiplier < 2 {
 		opts.Trigger.LevelSizeMultiplier = d.Trigger.LevelSizeMultiplier
+	}
+	if opts.Trigger.L0ToBaseRatio <= 0 {
+		opts.Trigger.L0ToBaseRatio = d.Trigger.L0ToBaseRatio
+	}
+	if opts.Trigger.L0MaxDepth <= 0 {
+		opts.Trigger.L0MaxDepth = d.Trigger.L0MaxDepth
+	}
+	if opts.Trigger.L0MaxAge <= 0 {
+		opts.Trigger.L0MaxAge = d.Trigger.L0MaxAge
 	}
 	if opts.Output.BloomBitsPerKey == 0 {
 		opts.Output.BloomBitsPerKey = d.Output.BloomBitsPerKey
@@ -385,27 +395,35 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		// cannot be planned still reports as critical, instead of going quiet
 		// exactly when it is most backed up.
 		critical := l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount)
-		inputs := m.L0SSTs
-		if len(inputs) > maxCompactionSSTsPerJob {
-			inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
-		}
-		plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
-		if err != nil {
-			firstPlanningErr = err
-			c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
+		if !c.l0ShouldDrain(m, time.Now()) {
+			// Not yet worth rewriting L1: merge new L0 SSTs with each other,
+			// or wait for more to arrive.
+			if plan := c.planL0Merge(m); plan != nil {
+				candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
+			}
 		} else {
-			candidate := compactionCandidate{
-				plan:      plan,
-				workUnits: 1,
-				critical:  critical,
+			inputs := m.L0SSTs
+			if len(inputs) > maxCompactionSSTsPerJob {
+				inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
 			}
-			if plan.sourceLevel != 0 {
-				// This lower-level plan is a prerequisite selected specifically to
-				// unblock L0. Run it before unrelated level work; otherwise the
-				// lower-level round robin can delay the drain while L0 keeps growing.
-				return []compactionCandidate{candidate}, nil
+			plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
+			if err != nil {
+				firstPlanningErr = err
+				c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
+			} else {
+				candidate := compactionCandidate{
+					plan:      plan,
+					workUnits: 1,
+					critical:  critical,
+				}
+				if plan.sourceLevel != 0 {
+					// This lower-level plan is a prerequisite selected specifically to
+					// unblock L0. Run it before unrelated level work; otherwise the
+					// lower-level round robin can delay the drain while L0 keeps growing.
+					return []compactionCandidate{candidate}, nil
+				}
+				candidates = append(candidates, candidate)
 			}
-			candidates = append(candidates, candidate)
 		}
 	}
 	plannedLevels := make(map[uint32]struct{}, len(candidates))
@@ -449,6 +467,112 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 
 func (c *compactor) l0NeedsPlanning(m *manifestState) bool {
 	return m != nil && len(m.L0SSTs) >= c.opts.Trigger.L0SSTCount
+}
+
+// l0Work returns how many SSTs L0 held as of the last refresh, and whether
+// that is enough for an L0 job.
+func (c *compactor) l0Work() (ssts int, enough bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.manifest != nil {
+		ssts = len(c.manifest.L0SSTs)
+	}
+	return ssts, c.l0NeedsPlanning(c.manifest)
+}
+
+// planL0Merge returns a merge of the newest L0 SSTs with each other, or nil
+// when no run of two or more qualifies yet.
+//
+// It starts at the newest SST and takes older ones while the next is no
+// larger than everything taken so far: SSTs then grow like a binary counter,
+// each byte is rewritten about log2 times before it reaches L1, and every SST
+// saved since the last cycle is taken by one job however many arrived. The
+// run is adjacent in L0 and its output takes its place.
+func (c *compactor) planL0Merge(m *manifestState) *levelCompactionPlan {
+	if m == nil || len(m.L0SSTs) < 2 {
+		return nil
+	}
+	l0 := m.L0SSTs
+	total, n := l0[0].Size, 1
+	for n < len(l0) && n < maxCompactionSSTsPerJob &&
+		l0[n].Size <= total && total+l0[n].Size <= c.opts.Output.TargetSSTBytes {
+		total += l0[n].Size
+		n++
+	}
+	if n < 2 {
+		return nil
+	}
+	return &levelCompactionPlan{
+		sourceLevel:      0,
+		destinationLevel: 0,
+		sourceSSTs:       append([]sstMetadata(nil), l0[:n]...),
+	}
+}
+
+// l0ShouldDrain reports whether L0 should merge into L1 now: when it holds at
+// least L0ToBaseRatio of the L1 bytes it overlaps, so the rewrite of L1 is
+// worth it (always so when it overlaps nothing, as with keys written in
+// order); when some key is covered by L0MaxDepth L0 SSTs; or when L0's oldest
+// data is L0MaxAge old.
+func (c *compactor) l0ShouldDrain(m *manifestState, now time.Time) bool {
+	l0 := m.L0SSTs
+	if len(l0) == 0 {
+		return false
+	}
+	var l0Bytes, overlapBytes int64
+	oldest := l0[0].OldestData()
+	for _, sst := range l0 {
+		l0Bytes += sst.Size
+		if t := sst.OldestData(); !t.IsZero() && (oldest.IsZero() || t.Before(oldest)) {
+			oldest = t
+		}
+	}
+	minKey, maxKey := sstBounds(l0)
+	if l1 := m.Level(1); l1 != nil {
+		for _, sst := range l1.OverlappingSSTs(minKey, maxKey) {
+			overlapBytes += sst.Size
+		}
+	}
+	switch {
+	case float64(l0Bytes) >= c.opts.Trigger.L0ToBaseRatio*float64(overlapBytes):
+		return true
+	case l0Depth(l0) >= c.opts.Trigger.L0MaxDepth:
+		return true
+	case !oldest.IsZero() && now.Sub(oldest) >= c.opts.Trigger.L0MaxAge:
+		return true
+	}
+	return false
+}
+
+// l0Depth is the largest number of SSTs covering any one key: the L0 SSTs a
+// lookup of that key checks.
+func l0Depth(ssts []sstMetadata) int {
+	type edge struct {
+		key   []byte
+		start bool
+	}
+	edges := make([]edge, 0, 2*len(ssts))
+	for _, sst := range ssts {
+		edges = append(edges, edge{sst.MinKey, true}, edge{sst.MaxKey, false})
+	}
+	// Key ranges are inclusive, so at an equal key a start counts before an
+	// end.
+	sort.Slice(edges, func(i, j int) bool {
+		if c := bytes.Compare(edges[i].key, edges[j].key); c != 0 {
+			return c < 0
+		}
+		return edges[i].start && !edges[j].start
+	})
+	depth, deepest := 0, 0
+	for _, e := range edges {
+		if e.start {
+			depth++
+			deepest = max(deepest, depth)
+		} else {
+			depth--
+		}
+	}
+	return deepest
 }
 
 func (c *compactor) reportPlanningBlocked(sourceLevel uint32, sstCount int, critical bool, err error) {
@@ -573,6 +697,17 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		maxCompactionSSTsPerJob)
 }
 
+// oldestData returns when the oldest data in ssts was written.
+func oldestData(ssts []sstMetadata) time.Time {
+	var oldest time.Time
+	for _, sst := range ssts {
+		if t := sst.OldestData(); !t.IsZero() && (oldest.IsZero() || t.Before(oldest)) {
+			oldest = t
+		}
+	}
+	return oldest.UTC()
+}
+
 func sstBounds(ssts []sstMetadata) ([]byte, []byte) {
 	var minKey, maxKey []byte
 	for i := range ssts {
@@ -657,8 +792,14 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 				_ = reader.Close()
 			}
 		}()
+		// An L0 merge's output takes one position in L0, so it is never
+		// split; its inputs are planned to fit one SST.
+		targetSize := c.opts.Output.TargetSSTBytes
+		if plan.destinationLevel == 0 {
+			targetSize = math.MaxInt64
+		}
 		results, writeErr := c.writeCompactedSSTs(
-			ctx, newMergeIterator(iters), identity, expiryCutoffMillis)
+			ctx, newMergeIterator(iters), identity, expiryCutoffMillis, targetSize)
 		if writeErr != nil {
 			return writeErr
 		}
@@ -669,6 +810,14 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 	}
 	for i := range outputs {
 		outputs[i].Level = plan.destinationLevel
+	}
+	if plan.destinationLevel == 0 && !plan.metadataOnly {
+		// The output is new but its data is not: it keeps the age of the
+		// oldest input, which the L0 age limit reads.
+		oldest := oldestData(plan.sourceSSTs)
+		for i := range outputs {
+			outputs[i].OldestDataAt = oldest
+		}
 	}
 
 	for _, output := range outputs {
@@ -934,6 +1083,7 @@ func (c *compactor) writeCompactedSSTs(
 	iter *kMergeIterator,
 	identity sstStreamSetIdentity,
 	expiryCutoffMillis int64,
+	targetSize int64,
 ) (results []streamSSTResult, err error) {
 	defer func() {
 		err = errors.Join(err, iter.close())
@@ -957,7 +1107,7 @@ func (c *compactor) writeCompactedSSTs(
 	}
 
 	results, err = writeMultipleSSTsStreaming(
-		ctx, adapter, sstOpts, identity, c.opts.Output.TargetSSTBytes, uploadFn)
+		ctx, adapter, sstOpts, identity, targetSize, uploadFn)
 	if err != nil {
 		if errors.Is(err, errEmptyIterator) {
 			return nil, nil

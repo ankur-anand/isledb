@@ -22,6 +22,10 @@ const (
 	sstChunkSize = 128 << 10
 	// maxReadAheadChunks caps how many chunks a scan fetches in one request.
 	maxReadAheadChunks = 32
+	// maxL0ReadAheadChunks is the cap for an L0 SST: a scan merges one source
+	// per overlapping L0 SST, often a dozen or more, and each holds its
+	// read-ahead in memory. 8 chunks is 1 MiB, Pebble's cap for remote files.
+	maxL0ReadAheadChunks = 8
 	// smallSSTBytes is the largest SST fetched and cached whole, together
 	// with its Bloom sidecar, in one request.
 	smallSSTBytes = 4 << 20
@@ -50,6 +54,8 @@ type sstObject struct {
 	// whole reports that the SST is fetched and cached whole: it is small, or
 	// its metadata offset is unknown (an SST from before offsets were recorded).
 	whole bool
+	// readAheadChunks caps a scan's read-ahead in this SST.
+	readAheadChunks uint32
 }
 
 func newSSTObject(store *blobstore.Store, meta sstMetadata, smallLimit int64) sstObject {
@@ -73,6 +79,10 @@ func newSSTObject(store *blobstore.Store, meta sstMetadata, smallLimit int64) ss
 		o.metaOffset = 0
 	}
 	o.whole = o.size <= smallLimit || o.metaOffset <= 0
+	o.readAheadChunks = maxReadAheadChunks
+	if meta.Level == 0 {
+		o.readAheadChunks = maxL0ReadAheadChunks
+	}
 	return o
 }
 
@@ -770,7 +780,7 @@ func (h *sstReadHandle) readData(ctx context.Context, p []byte, off int64) error
 		default:
 			// Each request of a continuing scan reads twice as far ahead.
 			if sequential {
-				h.chunks = min(max(2*h.chunks, 1), maxReadAheadChunks)
+				h.chunks = min(max(2*h.chunks, 1), max(o.readAheadChunks, 1))
 			}
 			// end is at most MetaOffset, so its chunk exists.
 			want := max(min(i+max(h.chunks, 1), o.numChunks()), uint32((end-1)/sstChunkSize)+1)
