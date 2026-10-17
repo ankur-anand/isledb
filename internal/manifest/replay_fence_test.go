@@ -135,7 +135,10 @@ func TestReplay_Snapshot_FenceClaimInWindow_PreservesEarlierEpochs(t *testing.T)
 	}
 }
 
-func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
+// TestReplay_Snapshot_NoFenceClaimInWindow_AppliesEveryEntry: with no claim
+// in the window, every entry was committed while its epoch held the fence,
+// so each is applied, whatever epoch CURRENT names now.
+func TestReplay_Snapshot_NoFenceClaimInWindow_AppliesEveryEntry(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("replay-fence-seed")
 	defer store.Close()
@@ -176,7 +179,7 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 		Role:    FenceRoleWriter,
 		Epoch:   1,
 		Op:      LogOpAddSSTable,
-		SSTable: &SSTMeta{ID: "writer-stale.sst", Epoch: 1, Level: 0},
+		SSTable: &SSTMeta{ID: "writer-earlier.sst", Epoch: 1, Level: 0},
 	})
 	writeLogEntry(t, ctx, backend, &ManifestLogEntry{
 		Seq:     21,
@@ -193,7 +196,7 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 		Compaction: &CompactionLogPayload{
 			RemoveSSTableIDs: []string{"stale-input"},
 			DestinationLevel: 1,
-			AddSSTables:      []SSTMeta{{ID: "compactor-stale.sst", Epoch: 1, Level: 1}},
+			AddSSTables:      []SSTMeta{{ID: "compactor-earlier.sst", Epoch: 1, Level: 1, MinKey: []byte("a"), MaxKey: []byte("b")}},
 		},
 	})
 	writeLogEntry(t, ctx, backend, &ManifestLogEntry{
@@ -204,7 +207,7 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 		Compaction: &CompactionLogPayload{
 			RemoveSSTableIDs: []string{"valid-input"},
 			DestinationLevel: 1,
-			AddSSTables:      []SSTMeta{{ID: "compactor-valid.sst", Epoch: 2, Level: 1}},
+			AddSSTables:      []SSTMeta{{ID: "compactor-valid.sst", Epoch: 2, Level: 1, MinKey: []byte("c"), MaxKey: []byte("d")}},
 		},
 	})
 
@@ -215,14 +218,14 @@ func TestReplay_Snapshot_NoFenceClaimInWindow_SeedsFromCurrent(t *testing.T) {
 	if m.LookupSST("snap-base.sst") == nil {
 		t.Fatalf("expected snapshot sst to be present")
 	}
-	if m.LookupSST("writer-stale.sst") != nil {
-		t.Fatalf("writer-stale.sst should be filtered when seeding from CURRENT")
+	if m.LookupSST("writer-earlier.sst") == nil {
+		t.Fatalf("writer-earlier.sst, committed before the takeover, should be applied")
 	}
 	if m.LookupSST("writer-valid.sst") == nil {
 		t.Fatalf("writer-valid.sst should be applied")
 	}
-	if m.LookupSST("compactor-stale.sst") != nil {
-		t.Fatalf("compactor-stale.sst should be filtered when seeding from CURRENT")
+	if m.LookupSST("compactor-earlier.sst") == nil {
+		t.Fatalf("compactor-earlier.sst, committed before the takeover, should be applied")
 	}
 	if m.LookupSST("compactor-valid.sst") == nil {
 		t.Fatalf("compactor-valid.sst should be applied")
