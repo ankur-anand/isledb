@@ -697,6 +697,12 @@ func (s *Store) reconcilePendingWriterCommit(
 			ErrWriterCommitConflict, entry.CommitID)
 	}
 
+	if current != nil && writerCommitMarkersEqual(current.LastWriterCommit, marker) {
+		// CURRENT records this exact commit as the writer's last: it landed.
+		// This holds even once a checkpoint has folded its entry away.
+		s.pendingWriterCommit = nil
+		return reconcileWriterCommitMarker(current.LastWriterCommit, entry)
+	}
 	retainedFrom := retainedEntryFloor(current)
 	if marker.ManifestSeq < retainedFrom {
 		return true, fmt.Errorf("%w: commit_id=%q manifest_seq=%d retained_from=%d",
