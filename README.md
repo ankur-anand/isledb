@@ -234,6 +234,9 @@ func runMaintenance(ctx context.Context, bucketURL string) error {
 The active writer publishes maintenance results, while cleanup proceeds at its
 own bounded pace. Use `RunOnce` instead of `Run` for a scheduled job.
 
+Or run it as a service, with no code: `isledb maintenance --prefix
+prod/accounts`. See [Running `isledb maintenance`](docs/isledb-maintenance.md).
+
 ## Shared read cache
 
 `isledb cache` is an optional service that sits between readers and object

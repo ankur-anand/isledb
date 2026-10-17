@@ -51,7 +51,7 @@ type Database struct {
 func NewConfig() service.Config {
 	return &Config{
 		Server:  service.DefaultServer(":8090", "127.0.0.1:8091"),
-		Reads:   Reads{MaxBytes: 256 << 20, MaxWait: service.Duration(2 * time.Minute)},
+		Reads:   Reads{MaxBytes: 256 << 20, MaxWait: service.Duration(readcache.DefaultMaxReadWait)},
 		Current: Current{Poll: service.Duration(500 * time.Millisecond), LongPoll: service.Duration(30 * time.Second)},
 	}
 }
