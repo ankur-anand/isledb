@@ -539,6 +539,30 @@ func TestSSTReadable_ReadAheadDoublesPerRequest(t *testing.T) {
 	}
 }
 
+// TestSSTReadable_ReadAheadIsSmallerForL0 scans the same SST placed in L0: a
+// scan merges one source per overlapping L0 SST, so each reads ahead at most
+// maxL0ReadAheadChunks.
+func TestSSTReadable_ReadAheadIsSmallerForL0(t *testing.T) {
+	f := newReadableTestFixture(t, 40_000, true)
+	f.meta.Level = 0
+	f.state = &manifestState{L0SSTs: []manifest.SSTMeta{f.meta}}
+	f.scan(t, 0, len(f.entries))
+	var largest int64
+	for _, r := range f.dataRanges(f.ranges.take()) {
+		largest = max(largest, (r.end-r.start+sstChunkSize-1)/sstChunkSize)
+	}
+	if largest != maxL0ReadAheadChunks {
+		t.Fatalf("largest L0 read-ahead %d chunks, want %d", largest, maxL0ReadAheadChunks)
+	}
+	if got := f.reader.fetcher.object(f.meta).readAheadChunks; got != maxL0ReadAheadChunks {
+		t.Fatalf("L0 object read-ahead cap %d", got)
+	}
+	f.meta.Level = 1
+	if got := f.reader.fetcher.object(f.meta).readAheadChunks; got != maxReadAheadChunks {
+		t.Fatalf("L1 object read-ahead cap %d", got)
+	}
+}
+
 // TestSSTReadable_BloomMissFetchesOnlyBloom evicts a small SST's Bloom
 // filter while the SST stays cached whole: the next lookup fetches the Bloom
 // range alone, not the whole object again.

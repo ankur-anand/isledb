@@ -123,6 +123,10 @@ func New(bkt *blob.Bucket, bucketName, prefix string) *Store {
 	})
 }
 
+// PacesOverwrites reports whether s spaces conditional writes of one object
+// apart, as it does on Cloud Storage.
+func (s *Store) PacesOverwrites() bool { return s.pacer != nil }
+
 // withPacer spaces s's conditional writes of one object GCSOverwriteGap
 // apart when s is on GCS.
 func withPacer(s *Store) *Store {

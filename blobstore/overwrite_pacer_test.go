@@ -125,8 +125,11 @@ func TestGCSStoreSpacesWritesOfOneObject(t *testing.T) {
 	if s.pacer == nil || s.pacer.gap != GCSOverwriteGap {
 		t.Fatalf("a GCS store has pacer %+v, want one with a %s gap", s.pacer, GCSOverwriteGap)
 	}
-	if NewMemory("p").pacer != nil {
+	if NewMemory("p").pacer != nil || NewMemory("p").PacesOverwrites() {
 		t.Fatal("a memory store is paced")
+	}
+	if !s.PacesOverwrites() {
+		t.Fatal("a GCS store does not report pacing")
 	}
 	ctx := context.Background()
 	attrs, err := s.WriteIfMatch(ctx, "paced/CURRENT", []byte("1"), "")

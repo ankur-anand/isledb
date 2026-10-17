@@ -29,6 +29,8 @@ const (
 	defaultCheckpointReplayBytes       uint64 = 32 << 20
 	defaultMaintenanceIdleInterval            = 5 * time.Second
 	maintenanceActiveInterval                 = 100 * time.Millisecond
+	maintenanceL0Interval                     = 2 * time.Second
+	maintenanceL0IntervalPaced                = 5 * time.Second
 	defaultReclaimDeleteConcurrency           = 4
 	defaultSSTReclaimPollInterval             = time.Second
 	defaultChangeReclaimPollInterval          = 5 * time.Second
@@ -125,6 +127,20 @@ type SSTCompactionOptions struct {
 	// TargetSSTBytes is the approximate output-file size. Encoding settings
 	// come from DBOptions.SSTOutput.
 	TargetSSTBytes int64
+	// L0ToBaseRatio is the share of the L1 bytes that L0 overlaps which L0
+	// must hold before it merges into L1. Below it, new L0 files merge with
+	// each other instead, so L1 is not rewritten for a little new data. Zero
+	// selects 1: L0 merges into L1 once it holds as many bytes as it would
+	// rewrite there.
+	L0ToBaseRatio float64
+	// L0MaxDepth is the number of L0 files covering one key that makes L0
+	// merge into L1 whatever its size, bounding the files a lookup checks.
+	// Zero selects 16.
+	L0MaxDepth int
+	// L0MaxAge is the age of L0's oldest data that makes L0 merge into L1
+	// whatever its size, so a database that stops being written drains L0.
+	// Zero selects 30 minutes.
+	L0MaxAge time.Duration
 }
 
 // ManifestCheckpointOptions controls when maintenance snapshots manifest
@@ -241,6 +257,9 @@ type SSTCompactionStats struct {
 	// every rewrite, plus the sources of any move that was checksum-verified.
 	// It is the GET side of the cost; RewrittenBytes is the PUT side.
 	ReadBytes int64
+	// L0Merges is the subset of Jobs that merged new L0 files with each other
+	// rather than into L1.
+	L0Merges int
 	// RewrittenBytes is what compaction genuinely wrote, and the figure that
 	// tracks object-store cost and write amplification. Reading OutputBytes
 	// instead overstates both, by the whole of MovedBytes.
@@ -388,6 +407,9 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 			BaseLevelBytes:    compaction.Trigger.BaseLevelBytes,
 			LevelGrowthFactor: compaction.Trigger.LevelSizeMultiplier,
 			TargetSSTBytes:    compaction.Output.TargetSSTBytes,
+			L0ToBaseRatio:     compaction.Trigger.L0ToBaseRatio,
+			L0MaxDepth:        compaction.Trigger.L0MaxDepth,
+			L0MaxAge:          compaction.Trigger.L0MaxAge,
 		},
 		ManifestCheckpoint: ManifestCheckpointOptions{
 			TargetReplayPages: defaultCheckpointReplayPages,
@@ -437,6 +459,8 @@ type Maintenance struct {
 	pageGC      *manifestPageCleaner
 	deleter     *limitedObjectDeleter
 	fenceToken  *manifest.FenceToken
+	// l0SSTsSeen is how many SSTs L0 held after the Run loop's last cycle.
+	l0SSTsSeen int
 
 	lifecycleMu   sync.Mutex
 	closeMu       sync.Mutex
@@ -645,7 +669,8 @@ func normalizeDeleterOptions(name string, opts, defaults DeleterOptions) (Delete
 
 func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTCompactionOptions, error) {
 	if opts.ReadConcurrency < 0 || opts.L0TriggerSSTs < 0 ||
-		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.TargetSSTBytes < 0 {
+		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.TargetSSTBytes < 0 ||
+		opts.L0ToBaseRatio < 0 || opts.L0MaxDepth < 0 || opts.L0MaxAge < 0 {
 		return SSTCompactionOptions{}, fmt.Errorf("%w: invalid SST compaction option", ErrInvalidMaintenanceOptions)
 	}
 	if opts.LevelGrowthFactor == 1 {
@@ -666,6 +691,15 @@ func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTComp
 	if opts.TargetSSTBytes == 0 {
 		opts.TargetSSTBytes = defaults.TargetSSTBytes
 	}
+	if opts.L0ToBaseRatio == 0 {
+		opts.L0ToBaseRatio = defaults.L0ToBaseRatio
+	}
+	if opts.L0MaxDepth == 0 {
+		opts.L0MaxDepth = defaults.L0MaxDepth
+	}
+	if opts.L0MaxAge == 0 {
+		opts.L0MaxAge = defaults.L0MaxAge
+	}
 	return opts, nil
 }
 
@@ -684,6 +718,34 @@ func normalizeChangeFeedRetentionOptions(opts ChangeFeedRetentionOptions) (chang
 	}, nil
 }
 
+// l0Interval is how soon maintenance comes back while L0 has work. New L0
+// files pile up between cycles, about 8 per 2 s at 250 ms saves, and a
+// lookup checks every one, so it is much shorter than the idle interval. On a
+// store that spaces writes of one object apart, as Cloud Storage requires,
+// each applied job shares that budget with the writer's commits, so it is
+// longer there.
+func (m *Maintenance) l0Interval() time.Duration {
+	if m.compactor.store.PacesOverwrites() {
+		return maintenanceL0IntervalPaced
+	}
+	return maintenanceL0Interval
+}
+
+// revisitL0 reports whether maintenance should come back at the L0 interval
+// after a cycle: L0 holds enough SSTs for a job, and the cycle either ran a
+// job or found L0 grown since the cycle before. A cycle that found nothing to
+// do in an L0 that isn't growing would find nothing again soon, so it waits
+// the idle interval instead. Only the Run loop calls it.
+func (m *Maintenance) revisitL0(stats MaintenanceStats) bool {
+	if m.compactor == nil {
+		return false
+	}
+	ssts, enough := m.compactor.l0Work()
+	grew := ssts > m.l0SSTsSeen
+	m.l0SSTsSeen = ssts
+	return enough && (grew || stats.SSTCompaction.Jobs > 0)
+}
+
 func (m *Maintenance) compactorOptions() compactorOptions {
 	p := m.opts.sstCompaction
 	return compactorOptions{
@@ -694,6 +756,9 @@ func (m *Maintenance) compactorOptions() compactorOptions {
 			L0SSTCount:          p.L0TriggerSSTs,
 			BaseLevelBytes:      p.BaseLevelBytes,
 			LevelSizeMultiplier: p.LevelGrowthFactor,
+			L0ToBaseRatio:       p.L0ToBaseRatio,
+			L0MaxDepth:          p.L0MaxDepth,
+			L0MaxAge:            p.L0MaxAge,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  p.TargetSSTBytes,
@@ -786,6 +851,8 @@ func (m *Maintenance) Run(ctx context.Context) error {
 		delay := m.opts.idleInterval
 		if stats.State == MaintenanceWaitingForWriter {
 			delay = min(delay, maintenanceActiveInterval)
+		} else if m.revisitL0(stats) {
+			delay = min(delay, m.l0Interval())
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -1433,6 +1500,9 @@ func (m *Maintenance) recordCompaction(job compactionJob, err error) {
 		return
 	}
 	stats.RewrittenBytes += bytes
+	if job.DestinationLevel == 0 {
+		stats.L0Merges++
+	}
 }
 
 func (m *Maintenance) recordChangeFeed(stats ChangeFeedCleanupStats) {

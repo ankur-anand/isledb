@@ -8,8 +8,14 @@ import (
 )
 
 const (
-	LayoutVersion = 2
-	CurrentFormat = "isledb-manifest-v2"
+	// LayoutVersion is the layout new databases and manifest pages are written
+	// with. A database moves to LayoutVersionL0Merge in the same CURRENT update
+	// that records its first merge within L0: earlier releases would replay
+	// that entry by dropping the merged data, so they must refuse the database
+	// from then on, and only from then on.
+	LayoutVersion        = 2
+	LayoutVersionL0Merge = 3
+	CurrentFormat        = "isledb-manifest-v2"
 
 	CommitPageTypeLeaf  = "commit_l00"
 	CommitPageTypeIndex = "commit_index"

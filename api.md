@@ -1375,6 +1375,9 @@ type SSTCompactionOptions struct {
     BaseLevelBytes    int64
     LevelGrowthFactor int
     TargetSSTBytes    int64
+    L0ToBaseRatio     float64
+    L0MaxDepth        int
+    L0MaxAge          time.Duration
 }
 
 type ManifestCheckpointOptions struct {
@@ -1411,6 +1414,9 @@ func DefaultMaintenanceOptions() MaintenanceOptions
 | `SSTCompaction.BaseLevelBytes` | 512 MiB |
 | `SSTCompaction.LevelGrowthFactor` | 8 |
 | `SSTCompaction.TargetSSTBytes` | 64 MiB |
+| `SSTCompaction.L0ToBaseRatio` | 1 |
+| `SSTCompaction.L0MaxDepth` | 16 L0 files |
+| `SSTCompaction.L0MaxAge` | 30 minutes |
 | `ManifestCheckpoint.TargetReplayPages` | 64 pages |
 | `ManifestCheckpoint.TargetReplayBytes` | 32 MiB |
 | `ChangeFeedRetention` | `nil`: history kept forever |
@@ -1433,6 +1439,29 @@ session directory below it. A clean close removes the session; a later epoch
 tries to remove abandoned ones, and a failed cleanup never stops maintenance
 from opening. IsleDB never deletes the configured directory itself or
 anything below it that it did not create.
+
+**How L0 is compacted.** The writer saves a small L0 file at each flush.
+Once L0 holds `L0TriggerSSTs` files, each maintenance cycle does one of two
+things:
+
+- **Merge L0 into L1** when L0 holds at least `L0ToBaseRatio` of the L1 bytes
+  it overlaps, when some key is covered by `L0MaxDepth` L0 files, or when L0's
+  oldest data is `L0MaxAge` old. Files that overlap nothing in L1, as with
+  keys written in order, move without being rewritten.
+- **Otherwise, merge the newest L0 files with each other** into one L0 file,
+  so L1 isn't rewritten for a little new data. L0 then stays a few files deep,
+  and each byte is rewritten a few times in small merges on its way to L1.
+
+With random keys, L0 overlaps nearly all of L1, so `L0ToBaseRatio` rarely
+triggers and `L0MaxDepth` decides when L0 is merged into L1.
+
+While L0 has work and is changing, maintenance runs a cycle every 2 seconds
+(5 seconds on Cloud Storage) instead of every `IdleInterval`.
+`SSTCompactionStats.L0Merges` counts the merges within L0.
+
+The first merge within L0 moves the database to layout version 3. Releases
+before this one refuse to open it from then on, so upgrade every process
+that opens the database before running this release's maintenance.
 
 Compacted SSTs are encoded with `DBOptions.SSTOutput.Compacted`. The
 compaction planner's limits are described in
@@ -1858,6 +1887,7 @@ type SSTCompactionStats struct {
     MovedJobs            int
     MovedBytes           int64
     ReadBytes            int64
+    L0Merges             int
     RewrittenBytes       int64
 }
 

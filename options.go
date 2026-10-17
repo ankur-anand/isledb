@@ -205,6 +205,19 @@ type compactionTriggerOptions struct {
 
 	// LevelSizeMultiplier controls geometric growth of L1..Ln.
 	LevelSizeMultiplier int
+
+	// L0ToBaseRatio is the share of the L1 bytes that L0 overlaps which L0
+	// must hold before it merges into L1. Below it, L0 SSTs merge with each
+	// other instead, so L1 is not rewritten for a little new data.
+	L0ToBaseRatio float64
+
+	// L0MaxDepth is the number of L0 SSTs covering one key that makes L0
+	// merge into L1 whatever its size, bounding the SSTs a lookup checks.
+	L0MaxDepth int
+
+	// L0MaxAge is the age of L0's oldest data that makes L0 merge into L1
+	// whatever its size, so a database that stops being written drains L0.
+	L0MaxAge time.Duration
 }
 
 type compactionOutputOptions struct {
@@ -233,6 +246,9 @@ func defaultCompactorOptions() compactorOptions {
 			L0SSTCount:          8,
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
+			L0ToBaseRatio:       1,
+			L0MaxDepth:          16,
+			L0MaxAge:            30 * time.Minute,
 		},
 		Output: compactionOutputOptions{
 			TargetSSTBytes:  64 * 1024 * 1024,
