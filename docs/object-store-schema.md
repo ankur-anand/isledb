@@ -100,9 +100,13 @@ contains:
 The current format is:
 
 ```text
-layout_version: 2
+layout_version: 2 or 3
 format: isledb-manifest-v2
 ```
+
+A database is created at layout 2 and moves to layout 3 when maintenance
+first merges small L0 files with each other. Releases that read only layout 2
+refuse a database from then on.
 
 `MaxPinnedViewAge` is a persisted store policy. It defaults to one hour and
 defines how long an already-loaded reader view can remain usable. Later writers

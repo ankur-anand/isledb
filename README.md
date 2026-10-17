@@ -30,7 +30,31 @@ IsleDB provides:
   <img src="docs/architecture-light.svg" width="100%" alt="IsleDB architecture: one writer commits to object storage; maintenance compacts it; reader processes read through their local cache, then an optional shared read cache, then object storage; the shared cache tells readers about new commits.">
 </picture>
 
-## Install
+Use IsleDB as a Go library, or run it as services that any language reaches
+over HTTP:
+
+**[Use it as a Go library](#use-it-as-a-go-library) · [Run it as services](#run-it-as-services)**
+
+## When IsleDB fits
+
+IsleDB is a good fit when:
+
+- object storage is the durability and capacity layer;
+- writes can be buffered and published in batches;
+- readers should scale without maintaining database replicas;
+- second-scale freshness is acceptable;
+- compaction should run away from application servers.
+
+Choose a different database when you need:
+
+- consistent sub-10-millisecond read-after-write latency;
+- multi-key transactions or compare-and-swap updates;
+- secondary indexes, joins, or a query language;
+- high-frequency updates to a small, hot dataset.
+
+## Use it as a Go library
+
+### Install
 
 ```bash
 go get github.com/ankur-anand/isledb
@@ -38,7 +62,7 @@ go get github.com/ankur-anand/isledb
 
 IsleDB requires Go 1.25 or newer.
 
-## Quick start
+### Quick start
 
 This example uses an Amazon S3 bucket; credentials come from the standard AWS
 environment (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, an instance role, and so on).
@@ -134,7 +158,7 @@ for each database.
 > them in production. Use S3, Google Cloud Storage, Azure Blob Storage, or an
 > S3-compatible store.
 
-## Behavior to know
+### Behavior to know
 
 - `Put`, `PutWithTTL`, and `Delete` buffer mutations in memory and return
   each mutation's sequence. `WaitCommitted(ctx, seq)` returns once that write
@@ -159,7 +183,7 @@ for each database.
 - Run maintenance in production so compaction, checkpoints, configured
   retention, and physical cleanup continue to make progress.
 
-### Shutting down
+#### Shutting down
 
 `Drain` stops intake and commits everything accepted, retrying until its
 context ends; `Close` is the final step:
@@ -183,7 +207,7 @@ crash loses at most one interval of writes.
 See the [Go API guide](api.md) for scans, iterators, snapshots, prefetching,
 configuration, metrics, and error handling.
 
-## Optional change feed
+### Change feed
 
 Enable the change feed when another service needs committed mutations in writer
 order:
@@ -206,7 +230,7 @@ Consumers use `OpenChangeReader` with an opaque, persistent cursor. See
 [Change feed](api.md#change-feed)
 for the complete example and retention behavior.
 
-## Run maintenance separately
+### Maintenance
 
 Maintenance can run continuously in its own service or periodically as a job.
 It opens the same database prefix as the writer and readers.
@@ -234,34 +258,13 @@ func runMaintenance(ctx context.Context, bucketURL string) error {
 The active writer publishes maintenance results, while cleanup proceeds at its
 own bounded pace. Use `RunOnce` instead of `Run` for a scheduled job.
 
-Or run it as a service, with no code: `isledb maintenance --prefix
-prod/accounts`. See [Running `isledb maintenance`](docs/isledb-maintenance.md).
+To run it without writing code, see the
+[maintenance service](#maintenance-service).
 
-## Shared read cache
+### Reading through the shared cache
 
-`isledb cache` is an optional service that sits between readers and object
-storage, typically one per region. It serves immutable objects (SSTs,
-manifest pages, change batches) from chunks on its local disk, and relays
-`CURRENT` so readers learn of new commits through a long poll instead of
-polling storage.
-
-**Storage cost:** object reads from storage grow with the number of caches,
-not the number of readers: each object is fetched about once per cache while
-it stays on the cache's disk.
-
-Run it next to the readers:
-
-```bash
-go install github.com/ankur-anand/isledb/cmd/isledb@latest
-
-isledb cache \
-  --bucket-url 's3://my-bucket?region=us-east-1' \
-  --db prod/accounts \
-  --disk-dir /var/cache/isledb --disk-bytes 200GiB \
-  --auth-token-file /etc/isledb/tokens
-```
-
-Point readers and change-feed consumers at it:
+With an [`isledb cache`](#shared-read-cache) in the region, point readers and
+change-feed consumers at it:
 
 ```go
 opts := isledb.DefaultReaderOpenOptions(cacheDir)
@@ -276,14 +279,25 @@ feed, err := db.OpenChangeReader(ctx, isledb.ChangeReaderOptions{
 })
 ```
 
-The cache only makes reads faster and cheaper; it never decides what readers
-see. Readers check what it returns against checksums, reject a copy of
-`CURRENT` that is too old, and read storage directly whenever the cache is
-slow, down, or wrong.
-See [Running `isledb cache`](docs/isledb-cache.md) and the
-[read cache HTTP API](docs/read-cache-api.md).
+## Run it as services
 
-## Writer service
+One binary runs each service:
+
+```bash
+go install github.com/ankur-anand/isledb/cmd/isledb@latest
+```
+
+| Service | Does | Listens on | Run |
+| --- | --- | --- | --- |
+| `isledb writer` | Takes writes over HTTP | `:8070` | One per database |
+| `isledb reader` | Serves reads and scans over HTTP | `:8080` | As many as you need |
+| `isledb maintenance` | Compacts and cleans up; no API | admin only, `127.0.0.1:8061` | One per database |
+| `isledb cache` | Optional regional read cache | `:8090` | One or more per region |
+
+Each also serves health checks and metrics on its admin address. Run
+`isledb help` for the list, and `isledb <service> -h` for a service's flags.
+
+### Writer service
 
 `isledb writer` holds the writer for one database and serves writes over
 HTTP, so services in any language can write:
@@ -306,7 +320,7 @@ deletes go to `POST /v1/kv` and apply atomically. Run one writer per
 database. See [Running `isledb writer`](docs/isledb-writer.md) and the
 [writer HTTP API](docs/writer-api.md).
 
-## Reader service
+### Reader service
 
 `isledb reader` serves reads over HTTP. Replicas share nothing, so you scale
 reads by adding them behind a load balancer:
@@ -333,36 +347,72 @@ writes it includes. See
 [Running `isledb reader`](docs/isledb-reader.md) and the
 [reader HTTP API](docs/reader-api.md).
 
-## When IsleDB fits
+### Maintenance service
 
-IsleDB is a good fit when:
+`isledb maintenance` compacts the database, keeps its metadata short and
+deletes what is no longer needed. It has no API. Run exactly one per
+database, alongside the writer:
 
-- object storage is the durability and capacity layer;
-- writes can be buffered and published in batches;
-- readers should scale without maintaining database replicas;
-- second-scale freshness is acceptable;
-- compaction should run away from application servers.
+```bash
+isledb maintenance \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts \
+  --scratch-dir /var/lib/isledb/scratch
+```
 
-Choose a different database when you need:
+A second one for the same database takes over, and the first stops working
+and reports not ready. See
+[Running `isledb maintenance`](docs/isledb-maintenance.md).
 
-- consistent sub-10-millisecond read-after-write latency;
-- multi-key transactions or compare-and-swap updates;
-- secondary indexes, joins, or a query language;
-- high-frequency updates to a small, hot dataset.
+### Shared read cache
+
+`isledb cache` is an optional service that sits between readers and object
+storage, typically one per region. It serves immutable objects (SSTs,
+manifest pages, change batches) from chunks on its local disk, and relays
+`CURRENT` so readers learn of new commits through a long poll instead of
+polling storage.
+
+Run it next to the readers:
+
+```bash
+isledb cache \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --db prod/accounts \
+  --disk-dir /var/cache/isledb --disk-bytes 200GiB \
+  --auth-token-file /etc/isledb/tokens
+```
+
+The cache only makes reads faster and cheaper; it never decides what readers
+see. Readers check what it returns against checksums, reject a copy of
+`CURRENT` that is too old, and read storage directly whenever the cache is
+slow, down, or wrong.
+See [Running `isledb cache`](docs/isledb-cache.md) and the
+[read cache HTTP API](docs/read-cache-api.md).
+
+An `isledb reader` uses it through `read_cache.url`; a Go program, through
+[`ReadCacheOptions`](#reading-through-the-shared-cache).
 
 ## Documentation
 
+Library:
+
 - [Go API guide](api.md)
 - [Go package reference](https://pkg.go.dev/github.com/ankur-anand/isledb)
-- [Choosing and setting up object storage](docs/object-store-guide.md)
-- [Cost approximation](docs/cost-approximation.md)
-- [Object-store layout and operations](docs/object-store-schema.md)
-- [Running the shared read cache](docs/isledb-cache.md)
-- [Running the writer service](docs/isledb-writer.md) and its [HTTP API](docs/writer-api.md)
-- [Running the reader service](docs/isledb-reader.md) and its [HTTP API](docs/reader-api.md)
 - [Local quickstart](examples/quickstart)
 - [Separate writer, reader, and maintenance services with MinIO](examples/minio-services)
 - [Restartable change-feed consumer with Azurite](examples/changefeed-azurite)
+
+Services:
+
+- [Running the writer service](docs/isledb-writer.md) and its [HTTP API](docs/writer-api.md)
+- [Running the reader service](docs/isledb-reader.md) and its [HTTP API](docs/reader-api.md)
+- [Running the maintenance service](docs/isledb-maintenance.md)
+- [Running the shared read cache](docs/isledb-cache.md) and its [HTTP API](docs/read-cache-api.md)
+
+Storage:
+
+- [Choosing and setting up object storage](docs/object-store-guide.md)
+- [Object-store layout and operations](docs/object-store-schema.md)
 
 ## Acknowledgments
 
