@@ -519,9 +519,9 @@ func TestWriter_FlushRequeuesOnManifestFailure(t *testing.T) {
 	defer store.Close()
 
 	baseStorage := manifest.NewBlobStoreBackend(store)
-	// Fail the flush publish. The first two CURRENT writes claim the writer fence
-	// and commit the fence-claim entry.
-	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 3}
+	// Fail the flush publish. The first CURRENT write claims the writer fence,
+	// its claim entry with it.
+	failStorage := &failOnceStorage{Storage: baseStorage, failOnWrite: 2}
 	manifestStore := manifest.NewStoreWithStorage(failStorage)
 
 	w, err := newWriter(ctx, store, manifestStore, testWriterOptions(1<<20, 0))
@@ -704,7 +704,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterLostResponse(t *testing.T)
 	lostResponse := errors.New("lost CURRENT response")
 	storage := &applyThenFailOnceStorage{
 		Storage:     manifest.NewBlobStoreBackend(store),
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     lostResponse,
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
@@ -793,7 +793,7 @@ func TestWriter_FlushReconcilesAppliedManifestCASAfterMultipleSuccessors(t *test
 	lostResponse := errors.New("lost CURRENT response")
 	storage := &applyThenFailOnceStorage{
 		Storage:     base,
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     lostResponse,
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
@@ -865,7 +865,7 @@ func TestWriter_ReconciledCommitMarksSupersededWriterFenced(t *testing.T) {
 	lostResponse := errors.New("lost CURRENT response")
 	storage := &applyThenFailOnceStorage{
 		Storage:     base,
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     lostResponse,
 	}
 	manifestStore := manifest.NewStoreWithStorage(storage)
@@ -952,7 +952,7 @@ func TestWriter_BackgroundFlushFailureIsRetried(t *testing.T) {
 	rootCause := errors.New("injected background publish failure")
 	storage := &failOnceStorage{
 		Storage:     manifest.NewBlobStoreBackend(store),
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     rootCause,
 	}
 	callback := make(chan error, 2)
@@ -1016,7 +1016,7 @@ func TestWriter_BackgroundLostResponseCommits(t *testing.T) {
 	lost := errors.New("injected lost response")
 	storage := &applyThenFailOnceStorage{
 		Storage:     manifest.NewBlobStoreBackend(store),
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     lost,
 	}
 	opts := testWriterOptions(1<<20, 0)
@@ -1057,7 +1057,7 @@ func TestWriter_OnFlushErrorCanClose(t *testing.T) {
 	rootCause := errors.New("injected background publish failure")
 	storage := &failOnceStorage{
 		Storage:     manifest.NewBlobStoreBackend(store),
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     rootCause,
 	}
 

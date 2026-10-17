@@ -155,31 +155,16 @@ func (s *Store) ClaimWriterWithPolicy(ctx context.Context, ownerID string, maxPi
 }
 
 func (s *Store) claimWriter(ctx context.Context, ownerID string, maxPinnedViewAge *time.Duration) (*FenceToken, error) {
-	token, err := s.claimFence(ctx, FenceRoleWriter, ownerID, maxPinnedViewAge)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.writeFenceClaimEntry(ctx, FenceRoleWriter, token); err != nil {
-		return nil, fmt.Errorf("write fence claim entry: %w", err)
-	}
-
-	return token, nil
+	return s.claimFence(ctx, FenceRoleWriter, ownerID, maxPinnedViewAge)
 }
 
 func (s *Store) ClaimCompactor(ctx context.Context, ownerID string) (*FenceToken, error) {
-	token, err := s.claimFence(ctx, FenceRoleCompactor, ownerID, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.writeFenceClaimEntry(ctx, FenceRoleCompactor, token); err != nil {
-		return nil, fmt.Errorf("write fence claim entry: %w", err)
-	}
-
-	return token, nil
+	return s.claimFence(ctx, FenceRoleCompactor, ownerID, nil)
 }
 
+// claimFence takes role's fence and records the claim in the log in one
+// write of CURRENT. Were they two writes, a replay between them would see the
+// new epoch with no claim saying where it began.
 func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, maxPinnedViewAge *time.Duration) (*FenceToken, error) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -242,8 +227,25 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, 
 		case FenceRoleCompactor:
 			current.CompactorFence = newFence
 		}
-
-		if err := s.writeCurrentWithCAS(ctx, current, etag); err != nil {
+		claim := ManifestLogEntry{
+			Role:  role,
+			Epoch: newEpoch,
+			Op:    LogOpFenceClaim,
+			FenceClaim: &FenceClaimPayload{
+				Role:      role,
+				Epoch:     newEpoch,
+				Owner:     ownerID,
+				ClaimedAt: newFence.ClaimedAt,
+			},
+		}
+		if err := s.placeEntry(ctx, current, &claim); err != nil {
+			return nil, err
+		}
+		data, err := s.encodeCurrentForCASWithRotation(ctx, current)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.writeEncodedCurrentWithCAS(ctx, current, data, etag); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
 				backoff := time.Millisecond * 10 * time.Duration(attempt+1)
 				if err := sleepWithContext(ctx, backoff); err != nil {
@@ -261,6 +263,7 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, 
 		case FenceRoleCompactor:
 			s.compactorFence = newFence
 		}
+		s.nextSeq = current.NextSeq
 		s.mu.Unlock()
 
 		return newFence, nil
@@ -298,21 +301,6 @@ func sleepBeforeCurrentCASRetry(ctx context.Context, attempt int) error {
 	jitterWindow := delay / 2
 	jitter := time.Duration(time.Now().UnixNano() % int64(jitterWindow+1))
 	return sleepWithContext(ctx, delay/2+jitter)
-}
-
-func (s *Store) writeFenceClaimEntry(ctx context.Context, role FenceRole, token *FenceToken) error {
-	entry := &ManifestLogEntry{
-		Role:  role,
-		Epoch: token.Epoch,
-		Op:    LogOpFenceClaim,
-		FenceClaim: &FenceClaimPayload{
-			Role:      role,
-			Epoch:     token.Epoch,
-			Owner:     token.Owner,
-			ClaimedAt: token.ClaimedAt,
-		},
-	}
-	return s.appendInternal(ctx, entry, role)
 }
 
 func (s *Store) CheckWriterFence(ctx context.Context) error {
@@ -507,7 +495,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		}
 
 		nextEntry := *entry
-		nextEntry.Seq = current.NextSeq
 		switch role {
 		case FenceRoleWriter:
 			nextEntry.Role = FenceRoleWriter
@@ -520,12 +507,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 				nextEntry.Epoch = current.CompactorFence.Epoch
 			}
 		}
-		if nextEntry.ID.IsNil() {
-			nextEntry.ID = ksuid.New()
-		}
-		if nextEntry.Timestamp.IsZero() {
-			nextEntry.Timestamp = time.Now().UTC()
-		}
 		if err := validateRetiredObjects(&nextEntry); err != nil {
 			return err
 		}
@@ -535,20 +516,9 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			updated = &Current{NextEpoch: 1}
 		}
 		normalizeCurrent(updated)
-		if len(updated.ActiveEntries) >= s.activeLimit() {
-			if err := s.rotateActiveEntries(ctx, updated); err != nil {
-				return err
-			}
+		if err := s.placeEntry(ctx, updated, &nextEntry); err != nil {
+			return err
 		}
-		if updated.LogSeqStart == updated.NextSeq {
-			updated.LogSeqStart = nextEntry.Seq
-		}
-		if !updated.ChangeFeedEnabled && updated.ChangeFeedLogStart == 0 {
-			updated.ChangeFeedLogStart = updated.LogSeqStart
-		}
-		updated.ActiveEntries = append(updated.ActiveEntries, nextEntry)
-		updated.NextSeq = nextEntry.Seq + 1
-		updated.NextEpoch = nextEpochFromEntry(updated.NextEpoch, &nextEntry)
 		var writerMarker *WriterCommitMarker
 		if nextEntry.Role == FenceRoleWriter && nextEntry.Op == LogOpAddSSTable && nextEntry.CommitID != "" {
 			writerMarker, err = writerCommitMarker(&nextEntry)
@@ -586,6 +556,33 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 	}
 
 	return ErrFenceConflict
+}
+
+// placeEntry appends entry to current's log at its next sequence, moving the
+// active entries to a page first when they are full.
+func (s *Store) placeEntry(ctx context.Context, current *Current, entry *ManifestLogEntry) error {
+	entry.Seq = current.NextSeq
+	if entry.ID.IsNil() {
+		entry.ID = ksuid.New()
+	}
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = time.Now().UTC()
+	}
+	if len(current.ActiveEntries) >= s.activeLimit() {
+		if err := s.rotateActiveEntries(ctx, current); err != nil {
+			return err
+		}
+	}
+	if current.LogSeqStart == current.NextSeq {
+		current.LogSeqStart = entry.Seq
+	}
+	if !current.ChangeFeedEnabled && current.ChangeFeedLogStart == 0 {
+		current.ChangeFeedLogStart = current.LogSeqStart
+	}
+	current.ActiveEntries = append(current.ActiveEntries, *entry)
+	current.NextSeq = entry.Seq + 1
+	current.NextEpoch = nextEpochFromEntry(current.NextEpoch, entry)
+	return nil
 }
 
 func (s *Store) AppendAddSSTableWithFence(ctx context.Context, sst SSTMeta) (*ManifestLogEntry, error) {
@@ -1416,48 +1413,17 @@ func (s *Store) replayFromSnapshot(ctx context.Context, current *Current, snap *
 		}
 	}
 	var maxSeq uint64
-	var maxWriterFenceClaimEpoch uint64
-	var maxCompactorFenceClaimEpoch uint64
-	var maxWriterEntryEpoch uint64
-	var maxCompactorEntryEpoch uint64
 	for _, entry := range entries {
-		if entry.Seq > maxSeq {
-			maxSeq = entry.Seq
-		}
-		if entry.Op == LogOpFenceClaim {
-			if entry.Role == FenceRoleWriter && entry.Epoch > maxWriterFenceClaimEpoch {
-				maxWriterFenceClaimEpoch = entry.Epoch
-			} else if entry.Role == FenceRoleCompactor && entry.Epoch > maxCompactorFenceClaimEpoch {
-				maxCompactorFenceClaimEpoch = entry.Epoch
-			}
-		}
-		if entry.Role == FenceRoleWriter && entry.Epoch > maxWriterEntryEpoch {
-			maxWriterEntryEpoch = entry.Epoch
-		} else if entry.Role == FenceRoleCompactor && entry.Epoch > maxCompactorEntryEpoch {
-			maxCompactorEntryEpoch = entry.Epoch
-		}
+		maxSeq = max(maxSeq, entry.Seq)
 	}
 
-	// track the active epochs per role. Seed from CURRENT only if:
-	// 1. No fence-claim exists in the log window (truncated logs), OR
-	// 2. The log contains entries at CURRENT's epoch but NO fence-claim for that epoch
-	// (writer/compactor crashed after updating CURRENT but before writing fence-claim log)
-	// Otherwise, we start from zero and let fence-claim logs advance epochs in order,
-	// preserving entries that appeared before the fence-claim.
+	// The active epochs come from the claims in the log alone. Every entry
+	// was appended by a CAS on CURRENT while its epoch held the fence, and a
+	// claim is in the same CAS as its fence, so an entry before the window's
+	// first claim was committed by a writer then in charge: it is applied,
+	// whatever epoch CURRENT names now.
 	var activeWriterEpoch uint64
 	var activeCompactorEpoch uint64
-	if current != nil {
-		if current.WriterFence != nil &&
-			(maxWriterFenceClaimEpoch == 0 ||
-				(maxWriterEntryEpoch >= current.WriterFence.Epoch && maxWriterFenceClaimEpoch < current.WriterFence.Epoch)) {
-			activeWriterEpoch = current.WriterFence.Epoch
-		}
-		if current.CompactorFence != nil &&
-			(maxCompactorFenceClaimEpoch == 0 ||
-				(maxCompactorEntryEpoch >= current.CompactorFence.Epoch && maxCompactorFenceClaimEpoch < current.CompactorFence.Epoch)) {
-			activeCompactorEpoch = current.CompactorFence.Epoch
-		}
-	}
 
 	for _, entry := range entries {
 		// we will handle fence claim entries - they update the active epoch (monotonically)

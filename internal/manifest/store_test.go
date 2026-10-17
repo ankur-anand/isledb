@@ -637,17 +637,16 @@ func TestReplay_BackwardsCompatibleWithEntriesWithoutRoleEpoch(t *testing.T) {
 	}
 }
 
-func TestReplay_SeedsEpochFromCurrentAfterSnapshot(t *testing.T) {
+// TestReplay_NoClaimInWindowKeepsEarlierEpochs: a checkpoint left no claim
+// in the window and CURRENT names a later writer. The epoch-1 entry was
+// committed before that writer took over, so it is applied.
+func TestReplay_NoClaimInWindowKeepsEarlierEpochs(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
 
 	ms := NewStore(store)
 	backend := NewBlobStoreBackend(store)
-
-	// Scenario: Simulating snapshotting that truncated logs.
-	// CURRENT has WriterFence.Epoch=2, but the fence-claim log for epoch=2 is gone.
-	// A stale entry (epoch=1) appears in the remaining logs and should be filtered.
 
 	current := &Current{
 		LogSeqStart: 10,
@@ -673,7 +672,7 @@ func TestReplay_SeedsEpochFromCurrentAfterSnapshot(t *testing.T) {
 			Role:    FenceRoleWriter,
 			Epoch:   1,
 			Op:      LogOpAddSSTable,
-			SSTable: &SSTMeta{ID: "stale-after-snapshot.sst", Epoch: 1, Level: 0},
+			SSTable: &SSTMeta{ID: "before-takeover.sst", Epoch: 1, Level: 0},
 		},
 		{
 			ID:      ksuid.New(),
@@ -692,20 +691,14 @@ func TestReplay_SeedsEpochFromCurrentAfterSnapshot(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	if len(manifest.L0SSTs) != 1 {
-		t.Fatalf("expected 1 L0 SST, got %d: %+v", len(manifest.L0SSTs), manifest.L0SSTs)
-	}
-	if manifest.L0SSTs[0].ID != "valid-epoch2.sst" {
-		t.Errorf("expected valid-epoch2.sst, got %s", manifest.L0SSTs[0].ID)
-	}
-
-	for _, sst := range manifest.L0SSTs {
-		if sst.ID == "stale-after-snapshot.sst" {
-			t.Error("stale-after-snapshot.sst should have been filtered out")
-		}
+	if len(manifest.L0SSTs) != 2 || manifest.LookupSST("before-takeover.sst") == nil || manifest.LookupSST("valid-epoch2.sst") == nil {
+		t.Fatalf("expected both SSTs, got %+v", manifest.L0SSTs)
 	}
 }
 
+// TestReplay_IgnoresLowerEpochFenceClaim: a claim for a lower epoch after a
+// higher one does not move the active epoch back, so entries below the
+// higher epoch after it stay filtered.
 func TestReplay_IgnoresLowerEpochFenceClaim(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
@@ -714,21 +707,11 @@ func TestReplay_IgnoresLowerEpochFenceClaim(t *testing.T) {
 	ms := NewStore(store)
 	backend := NewBlobStoreBackend(store)
 
-	// Scenario: Writer B claims epoch=5, updates CURRENT, but crashes before writing
-	// its fence-claim log. Writer A's fence-claim log with epoch=3 still exists.
-	// On replay:
-	// 1. CURRENT seeds activeWriterEpoch=5
-	// 2. Processing epoch=3 fence-claim should NOT downgrade to 3
-	// 3. Entries with epoch=4 should still be filtered as stale
-
 	current := &Current{
 		LogSeqStart: 0,
-		NextSeq:     3,
+		NextSeq:     4,
 		NextEpoch:   6,
-		WriterFence: &FenceToken{
-			Epoch: 5,
-			Owner: "writer-B",
-		},
+		WriterFence: &FenceToken{Epoch: 5, Owner: "writer-B"},
 	}
 	currentData, err := EncodeCurrent(current)
 	if err != nil {
@@ -737,61 +720,31 @@ func TestReplay_IgnoresLowerEpochFenceClaim(t *testing.T) {
 	if _, err := backend.WriteCurrentCAS(ctx, currentData, ""); err != nil {
 		t.Fatalf("write current: %v", err)
 	}
-
-	entries := []*ManifestLogEntry{
-		{
-			ID:    ksuid.New(),
-			Seq:   0,
-			Role:  FenceRoleWriter,
-			Epoch: 3,
-			Op:    LogOpFenceClaim,
-			FenceClaim: &FenceClaimPayload{
-				Role:      FenceRoleWriter,
-				Epoch:     3,
-				Owner:     "writer-A",
-				ClaimedAt: time.Now(),
-			},
-		},
-		{
-			ID:      ksuid.New(),
-			Seq:     1,
-			Role:    FenceRoleWriter,
-			Epoch:   4,
-			Op:      LogOpAddSSTable,
-			SSTable: &SSTMeta{ID: "stale-epoch4.sst", Epoch: 4, Level: 0},
-		},
-		{
-			ID:      ksuid.New(),
-			Seq:     2,
-			Role:    FenceRoleWriter,
-			Epoch:   5,
-			Op:      LogOpAddSSTable,
-			SSTable: &SSTMeta{ID: "valid-epoch5.sst", Epoch: 5, Level: 0},
-		},
+	claim := func(seq, epoch uint64, owner string) *ManifestLogEntry {
+		return &ManifestLogEntry{ID: ksuid.New(), Seq: seq, Role: FenceRoleWriter, Epoch: epoch, Op: LogOpFenceClaim,
+			FenceClaim: &FenceClaimPayload{Role: FenceRoleWriter, Epoch: epoch, Owner: owner, ClaimedAt: time.Now()}}
 	}
-
-	commitEntriesForTest(t, ctx, backend, entries)
+	commitEntriesForTest(t, ctx, backend, []*ManifestLogEntry{
+		claim(0, 5, "writer-B"),
+		claim(1, 3, "writer-A"),
+		{ID: ksuid.New(), Seq: 2, Role: FenceRoleWriter, Epoch: 4, Op: LogOpAddSSTable,
+			SSTable: &SSTMeta{ID: "stale-epoch4.sst", Epoch: 4, Level: 0}},
+		{ID: ksuid.New(), Seq: 3, Role: FenceRoleWriter, Epoch: 5, Op: LogOpAddSSTable,
+			SSTable: &SSTMeta{ID: "valid-epoch5.sst", Epoch: 5, Level: 0}},
+	})
 
 	manifest, err := ms.Replay(ctx)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-
-	if len(manifest.L0SSTs) != 1 {
-		t.Fatalf("expected 1 L0 SST, got %d: %+v", len(manifest.L0SSTs), manifest.L0SSTs)
-	}
-	if manifest.L0SSTs[0].ID != "valid-epoch5.sst" {
-		t.Errorf("expected valid-epoch5.sst, got %s", manifest.L0SSTs[0].ID)
-	}
-
-	for _, sst := range manifest.L0SSTs {
-		if sst.ID == "stale-epoch4.sst" {
-			t.Error("stale-epoch4.sst should have been filtered (epoch 4 < 5)")
-		}
+	if len(manifest.L0SSTs) != 1 || manifest.L0SSTs[0].ID != "valid-epoch5.sst" {
+		t.Fatalf("expected only valid-epoch5.sst, got %+v", manifest.L0SSTs)
 	}
 }
 
-func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
+// TestReplay_NoClaimInWindowKeepsEarlierCompactorEpochs is the compactor's
+// version of TestReplay_NoClaimInWindowKeepsEarlierEpochs.
+func TestReplay_NoClaimInWindowKeepsEarlierCompactorEpochs(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("test")
 	defer store.Close()
@@ -826,7 +779,7 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 			Compaction: &CompactionLogPayload{
 				RemoveSSTableIDs: []string{"stale-input"},
 				DestinationLevel: 1,
-				AddSSTables:      []SSTMeta{{ID: "stale-compacted.sst", Epoch: 2, Level: 1}},
+				AddSSTables:      []SSTMeta{{ID: "before-takeover.sst", Epoch: 2, Level: 1, MinKey: []byte("a"), MaxKey: []byte("b")}},
 			},
 		},
 		{
@@ -838,7 +791,7 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 			Compaction: &CompactionLogPayload{
 				RemoveSSTableIDs: []string{"valid-input"},
 				DestinationLevel: 1,
-				AddSSTables:      []SSTMeta{{ID: "valid-compacted.sst", Epoch: 3, Level: 1}},
+				AddSSTables:      []SSTMeta{{ID: "valid-compacted.sst", Epoch: 3, Level: 1, MinKey: []byte("c"), MaxKey: []byte("d")}},
 			},
 		},
 	}
@@ -850,11 +803,8 @@ func TestReplay_SeedsCompactorEpochFromCurrentAfterSnapshot(t *testing.T) {
 		t.Fatalf("replay: %v", err)
 	}
 
-	if len(manifest.Levels) != 1 {
-		t.Fatalf("expected 1 level, got %d", len(manifest.Levels))
-	}
-	if manifest.Levels[0].SSTs[0].ID != "valid-compacted.sst" {
-		t.Errorf("expected valid-compacted.sst, got %s", manifest.Levels[0].SSTs[0].ID)
+	if manifest.LookupSST("before-takeover.sst") == nil || manifest.LookupSST("valid-compacted.sst") == nil {
+		t.Fatalf("expected both compacted SSTs, got %+v", manifest.Levels)
 	}
 }
 

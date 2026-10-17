@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/segmentio/ksuid"
 )
 
 const MaintenanceHeadLayoutVersion = 2
@@ -699,26 +697,12 @@ func validateCheckpointSnapshotFence(role string, fence *FenceToken, nextEpoch u
 }
 
 func (s *Store) appendWriterOwnedMaintenanceEntry(ctx context.Context, current *Current, entry *ManifestLogEntry) error {
-	if len(current.ActiveEntries) >= s.activeLimit() {
-		if err := s.rotateActiveEntries(ctx, current); err != nil {
-			return err
-		}
-	}
-	entry.ID = ksuid.New()
-	entry.Seq = current.NextSeq
 	entry.Role = FenceRoleWriter
 	entry.Epoch = current.WriterFence.Epoch
-	entry.Timestamp = time.Now().UTC()
 	if err := validateRetiredObjects(entry); err != nil {
 		return err
 	}
-	if current.LogSeqStart == current.NextSeq {
-		current.LogSeqStart = entry.Seq
-	}
-	current.ActiveEntries = append(current.ActiveEntries, *entry)
-	current.NextSeq = entry.Seq + 1
-	current.NextEpoch = nextEpochFromEntry(current.NextEpoch, entry)
-	return nil
+	return s.placeEntry(ctx, current, entry)
 }
 
 func receiptMatchesCommand(receipt *MaintenanceReceipt, command *MaintenanceCommand) bool {

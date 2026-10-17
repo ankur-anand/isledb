@@ -335,7 +335,7 @@ func TestDBOnFlushErrorCanCloseWriter(t *testing.T) {
 	rootCause := errors.New("injected background publish failure")
 	storage := &failOnceStorage{
 		Storage:     manifest.NewBlobStoreBackend(store),
-		failOnWrite: 3,
+		failOnWrite: 2,
 		failErr:     rootCause,
 	}
 	db, err := openDB(ctx, store, dbOpenOptions{manifestStorage: storage})
