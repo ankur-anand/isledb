@@ -260,6 +260,12 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, 
 		switch role {
 		case FenceRoleWriter:
 			s.writerFence = newFence
+			// A new session: what the last one saw replace it, and its
+			// uncertain commit, which this claim's BaseSeq accounts for, are
+			// not this one's.
+			s.successorWriterFence = nil
+			s.successorNextSeq = 0
+			s.pendingWriterCommit = nil
 		case FenceRoleCompactor:
 			s.compactorFence = newFence
 		}
