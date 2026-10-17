@@ -294,7 +294,7 @@ isledb writer \
 
 ```bash
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  --data '{"name":"a"}' 'http://isledb-writer:8070/v1/kv/user%2F42?ttl=24h'
+  --data '{"name":"a"}' 'http://isledb-writer:8070/v1/kv/user/42?ttl=24h'
 # {"write_id":"1.1","revision":"2"}
 ```
 
@@ -302,6 +302,33 @@ A write is answered once it is durable in object storage; batches of puts and
 deletes go to `POST /v1/kv` and apply atomically. Run one writer per
 database. See [Running `isledb writer`](docs/isledb-writer.md) and the
 [writer HTTP API](docs/writer-api.md).
+
+## Reader service
+
+`isledb reader` serves reads over HTTP. Replicas share nothing, so you scale
+reads by adding them behind a load balancer:
+
+```bash
+isledb reader \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts \
+  --cache-dir /var/cache/isledb \
+  --auth-token-file /etc/isledb/tokens
+```
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" 'http://isledb-reader:8080/v1/kv/user/42'
+# {"name":"a"}
+curl -H "Authorization: Bearer $TOKEN" 'http://isledb-reader:8080/v1/kv?prefix=user/'
+# {"items":[{"key":"user/42","value":"{\"name\":\"a\"}"}]}
+```
+
+The paths match the writer's, so one gateway can route `GET` to readers and
+writes to the writer. A read is usually within a second of the writer (about
+two on Google Cloud Storage), and its `Isledb-Revision` header says which
+writes it includes. See
+[Running `isledb reader`](docs/isledb-reader.md) and the
+[reader HTTP API](docs/reader-api.md).
 
 ## When IsleDB fits
 
@@ -324,9 +351,12 @@ Choose a different database when you need:
 
 - [Go API guide](api.md)
 - [Go package reference](https://pkg.go.dev/github.com/ankur-anand/isledb)
+- [Choosing and setting up object storage](docs/object-store-guide.md)
+- [Cost approximation](docs/cost-approximation.md)
 - [Object-store layout and operations](docs/object-store-schema.md)
 - [Running the shared read cache](docs/isledb-cache.md)
 - [Running the writer service](docs/isledb-writer.md) and its [HTTP API](docs/writer-api.md)
+- [Running the reader service](docs/isledb-reader.md) and its [HTTP API](docs/reader-api.md)
 - [Local quickstart](examples/quickstart)
 - [Separate writer, reader, and maintenance services with MinIO](examples/minio-services)
 - [Restartable change-feed consumer with Azurite](examples/changefeed-azurite)

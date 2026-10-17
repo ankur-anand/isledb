@@ -48,7 +48,7 @@ cache:
 
   reads:
     max_bytes: 256MiB
-    max_wait: 2m
+    max_wait: 5s
 
   current:
     poll: 500ms
@@ -101,7 +101,7 @@ listener off.
 | `cache.disk.dir` | `--disk-dir` | `ISLEDB_CACHE_DISK_DIR` | required | Chunk directory, on local disk |
 | `cache.disk.bytes` | `--disk-bytes` | `ISLEDB_CACHE_DISK_BYTES` | required | Disk budget |
 | `cache.reads.max_bytes` | `--max-read-bytes` | `ISLEDB_CACHE_READS_MAX_BYTES` | `256MiB` | Bytes read from storage at once; at least `4MiB` |
-| `cache.reads.max_wait` | `--max-read-wait` | `ISLEDB_CACHE_READS_MAX_WAIT` | `2m` | Longest a storage read waits for budget |
+| `cache.reads.max_wait` | `--max-read-wait` | `ISLEDB_CACHE_READS_MAX_WAIT` | `5s` | Longest a storage read waits for budget. About half the readers' timeout to the cache. |
 | `cache.current.poll` | `--current-poll` | `ISLEDB_CACHE_CURRENT_POLL` | `500ms` | How often `CURRENT` is read |
 | `cache.current.long_poll` | `--long-poll` | `ISLEDB_CACHE_CURRENT_LONG_POLL` | `30s` | Longest a long poll is held, at most `30s` |
 | `cache.auth.token_file` | `--auth-token-file` | `ISLEDB_CACHE_AUTH_TOKEN_FILE` | | Bearer tokens, one per line |
@@ -124,7 +124,9 @@ The cache refuses to start without authentication unless `cache.auth.insecure` i
   new file cannot be read or holds no tokens, the tokens in use stay.
 - **Client certificates.** With `cache.tls.client_ca`, clients must present a
   certificate it signed. With both tokens and client certificates set, both
-  are required.
+  are required. An `isledb reader` presents one with `read_cache.cert` and
+  `read_cache.key`, and trusts a cache certificate from a private CA with
+  `read_cache.ca_file`.
 
 Each database is served only its own objects: those right under its prefix,
 not those of a database nested under it (`prod/a/b` under `prod/a`), and,
@@ -189,8 +191,11 @@ Chunks on disk are kept. After a restart, requests carrying
   chunk store locks it.
 - **Timeouts in front of the cache.** Load balancers and proxies must allow
   idle connections longer than `cache.current.long_poll`, or they cut long polls
-  off. Readers' own timeout to the cache should be about `cache.reads.max_wait`
-  or less; set `cache.reads.max_wait` near the readers' timeout plus a margin.
+  off. An `isledb reader` waits up to 10 seconds for the cache, then reads
+  storage itself. `cache.reads.max_wait`, 5 seconds by default, is about half
+  that, so a read that waited for its turn still has time to fetch and
+  answer. Raise it only for clients that wait longer, to about half their
+  timeout.
 - **Several replicas.** Round-robin works: each replica relays `CURRENT` on
   its own, and readers treat a copy behind their view as nothing new. Each
   replica then caches every hot chunk. Hashing object requests by path at

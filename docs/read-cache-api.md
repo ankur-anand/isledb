@@ -218,14 +218,12 @@ alone.
   disconnects does not fail others waiting on the same chunks.
 - Storage reads in progress are capped in bytes (`MaxReadBytes`, default
   256 MiB). Past the cap, a read waits its turn, in arrival order, for at most
-  `MaxReadWait` (default 2 minutes), and then fails with 502. The wait does
-  not shorten the storage request's own 30-second timeout. A busy cache
-  therefore answers late rather than failing: a reader's timeout to the cache
-  should be as long as the delay it accepts before reading storage itself.
-  Set `MaxReadWait` near that timeout plus a margin: a queued read keeps its
-  place after its reader gives up, so a wait much longer than the readers'
-  timeout spends budget on fetches whose requesters have left, ahead of
-  requests still waiting.
+  `MaxReadWait` (default 5 seconds), and then fails with 502. The wait does
+  not shorten the storage request's own 30-second timeout. Set `MaxReadWait`
+  to about half the readers' timeout to the cache (10 seconds by default), so
+  a read that gets its turn still has time to fetch and answer: a queued read
+  keeps its place after its reader gives up, so a longer wait spends budget
+  on fetches whose requesters have left, ahead of requests still waiting.
   Hits are never queued.
 - A response is sent 4 MiB at a time. The status and headers are sent once
   the first 4 MiB are in hand, so an error there gets its own status. A

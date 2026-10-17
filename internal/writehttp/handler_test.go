@@ -188,7 +188,13 @@ func TestKeysAreTakenAsSent(t *testing.T) {
 			t.Fatalf("PUT %q: %d %v", key, r.status, r.body)
 		}
 	}
+	if r := do(t, f.server, http.MethodPut, "/v1/kv/user/42", []byte("raw")); r.status != http.StatusOK {
+		t.Fatalf("PUT with an unencoded slash: %d %v", r.status, r.body)
+	}
 	reader := f.reader(t)
+	if v, ok, err := reader.Get(f.ctx, []byte("user/42")); err != nil || !ok || string(v) != "raw" {
+		t.Fatalf("key user/42: %q %t %v, want raw", v, ok, err)
+	}
 	for i, key := range keys {
 		want := fmt.Sprint(i)
 		if i == 0 {

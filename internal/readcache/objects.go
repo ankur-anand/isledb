@@ -34,7 +34,7 @@ var fetchTimeout = 30 * time.Second
 // Defaults of ObjectsOptions fields left zero.
 const (
 	DefaultMaxReadBytes int64 = 256 << 20
-	DefaultMaxReadWait        = 2 * time.Minute
+	DefaultMaxReadWait        = 5 * time.Second
 )
 
 // ObjectsOptions configures Objects.
@@ -47,11 +47,12 @@ type ObjectsOptions struct {
 	MaxReadBytes int64
 	// MaxReadWait caps how long a storage read waits for MaxReadBytes; past
 	// it the read fails, and with it every request waiting on its chunks.
-	// The wait does not count against the storage request's own timeout, so
-	// a busy cache answers later rather than failing. A reader's timeout to
-	// the cache should allow for it. Set it near the readers' timeout plus a
-	// margin: a wait much longer than the readers' timeout spends budget on
-	// fetches whose requesters have left. Zero means DefaultMaxReadWait.
+	// The wait does not count against the storage request's own timeout.
+	// Set it to about half the readers' timeout to the cache, 10 seconds by
+	// default, so a read that gets its turn still has time to fetch and
+	// answer: a queued read keeps its place after its reader gives up, so a
+	// longer wait spends budget on fetches whose requesters have left, ahead
+	// of requests still waiting. Zero means DefaultMaxReadWait.
 	MaxReadWait time.Duration
 }
 
