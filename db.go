@@ -395,6 +395,8 @@ type DB struct {
 	maintenanceWake chan struct{}
 	storePolicy     StorePolicy
 	sstOutput       SSTOutputOptions
+	// changeFeedPayload, if set, is the feed OpenWriter turns on.
+	changeFeedPayload manifest.ChangeFeedPayload
 
 	mu              sync.Mutex
 	closers         []dbCloser
@@ -459,16 +461,24 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		return nil, err
 	}
 	if opts.changeFeedPayload != "" {
-		if err := manifestStore.EnableChangeFeed(ctx, opts.changeFeedPayload); err != nil {
+		// Only a writer turns the feed on, in OpenWriter; here a feed that
+		// is already on must have the payload asked for.
+		view, err := manifestStore.LoadChangeFeedView(ctx)
+		if err != nil {
 			return nil, err
+		}
+		if view.Enabled() && view.Payload() != opts.changeFeedPayload {
+			return nil, fmt.Errorf("%w: configured=%q requested=%q",
+				ErrChangeFeedPayloadMismatch, view.Payload(), opts.changeFeedPayload)
 		}
 	}
 	return &DB{
-		store:           store,
-		manifestStore:   manifestStore,
-		maintenanceWake: make(chan struct{}, 1),
-		storePolicy:     storePolicy,
-		sstOutput:       sstOutput,
+		store:             store,
+		manifestStore:     manifestStore,
+		maintenanceWake:   make(chan struct{}, 1),
+		storePolicy:       storePolicy,
+		sstOutput:         sstOutput,
+		changeFeedPayload: opts.changeFeedPayload,
 	}, nil
 }
 
@@ -479,11 +489,6 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		return nil, err
 	}
 
-	changeFeedView, err := db.manifestStore.LoadChangeFeedView(ctx)
-	if err != nil {
-		db.releaseWriter(nil)
-		return nil, err
-	}
 	w, err := newWriterWithMaintenanceWake(
 		ctx,
 		db.store,
@@ -494,6 +499,20 @@ func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, erro
 		db.sstOutput.L0,
 	)
 	if err != nil {
+		db.releaseWriter(nil)
+		return nil, err
+	}
+	// The writer holds the fence now: it turns the feed on if asked, then
+	// follows whatever feed the database has, before taking any write.
+	if db.changeFeedPayload != "" {
+		err = db.manifestStore.EnableChangeFeed(ctx, db.changeFeedPayload)
+	}
+	var changeFeedView *manifest.ChangeFeedView
+	if err == nil {
+		changeFeedView, err = db.manifestStore.LoadChangeFeedView(ctx)
+	}
+	if err != nil {
+		_ = w.close(ctx)
 		db.releaseWriter(nil)
 		return nil, err
 	}
