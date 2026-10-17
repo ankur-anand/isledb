@@ -474,6 +474,11 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
 			return err
 		}
+		// The fence first: a replaced writer must learn it is fenced, not
+		// that its commit lacks what the new writer's feed needs.
+		if err := s.checkFenceWithCurrent(role, current); err != nil {
+			return err
+		}
 		if role == FenceRoleWriter && current.ChangeFeedEnabled && entry.Op == LogOpAddSSTable {
 			if entry.ChangeBatch == nil {
 				return ErrChangeFeedRequired
@@ -482,10 +487,6 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 				return fmt.Errorf("%w: batch=%q configured=%q",
 					ErrChangeFeedPayloadMismatch, entry.ChangeBatch.Payload, current.ChangeFeedPayload)
 			}
-		}
-
-		if err := s.checkFenceWithCurrent(role, current); err != nil {
-			return err
 		}
 		if err := s.admitL0Merge(ctx, current, entry); err != nil {
 			if errors.Is(err, errL0MergeDoesNotFit) {
@@ -1522,6 +1523,10 @@ func (s *Store) ListEntries(ctx context.Context) ([]uint64, error) {
 // EnableChangeFeed permanently enables change batches with one payload policy
 // for subsequent writer commits. Existing history is excluded by advancing
 // the retained floor to the current manifest head.
+// EnableChangeFeed turns the change feed on with payload, or confirms it is
+// on with it. Only the writer may turn it on: every commit after must carry
+// its changes, which only a writer that turned the feed on before buffering
+// records.
 func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload) error {
 	if !payload.Valid() {
 		return fmt.Errorf("%w: %q", ErrInvalidChangeFeedPayload, payload)
@@ -1547,6 +1552,9 @@ func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload)
 					ErrChangeFeedPayloadMismatch, current.ChangeFeedPayload, payload)
 			}
 			return nil
+		}
+		if err := s.checkFenceWithCurrent(FenceRoleWriter, current); err != nil {
+			return err
 		}
 
 		updated := current.Clone()

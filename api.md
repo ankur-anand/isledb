@@ -1028,7 +1028,8 @@ for {
 
 ## Change feed
 
-The change feed is optional. Turn it on when opening the database:
+The change feed is optional. Open the database with it, then open the
+writer: the writer turns it on.
 
 ```go
 db, err := isledb.Open(ctx, bucketURL, isledb.DBOptions{
@@ -1056,10 +1057,16 @@ type ChangeFeedOptions struct {
   suits invalidation and "fetch the current value" consumers.
 - `ChangeFeedFullValues` also records PUT values, for replaying history.
 
-The payload mode is stored when the feed is enabled and cannot change.
+Only a writer turns the feed on: `OpenWriter`, on a `DB` opened with
+`ChangeFeed`, turns it on once it holds the database, before it takes any
+write. Opening a `DB` with `ChangeFeed` and no writer, for a reader, a change
+reader or maintenance, only checks the mode; it doesn't turn the feed on, so a
+running writer without the feed keeps committing.
+
+The payload mode is stored when the feed is turned on and cannot change.
 Reopening with a different mode returns `ErrChangeFeedPayloadMismatch`;
-reopening with `ChangeFeed == nil` adopts the stored mode. Enabling the feed
-on an existing database starts it at the current head; older history is not
+reopening with `ChangeFeed == nil` adopts the stored mode. Turning the feed on
+for an existing database starts it at the current head; older history is not
 added.
 
 ### Types

@@ -425,6 +425,7 @@ func TestMaintenanceStagesShareOneMailboxClaim(t *testing.T) {
 		t.Fatalf("OpenDB: %v", err)
 	}
 	defer db.Close()
+	turnFeedOn(t, ctx, db)
 
 	opts := DefaultMaintenanceOptions()
 	opts.ChangeFeedRetention = &changeFeed
@@ -651,6 +652,7 @@ func TestStaleMaintenanceCannotRunChangeFeedCleanup(t *testing.T) {
 		t.Fatalf("OpenDB(first): %v", err)
 	}
 	defer firstDB.Close()
+	turnFeedOn(t, ctx, firstDB)
 	secondDB, err := openDB(ctx, store, dbOpenOptions{})
 	if err != nil {
 		t.Fatalf("OpenDB(second): %v", err)

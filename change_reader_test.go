@@ -628,6 +628,19 @@ func TestChangeReaderMissingContinuationRefreshesToExpiredCursor(t *testing.T) {
 	}
 }
 
+// turnFeedOn opens and closes a writer on db: only a writer turns on the
+// change feed its DB was opened with.
+func turnFeedOn(t *testing.T, ctx context.Context, db *DB) {
+	t.Helper()
+	writer, err := db.OpenWriter(ctx, testChangeWriterOptions())
+	if err != nil {
+		t.Fatalf("open writer to turn the feed on: %v", err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+}
+
 func TestChangeFeedEnablementPersistsAcrossDBInstances(t *testing.T) {
 	ctx := context.Background()
 	bucket := memblob.OpenBucket(nil)
@@ -640,6 +653,7 @@ func TestChangeFeedEnablementPersistsAcrossDBInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first DB: %v", err)
 	}
+	turnFeedOn(t, ctx, first)
 	if err := first.Close(); err != nil {
 		t.Fatalf("close first DB: %v", err)
 	}
@@ -692,6 +706,7 @@ func TestChangeFeedRetentionMaintenanceConfigurationIsPublicAndCopied(t *testing
 		t.Fatalf("open DB: %v", err)
 	}
 	defer db.Close()
+	turnFeedOn(t, ctx, db)
 
 	retention := ChangeFeedRetentionOptions{}
 	opts := DefaultMaintenanceOptions()
@@ -849,6 +864,7 @@ func TestChangeFeedPayloadConfigurationIsExplicitAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enable keys-only feed: %v", err)
 	}
+	turnFeedOn(t, ctx, first)
 	if err := first.Close(); err != nil {
 		t.Fatalf("close first DB: %v", err)
 	}
@@ -1120,9 +1136,13 @@ func TestChangeReaderDecodedBlockCacheIsBounded(t *testing.T) {
 	}
 }
 
-func TestChangeFeedEnablementFencesCommitWithoutBatch(t *testing.T) {
+// TestChangeFeedIsTurnedOnOnlyByAWriter: opening a DB with a feed from
+// another process does not turn it on under a running writer without one,
+// which could then never commit. A writer with the feed takes over and turns
+// it on; the old writer is fenced, and the new one commits its changes.
+func TestChangeFeedIsTurnedOnOnlyByAWriter(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("change-feed-required")
+	store := blobstore.NewMemory("change-feed-writer-only")
 	defer store.Close()
 
 	oldDB, err := openDB(ctx, store, dbOpenOptions{})
@@ -1130,24 +1150,54 @@ func TestChangeFeedEnablementFencesCommitWithoutBatch(t *testing.T) {
 		t.Fatalf("open old DB: %v", err)
 	}
 	defer oldDB.Close()
-	writer, err := oldDB.OpenWriter(ctx, testChangeWriterOptions())
+	old, err := oldDB.OpenWriter(ctx, testChangeWriterOptions())
 	if err != nil {
 		t.Fatalf("open old writer: %v", err)
 	}
-	defer writer.Close(ctx)
-	if _, err := writer.Put(ctx, []byte("before-enable"), []byte("value")); err != nil {
-		t.Fatalf("put before enable: %v", err)
+	defer old.Close(ctx)
+	if _, err := old.Put(ctx, []byte("before"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
 
-	newDB, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
+	feedDB, err := openDB(ctx, store, dbOpenOptions{changeFeedPayload: manifest.ChangeFeedPayloadFullValues})
 	if err != nil {
-		t.Fatalf("enable feed from second DB: %v", err)
+		t.Fatalf("open DB with a feed: %v", err)
 	}
-	defer newDB.Close()
+	defer feedDB.Close()
+	if err := old.Flush(ctx); err != nil {
+		t.Fatalf("the running writer could not commit after another DB opened with a feed: %v", err)
+	}
+	if _, err := feedDB.OpenChangeReader(ctx); !errors.Is(err, ErrChangeFeedDisabled) {
+		t.Fatalf("change reader before any writer turned the feed on: %v, want %v", err, ErrChangeFeedDisabled)
+	}
 
-	err = writer.Flush(ctx)
-	if !errors.Is(err, manifest.ErrChangeFeedRequired) {
-		t.Fatalf("flush error=%v want=%v", err, manifest.ErrChangeFeedRequired)
+	writer, err := feedDB.OpenWriter(ctx, testChangeWriterOptions())
+	if err != nil {
+		t.Fatalf("open writer with the feed: %v", err)
+	}
+	defer writer.Close(ctx)
+	if _, err := old.Put(ctx, []byte("late"), []byte("v")); err == nil {
+		if err := old.Flush(ctx); !errors.Is(err, ErrFenced) {
+			t.Fatalf("old writer flush after the takeover: %v, want %v", err, ErrFenced)
+		}
+	}
+	if _, err := writer.Put(ctx, []byte("after"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("flush with the feed: %v", err)
+	}
+	reader, err := feedDB.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatalf("open change reader: %v", err)
+	}
+	defer reader.Close()
+	page, err := reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(page.Changes) != 1 || string(page.Changes[0].Key) != "after" {
+		t.Fatalf("changes %+v, want only after", page.Changes)
 	}
 }
 
@@ -1170,6 +1220,7 @@ func TestChangeReaderLifecycleAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open enabled DB: %v", err)
 	}
+	turnFeedOn(t, ctx, enabled)
 	first, err := enabled.OpenChangeReader(ctx)
 	if err != nil {
 		t.Fatalf("open first change reader: %v", err)

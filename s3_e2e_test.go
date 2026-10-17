@@ -441,16 +441,14 @@ func runChangeFeedRetentionE2E(t testing.TB, ctx context.Context, store *blobsto
 	t.Helper()
 
 	db, err := openDB(ctx, store, dbOpenOptions{
-		sstOutput:   testSSTOutput("none", 4096),
-		storePolicy: StorePolicy{MaxPinnedViewAge: time.Second},
+		sstOutput:         testSSTOutput("none", 4096),
+		storePolicy:       StorePolicy{MaxPinnedViewAge: time.Second},
+		changeFeedPayload: manifest.ChangeFeedPayloadFullValues, // the writer below turns it on
 	})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	if err := db.manifestStore.EnableChangeFeed(ctx, manifest.ChangeFeedPayloadFullValues); err != nil {
-		t.Fatalf("enable change feed: %v", err)
-	}
 
 	writerOpts := DefaultWriterOptions()
 	writerOpts.OwnerID = "change-feed-e2e-writer"
