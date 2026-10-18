@@ -893,7 +893,7 @@ for one.
 |---|---|
 | Refreshes succeed | The view is never older than `RefreshAfter`. |
 | A refresh fails, or takes over 30 seconds | Reads keep using the loaded view, and count in `stale_reads_total`. The next refresh is tried about 30 seconds later (15 to 45, or `RefreshAfter` if that is shorter). A warning is logged at most once a minute, and an info line when refreshes recover. |
-| The view is older than `MaxPinnedViewAge` | A read waits for a refresh and fails if it fails. Background refreshes keep trying, so reads work again as soon as storage answers. |
+| The view is older than `MaxPinnedViewAge` | A read waits for a refresh and fails if it fails, or with `ErrReadViewExpired` if storage's `CURRENT` is behind the view. Background refreshes keep trying, so reads work again as soon as storage answers. |
 
 So during an outage reads can be up to `MaxPinnedViewAge` old, and they stay
 correct: every SST a view names is kept until the view expires.

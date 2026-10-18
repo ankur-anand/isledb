@@ -28,6 +28,10 @@ type fakeRelay struct {
 	// below zero answers at once.
 	hold      time.Duration
 	longPolls atomic.Int64
+	// blocked, when set, holds each CURRENT read until it is closed, after
+	// sending on entered.
+	blocked chan struct{}
+	entered chan struct{}
 }
 
 func (f *fakeRelay) set(t *testing.T, data []byte, age time.Duration) {
@@ -81,6 +85,17 @@ func (f *fakeRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(readcache.HeaderAgeMillis, strconv.FormatInt(f.age.Milliseconds(), 10))
 		f.mu.Unlock()
 		return
+	}
+	f.mu.Lock()
+	blocked, entered := f.blocked, f.entered
+	f.mu.Unlock()
+	if blocked != nil {
+		entered <- struct{}{}
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+			return
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -381,5 +396,65 @@ func TestRefreshesContinueWhenTheCacheCopyIsNoNewer(t *testing.T) {
 	time.Sleep(3500 * time.Millisecond)
 	if n := relayed() - before; n < 2 || n > 5 {
 		t.Fatalf("%v refreshes through the cache in 3.5s at one a second, want 2 to 5", n)
+	}
+}
+
+// TestExpiredViewReadsStorageWhenTheCacheCopyIsNoNewer: the view has
+// expired, the cache's copy of CURRENT is the view's own, and storage has a
+// newer one. The refresh through the cache renews nothing, so the read reads
+// CURRENT from storage and succeeds with the newer data.
+func TestExpiredViewReadsStorageWhenTheCacheCopyIsNoNewer(t *testing.T) {
+	f := newRelayFixture(t)
+	viewCurrent := f.storageCurrent(t)
+	f.commit(t, "b") // only storage has it
+	// The view's own CURRENT, dated before the view was loaded: a refresh
+	// through the cache takes it and publishes nothing.
+	f.relay.set(t, viewCurrent, 4*time.Second)
+	f.reader.mu.Lock()
+	f.reader.viewExpiresAt = time.Now().Add(-time.Second)
+	f.reader.mu.Unlock()
+	before := f.outcome("relayed")
+
+	// Only storage's CURRENT holds b: finding it shows the read went there,
+	// after the refresh through the cache renewed nothing. (That refresh also
+	// re-arms the timer against the past expiry, so one more background
+	// refresh may run through the cache alongside.)
+	if _, found, err := f.reader.Get(f.ctx, []byte("b")); err != nil || !found {
+		t.Fatalf("Get(b) on an expired view: found %t, %v; want storage's newer view", found, err)
+	}
+	if f.outcome("relayed") == before {
+		t.Fatal("the refresh did not try the cache first")
+	}
+}
+
+// TestForcedRefreshDoesNotJoinALoadThroughTheCache: while a refresh through
+// the cache is held reading CURRENT, a forced Refresh reads storage on its
+// own and publishes the newer view, rather than waiting on that load.
+func TestForcedRefreshDoesNotJoinALoadThroughTheCache(t *testing.T) {
+	f := newRelayFixture(t)
+	f.commit(t, "b") // the relay still serves the CURRENT before it
+	release := make(chan struct{})
+	f.relay.mu.Lock()
+	f.relay.blocked, f.relay.entered = release, make(chan struct{}, 1)
+	entered := f.relay.entered
+	f.relay.mu.Unlock()
+	defer close(release)
+
+	f.reader.viewDue.Store(true)
+	go func() { _ = f.reader.refreshManifest(f.ctx, false) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresh through the cache never asked it")
+	}
+	// Below the fixture's 1s cache timeout, after which the held load would
+	// read storage itself: Refresh must not be waiting on it.
+	ctx, cancel := context.WithTimeout(f.ctx, 500*time.Millisecond)
+	defer cancel()
+	if err := f.reader.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh while a load through the cache is held: %v", err)
+	}
+	if _, found, err := f.reader.Get(f.ctx, []byte("b")); err != nil || !found {
+		t.Fatalf("Get(b) after Refresh: found %t, %v", found, err)
 	}
 }

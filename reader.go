@@ -300,6 +300,12 @@ func (r *Reader) startRequestedRefresh() {
 	r.refreshInBackground()
 }
 
+func (r *Reader) viewExpired() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return !time.Now().Before(r.viewExpiresAt)
+}
+
 // Refresh reloads and publishes the current manifest view.
 func (r *Reader) Refresh(ctx context.Context) (err error) {
 	done, err := r.beginRead()
@@ -312,16 +318,29 @@ func (r *Reader) Refresh(ctx context.Context) (err error) {
 
 // checkManifestView runs before every read. A view that has not expired is
 // used as is, since armViewTimer refreshes it; an expired one is refreshed
-// first, and the read fails if that refresh does.
+// first, and the read fails if that refresh does, or renews nothing.
 func (r *Reader) checkManifestView(ctx context.Context) error {
-	r.mu.RLock()
-	expired := !time.Now().Before(r.viewExpiresAt)
-	r.mu.RUnlock()
-	if expired {
+	if r.viewExpired() {
 		if r.publishHeldIfDue() {
 			return nil
 		}
-		return r.refreshManifest(ctx, false)
+		if err := r.refreshManifest(ctx, false); err != nil {
+			return err
+		}
+		if r.viewExpired() && r.fetcher.cache != nil {
+			// The refresh found nothing newer in a cache's copy no newer
+			// than the view: read CURRENT from storage. Without a cache the
+			// refresh already did.
+			if err := r.refreshManifest(ctx, true); err != nil {
+				return err
+			}
+		}
+		if r.viewExpired() {
+			// CURRENT is behind the view: storage went back. The view's
+			// SSTs may already be deleted, so it must not be read.
+			return ErrReadViewExpired
+		}
+		return nil
 	}
 	if r.stale.Load() {
 		r.metrics.ObserveStaleRead()
