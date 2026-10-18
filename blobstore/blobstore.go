@@ -424,6 +424,10 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 		}
 	}
 
+	// Cancelling the writer's context is what aborts it: Close alone
+	// stores whatever was copied before a failure.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	w, err := s.bucket.NewWriter(ctx, key, opts)
 	if err != nil {
 		return Attributes{}, s.mapError(err)
@@ -431,6 +435,7 @@ func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *
 
 	written, err := io.Copy(w, r)
 	if err != nil {
+		cancel()
 		_ = w.Close()
 		return Attributes{}, err
 	}

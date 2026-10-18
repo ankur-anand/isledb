@@ -878,3 +878,35 @@ func TestWriteIfMatchFallbackOneWinner(t *testing.T) {
 		etag = nextETag
 	}
 }
+
+// failAfterReader returns data, then fails, as a producer that broke partway.
+type failAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestWriteReaderStoresNothingWhenTheCopyFails: a source that fails partway
+// leaves no object, not one holding what was read before the failure.
+func TestWriteReaderStoresNothingWhenTheCopyFails(t *testing.T) {
+	forEachStore(t, "abort", func(t *testing.T, h storeHarness) {
+		ctx := context.Background()
+		key := h.store.SSTPath("partial.sst")
+		broken := errors.New("producer failed")
+		src := &failAfterReader{data: []byte(strings.Repeat("x", 64<<10)), err: broken}
+		if _, err := h.store.WriteReader(ctx, key, src, nil); !errors.Is(err, broken) {
+			t.Fatalf("WriteReader: %v, want the source's error", err)
+		}
+		if exists, err := h.store.Exists(ctx, key); err != nil || exists {
+			t.Fatalf("after a failed copy the object exists=%t (%v); want none", exists, err)
+		}
+	})
+}
