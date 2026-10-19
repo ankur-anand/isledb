@@ -23,6 +23,8 @@ demo/p000/
         <page-id>.page.zst
       ...
     gc/
+      sst/intents/
+        <intent-id>.json
       sst/plans/
         <plan-id>.json
       sst/ready/
@@ -104,9 +106,9 @@ layout_version: 2 or 3
 format: isledb-manifest-v2
 ```
 
-A database is created at layout 2 and moves to layout 3 when maintenance
-first merges small L0 files with each other. Releases that read only layout 2
-refuse a database from then on.
+A database is created at layout 2 and moves to layout 3 when small L0 files
+are first merged with each other. Releases that read only layout 2 refuse a
+database from then on.
 
 `MaxPinnedViewAge` is a persisted store policy. It defaults to one hour and
 defines how long an already-loaded reader view can remain usable. Later writers
@@ -192,8 +194,10 @@ self-describing and readable when compression or block-size settings change for
 new output.
 
 Compaction writes replacement SSTs before publishing the new topology through
-`CURRENT`. Replaced SSTs remain physically present until the pinned-view safety
-window has passed and maintenance deletes them.
+`CURRENT`. The writer does the same for its own recent L0 files, which it
+merges into one larger file every 64 MiB or five minutes. Replaced SSTs remain
+physically present until the pinned-view safety window has passed and
+maintenance deletes them.
 
 ## Change-feed objects
 
@@ -255,6 +259,7 @@ The JSON objects below `manifest/gc/` are durable deletion work, not user data
 and not temporary files:
 
 ```text
+manifest/gc/sst/intents/<intent-id>.json
 manifest/gc/sst/plans/<plan-id>.json
 manifest/gc/sst/ready/<not-before>-<plan-id>.json
 manifest/gc/change-feed/plans/<plan-id>.json
@@ -271,6 +276,15 @@ the first durable deadline instead of creating new work. The `ready/` record
 contains the same validated plan under a fixed-width UTC `NotBefore` prefix.
 Lexicographic listing therefore visits due plans first and stops before fetching
 the first future plan. Both records are removed after target deletion succeeds.
+Maintenance writes them for its compactions; the writer writes them for the
+L0 files its own merges replace.
+
+`sst/intents/` holds one record per L0 merge the writer has started: the
+files it is merging and the file it is writing. The writer marks the record
+settled once the merge is decided and its deletion plan exists. Maintenance
+removes settled records, and resolves records left by a writer that lost its
+fence by planning the deletion of whatever they name that the manifest no
+longer references.
 
 SST and change-feed plans contain bounded lists of exact deletion targets.
 Manifest-page plans contain a retained sequence floor and maximum page level,
@@ -316,8 +330,9 @@ those provider-owned versions or uploads separately.
 
 - Give normal readers GET access to manifest metadata, SSTs, and change batches.
 - Give the writer read and conditional-write access to `manifest/CURRENT`, read
-  access to `maintenance/HEAD`, and create access to SST, change-batch, and
-  manifest-page objects.
+  access to `maintenance/HEAD`, create access to SST, change-batch, and
+  manifest-page objects, and create and overwrite access below
+  `manifest/gc/sst/`.
 - Give maintenance read access to the database, conditional-write access to
   `maintenance/HEAD`, and the list, create, and delete permissions required by
   its configured compaction and reclamation work.
