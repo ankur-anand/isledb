@@ -2,22 +2,29 @@ package isledb
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
 
-// l0Planner builds an L0, given newest first by size, of SSTs that all span
-// key-000..key-100 and were written now, over an L1 of l1Bytes covering the
-// same keys.
+// mergedSSTID names an L0 file as the writer's merges and compaction outputs
+// are named.
+func mergedSSTID(i int) string {
+	return fmt.Sprintf("compacted-%064x-%04d.sst", i, 1)
+}
+
+// l0Planner builds an L0, given newest first by size, of merged SSTs that all
+// span key-000..key-100 and were written now, over an L1 of l1Bytes covering
+// the same keys.
 func l0Planner(t *testing.T, sizes []int64, l1Bytes int64) (*compactor, *manifestState) {
 	t.Helper()
 	c := plannerOnlyCompactor()
 	m := &manifestState{}
 	for i := len(sizes) - 1; i >= 0; i-- {
 		sst := plannerSST(0, 0, 100)
-		sst.ID = fmt.Sprintf("l0-%02d", i)
+		sst.ID = mergedSSTID(i)
 		sst.Size = sizes[i]
 		sst.SeqLo, sst.SeqHi = uint64(100-i)*10, uint64(100-i)*10+5
 		sst.CreatedAt = time.Now()
@@ -31,6 +38,17 @@ func l0Planner(t *testing.T, sizes []int64, l1Bytes int64) (*compactor, *manifes
 	return c, m
 }
 
+// rawFlush is one writer flush file, named by the writer's grammar, written
+// at createdAt.
+func rawFlush(i int, size int64, createdAt time.Time) sstMetadata {
+	sst := plannerSST(0, 0, 100)
+	sst.ID = buildSSTIDWithTimestamp(uint64(1000+i), uint64(2000+10*i), uint64(2000+10*i+5), createdAt)
+	sst.Size = size
+	sst.SeqLo, sst.SeqHi = uint64(2000+10*i), uint64(2000+10*i+5)
+	sst.CreatedAt = createdAt
+	return sst
+}
+
 func repeat(size int64, n int) []int64 {
 	out := make([]int64, n)
 	for i := range out {
@@ -39,50 +57,109 @@ func repeat(size int64, n int) []int64 {
 	return out
 }
 
-func TestL0PlannerMergesNewFilesWithEachOtherFirst(t *testing.T) {
-	c, m := l0Planner(t, repeat(25<<10, 8), 256<<20)
-	plan, err := plannedCandidateForLevel(c, m, 0)
-	if err != nil {
-		t.Fatal(err)
+func l0IDList(ssts []sstMetadata) string {
+	ids := make([]string, len(ssts))
+	for i, sst := range ssts {
+		ids[i] = sst.ID
 	}
-	if plan == nil || plan.destinationLevel != 0 {
-		t.Fatalf("plan %+v, want an L0 merge: 200 KiB of L0 is not worth rewriting 256 MiB of L1", plan)
-	}
-	if len(plan.sourceSSTs) != 8 || plan.sourceSSTs[0].ID != m.L0SSTs[0].ID {
-		t.Fatalf("merged %d SSTs starting at %q, want all 8 from the newest", len(plan.sourceSSTs), plan.sourceSSTs[0].ID)
-	}
+	return strings.Join(ids, ",")
 }
 
-func TestL0PlannerTakesOlderFilesNoLargerThanTheTotal(t *testing.T) {
-	// 8 × 25 KiB = 200 KiB takes the 200 KiB file (400 KiB), then the 400 KiB
-	// one (800 KiB), and stops at the 4 MiB one.
-	sizes := append(repeat(25<<10, 8), 200<<10, 400<<10, 4<<20)
-	c, m := l0Planner(t, sizes, 256<<20)
-	plan := c.planL0Merge(m)
-	if plan == nil || len(plan.sourceSSTs) != 10 {
-		t.Fatalf("plan %+v, want the 10 newest SSTs", plan)
+func TestL0PlannerLeavesYoungFlushFilesToTheWriter(t *testing.T) {
+	// Deep enough and large enough against L1 to drain, if these were
+	// maintenance's to drain. They are the writer's: it merges them from
+	// memory within its own age limit.
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	for i := 15; i >= 0; i-- {
+		m.AddL0SST(rawFlush(i, 8<<20, time.Now()))
 	}
-}
-
-func TestL0PlannerWaitsWhenNoRunQualifies(t *testing.T) {
-	// The newest SST is smaller than the next, so there is no run of two;
-	// L0 must not fall back to rewriting L1.
-	sizes := []int64{25 << 10, 200 << 10, 400 << 10, 800 << 10, 1600 << 10, 3200 << 10, 6400 << 10, 12800 << 10}
-	c, m := l0Planner(t, sizes, 256<<20)
+	if got := c.drainableL0(m, time.Now()); len(got) != 0 {
+		t.Fatalf("drainable %s, want nothing: every file is a young flush", l0IDList(got))
+	}
 	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan != nil {
-		t.Fatalf("plan %+v, want no L0 job until more SSTs arrive", plan)
+		t.Fatalf("plan %+v, want none", plan)
+	}
+	if ssts, enough := (&compactor{opts: c.opts, manifest: m}).l0Work(); ssts != 0 || enough {
+		t.Fatalf("l0Work = %d, %v; want nothing to do", ssts, enough)
 	}
 }
 
-func TestL0PlannerRespectsTheOutputSize(t *testing.T) {
-	c, m := l0Planner(t, repeat(20<<20, 8), 512<<20)
-	plan := c.planL0Merge(m)
-	if plan == nil || len(plan.sourceSSTs) != 3 {
-		t.Fatalf("plan %+v, want 3 SSTs of 20 MiB: a fourth passes the 64 MiB output", plan)
+func TestL0PlannerDrainsFlushFilesPastTheAgeLimit(t *testing.T) {
+	// A writer that does not merge, or died: its flush files are nobody's
+	// once they are older than the age limit, and drain like any other.
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	old := time.Now().Add(-c.opts.Trigger.L0MaxAge - time.Minute)
+	for i := 7; i >= 0; i-- {
+		m.AddL0SST(rawFlush(i, 25<<10, old))
+	}
+	if got := c.drainableL0(m, time.Now()); len(got) != 8 {
+		t.Fatalf("drainable %d files, want all 8", len(got))
+	}
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || plan.destinationLevel != 1 || len(plan.sourceSSTs) != 8 {
+		t.Fatalf("plan %+v, want all 8 into L1", plan)
+	}
+}
+
+func TestL0PlannerDrainsOnlyBelowTheWritersFiles(t *testing.T) {
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	now := time.Now()
+	// Oldest first as committed: two merged files, a flush the writer did not
+	// keep a copy of, a merged file, then the writer's current run.
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(1), 64<<20, now))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 64<<20, now))
+	m.AddL0SST(rawFlush(3, 2<<20, now))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(4), 64<<20, now))
+	m.AddL0SST(rawFlush(5, 2<<20, now))
+	m.AddL0SST(rawFlush(6, 2<<20, now))
+
+	// The drain stops below the first young flush file from the old end: the
+	// merged file above it cannot move to L1 while an older version of a key
+	// may sit in that flush.
+	got := c.drainableL0(m, now)
+	if want := mergedSSTID(2) + "," + mergedSSTID(1); l0IDList(got) != want {
+		t.Fatalf("drainable %s, want %s", l0IDList(got), want)
+	}
+	// Once that flush ages past the limit, it and the merged file above it
+	// are drainable too; the writer's run still is not.
+	later := now.Add(c.opts.Trigger.L0MaxAge + time.Second)
+	m.L0SSTs[1].CreatedAt = later // the writer's run stays young
+	m.L0SSTs[0].CreatedAt = later
+	got = c.drainableL0(m, later)
+	if want := strings.Join([]string{mergedSSTID(4), m.L0SSTs[3].ID, mergedSSTID(2), mergedSSTID(1)}, ","); l0IDList(got) != want {
+		t.Fatalf("drainable %s, want %s", l0IDList(got), want)
+	}
+}
+
+func plannerSSTNamed(id string, size int64, createdAt time.Time) sstMetadata {
+	sst := plannerSST(0, 0, 100)
+	sst.ID = id
+	sst.Size = size
+	sst.CreatedAt = createdAt
+	return sst
+}
+
+func TestL0PlannerWaitsBelowTheDrainRules(t *testing.T) {
+	// Eight merged files well under the overlapped L1, not deep enough, not
+	// old: nothing to do until more arrive. Merging within L0 is the
+	// writer's, so no L0 job is planned.
+	c, m := l0Planner(t, repeat(25<<10, 8), 256<<20)
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != nil {
+		t.Fatalf("plan %+v, want no L0 job until a drain rule fires", plan)
 	}
 }
 
@@ -127,6 +204,7 @@ func TestL0PlannerMovesDisjointFilesWithoutRewrite(t *testing.T) {
 	m := &manifestState{}
 	for i := 0; i < 8; i++ {
 		sst := plannerSST(0, 200+10*i, 205+10*i)
+		sst.ID = mergedSSTID(i)
 		sst.Size = 25 << 10
 		sst.CreatedAt = time.Now()
 		m.AddL0SST(sst)

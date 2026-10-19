@@ -66,6 +66,7 @@ func TestSSTDeletionPlanEndToEndUsesOneWriterPublication(t *testing.T) {
 
 	opts := DefaultMaintenanceOptions()
 	opts.SSTCompaction.L0TriggerSSTs = 2
+	opts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.ManifestCheckpoint.TargetReplayPages = ^uint64(0)
 	opts.ManifestCheckpoint.TargetReplayBytes = ^uint64(0)

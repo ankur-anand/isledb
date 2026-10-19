@@ -341,6 +341,7 @@ func TestCompactor_L0Compaction(t *testing.T) {
 
 	compactorOpts := defaultCompactorOptions()
 	compactorOpts.Trigger.L0SSTCount = 4
+	compactorOpts.Trigger.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 
 	var compactionStarted, compactionEnded bool
 	var completedJob compactionJob
@@ -624,6 +625,7 @@ func TestCompactor_MultipleSSTs(t *testing.T) {
 
 	compactorOpts := defaultCompactorOptions()
 	compactorOpts.Trigger.L0SSTCount = 4
+	compactorOpts.Trigger.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	compactorOpts.Output.TargetSSTBytes = 4 * 1024
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
@@ -667,6 +669,7 @@ func TestConsecutiveCompaction_Integration(t *testing.T) {
 	compactorOpts := compactorOptions{
 		Trigger: compactionTriggerOptions{
 			L0SSTCount:          2,
+			L0MaxAge:            time.Nanosecond, // Flush files are nobody's at once: this test drives maintenance over them.
 			BaseLevelBytes:      512 * 1024 * 1024,
 			LevelSizeMultiplier: 8,
 		},
@@ -1195,6 +1198,7 @@ func TestCompactor_ValidateSSTChecksum(t *testing.T) {
 	cOpts := defaultCompactorOptions()
 	cOpts.Safety.ValidateSSTChecksum = true
 	cOpts.Trigger.L0SSTCount = 1
+	cOpts.Trigger.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	c, err := newCompactor(ctx, store, manifestStore, cOpts)
 	if err != nil {
 		t.Fatalf("newCompactor: %v", err)
@@ -1360,6 +1364,7 @@ func TestCompactorCommitsRetirementRecords(t *testing.T) {
 
 	compactorOpts := defaultCompactorOptions()
 	compactorOpts.Trigger.L0SSTCount = 2
+	compactorOpts.Trigger.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 
 	compactor, err := newCompactor(ctx, store, manifestStore, compactorOpts)
 	if err != nil {

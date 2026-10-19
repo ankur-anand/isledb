@@ -10,8 +10,9 @@ import (
 )
 
 // TestL0MergesKeepTheNewestVersion overwrites and deletes the same keys in many
-// small saves over a larger L1, so maintenance merges L0 SSTs with each other,
-// and checks every lookup and scan still returns the newest version.
+// small saves over a larger L1, so the writer merges its L0 SSTs with each
+// other from memory while maintenance runs, and checks every lookup and scan
+// still returns the newest version.
 func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -25,6 +26,8 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 
 	wopts := DefaultWriterOptions()
 	wopts.Flush.Interval = 0
+	// Small runs, so a 40-save test sees several merges.
+	wopts.L0Merge.TargetBytes = 16 << 10
 	writer, err := db.OpenWriter(ctx, wopts)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +70,6 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 
 	// Small saves that overwrite and delete the same keys again and again,
 	// across the whole key range.
-	var merges int
 	for round := 0; round < 40; round++ {
 		for _, i := range []int{round % 7, 100 + round%11, 250, 499 - round%5} {
 			put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%02d", round))
@@ -79,18 +81,26 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 		if err := writer.Flush(ctx); err != nil {
 			t.Fatal(err)
 		}
-		merges += driveMaintenanceToIdle(t, ctx, maintenance, writer).SSTCompaction.L0Merges
+		stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
+		if stats.SSTCompaction.L0Merges != 0 {
+			t.Fatalf("maintenance merged within L0: %d jobs; that is the writer's", stats.SSTCompaction.L0Merges)
+		}
 	}
-	if merges == 0 {
-		t.Fatal("no L0 merges: small saves over a large L1 should merge within L0")
+	// One more pass publishes any merge finished after the last save.
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	m := replayManifestForTest(t, ctx, store)
 	if m.L0SSTCount() >= 40 {
-		t.Fatalf("L0 holds %d SSTs after 40 saves and %d merges", m.L0SSTCount(), merges)
+		t.Fatalf("L0 holds %d SSTs after 40 saves", m.L0SSTCount())
 	}
 	merged := false
+	merges := 0
 	for _, sst := range m.L0SSTs {
+		if isCompactionSSTID(sst.ID) {
+			merges++
+		}
 		if !sst.OldestDataAt.IsZero() {
 			merged = true
 			if !sst.OldestDataAt.Before(sst.CreatedAt) && !sst.OldestDataAt.Equal(sst.CreatedAt) {
@@ -98,8 +108,8 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 			}
 		}
 	}
-	if !merged {
-		t.Fatal("no merged SST in L0 carries OldestDataAt")
+	if !merged || merges == 0 {
+		t.Fatal("no merged SST in L0: small saves should have been merged by the writer")
 	}
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})

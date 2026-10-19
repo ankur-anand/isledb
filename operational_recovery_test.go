@@ -282,6 +282,7 @@ func TestOperationalRecovery_SustainedCASConflictsAcrossWriteAndMaintenance(t *t
 	}
 	maintenanceOpts := DefaultMaintenanceOptions()
 	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)

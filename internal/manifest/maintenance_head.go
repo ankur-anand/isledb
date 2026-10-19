@@ -602,6 +602,19 @@ func (s *Store) applyMaintenanceCommand(
 		if err := validateCompactionPayload(command.Compaction.Payload); err != nil {
 			return fmt.Errorf("%w: %v", ErrMaintenanceCommandRejected, err)
 		}
+		// Every input must still be live. Maintenance planned on an older
+		// manifest; the writer may since have merged some of these files
+		// away. Applying anyway would add outputs holding data a live file
+		// still holds, and retire files twice.
+		live, err := s.replayCurrent(ctx, current, false)
+		if err != nil {
+			return err
+		}
+		for _, id := range command.Compaction.Payload.RemoveSSTableIDs {
+			if live.LookupSST(id) == nil {
+				return fmt.Errorf("%w: compaction input %q is no longer live", ErrMaintenanceCommandRejected, id)
+			}
+		}
 		if err := s.admitL0Merge(ctx, current, entry); err != nil {
 			if errors.Is(err, errL0MergeDoesNotFit) {
 				return fmt.Errorf("%w: %v", ErrMaintenanceCommandRejected, err)

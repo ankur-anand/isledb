@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
@@ -12,23 +13,24 @@ import (
 // BenchmarkL0SmallSaves writes tiny saves of random keys over a large L1, as a
 // writer saving every 250 ms at a low write rate does, and runs one
 // maintenance job per 8 saves, about one 2 s cycle. It reports how many bytes
-// compaction rewrote per byte saved, and how deep L0 got, with L0 merges and
-// with every L0 job going straight to L1 as before them. Scaled down: an
-// 8 MiB L1 and 1 KiB saves keep L1 about 8,000 saves deep, as a 256 MiB L1
-// is to 25 KiB saves.
+// maintenance rewrote per byte saved, and how deep L0 got, with the writer
+// merging its saves from memory and without. Scaled down: an 8 MiB L1 and
+// 1 KiB saves keep L1 about 8,000 saves deep, as a 256 MiB L1 is to 25 KiB
+// saves. Without writer merges, saves wait for the age limit, so that mode
+// shortens it to see them drain.
 //
 //	go test -run '^$' -bench BenchmarkL0SmallSaves -benchtime 1x
 func BenchmarkL0SmallSaves(b *testing.B) {
 	for _, mode := range []struct {
-		name  string
-		ratio float64
+		name         string
+		writerMerges bool
 	}{
-		{"straight-to-L1", 1e-12},
-		{"L0-merges", 0}, // the default
+		{"straight-to-L1", false},
+		{"writer-merges", true},
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			for range b.N {
-				rewritten, saved, deepest, avg := runSmallSaves(b, mode.ratio)
+				rewritten, saved, deepest, avg := runSmallSaves(b, mode.writerMerges)
 				b.ReportMetric(float64(rewritten)/float64(saved), "rewritten/saved")
 				b.ReportMetric(float64(deepest), "max-L0-files")
 				b.ReportMetric(avg, "avg-L0-files")
@@ -37,7 +39,7 @@ func BenchmarkL0SmallSaves(b *testing.B) {
 	}
 }
 
-func runSmallSaves(b *testing.B, ratio float64) (rewritten, saved int64, deepest int, avgDepth float64) {
+func runSmallSaves(b *testing.B, writerMerges bool) (rewritten, saved int64, deepest int, avgDepth float64) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("l0-small-saves")
 	defer store.Close()
@@ -48,6 +50,9 @@ func runSmallSaves(b *testing.B, ratio float64) (rewritten, saved int64, deepest
 	defer db.Close()
 	wopts := DefaultWriterOptions()
 	wopts.Flush.Interval = 0
+	if writerMerges {
+		wopts.L0Merge.TargetBytes = 64 << 10 // 64 saves of 1 KiB, as 64 MiB is to 1 MiB saves
+	}
 	writer, err := db.OpenWriter(ctx, wopts)
 	if err != nil {
 		b.Fatal(err)
@@ -56,7 +61,9 @@ func runSmallSaves(b *testing.B, ratio float64) (rewritten, saved int64, deepest
 	mopts := DefaultMaintenanceOptions()
 	mopts.SSTCompaction.BaseLevelBytes = 1 << 60 // keep everything in L1
 	mopts.SSTCompaction.TargetSSTBytes = 2 << 20
-	mopts.SSTCompaction.L0ToBaseRatio = ratio
+	if !writerMerges {
+		mopts.SSTCompaction.L0MaxAge = time.Nanosecond // flush files are nobody's at once
+	}
 	maintenance, err := db.OpenMaintenance(ctx, mopts)
 	if err != nil {
 		b.Fatal(err)
