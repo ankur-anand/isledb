@@ -500,6 +500,97 @@ func TestWriterL0Merge_PublishReconcilesAppliedCASAfterLostResponse(t *testing.T
 	}
 }
 
+// TestWriterL0Merge_UncertainFlushIsRetriedBeforeAWaitingMerge loses the
+// reply to a flush commit while a merge finishes and waits to be published.
+// The manifest refuses every other commit until the flush is settled, so the
+// pass must retry the flush first; publishing the merge first would fail
+// every pass forever.
+func TestWriterL0Merge_UncertainFlushIsRetriedBeforeAWaitingMerge(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-l0-merge-uncertain-flush")
+	defer store.Close()
+	lost := errors.New("lost CURRENT response")
+	// Writes to CURRENT: the fence claim, then one per flush. The second flush
+	// lands and loses its reply.
+	storage := &applyThenFailOnceStorage{Storage: manifest.NewBlobStoreBackend(store), failOnWrite: 3, failErr: lost}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	w, err := newWriter(ctx, store, manifestStore, testL0MergeWriterOptions(64<<20, time.Hour))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	merges := make(chan publishedMerge, 8)
+	w.onL0MergePublished = func(merged mergedL0Run, err error) { merges <- publishedMerge{merged, err} }
+
+	if _, err := w.put(ctx, []byte("a"), []byte("v-a")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush a: %v", err)
+	}
+	if _, err := w.put(ctx, []byte("b"), []byte("v-b")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); !errors.Is(err, lost) {
+		t.Fatalf("flush b error=%v, want %v", err, lost)
+	}
+	if !w.uncertainFlushPending() {
+		t.Fatalf("flush b not pending as uncertain")
+	}
+
+	// A merge of the held run finishes while flush b is unsettled.
+	w.l0Merge.mu.Lock()
+	w.l0Merge.closeFillingLocked()
+	w.l0Merge.startLocked()
+	w.l0Merge.mu.Unlock()
+	deadline := time.Now().Add(20 * time.Second)
+	for w.l0Merge.nextToPublish() == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("merge did not finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// One pass settles the flush, then publishes the merge.
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush after lost response: %v", err)
+	}
+	select {
+	case published := <-merges:
+		if published.err != nil {
+			t.Fatalf("merge refused: %v", published.err)
+		}
+		if l0 := l0IDsOf(t, manifestStore); len(l0) != 2 || l0[1] != published.merged.output.ID {
+			t.Fatalf("L0 = %v, want flush b then the merged file", l0)
+		}
+	default:
+		t.Fatalf("merge not published after the flush was settled")
+	}
+	if w.uncertainFlushPending() || w.manifestLog.PendingWriterCommitID() != "" {
+		t.Fatalf("a commit is still pending after the pass")
+	}
+	// Flush b landed exactly once.
+	seqs, err := manifestStore.ListEntries(ctx)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	flushes := 0
+	for _, seq := range seqs {
+		entry, err := manifestStore.ReadEntry(ctx, seq)
+		if err != nil {
+			t.Fatalf("ReadEntry(%d): %v", seq, err)
+		}
+		if entry.Op == manifest.LogOpAddSSTable && entry.SSTable != nil && entry.SSTable.MinKey != nil && string(entry.SSTable.MinKey) == "b" {
+			flushes++
+		}
+	}
+	if flushes != 1 {
+		t.Fatalf("flush b committed %d times", flushes)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
 func TestWriterL0Merge_RefusedMergeIsDropped(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-l0-merge-refused")

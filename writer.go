@@ -912,9 +912,18 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if err := w.applyStagedMaintenance(ctx); err != nil {
 		return err
 	}
-	// Merges before flushes: a merge waiting on an uncertain CAS result is
-	// resolved by its commit ID before another commit goes out.
 	w.l0Merge.pass(time.Now())
+
+	// The manifest settles one uncertain commit at a time and refuses every
+	// other commit until it is retried. Whichever of a flush and a merge was
+	// in flight goes first; a merge waits for an unsettled flush, and a flush
+	// for an unsettled merge.
+	flushFirst := w.uncertainFlushPending()
+	if flushFirst {
+		if err := w.commitFlushes(ctx); err != nil {
+			return err
+		}
+	}
 	if err := w.publishL0Merges(ctx); err != nil {
 		return err
 	}
@@ -927,7 +936,35 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 			w.reportRecovery(&w.l0Merge.retireFailures)
 		}
 	}
+	if flushFirst {
+		return nil
+	}
+	return w.commitFlushes(ctx)
+}
 
+// uncertainFlushPending reports whether the manifest is waiting on a flush
+// commit whose CAS result was lost. That flush must be retried before any
+// other commit.
+func (w *writer) uncertainFlushPending() bool {
+	pending := w.manifestLog.PendingWriterCommitID()
+	if pending == "" {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, flush := range w.immQueue {
+		if flush.commitID == pending {
+			return true
+		}
+	}
+	return false
+}
+
+// commitFlushes commits the queued memtables oldest first, each attempt under
+// its own deadline. A memtable that fails stays at the head of the queue, and
+// the next attempt reconciles it, so a commit whose response was lost is not
+// repeated.
+func (w *writer) commitFlushes(ctx context.Context) error {
 	w.mu.Lock()
 	throughSeq := w.seq
 	w.mu.Unlock()
