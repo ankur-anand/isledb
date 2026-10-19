@@ -281,6 +281,11 @@ type SSTCleanupStats struct {
 	OrphanObjectsScanned int
 	OrphanCandidates     int
 	OrphansDeleted       int
+	// Writer L0 merge intents looked at, settled ones removed, and abandoned
+	// ones resolved into deletion plans.
+	IntentsScanned  int
+	IntentsSettled  int
+	IntentsResolved int
 }
 
 // ManifestCheckpointStats describes a manifest checkpoint staged in one cycle.
@@ -1149,6 +1154,9 @@ func publicSSTCleanupStats(stats sstCleanupWorkStats) SSTCleanupStats {
 		OrphanObjectsScanned: stats.OrphanObjectsScanned,
 		OrphanCandidates:     stats.OrphanCandidates,
 		OrphansDeleted:       stats.OrphansDeleted,
+		IntentsScanned:       stats.IntentsScanned,
+		IntentsSettled:       stats.IntentsSettled,
+		IntentsResolved:      stats.IntentsResolved,
 	}
 }
 
@@ -1168,6 +1176,9 @@ func mergeSSTCleanupStats(dst *SSTCleanupStats, src SSTCleanupStats) {
 	dst.OrphanObjectsScanned += src.OrphanObjectsScanned
 	dst.OrphanCandidates += src.OrphanCandidates
 	dst.OrphansDeleted += src.OrphansDeleted
+	dst.IntentsScanned += src.IntentsScanned
+	dst.IntentsSettled += src.IntentsSettled
+	dst.IntentsResolved += src.IntentsResolved
 }
 
 func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
@@ -1529,6 +1540,9 @@ func (m *Maintenance) recordSSTCleanup(stats sstCleanupWorkStats) {
 		cleanup.OrphanObjectsScanned += stats.OrphanObjectsScanned
 		cleanup.OrphanCandidates += stats.OrphanCandidates
 		cleanup.OrphansDeleted += stats.OrphansDeleted
+		cleanup.IntentsScanned += stats.IntentsScanned
+		cleanup.IntentsSettled += stats.IntentsSettled
+		cleanup.IntentsResolved += stats.IntentsResolved
 	}
 	m.statsMu.Unlock()
 }

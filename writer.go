@@ -271,6 +271,9 @@ func newWriterWithMaintenanceWake(
 	w.commitFailures.kind = "commits"
 	w.maintenanceFailures.kind = "maintenance"
 	w.l0Merge = newL0Merger(w, opts.L0Merge)
+	// Flush files a previous writer left unmerged at the new end of L0 are
+	// taken over now, before this writer's own flushes land ahead of them.
+	w.l0Merge.adoptLeftovers(writerCtx, w.l0Merge.leftoverL0Run(m.L0SSTs))
 	w.attemptTimeoutBase.Store(int64(commitAttemptBase))
 
 	// What the manifest holds is committed: report it before the first

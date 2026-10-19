@@ -120,9 +120,11 @@ type l0Merger struct {
 	closed  []*l0Run
 	held    int64
 	// running is set while a merge goroutine works through closed; done is
-	// closed when it exits.
-	running bool
-	done    chan struct{}
+	// closed when it exits. adopting is closed when the startup adoption of
+	// a previous writer's files has finished; nil when there was none.
+	running  bool
+	done     chan struct{}
+	adopting chan struct{}
 	// finished are merges uploaded and waiting for the committer to publish,
 	// oldest first.
 	finished []mergedL0Run
@@ -283,11 +285,87 @@ func (m *l0Merger) wait() {
 		return
 	}
 	m.mu.Lock()
-	done := m.done
+	done, adopting := m.done, m.adopting
 	m.mu.Unlock()
+	if adopting != nil {
+		<-adopting
+	}
 	if done != nil {
 		<-done
 	}
+}
+
+// leftoverL0Run is the flush files a previous writer committed and did not
+// merge: the raw files at the new end of L0, oldest first, as many as fit the
+// held limit. Nobody holds their bytes, and maintenance leaves young flush
+// files alone, so the new writer takes them over.
+func (m *l0Merger) leftoverL0Run(l0 []sstMetadata) []sstMetadata {
+	if m == nil {
+		return nil
+	}
+	var leftovers []sstMetadata // newest first, as L0 is
+	var bytes int64
+	for _, sst := range l0 {
+		if _, raw := writerSSTEpoch(sst.ID); !raw {
+			break
+		}
+		if bytes+sst.Size > l0MergeHeldRuns*m.target {
+			break
+		}
+		bytes += sst.Size
+		leftovers = append(leftovers, sst)
+	}
+	for i, j := 0, len(leftovers)-1; i < j; i, j = i+1, j-1 {
+		leftovers[i], leftovers[j] = leftovers[j], leftovers[i]
+	}
+	return leftovers
+}
+
+// adoptLeftovers downloads a previous writer's unmerged flush files and queues
+// them as a closed run, to be merged like any other. It runs in the
+// background so opening the writer does not wait on the downloads. A download
+// that fails leaves the files where they are; they drain once they are older
+// than maintenance's age limit.
+func (m *l0Merger) adoptLeftovers(ctx context.Context, leftovers []sstMetadata) {
+	if m == nil || len(leftovers) == 0 {
+		return
+	}
+	m.mu.Lock()
+	m.adopting = make(chan struct{})
+	m.mu.Unlock()
+	go func() {
+		defer func() {
+			m.mu.Lock()
+			close(m.adopting)
+			m.mu.Unlock()
+		}()
+		run := &l0Run{}
+		for _, sst := range leftovers {
+			data, _, err := m.w.store.Read(ctx, m.w.store.SSTPath(sst.ID))
+			if err == nil && int64(len(data)) < sst.Size {
+				err = fmt.Errorf("object %d bytes, manifest size %d", len(data), sst.Size)
+			}
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.Warn("isledb: could not adopt a previous writer's flush file; leaving it to maintenance",
+						"component", "writer", "sst_id", sst.ID, "error", err)
+				}
+				return
+			}
+			run.add(heldSST{meta: sst, data: data})
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.w.ctx.Err() != nil {
+			return
+		}
+		m.closed = append([]*l0Run{run}, m.closed...)
+		m.held += run.bytes
+		m.w.metrics.ObserveL0MergeHeld(m.held)
+		slog.Info("isledb: adopted a previous writer's flush files for merging",
+			"component", "writer", "files", len(run.ssts), "bytes", run.bytes)
+		m.startLocked()
+	}()
 }
 
 func (m *l0Merger) closeFillingLocked() {

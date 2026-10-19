@@ -28,6 +28,7 @@ const (
 	defaultSSTDeletionPlanBatchSize = 128
 	defaultSSTOrphanAuditEvery      = 24 * time.Hour
 	defaultSSTOrphanGrace           = 24 * time.Hour
+	defaultSSTIntentAuditEvery      = 5 * time.Minute
 	defaultSSTOrphanScanLimit       = 1024
 )
 
@@ -45,6 +46,11 @@ type sstCleanupWorkStats struct {
 	OrphanObjectsScanned int
 	OrphanCandidates     int
 	OrphansDeleted       int
+	// Writer L0 merge intents the audit scanned, settled ones it removed,
+	// and abandoned ones it resolved into deletion plans.
+	IntentsScanned  int
+	IntentsSettled  int
+	IntentsResolved int
 }
 
 // sstDeletionPlanSource is what retired the plan's targets. A maintenance
@@ -127,6 +133,8 @@ type sstCleanerOptions struct {
 	OrphanAuditEvery time.Duration
 	OrphanGrace      time.Duration
 	OrphanScanLimit  int
+	// IntentAuditEvery is how often writer L0 merge intents are looked at.
+	IntentAuditEvery time.Duration
 	ManifestLog      *manifest.Store
 	Now              func() time.Time
 	Deleter          objectDeleter
@@ -146,6 +154,7 @@ type sstCleaner struct {
 
 	nextOrphanAudit time.Time
 	orphanAudit     *sstOrphanAuditState
+	nextIntentAudit time.Time
 
 	// Control work only signals that a durable plan may have changed the first
 	// ready key. It never waits for reclaim-lane network I/O. Missing or
@@ -168,6 +177,7 @@ func defaultSSTCleanerOptions() sstCleanerOptions {
 		OrphanAuditEvery: defaultSSTOrphanAuditEvery,
 		OrphanGrace:      defaultSSTOrphanGrace,
 		OrphanScanLimit:  defaultSSTOrphanScanLimit,
+		IntentAuditEvery: defaultSSTIntentAuditEvery,
 		Now:              func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -198,6 +208,9 @@ func newSSTCleaner(store *blobstore.Store, opts sstCleanerOptions) *sstCleaner {
 	}
 	if opts.OrphanScanLimit <= 0 {
 		opts.OrphanScanLimit = defaults.OrphanScanLimit
+	}
+	if opts.IntentAuditEvery <= 0 {
+		opts.IntentAuditEvery = defaults.IntentAuditEvery
 	}
 	if opts.Now == nil {
 		opts.Now = defaults.Now
@@ -586,6 +599,12 @@ func (c *sstCleaner) runScheduledOnce(
 		c.pendingPlanKey = ""
 	}
 	remainingDeletes := c.opts.DeleteBatchSize - stats.Attempted
+	if err == nil && c.opts.ManifestLog != nil && (c.nextIntentAudit.IsZero() || !passNow.Before(c.nextIntentAudit)) {
+		intentStats, intentErr := c.runIntentAudit(ctx, passNow)
+		mergeSSTCleanupWorkStats(&stats, &intentStats)
+		err = errors.Join(err, intentErr)
+		c.nextIntentAudit = passNow.Add(c.opts.IntentAuditEvery)
+	}
 	auditDue := c.orphanAudit != nil || c.nextOrphanAudit.IsZero() || !passNow.Before(c.nextOrphanAudit)
 	if err == nil && c.opts.ManifestLog != nil && auditDue && remainingDeletes > 0 {
 		auditStats, auditErr := c.runOrphanAudit(ctx, passNow, remainingDeletes)
@@ -595,6 +614,9 @@ func (c *sstCleaner) runScheduledOnce(
 	nextDue := stats.NextDue
 	if c.orphanAudit == nil && !c.nextOrphanAudit.IsZero() {
 		nextDue = earlierReclamationDeadline(nextDue, c.nextOrphanAudit)
+	}
+	if c.opts.ManifestLog != nil && !c.nextIntentAudit.IsZero() {
+		nextDue = earlierReclamationDeadline(nextDue, c.nextIntentAudit)
 	}
 	schedule := reclamationLaneSchedule{
 		observedAt: c.opts.Now().UTC(),
@@ -615,6 +637,9 @@ func mergeSSTCleanupWorkStats(dst, src *sstCleanupWorkStats) {
 	dst.OrphanObjectsScanned += src.OrphanObjectsScanned
 	dst.OrphanCandidates += src.OrphanCandidates
 	dst.OrphansDeleted += src.OrphansDeleted
+	dst.IntentsScanned += src.IntentsScanned
+	dst.IntentsSettled += src.IntentsSettled
+	dst.IntentsResolved += src.IntentsResolved
 }
 
 func (c *sstCleaner) planAvailable() {
