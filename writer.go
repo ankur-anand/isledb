@@ -58,8 +58,9 @@ type writer struct {
 	// l0Merge holds committed flushes and merges them; nil when L0Merge is
 	// off.
 	l0Merge *l0Merger
-	// onL0Merged, set only by tests, sees every merge the committer takes.
-	onL0Merged func(mergedL0Run)
+	// onL0MergePublished, set only by tests, sees every merge the committer
+	// settles: landed, or refused with the error.
+	onL0MergePublished func(mergedL0Run, error)
 
 	changeFeedPayload ChangeFeedPayload
 	ctx               context.Context
@@ -905,12 +906,11 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if err := w.applyStagedMaintenance(ctx); err != nil {
 		return err
 	}
-	// Merges finished since the last pass. Publishing them is not wired yet:
-	// until it is, a merged file is an object nothing references.
-	for _, merged := range w.l0Merge.pass(time.Now()) {
-		if w.onL0Merged != nil {
-			w.onL0Merged(merged)
-		}
+	// Merges before flushes: a merge waiting on an uncertain CAS result is
+	// resolved by its commit ID before another commit goes out.
+	w.l0Merge.pass(time.Now())
+	if err := w.publishL0Merges(ctx); err != nil {
+		return err
 	}
 
 	w.mu.Lock()
@@ -1078,6 +1078,13 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 	if command == nil {
 		return nil
 	}
+	// Maintenance takes files from the old end of L0 and the writer holds
+	// the new end; when a command reaches into what the writer holds, the
+	// writer yields. It applies the command and forgets those copies.
+	if dropped := w.l0Merge.dropTouching(maintenanceCommandSSTIDs(command)); dropped > 0 {
+		slog.Info("isledb: maintenance took files held for merging; dropped",
+			"component", "writer", "command_id", command.ID, "runs", dropped)
+	}
 	applyCtx, cancel := context.WithTimeout(ctx, maintenanceApplyTimeout)
 	defer cancel()
 	_, err := w.manifestLog.ApplyMaintenanceCommand(applyCtx, *command)
@@ -1096,6 +1103,19 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 		w.reportFailure(&w.maintenanceFailures, fmt.Errorf("apply maintenance command: %w", err))
 		return nil
 	}
+}
+
+// maintenanceCommandSSTIDs is the SSTs a command removes from the manifest.
+func maintenanceCommandSSTIDs(command *manifest.MaintenanceCommand) []string {
+	switch {
+	case command == nil:
+		return nil
+	case command.Compaction != nil:
+		return command.Compaction.Payload.RemoveSSTableIDs
+	case command.RemoveSSTables != nil:
+		return command.RemoveSSTables.SSTableIDs
+	}
+	return nil
 }
 
 // failureRun tracks one kind of retried failure, commits or maintenance, from

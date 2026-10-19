@@ -17,6 +17,7 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/objstorage"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/segmentio/ksuid"
 )
 
 // The writer merges its own L0 files. Every flush is committed as one small
@@ -72,15 +73,36 @@ func (r *l0Run) metas() []sstMetadata {
 	return metas
 }
 
+func (r *l0Run) touches(ids map[string]struct{}) bool {
+	for _, sst := range r.ssts {
+		if _, ok := ids[sst.meta.ID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // mergedL0Run is a run the writer has merged and uploaded, not yet published.
+// commitID stays the same across publish attempts, so an uncertain CAS
+// result cannot replace the run twice.
 type mergedL0Run struct {
-	inputs []sstMetadata // oldest first, as committed
-	output sstMetadata
+	commitID string
+	inputs   []sstMetadata // oldest first, as committed
+	output   sstMetadata
+}
+
+func (m *mergedL0Run) touches(ids map[string]struct{}) bool {
+	for _, sst := range m.inputs {
+		if _, ok := ids[sst.ID]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // l0Merger holds the writer's committed flushes and merges them. The
-// committer calls add after each commit and pass once per pass; one
-// background goroutine at a time does the merging.
+// committer calls add after each commit, pass once per pass, and publishes
+// what finished has; one background goroutine at a time does the merging.
 type l0Merger struct {
 	w      *writer
 	target int64
@@ -96,7 +118,8 @@ type l0Merger struct {
 	// closed when it exits.
 	running bool
 	done    chan struct{}
-	// finished are merges uploaded and waiting for the committer.
+	// finished are merges uploaded and waiting for the committer to publish,
+	// oldest first.
 	finished []mergedL0Run
 
 	failures failureRun
@@ -140,11 +163,10 @@ func (m *l0Merger) add(meta sstMetadata, data []byte) {
 }
 
 // pass is the committer's hook, once per pass: closes the filling run when it
-// is old enough, starts a merge if one is due, and returns the merges that
-// have finished since the last pass.
-func (m *l0Merger) pass(now time.Time) []mergedL0Run {
+// is old enough and starts a merge if one is due.
+func (m *l0Merger) pass(now time.Time) {
 	if m == nil {
-		return nil
+		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -152,9 +174,81 @@ func (m *l0Merger) pass(now time.Time) []mergedL0Run {
 		m.closeFillingLocked()
 	}
 	m.startLocked()
-	finished := m.finished
-	m.finished = nil
-	return finished
+}
+
+// nextToPublish is the oldest finished merge, or nil.
+func (m *l0Merger) nextToPublish() *mergedL0Run {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.finished) == 0 {
+		return nil
+	}
+	merged := m.finished[0]
+	return &merged
+}
+
+// published forgets a merge the committer has settled, landed or refused.
+func (m *l0Merger) published(commitID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, merged := range m.finished {
+		if merged.commitID == commitID {
+			m.finished = append(m.finished[:i], m.finished[i+1:]...)
+			return
+		}
+	}
+}
+
+// dropTouching forgets every run and unpublished merge that holds one of ids:
+// a maintenance command is about to take those files, and the writer never
+// contends for them. It returns how many runs and merges were dropped. A
+// merge running over a dropped run is discarded when it finishes.
+func (m *l0Merger) dropTouching(ids []string) int {
+	if m == nil || len(ids) == 0 {
+		return 0
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dropped := 0
+	if m.filling.touches(set) {
+		m.held -= m.filling.bytes
+		m.filling = l0Run{}
+		dropped++
+	}
+	kept := m.closed[:0]
+	for _, run := range m.closed {
+		if run.touches(set) {
+			m.held -= run.bytes
+			dropped++
+			continue
+		}
+		kept = append(kept, run)
+	}
+	m.closed = kept
+	keptMerges := m.finished[:0]
+	for _, merged := range m.finished {
+		if merged.touches(set) {
+			dropped++
+			continue
+		}
+		keptMerges = append(keptMerges, merged)
+	}
+	m.finished = keptMerges
+	if dropped > 0 {
+		m.w.metrics.ObserveL0MergeHeld(m.held)
+		m.w.metrics.ObserveL0MergeDropped(dropped)
+	}
+	return dropped
 }
 
 // heldBytes reports what the writer holds for merging.
@@ -227,13 +321,29 @@ func (m *l0Merger) run(done chan struct{}) {
 		}
 
 		m.mu.Lock()
-		m.closed = m.closed[1:]
+		if i := indexOfRun(m.closed, run); i < 0 {
+			// Dropped while merging: a maintenance command took its files.
+			// The output is an object nothing references.
+			m.mu.Unlock()
+			continue
+		} else {
+			m.closed = append(m.closed[:i], m.closed[i+1:]...)
+		}
 		m.held -= run.bytes
 		m.w.metrics.ObserveL0MergeHeld(m.held)
 		m.finished = append(m.finished, merged)
 		m.mu.Unlock()
 		m.w.reportRecovery(&m.failures)
 	}
+}
+
+func indexOfRun(runs []*l0Run, run *l0Run) int {
+	for i, candidate := range runs {
+		if candidate == run {
+			return i
+		}
+	}
+	return -1
 }
 
 // merge builds one SST from a run and uploads it. Inputs are read newest
@@ -322,7 +432,30 @@ func (m *l0Merger) merge(ctx context.Context, run *l0Run) (mergedL0Run, error) {
 
 	slog.Debug("isledb: l0 run merged", "component", "writer", "inputs", len(inputs),
 		"input_bytes", run.bytes, "output", meta.ID, "output_bytes", meta.Size)
-	return mergedL0Run{inputs: inputs, output: meta}, nil
+	return mergedL0Run{commitID: ksuid.New().String(), inputs: inputs, output: meta}, nil
+}
+
+// retired names every input of a merge as an object to delete once the merge
+// has replaced it.
+func (m *l0Merger) retired(merged *mergedL0Run) []manifest.RetiredObject {
+	retired := make([]manifest.RetiredObject, len(merged.inputs))
+	for i, input := range merged.inputs {
+		retired[i] = manifest.RetiredObject{
+			Kind: manifest.RetiredObjectSST,
+			ID:   input.ID,
+			Key:  m.w.store.SSTPath(input.ID),
+			Size: input.Size,
+		}
+	}
+	return retired
+}
+
+func (m *l0Merger) inputIDs(merged *mergedL0Run) []string {
+	ids := make([]string, len(merged.inputs))
+	for i, input := range merged.inputs {
+		ids[i] = input.ID
+	}
+	return ids
 }
 
 // identity names the merge's output: a hash over the writer fence, the
@@ -389,6 +522,57 @@ func l0RunExpiryCutoff(inputs []sstMetadata) time.Time {
 		}
 	}
 	return cutoff.UTC()
+}
+
+// publishL0Merges publishes finished merges, oldest first. A merge the
+// manifest refuses, because its run is no longer adjacent in L0, is dropped:
+// nothing was written, and its output is an object nothing references. Any
+// other failure ends the pass, so the next pass retries the same merge first
+// and an uncertain CAS result is resolved by its commit ID before anything
+// else is published.
+func (w *writer) publishL0Merges(ctx context.Context) error {
+	for {
+		merged := w.l0Merge.nextToPublish()
+		if merged == nil {
+			return nil
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, commitAttemptBase)
+		entry, err := w.manifestLog.AppendWriterL0Merge(attemptCtx, manifest.WriterL0Merge{
+			ID:       merged.commitID,
+			InputIDs: w.l0Merge.inputIDs(merged),
+			Output:   merged.output,
+			Retired:  w.l0Merge.retired(merged),
+		})
+		cancel()
+		fenced := !w.manifestLog.WriterFenceObservedActive(w.fenceToken)
+		switch {
+		case err == nil:
+			w.l0Merge.published(merged.commitID)
+			w.metrics.ObserveL0MergePublished(nil)
+			slog.Debug("isledb: l0 merge published", "component", "writer", "output", merged.output.ID,
+				"inputs", len(merged.inputs), "manifest_seq", entry.Seq)
+			if w.onL0MergePublished != nil {
+				w.onL0MergePublished(*merged, nil)
+			}
+			if fenced {
+				w.markFenced()
+				return manifest.ErrFenced
+			}
+		case errors.Is(err, manifest.ErrInvalidManifest):
+			w.l0Merge.published(merged.commitID)
+			w.metrics.ObserveL0MergePublished(err)
+			slog.Warn("isledb: l0 merge refused; its files are no longer a run in L0",
+				"component", "writer", "output", merged.output.ID, "error", err)
+			if w.onL0MergePublished != nil {
+				w.onL0MergePublished(*merged, err)
+			}
+		case fenced || isFenceError(err):
+			w.markFenced()
+			return fmt.Errorf("publish l0 merge: %w", err)
+		default:
+			return fmt.Errorf("publish l0 merge: %w", err)
+		}
+	}
 }
 
 // heldSSTReadable gives Pebble's SST reader random access to an SST held in

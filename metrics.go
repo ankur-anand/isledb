@@ -40,6 +40,14 @@ type WriterMetrics struct {
 	// L0MergeHeldBytes is the bytes of committed flushes the writer holds
 	// for merging.
 	L0MergeHeldBytes prometheus.Gauge
+	// L0MergePublished counts merges that replaced their files in L0;
+	// L0MergeRefused counts merges the manifest refused because their files
+	// were no longer a run in L0; L0MergeDropped counts held runs and
+	// unpublished merges the writer gave up because a maintenance command
+	// took their files.
+	L0MergePublished prometheus.Counter
+	L0MergeRefused   prometheus.Counter
+	L0MergeDropped   prometheus.Counter
 }
 
 func (m *WriterMetrics) incCounter(counter prometheus.Counter) {
@@ -137,6 +145,28 @@ func (m *WriterMetrics) ObserveL0MergeSkipped(sizeBytes int64) {
 		return
 	}
 	m.addCounter(m.L0MergeSkippedBytes, float64(sizeBytes))
+}
+
+// ObserveL0MergePublished records a merge the committer settled: published,
+// or refused with the manifest's error.
+func (m *WriterMetrics) ObserveL0MergePublished(err error) {
+	if m == nil {
+		return
+	}
+	if err != nil {
+		m.incCounter(m.L0MergeRefused)
+		return
+	}
+	m.incCounter(m.L0MergePublished)
+}
+
+// ObserveL0MergeDropped records held runs and unpublished merges given up to
+// a maintenance command.
+func (m *WriterMetrics) ObserveL0MergeDropped(count int) {
+	if m == nil {
+		return
+	}
+	m.addCounter(m.L0MergeDropped, float64(count))
 }
 
 // ObserveL0MergeHeld records how many bytes the writer holds for merging.
@@ -263,6 +293,27 @@ func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 			Subsystem:   "writer",
 			Name:        "l0_merge_held_bytes",
 			Help:        "Bytes of committed flushes held in memory for merging.",
+			ConstLabels: constLabels,
+		}),
+		L0MergePublished: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merges_published_total",
+			Help:        "Merged L0 files that replaced their inputs in L0.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeRefused: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merges_refused_total",
+			Help:        "Merges the manifest refused because their inputs were no longer a run in L0.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merges_dropped_total",
+			Help:        "Held runs and unpublished merges given up because a maintenance command took their files.",
 			ConstLabels: constLabels,
 		}),
 	}

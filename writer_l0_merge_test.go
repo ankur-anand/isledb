@@ -3,14 +3,17 @@ package isledb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal"
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -25,6 +28,12 @@ func testL0MergeWriterOptions(targetBytes int64, maxAge time.Duration) WriterOpt
 type expectedEntry struct {
 	kind  internal.OpKind
 	value []byte
+}
+
+// publishedMerge is one settled merge as the committer reported it.
+type publishedMerge struct {
+	merged mergedL0Run
+	err    error
 }
 
 // readMergedSST reads a merged L0 file back from the store and returns its
@@ -81,8 +90,21 @@ func compactionNamedSSTs(t *testing.T, store *blobstore.Store) []string {
 	return ids
 }
 
-// waitForL0Merge runs passes until the committer takes a merge.
-func waitForL0Merge(t *testing.T, w *writer, merges <-chan mergedL0Run) mergedL0Run {
+func l0IDsOf(t *testing.T, manifestStore *manifest.Store) []string {
+	t.Helper()
+	m, err := manifestStore.Replay(context.Background())
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	ids := make([]string, len(m.L0SSTs))
+	for i, sst := range m.L0SSTs {
+		ids[i] = sst.ID
+	}
+	return ids
+}
+
+// waitForL0Merge runs passes until the committer settles a merge.
+func waitForL0Merge(t *testing.T, w *writer, merges <-chan publishedMerge) publishedMerge {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
@@ -96,7 +118,7 @@ func waitForL0Merge(t *testing.T, w *writer, merges <-chan mergedL0Run) mergedL0
 		}
 	}
 	t.Fatalf("no L0 merge within deadline; held=%d", w.l0Merge.heldBytes())
-	return mergedL0Run{}
+	return publishedMerge{}
 }
 
 func TestWriterL0Merge_OffByDefault(t *testing.T) {
@@ -128,7 +150,7 @@ func TestWriterL0Merge_OffByDefault(t *testing.T) {
 	}
 }
 
-func TestWriterL0Merge_MergesRunAtTargetBytes(t *testing.T) {
+func TestWriterL0Merge_MergesAndPublishesRunAtTargetBytes(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("writer-l0-merge-size")
 	defer store.Close()
@@ -139,14 +161,15 @@ func TestWriterL0Merge_MergesRunAtTargetBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	merges := make(chan mergedL0Run, 8)
-	w.onL0Merged = func(merged mergedL0Run) { merges <- merged }
+	merges := make(chan publishedMerge, 8)
+	w.onL0MergePublished = func(merged mergedL0Run, err error) { merges <- publishedMerge{merged, err} }
 
 	// Versions of the same keys across flushes, a delete, and an entry that
 	// expires before the run is merged. Each flush is one L0 file; writes
 	// are recorded per flush so the expectation can be built for exactly the
 	// files the merge took.
 	var perFlush []map[string]expectedEntry
+	var flushIDs []string // the L0 file each flush committed, in order
 	value := func(flush, key int) []byte {
 		return bytes.Repeat([]byte(fmt.Sprintf("f%d-k%d-", flush, key)), 16)
 	}
@@ -179,25 +202,26 @@ func TestWriterL0Merge_MergesRunAtTargetBytes(t *testing.T) {
 			t.Fatalf("flush: %v", err)
 		}
 		perFlush = append(perFlush, writes)
+		// The pass publishes merges before it flushes, so the newest L0 file
+		// is this flush's.
+		flushIDs = append(flushIDs, l0IDsOf(t, manifestStore)[0])
 	}
-	merged := waitForL0Merge(t, w, merges)
+	published := waitForL0Merge(t, w, merges)
+	if published.err != nil {
+		t.Fatalf("merge refused: %v", published.err)
+	}
+	merged := published.merged
 
-	// The inputs are the oldest files in L0, in commit order, one per flush.
-	committed, err := manifestStore.Replay(ctx)
-	if err != nil {
-		t.Fatalf("replay: %v", err)
-	}
+	// The inputs are the oldest flushes, in commit order, one per flush.
 	if len(merged.inputs) < 2 {
 		t.Fatalf("merge of %d inputs; want at least 2", len(merged.inputs))
 	}
-	l0 := committed.L0SSTs // newest first
-	if len(l0) < len(merged.inputs) || len(perFlush) < len(merged.inputs) {
-		t.Fatalf("L0 has %d files from %d flushes, merge has %d inputs", len(l0), len(perFlush), len(merged.inputs))
+	if len(flushIDs) < len(merged.inputs) {
+		t.Fatalf("%d flushes, merge has %d inputs", len(flushIDs), len(merged.inputs))
 	}
 	for i, input := range merged.inputs {
-		want := l0[len(l0)-1-i]
-		if input.ID != want.ID {
-			t.Fatalf("input %d = %s, want L0 file %s", i, input.ID, want.ID)
+		if input.ID != flushIDs[i] {
+			t.Fatalf("input %d = %s, want flush %s", i, input.ID, flushIDs[i])
 		}
 	}
 	expected := map[string]expectedEntry{}
@@ -231,14 +255,33 @@ func TestWriterL0Merge_MergesRunAtTargetBytes(t *testing.T) {
 	if !out.OldestDataAt.Equal(oldest) {
 		t.Fatalf("output oldest data %s, want oldest input %s", out.OldestDataAt, oldest)
 	}
-	if out.CreatedAt.Before(oldest) {
-		t.Fatalf("output created %s before its oldest input %s", out.CreatedAt, oldest)
-	}
 	if out.Epoch == 0 {
 		t.Fatalf("output has no epoch")
 	}
 	if ids := compactionNamedSSTs(t, store); len(ids) != 1 || ids[0] != out.ID {
 		t.Fatalf("compaction-named objects %v, want only %s", ids, out.ID)
+	}
+
+	// The manifest: the run is gone, the output sits where it was, at the
+	// old end, the later flushes are ahead of it, and CURRENT remembers the
+	// merge apart from the last flush.
+	wantL0 := []string{}
+	for i := len(flushIDs) - 1; i >= len(merged.inputs); i-- {
+		wantL0 = append(wantL0, flushIDs[i])
+	}
+	wantL0 = append(wantL0, out.ID)
+	if l0After := l0IDsOf(t, manifestStore); strings.Join(l0After, ",") != strings.Join(wantL0, ",") {
+		t.Fatalf("L0 after merge = %v, want %v", l0After, wantL0)
+	}
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.LastWriterL0Merge == nil || current.LastWriterL0Merge.CommitID != merged.commitID {
+		t.Fatalf("last writer l0 merge=%+v, want commit %s", current.LastWriterL0Merge, merged.commitID)
+	}
+	if current.LastWriterCommit == nil || current.LastWriterCommit.CommitID == merged.commitID {
+		t.Fatalf("last writer commit=%+v, must stay the last flush", current.LastWriterCommit)
 	}
 
 	// The output holds the newest version of every key the run saw: puts,
@@ -268,6 +311,35 @@ func TestWriterL0Merge_MergesRunAtTargetBytes(t *testing.T) {
 		}
 	}
 
+	// A reader sees the newest version of every key across all of L0,
+	// merged and not.
+	latest := map[string]expectedEntry{}
+	for _, writes := range perFlush {
+		for k, e := range writes {
+			latest[k] = e
+		}
+	}
+	reader, err := newReader(ctx, store, readerOptions{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newReader: %v", err)
+	}
+	defer reader.Close()
+	for k, want := range latest {
+		got, found, err := reader.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("Get(%s): %v", k, err)
+		}
+		if want.kind == internal.OpDelete {
+			if found {
+				t.Fatalf("Get(%s) found a deleted or expired key", k)
+			}
+			continue
+		}
+		if !found || !bytes.Equal(got, want.value) {
+			t.Fatalf("Get(%s) = %q found=%v, want %q", k, got, found, want.value)
+		}
+	}
+
 	if err := w.close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -284,8 +356,8 @@ func TestWriterL0Merge_MergesRunAtMaxAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	merges := make(chan mergedL0Run, 8)
-	w.onL0Merged = func(merged mergedL0Run) { merges <- merged }
+	merges := make(chan publishedMerge, 8)
+	w.onL0MergePublished = func(merged mergedL0Run, err error) { merges <- publishedMerge{merged, err} }
 
 	if _, err := w.put(ctx, []byte("only"), []byte("value")); err != nil {
 		t.Fatalf("put: %v", err)
@@ -297,7 +369,11 @@ func TestWriterL0Merge_MergesRunAtMaxAge(t *testing.T) {
 		t.Fatalf("nothing held after a committed flush")
 	}
 	time.Sleep(5 * time.Millisecond)
-	merged := waitForL0Merge(t, w, merges)
+	published := waitForL0Merge(t, w, merges)
+	if published.err != nil {
+		t.Fatalf("merge refused: %v", published.err)
+	}
+	merged := published.merged
 	if len(merged.inputs) != 1 {
 		t.Fatalf("merge of %d inputs, want the one held file", len(merged.inputs))
 	}
@@ -311,8 +387,175 @@ func TestWriterL0Merge_MergesRunAtMaxAge(t *testing.T) {
 	if held := w.l0Merge.heldBytes(); held != 0 {
 		t.Fatalf("held %d bytes after the merge", held)
 	}
+	if l0 := l0IDsOf(t, manifestStore); len(l0) != 1 || l0[0] != merged.output.ID {
+		t.Fatalf("L0 = %v, want only %s", l0, merged.output.ID)
+	}
 	if err := w.close(ctx); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// failMergeCASOnceStorage lets a CURRENT write that records an L0 merge land,
+// then reports it failed, once: the response was lost.
+type failMergeCASOnceStorage struct {
+	manifest.Storage
+	failed  atomic.Bool
+	failErr error
+}
+
+func (s *failMergeCASOnceStorage) WriteCurrentCAS(ctx context.Context, data []byte, expectedETag string) (string, error) {
+	etag, err := s.Storage.WriteCurrentCAS(ctx, data, expectedETag)
+	if err != nil {
+		return "", err
+	}
+	if bytes.Contains(data, []byte(`"last_writer_l0_merge"`)) && s.failed.CompareAndSwap(false, true) {
+		return "", s.failErr
+	}
+	return etag, nil
+}
+
+func TestWriterL0Merge_PublishReconcilesAppliedCASAfterLostResponse(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-l0-merge-lost-cas")
+	defer store.Close()
+	lost := errors.New("lost CURRENT response")
+	storage := &failMergeCASOnceStorage{Storage: manifest.NewBlobStoreBackend(store), failErr: lost}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+
+	w, err := newWriter(ctx, store, manifestStore, testL0MergeWriterOptions(64<<20, time.Millisecond))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	merges := make(chan publishedMerge, 8)
+	w.onL0MergePublished = func(merged mergedL0Run, err error) { merges <- publishedMerge{merged, err} }
+
+	if _, err := w.put(ctx, []byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	// Passes until the merge is uploaded and its publish loses its response.
+	// Every accepted write is already committed, so Flush reports nothing;
+	// the pass itself failed and the merge stays to be retried.
+	deadline := time.Now().Add(20 * time.Second)
+	for !storage.failed.Load() {
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publish never lost its response")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case published := <-merges:
+		t.Fatalf("merge settled before its retry: %+v", published)
+	default:
+	}
+	if w.l0Merge.nextToPublish() == nil {
+		t.Fatalf("merge forgotten after a lost response")
+	}
+	// A write after the uncertain publish is committed only once the merge is
+	// settled: the retry reconciles it from CURRENT and publishes nothing.
+	if _, err := w.put(ctx, []byte("k2"), []byte("v2")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush after lost response: %v", err)
+	}
+	select {
+	case published := <-merges:
+		if published.err != nil {
+			t.Fatalf("merge refused: %v", published.err)
+		}
+		merged := published.merged
+		seqs, err := manifestStore.ListEntries(ctx)
+		if err != nil {
+			t.Fatalf("ListEntries: %v", err)
+		}
+		count := 0
+		for _, seq := range seqs {
+			entry, err := manifestStore.ReadEntry(ctx, seq)
+			if err != nil {
+				t.Fatalf("ReadEntry(%d): %v", seq, err)
+			}
+			if entry.CommitID == merged.commitID {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("entries for the merge: %d, want 1", count)
+		}
+		l0 := l0IDsOf(t, manifestStore)
+		if len(l0) != 2 || l0[1] != merged.output.ID {
+			t.Fatalf("L0 = %v, want the new flush then %s", l0, merged.output.ID)
+		}
+	default:
+		t.Fatalf("merge not settled by the retry")
+	}
+	if w.l0Merge.nextToPublish() != nil {
+		t.Fatalf("merge still waiting after it was reconciled")
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestWriterL0Merge_RefusedMergeIsDropped(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-l0-merge-refused")
+	defer store.Close()
+	manifestStore := newManifestStore(store, nil)
+	w, err := newWriter(ctx, store, manifestStore, testL0MergeWriterOptions(64<<20, time.Hour))
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+	merges := make(chan publishedMerge, 8)
+	w.onL0MergePublished = func(merged mergedL0Run, err error) { merges <- publishedMerge{merged, err} }
+
+	if _, err := w.put(ctx, []byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	before, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+
+	// A merge whose inputs are not in L0: as after a drain took them.
+	w.l0Merge.mu.Lock()
+	w.l0Merge.finished = append(w.l0Merge.finished, mergedL0Run{
+		commitID: "stale-merge",
+		inputs:   []sstMetadata{{ID: "gone-1.sst", Size: 10}, {ID: "gone-2.sst", Size: 10}},
+		output:   sstMetadata{ID: "compacted-" + strings.Repeat("0", 64) + "-0001.sst", SeqLo: 1, SeqHi: 2, Size: 10, Epoch: 1},
+	})
+	w.l0Merge.mu.Unlock()
+
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	select {
+	case published := <-merges:
+		if !errors.Is(published.err, manifest.ErrInvalidManifest) {
+			t.Fatalf("settled with %v, want %v", published.err, manifest.ErrInvalidManifest)
+		}
+	default:
+		t.Fatalf("refused merge not settled")
+	}
+	if w.l0Merge.nextToPublish() != nil {
+		t.Fatalf("refused merge kept for retry")
+	}
+	after, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if after.NextSeq != before.NextSeq || after.LastWriterL0Merge != nil {
+		t.Fatalf("refused merge wrote to CURRENT: next %d -> %d, marker %+v", before.NextSeq, after.NextSeq, after.LastWriterL0Merge)
 	}
 }
 
@@ -407,8 +650,61 @@ func TestL0Merger_HeldLimit(t *testing.T) {
 	// Age closes a filling run on a pass.
 	m2 := newL0Merger(w, WriterL0MergeOptions{TargetBytes: 1 << 20, MaxAge: time.Millisecond})
 	m2.add(file("h", 10))
-	if finished := m2.pass(time.Now().Add(time.Second)); finished != nil || len(m2.closed) != 1 {
-		t.Fatalf("age did not close the run: closed=%d", len(m2.closed))
+	m2.pass(time.Now().Add(time.Second))
+	if len(m2.closed) != 1 || !m2.filling.empty() {
+		t.Fatalf("age did not close the run: closed=%d filling=%d", len(m2.closed), len(m2.filling.ssts))
+	}
+}
+
+func TestL0Merger_DropTouchingYieldsToMaintenance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := &writer{ctx: ctx}
+	m := newL0Merger(w, WriterL0MergeOptions{TargetBytes: 100, MaxAge: time.Hour})
+	file := func(id string, size int) (sstMetadata, []byte) {
+		return sstMetadata{ID: id, Size: int64(size), CreatedAt: time.Now()}, make([]byte, size)
+	}
+	// One closed run a,b,c; one filling run d; one finished merge of x,y.
+	for _, id := range []string{"a", "b", "c", "d"} {
+		m.add(file(id, 40))
+	}
+	m.finished = append(m.finished, mergedL0Run{commitID: "m-xy", inputs: []sstMetadata{{ID: "x"}, {ID: "y"}}})
+	if len(m.closed) != 1 || len(m.filling.ssts) != 1 || m.held != 160 {
+		t.Fatalf("setup: closed=%d filling=%d held=%d", len(m.closed), len(m.filling.ssts), m.held)
+	}
+
+	if dropped := m.dropTouching([]string{"unrelated"}); dropped != 0 || m.held != 160 {
+		t.Fatalf("unrelated ids dropped %d, held=%d", dropped, m.held)
+	}
+	// A command over the filling run's file.
+	if dropped := m.dropTouching([]string{"d"}); dropped != 1 || !m.filling.empty() || m.held != 120 {
+		t.Fatalf("filling: dropped=%d filling=%d held=%d", dropped, len(m.filling.ssts), m.held)
+	}
+	// A command over one file of the closed run drops the whole run.
+	if dropped := m.dropTouching([]string{"b"}); dropped != 1 || len(m.closed) != 0 || m.held != 0 {
+		t.Fatalf("closed: dropped=%d closed=%d held=%d", dropped, len(m.closed), m.held)
+	}
+	// A command over an unpublished merge's input forgets the merge.
+	if dropped := m.dropTouching([]string{"y"}); dropped != 1 || m.nextToPublish() != nil {
+		t.Fatalf("finished: dropped=%d next=%v", dropped, m.nextToPublish())
+	}
+}
+
+func TestMaintenanceCommandSSTIDs(t *testing.T) {
+	if ids := maintenanceCommandSSTIDs(nil); ids != nil {
+		t.Fatalf("nil command: %v", ids)
+	}
+	compaction := &manifest.MaintenanceCommand{Compaction: &manifest.CompactionCommand{
+		Payload: manifest.CompactionLogPayload{RemoveSSTableIDs: []string{"a", "b"}}}}
+	if ids := maintenanceCommandSSTIDs(compaction); len(ids) != 2 {
+		t.Fatalf("compaction: %v", ids)
+	}
+	remove := &manifest.MaintenanceCommand{RemoveSSTables: &manifest.RemoveSSTablesCommand{SSTableIDs: []string{"c"}}}
+	if ids := maintenanceCommandSSTIDs(remove); len(ids) != 1 || ids[0] != "c" {
+		t.Fatalf("remove: %v", ids)
+	}
+	if ids := maintenanceCommandSSTIDs(&manifest.MaintenanceCommand{}); ids != nil {
+		t.Fatalf("checkpoint: %v", ids)
 	}
 }
 
