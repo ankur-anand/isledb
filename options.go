@@ -42,7 +42,7 @@ type WriterOptions struct {
 	Values ValueOptions
 
 	// L0Merge controls the writer merging the small L0 files it commits into
-	// larger ones from memory. Off by default.
+	// larger ones from memory.
 	L0Merge WriterL0MergeOptions
 
 	// OnFlushError is called when a commit or a maintenance apply fails: on
@@ -89,8 +89,8 @@ type WriterMaintenanceOptions struct {
 // of about TargetBytes.
 type WriterL0MergeOptions struct {
 	// TargetBytes is the held bytes that start a merge and the approximate
-	// size of the merged file. Zero turns merging off. The writer holds up to
-	// twice this much.
+	// size of the merged file. Zero selects the default, 64 MiB. The writer
+	// holds up to twice this much.
 	TargetBytes int64
 
 	// MaxAge is how long a committed file is held before what is held is
@@ -123,7 +123,8 @@ func DefaultWriterOptions() WriterOptions {
 		},
 		Values: defaultWriterValueOptions(),
 		L0Merge: WriterL0MergeOptions{
-			MaxAge: 5 * time.Minute,
+			TargetBytes: 64 * 1024 * 1024,
+			MaxAge:      5 * time.Minute,
 		},
 	}
 }

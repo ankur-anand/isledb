@@ -347,6 +347,9 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, error) {
 		return WriterOptions{}, fmt.Errorf(
 			"%w: l0_merge_target_bytes=%d", ErrInvalidWriterOptions, opts.L0Merge.TargetBytes)
 	}
+	if opts.L0Merge.TargetBytes == 0 {
+		opts.L0Merge.TargetBytes = d.L0Merge.TargetBytes
+	}
 	if opts.L0Merge.MaxAge < 0 {
 		return WriterOptions{}, fmt.Errorf(
 			"%w: l0_merge_max_age=%s", ErrInvalidWriterOptions, opts.L0Merge.MaxAge)

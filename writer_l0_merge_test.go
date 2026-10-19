@@ -121,9 +121,9 @@ func waitForL0Merge(t *testing.T, w *writer, merges <-chan publishedMerge) publi
 	return publishedMerge{}
 }
 
-func TestWriterL0Merge_OffByDefault(t *testing.T) {
+func TestWriterL0Merge_OnByDefault(t *testing.T) {
 	ctx := context.Background()
-	store := blobstore.NewMemory("writer-l0-merge-off")
+	store := blobstore.NewMemory("writer-l0-merge-default")
 	defer store.Close()
 	manifestStore := newManifestStore(store, nil)
 
@@ -131,22 +131,19 @@ func TestWriterL0Merge_OffByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWriter: %v", err)
 	}
-	if w.l0Merge != nil {
-		t.Fatalf("merger built with L0Merge off")
+	defer w.close(ctx)
+	if w.l0Merge == nil || w.l0Merge.target != 64<<20 || w.l0Merge.maxAge != 5*time.Minute {
+		t.Fatalf("merger with default options: %+v", w.l0Merge)
 	}
-	for i := 0; i < 4; i++ {
-		if _, err := w.put(ctx, []byte(fmt.Sprintf("k%d", i)), []byte("v")); err != nil {
-			t.Fatalf("put: %v", err)
-		}
-		if err := w.flush(ctx); err != nil {
-			t.Fatalf("flush: %v", err)
-		}
+	// A flush is held for merging without any option set.
+	if _, err := w.put(ctx, []byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-	if err := w.close(ctx); err != nil {
-		t.Fatalf("close: %v", err)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
-	if ids := compactionNamedSSTs(t, store); len(ids) != 0 {
-		t.Fatalf("merged files with merging off: %v", ids)
+	if held := w.l0Merge.heldBytes(); held <= 0 {
+		t.Fatalf("nothing held after a flush with default options")
 	}
 }
 
@@ -729,11 +726,11 @@ func TestWriterOptions_L0MergeValidation(t *testing.T) {
 	if opts.L0Merge.TargetBytes != 1<<20 {
 		t.Fatalf("target changed to %d", opts.L0Merge.TargetBytes)
 	}
-	off, err := normalizeWriterOptions(WriterOptions{})
+	zero, err := normalizeWriterOptions(WriterOptions{})
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if off.L0Merge.TargetBytes != 0 {
-		t.Fatalf("merging on by default: %d", off.L0Merge.TargetBytes)
+	if zero.L0Merge.TargetBytes != 64<<20 {
+		t.Fatalf("zero target selects %d, want the 64 MiB default", zero.L0Merge.TargetBytes)
 	}
 }

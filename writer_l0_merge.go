@@ -138,6 +138,8 @@ type l0Merger struct {
 
 func newL0Merger(w *writer, opts WriterL0MergeOptions) *l0Merger {
 	if opts.TargetBytes <= 0 {
+		// Normalized options never carry zero; a writer built by hand in a
+		// test may. Nil means no merging and every method tolerates it.
 		return nil
 	}
 	m := &l0Merger{w: w, target: opts.TargetBytes, maxAge: opts.MaxAge}
