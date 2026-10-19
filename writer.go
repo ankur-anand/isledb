@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -54,6 +55,11 @@ type writer struct {
 	manifestLog *manifest.Store
 	opts        WriterOptions
 	sstOutput   SSTEncodingOptions
+	// l0Merge holds committed flushes and merges them; nil when L0Merge is
+	// off.
+	l0Merge *l0Merger
+	// onL0Merged, set only by tests, sees every merge the committer takes.
+	onL0Merged func(mergedL0Run)
 
 	changeFeedPayload ChangeFeedPayload
 	ctx               context.Context
@@ -173,6 +179,9 @@ type pendingFlush struct {
 	changes              *changeBatchBuffer
 	changeBatchCreatedAt time.Time
 	bytes                int64 // in-memory size when frozen, for State
+	// held copies the SST as it is uploaded, for the L0 merger; nil when
+	// merging is off. It survives commit retries like the upload it copies.
+	held *bytes.Buffer
 }
 
 func (p *pendingFlush) SeqLo() uint64 {
@@ -260,6 +269,7 @@ func newWriterWithMaintenanceWake(
 	}
 	w.commitFailures.kind = "commits"
 	w.maintenanceFailures.kind = "maintenance"
+	w.l0Merge = newL0Merger(w, opts.L0Merge)
 	w.attemptTimeoutBase.Store(int64(commitAttemptBase))
 
 	// What the manifest holds is committed: report it before the first
@@ -328,6 +338,17 @@ func normalizeWriterOptions(opts WriterOptions) (WriterOptions, error) {
 
 	if err := validateMemtableArena(opts.Memtable.TargetBytes, values); err != nil {
 		return WriterOptions{}, err
+	}
+	if opts.L0Merge.TargetBytes < 0 {
+		return WriterOptions{}, fmt.Errorf(
+			"%w: l0_merge_target_bytes=%d", ErrInvalidWriterOptions, opts.L0Merge.TargetBytes)
+	}
+	if opts.L0Merge.MaxAge < 0 {
+		return WriterOptions{}, fmt.Errorf(
+			"%w: l0_merge_max_age=%s", ErrInvalidWriterOptions, opts.L0Merge.MaxAge)
+	}
+	if opts.L0Merge.MaxAge == 0 {
+		opts.L0Merge.MaxAge = d.L0Merge.MaxAge
 	}
 	return opts, nil
 }
@@ -884,6 +905,13 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if err := w.applyStagedMaintenance(ctx); err != nil {
 		return err
 	}
+	// Merges finished since the last pass. Publishing them is not wired yet:
+	// until it is, a merged file is an object nothing references.
+	for _, merged := range w.l0Merge.pass(time.Now()) {
+		if w.onL0Merged != nil {
+			w.onL0Merged(merged)
+		}
+	}
 
 	w.mu.Lock()
 	throughSeq := w.seq
@@ -1177,7 +1205,16 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 	// index and Bloom filter. Sizing the upload buffer from it sends each in
 	// one request without a full-memtable buffer for every small save.
 	upload := blobstore.UploadInOneRequest(pending.bytes + pending.bytes/8 + 1<<20)
+	if w.l0Merge.enabled() && pending.held == nil {
+		pending.held = bytes.NewBuffer(make([]byte, 0, pending.bytes))
+	}
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
+		if pending.held != nil {
+			// Keep the object as uploaded. A retried upload starts over, and
+			// so does the copy.
+			pending.held.Reset()
+			r = io.TeeReader(r, pending.held)
+		}
 		sstPath := w.store.SSTPath(sstID)
 		_, err := w.store.WriteReader(ctx, sstPath, r, upload)
 		return err
@@ -1261,6 +1298,14 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) (write
 		return 0, 0, fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
+	if pending.held != nil {
+		// Committed: the copy joins the held run. A writer that has lost the
+		// fence will publish nothing more, so it keeps nothing either.
+		if !fenced {
+			w.l0Merge.add(*pending.sstable, pending.held.Bytes())
+		}
+		pending.held = nil
+	}
 	// Record this memtable's last sequence, not the writer's counter. A commit
 	// reconciled after a successor took the fence is recorded together with
 	// the fencing, so it stays a success.
@@ -1437,6 +1482,7 @@ func (w *writer) stop() {
 	w.committerCancel()
 	<-w.pollerDone
 	<-w.committerDone
+	w.l0Merge.wait()
 }
 
 // finished reports whether the writer has stopped for good: closed or fenced.

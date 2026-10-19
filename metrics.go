@@ -26,6 +26,20 @@ type WriterMetrics struct {
 	// was accepted, or 0 when every write is committed: time() minus it is how
 	// long writes have waited to become durable.
 	OldestUncommitted prometheus.Gauge
+
+	// L0MergeTotal counts merged L0 files the writer uploaded; L0MergeErrors
+	// counts merge attempts that failed and are retried.
+	L0MergeTotal  prometheus.Counter
+	L0MergeErrors prometheus.Counter
+	// L0MergeBytes is the bytes of merged L0 files uploaded: the writer's
+	// share of write amplification.
+	L0MergeBytes prometheus.Counter
+	// L0MergeSkippedBytes is the bytes of flushes committed without a held
+	// copy because the writer already held as much as it may.
+	L0MergeSkippedBytes prometheus.Counter
+	// L0MergeHeldBytes is the bytes of committed flushes the writer holds
+	// for merging.
+	L0MergeHeldBytes prometheus.Gauge
 }
 
 func (m *WriterMetrics) incCounter(counter prometheus.Counter) {
@@ -101,6 +115,36 @@ func (m *WriterMetrics) ObserveFlushBytes(sizeBytes int64) {
 	if sizeBytes > 0 {
 		m.addCounter(m.FlushBytes, float64(sizeBytes))
 	}
+}
+
+// ObserveL0Merge records one attempt to merge held L0 files: the output's
+// size when it uploaded, or the error.
+func (m *WriterMetrics) ObserveL0Merge(outputBytes int64, err error) {
+	if m == nil {
+		return
+	}
+	if err != nil {
+		m.incCounter(m.L0MergeErrors)
+		return
+	}
+	m.incCounter(m.L0MergeTotal)
+	m.addCounter(m.L0MergeBytes, float64(outputBytes))
+}
+
+// ObserveL0MergeSkipped records a flush committed without a held copy.
+func (m *WriterMetrics) ObserveL0MergeSkipped(sizeBytes int64) {
+	if m == nil {
+		return
+	}
+	m.addCounter(m.L0MergeSkippedBytes, float64(sizeBytes))
+}
+
+// ObserveL0MergeHeld records how many bytes the writer holds for merging.
+func (m *WriterMetrics) ObserveL0MergeHeld(heldBytes int64) {
+	if m == nil || m.L0MergeHeldBytes == nil {
+		return
+	}
+	m.L0MergeHeldBytes.Set(float64(heldBytes))
 }
 
 func (m *WriterMetrics) ObserveFlush(d time.Duration, err error) {
@@ -184,6 +228,41 @@ func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 			Subsystem:   "writer",
 			Name:        "delete_total",
 			Help:        "Total Delete Operations.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merges_total",
+			Help:        "Merged L0 files the writer uploaded.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merge_errors_total",
+			Help:        "L0 merge attempts that failed; they are retried.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merge_bytes_total",
+			Help:        "Bytes of merged L0 files uploaded.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeSkippedBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merge_skipped_bytes_total",
+			Help:        "Bytes of flushes committed without a held copy because the held limit was reached.",
+			ConstLabels: constLabels,
+		}),
+		L0MergeHeldBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "l0_merge_held_bytes",
+			Help:        "Bytes of committed flushes held in memory for merging.",
 			ConstLabels: constLabels,
 		}),
 	}
