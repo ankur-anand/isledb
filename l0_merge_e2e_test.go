@@ -139,3 +139,115 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 	}
 	t.Logf("40 saves, %d L0 merges, L0 now %d SSTs, L1 %d SSTs", merges, m.L0SSTCount(), len(m.Levels))
 }
+
+// TestMaintenanceCombinesMergedFilesOverALargeL1 scales the large-L1 case
+// down: a base in L1 many times the merge output size, with a depth limit the
+// ratio cannot be reached within, so maintenance combines the writer's merged
+// files with each other before draining them. Every lookup still returns the
+// newest version.
+func TestMaintenanceCombinesMergedFilesOverALargeL1(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	store := blobstore.NewMemory("l0-combine")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	wopts := DefaultWriterOptions()
+	wopts.Flush.Interval = 0
+	// Every save becomes its own merged file: the run closes by age on the
+	// pass after the save.
+	wopts.L0Merge.TargetBytes = 1 << 20
+	wopts.L0Merge.MaxAge = time.Millisecond
+	wopts.Metrics = DefaultWriterMetrics(nil)
+	writer, err := db.OpenWriter(ctx, wopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close(ctx) }()
+	mopts := DefaultMaintenanceOptions()
+	mopts.SSTCompaction.L0TriggerSSTs = 1
+	mopts.SSTCompaction.L0MaxDepth = 4
+	mopts.SSTCompaction.TargetSSTBytes = 8 << 10
+	mopts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenance, err := db.OpenMaintenance(ctx, mopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = maintenance.Close(ctx) }()
+
+	expected := map[string][]byte{}
+	put := func(key, value string) {
+		if _, err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = []byte(value)
+	}
+	// A base in L1 of about 60 KiB: with 8 KiB outputs the ratio needs about
+	// eight files and the depth limit is four, so merged files are combined
+	// in pairs.
+	for i := 0; i < 500; i++ {
+		put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("base-%04d-%0100d", i, i))
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The base is merged by the writer, then drained: it overlaps nothing.
+	waitForNoRawL0(t, ctx, writer, store)
+	driveMaintenanceToIdle(t, ctx, maintenance, writer)
+	if m := replayManifestForTest(t, ctx, store); m.L0SSTCount() != 0 || len(m.Levels) == 0 {
+		t.Fatalf("base not drained: L0=%d levels=%d", m.L0SSTCount(), len(m.Levels))
+	}
+
+	var combines int
+	for round := 0; round < 24; round++ {
+		for _, i := range []int{round % 7, 100 + round%11, 250, 499 - round%5} {
+			put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%02d", round))
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Publish the merge of this save, then let maintenance look.
+		waitForNoRawL0(t, ctx, writer, store)
+		combines += driveMaintenanceToIdle(t, ctx, maintenance, writer).SSTCompaction.L0Merges
+	}
+	if combines == 0 {
+		t.Fatal("maintenance combined no merged files over a large L1")
+	}
+	if int(testutil.ToFloat64(wopts.Metrics.L0MergePublished)) == 0 {
+		t.Fatal("the writer published no merges")
+	}
+
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	defer reader.Close()
+	assertReaderHasAll(t, ctx, reader, expected)
+	t.Logf("%d combines by maintenance, L0 now %d SSTs", combines, replayManifestForTest(t, ctx, store).L0SSTCount())
+}
+
+// waitForNoRawL0 runs writer passes until every L0 file is a merged one: the
+// writer's background merges have finished and been published.
+func waitForNoRawL0(t *testing.T, ctx context.Context, writer *Writer, store *blobstore.Store) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		raw := 0
+		for _, sst := range replayManifestForTest(t, ctx, store).L0SSTs {
+			if !isCompactionSSTID(sst.ID) {
+				raw++
+			}
+		}
+		if raw == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d raw L0 files still unmerged", raw)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

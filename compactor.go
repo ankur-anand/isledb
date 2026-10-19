@@ -397,8 +397,9 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		// cannot be planned still reports as critical, instead of going quiet
 		// exactly when it is most backed up.
 		critical := l0CompactionCritical(len(drainable), c.opts.Trigger.L0SSTCount)
-		// Not yet worth rewriting L1: wait for more to arrive. New L0 files
-		// are merged with each other by the writer, from memory.
+		// New L0 files are merged with each other by the writer, from memory.
+		// Maintenance drains the result into L1 when a rule fires, combines
+		// merged files first when L1 is large, and otherwise waits.
 		if c.l0ShouldDrain(drainable, m, now) {
 			inputs := drainable
 			if len(inputs) > maxCompactionSSTsPerJob {
@@ -422,6 +423,10 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				}
 				candidates = append(candidates, candidate)
 			}
+		} else if plan := c.planL0Combine(drainable, m); plan != nil {
+			// A large L1: the ratio needs more merged files than the depth
+			// limit allows, so combine finished ones first.
+			candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
 		}
 	}
 	plannedLevels := make(map[uint32]struct{}, len(candidates))
@@ -511,6 +516,68 @@ func (c *compactor) l0Work() (ssts int, enough bool) {
 	defer c.mu.Unlock()
 	drainable := c.drainableL0(c.manifest, time.Now())
 	return len(drainable), c.l0NeedsPlanning(drainable)
+}
+
+// l0OverlapBytes is the L1 bytes l0 overlaps: what a drain of l0 rewrites.
+func l0OverlapBytes(l0 []sstMetadata, m *manifestState) int64 {
+	if len(l0) == 0 || m == nil {
+		return 0
+	}
+	var overlap int64
+	minKey, maxKey := sstBounds(l0)
+	if l1 := m.Level(1); l1 != nil {
+		for _, sst := range l1.OverlappingSSTs(minKey, maxKey) {
+			overlap += sst.Size
+		}
+	}
+	return overlap
+}
+
+// planL0Combine combines merged L0 files with each other when L1 is large: a
+// drain pays off once L0 holds L0ToBaseRatio of the L1 it overlaps, and if
+// that takes more files of TargetSSTBytes than L0MaxDepth allows, the depth
+// rule would force a drain early and rewrite L1 far more often than needed.
+// Combining finished merged files, in groups just large enough that the
+// ratio is reached within the depth limit, lets the bytes pile up while the
+// count stays low. Only files right of the drain boundary are considered, so
+// the writer's own merging is never contended; a file already combined, or a
+// flush file between merged ones, breaks a run.
+func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState) *levelCompactionPlan {
+	ratio, target, depth := c.opts.Trigger.L0ToBaseRatio, c.opts.Output.TargetSSTBytes, c.opts.Trigger.L0MaxDepth
+	overlap := l0OverlapBytes(drainable, m)
+	if overlap <= 0 || target <= 0 || depth <= 0 || ratio <= 0 {
+		return nil
+	}
+	needed := int(math.Ceil(ratio * float64(overlap) / float64(target)))
+	if needed <= depth {
+		return nil
+	}
+	group := min((needed+depth-1)/depth, maxCompactionSSTsPerJob)
+	if group < 2 {
+		return nil
+	}
+	combinedSize := int64(group) * target
+	notCombined := func(sst sstMetadata) bool {
+		return isCompactionSSTID(sst.ID) && sst.Size < combinedSize/2
+	}
+	// From the old end, the first adjacent run of group files not yet
+	// combined. drainable is newest first; the run is collected oldest first
+	// and returned newest first, the order duplicate-key precedence follows.
+	var run []sstMetadata
+	for i := len(drainable) - 1; i >= 0 && len(run) < group; i-- {
+		if !notCombined(drainable[i]) {
+			run = run[:0]
+			continue
+		}
+		run = append(run, drainable[i])
+	}
+	if len(run) < group {
+		return nil
+	}
+	for i, j := 0, len(run)-1; i < j; i, j = i+1, j-1 {
+		run[i], run[j] = run[j], run[i]
+	}
+	return &levelCompactionPlan{sourceLevel: 0, destinationLevel: 0, sourceSSTs: run}
 }
 
 // l0ShouldDrain reports whether L0 should merge into L1 now: when it holds at
