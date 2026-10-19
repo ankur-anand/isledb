@@ -912,6 +912,15 @@ func (w *writer) commitPass(ctx context.Context, final bool) error {
 	if err := w.publishL0Merges(ctx); err != nil {
 		return err
 	}
+	// Retirement records are not commits: a failure to write one is reported
+	// and tried again next pass, and never holds up a flush.
+	if w.l0Merge != nil {
+		if err := w.retireL0Merges(ctx); err != nil && ctx.Err() == nil {
+			w.reportFailure(&w.l0Merge.retireFailures, err)
+		} else if err == nil {
+			w.reportRecovery(&w.l0Merge.retireFailures)
+		}
+	}
 
 	w.mu.Lock()
 	throughSeq := w.seq

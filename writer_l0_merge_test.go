@@ -528,12 +528,14 @@ func TestWriterL0Merge_RefusedMergeIsDropped(t *testing.T) {
 	}
 
 	// A merge whose inputs are not in L0: as after a drain took them.
+	inputs := []sstMetadata{{ID: "gone-1.sst", Size: 10}, {ID: "gone-2.sst", Size: 10}}
+	output := sstMetadata{ID: "compacted-" + strings.Repeat("0", 64) + "-0001.sst", SeqLo: 1, SeqHi: 2, Size: 10, Epoch: 1}
+	intent, err := w.l0Merge.writeL0MergeIntent(ctx, inputs, output.ID)
+	if err != nil {
+		t.Fatalf("writeL0MergeIntent: %v", err)
+	}
 	w.l0Merge.mu.Lock()
-	w.l0Merge.finished = append(w.l0Merge.finished, mergedL0Run{
-		commitID: "stale-merge",
-		inputs:   []sstMetadata{{ID: "gone-1.sst", Size: 10}, {ID: "gone-2.sst", Size: 10}},
-		output:   sstMetadata{ID: "compacted-" + strings.Repeat("0", 64) + "-0001.sst", SeqLo: 1, SeqHi: 2, Size: 10, Epoch: 1},
-	})
+	w.l0Merge.finished = append(w.l0Merge.finished, mergedL0Run{commitID: "stale-merge", intent: intent, inputs: inputs, output: output})
 	w.l0Merge.mu.Unlock()
 
 	if err := w.flush(ctx); err != nil {
@@ -659,7 +661,9 @@ func TestL0Merger_HeldLimit(t *testing.T) {
 func TestL0Merger_DropTouchingYieldsToMaintenance(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	w := &writer{ctx: ctx}
+	store := blobstore.NewMemory("l0-merger-drop")
+	defer store.Close()
+	w := &writer{ctx: ctx, store: store}
 	m := newL0Merger(w, WriterL0MergeOptions{TargetBytes: 100, MaxAge: time.Hour})
 	file := func(id string, size int) (sstMetadata, []byte) {
 		return sstMetadata{ID: id, Size: int64(size), CreatedAt: time.Now()}, make([]byte, size)

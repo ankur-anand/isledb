@@ -87,8 +87,13 @@ func (r *l0Run) touches(ids map[string]struct{}) bool {
 // result cannot replace the run twice.
 type mergedL0Run struct {
 	commitID string
+	intent   sstMergeIntent
 	inputs   []sstMetadata // oldest first, as committed
 	output   sstMetadata
+}
+
+func (m *mergedL0Run) outputTarget(store *blobstore.Store) []sstDeletionTarget {
+	return []sstDeletionTarget{{ID: m.output.ID, Key: store.SSTPath(m.output.ID), Size: m.output.Size}}
 }
 
 func (m *mergedL0Run) touches(ids map[string]struct{}) bool {
@@ -121,8 +126,12 @@ type l0Merger struct {
 	// finished are merges uploaded and waiting for the committer to publish,
 	// oldest first.
 	finished []mergedL0Run
+	// retirements are settled merges whose deletion plan the committer has
+	// still to write.
+	retirements []l0MergeRetirement
 
-	failures failureRun
+	failures       failureRun
+	retireFailures failureRun
 }
 
 func newL0Merger(w *writer, opts WriterL0MergeOptions) *l0Merger {
@@ -131,6 +140,7 @@ func newL0Merger(w *writer, opts WriterL0MergeOptions) *l0Merger {
 	}
 	m := &l0Merger{w: w, target: opts.TargetBytes, maxAge: opts.MaxAge}
 	m.failures.kind = "l0 merges"
+	m.retireFailures.kind = "l0 merge retirements"
 	return m
 }
 
@@ -238,6 +248,11 @@ func (m *l0Merger) dropTouching(ids []string) int {
 	keptMerges := m.finished[:0]
 	for _, merged := range m.finished {
 		if merged.touches(set) {
+			// Its output will never replace anything: retire it.
+			m.retirements = append(m.retirements, l0MergeRetirement{
+				intent: merged.intent, outcome: sstDeletionOutcomeOutput,
+				appliedAt: time.Now().UTC(), targets: merged.outputTarget(m.w.store),
+			})
 			dropped++
 			continue
 		}
@@ -323,7 +338,11 @@ func (m *l0Merger) run(done chan struct{}) {
 		m.mu.Lock()
 		if i := indexOfRun(m.closed, run); i < 0 {
 			// Dropped while merging: a maintenance command took its files.
-			// The output is an object nothing references.
+			// The output will never replace anything: retire it.
+			m.retirements = append(m.retirements, l0MergeRetirement{
+				intent: merged.intent, outcome: sstDeletionOutcomeOutput,
+				appliedAt: time.Now().UTC(), targets: merged.outputTarget(m.w.store),
+			})
 			m.mu.Unlock()
 			continue
 		} else {
@@ -385,6 +404,12 @@ func (m *l0Merger) merge(ctx context.Context, run *l0Run) (mergedL0Run, error) {
 	if err != nil {
 		return mergedL0Run{}, err
 	}
+	// The intent first: from here on an object may exist that only this
+	// record and the manifest can account for.
+	intent, err := m.writeL0MergeIntent(ctx, inputs, output.ID)
+	if err != nil {
+		return mergedL0Run{}, err
+	}
 
 	readers := make([]*sstable.Reader, 0, len(run.ssts))
 	iters := make([]sstable.Iterator, 0, len(run.ssts))
@@ -432,7 +457,7 @@ func (m *l0Merger) merge(ctx context.Context, run *l0Run) (mergedL0Run, error) {
 
 	slog.Debug("isledb: l0 run merged", "component", "writer", "inputs", len(inputs),
 		"input_bytes", run.bytes, "output", meta.ID, "output_bytes", meta.Size)
-	return mergedL0Run{commitID: ksuid.New().String(), inputs: inputs, output: meta}, nil
+	return mergedL0Run{commitID: ksuid.New().String(), intent: intent, inputs: inputs, output: meta}, nil
 }
 
 // retired names every input of a merge as an object to delete once the merge
@@ -548,6 +573,9 @@ func (w *writer) publishL0Merges(ctx context.Context) error {
 		switch {
 		case err == nil:
 			w.l0Merge.published(merged.commitID)
+			// The inputs stopped being referenced when the entry was committed.
+			w.l0Merge.retire(merged.intent, sstDeletionOutcomeInputs, entry.Timestamp,
+				sstDeletionTargets(w.store, merged.inputs))
 			w.metrics.ObserveL0MergePublished(nil)
 			slog.Debug("isledb: l0 merge published", "component", "writer", "output", merged.output.ID,
 				"inputs", len(merged.inputs), "manifest_seq", entry.Seq)
@@ -560,6 +588,8 @@ func (w *writer) publishL0Merges(ctx context.Context) error {
 			}
 		case errors.Is(err, manifest.ErrInvalidManifest):
 			w.l0Merge.published(merged.commitID)
+			// Nothing was published: the output never replaced anything.
+			w.l0Merge.retire(merged.intent, sstDeletionOutcomeOutput, time.Now(), merged.outputTarget(w.store))
 			w.metrics.ObserveL0MergePublished(err)
 			slog.Warn("isledb: l0 merge refused; its files are no longer a run in L0",
 				"component", "writer", "output", merged.output.ID, "error", err)
