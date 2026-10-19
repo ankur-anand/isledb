@@ -472,7 +472,7 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 		// successful while still treating the local session as terminal.
 		s.observeFenceWithCurrent(role, current)
 
-		if role == FenceRoleWriter && entry.CommitID != "" && entry.Op == LogOpAddSSTable {
+		if role == FenceRoleWriter && isWriterCommitEntry(entry) {
 			if applied, err := s.reconcilePendingWriterCommit(ctx, current, entry); applied || err != nil {
 				return err
 			}
@@ -527,12 +527,16 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			return err
 		}
 		var writerMarker *WriterCommitMarker
-		if nextEntry.Role == FenceRoleWriter && nextEntry.Op == LogOpAddSSTable && nextEntry.CommitID != "" {
+		if nextEntry.Role == FenceRoleWriter && isWriterCommitEntry(&nextEntry) {
 			writerMarker, err = writerCommitMarker(&nextEntry)
 			if err != nil {
 				return err
 			}
-			updated.LastWriterCommit = writerMarker
+			if nextEntry.Op == LogOpAddSSTable {
+				updated.LastWriterCommit = writerMarker
+			} else {
+				updated.LastWriterL0Merge = writerMarker
+			}
 		}
 		data, err := s.encodeCurrentForCASWithRotation(ctx, updated)
 		if err != nil {
@@ -666,12 +670,44 @@ func validateWriterCommit(commit WriterCommit) error {
 	return nil
 }
 
+// isWriterCommitEntry reports whether entry is one the writer publishes with
+// a commit ID and CURRENT records in a marker: a flush, or a merge of the
+// writer's own L0 files.
+func isWriterCommitEntry(entry *ManifestLogEntry) bool {
+	if entry == nil || entry.CommitID == "" {
+		return false
+	}
+	switch entry.Op {
+	case LogOpAddSSTable:
+		return true
+	case LogOpCompaction:
+		return isL0MergePayload(entry.Compaction)
+	}
+	return false
+}
+
+func isL0MergePayload(c *CompactionLogPayload) bool {
+	return c != nil && c.SourceLevel == 0 && c.DestinationLevel == 0
+}
+
+// writerMarkerFor is the marker in current that would record entry: flushes
+// and L0 merges are tracked apart, so a merge never moves the sequence at
+// which the writer's commits end.
+func writerMarkerFor(current *Current, entry *ManifestLogEntry) *WriterCommitMarker {
+	if current == nil || entry == nil {
+		return nil
+	}
+	if entry.Op == LogOpAddSSTable {
+		return current.LastWriterCommit
+	}
+	return current.LastWriterL0Merge
+}
+
 func reconcileWriterCommit(current *Current, entry *ManifestLogEntry) (bool, error) {
-	if current == nil || entry == nil || entry.CommitID == "" ||
-		entry.Role == FenceRoleCompactor || entry.Op != LogOpAddSSTable {
+	if current == nil || entry == nil || entry.Role == FenceRoleCompactor || !isWriterCommitEntry(entry) {
 		return false, nil
 	}
-	marker := current.LastWriterCommit
+	marker := writerMarkerFor(current, entry)
 	if marker == nil || marker.CommitID != entry.CommitID {
 		return false, nil
 	}
@@ -691,11 +727,11 @@ func (s *Store) reconcilePendingWriterCommit(
 	if marker == nil {
 		return false, nil
 	}
-	if entry == nil || entry.SSTable == nil || entry.CommitID != marker.CommitID {
+	if !isWriterCommitEntry(entry) || entry.CommitID != marker.CommitID {
 		return true, fmt.Errorf("%w: pending commit_id=%q retry commit_id=%q",
 			ErrWriterCommitConflict, marker.CommitID, entry.CommitID)
 	}
-	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	fingerprint, err := writerEntryFingerprint(entry)
 	if err != nil {
 		return true, err
 	}
@@ -704,11 +740,11 @@ func (s *Store) reconcilePendingWriterCommit(
 			ErrWriterCommitConflict, entry.CommitID)
 	}
 
-	if current != nil && writerCommitMarkersEqual(current.LastWriterCommit, marker) {
+	if recorded := writerMarkerFor(current, entry); writerCommitMarkersEqual(recorded, marker) {
 		// CURRENT records this exact commit as the writer's last: it landed.
 		// This holds even once a checkpoint has folded its entry away.
 		s.pendingWriterCommit = nil
-		return reconcileWriterCommitMarker(current.LastWriterCommit, entry)
+		return reconcileWriterCommitMarker(recorded, entry)
 	}
 	retainedFrom := retainedEntryFloor(current)
 	if marker.ManifestSeq < retainedFrom {
@@ -728,7 +764,7 @@ func (s *Store) reconcilePendingWriterCommit(
 			marker.ManifestSeq, err)
 	}
 	committed := entries[0]
-	if committed.Role != FenceRoleWriter || committed.Op != LogOpAddSSTable || committed.CommitID == "" {
+	if committed.Role != FenceRoleWriter || committed.Op != entry.Op || !isWriterCommitEntry(committed) {
 		s.pendingWriterCommit = nil
 		return false, nil
 	}
@@ -764,12 +800,9 @@ func writerCommitMarkersEqual(a, b *WriterCommitMarker) bool {
 }
 
 func reconcileWriterCommitMarker(marker *WriterCommitMarker, entry *ManifestLogEntry) (bool, error) {
-	if entry.SSTable == nil {
-		return true, fmt.Errorf("%w: commit_id=%q", ErrWriterCommitConflict, entry.CommitID)
-	}
-	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	fingerprint, err := writerEntryFingerprint(entry)
 	if err != nil {
-		return true, err
+		return true, fmt.Errorf("%w: commit_id=%q: %v", ErrWriterCommitConflict, entry.CommitID, err)
 	}
 	if marker.Fingerprint != fingerprint {
 		return true, fmt.Errorf("%w: commit_id=%q metadata mismatch", ErrWriterCommitConflict, entry.CommitID)
@@ -783,23 +816,47 @@ func reconcileWriterCommitMarker(marker *WriterCommitMarker, entry *ManifestLogE
 }
 
 func writerCommitMarker(entry *ManifestLogEntry) (*WriterCommitMarker, error) {
-	if entry == nil || entry.SSTable == nil {
-		return nil, fmt.Errorf("%w: missing sstable metadata", ErrInvalidWriterCommit)
-	}
-	fingerprint, err := writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	fingerprint, err := writerEntryFingerprint(entry)
 	if err != nil {
 		return nil, err
 	}
-	return &WriterCommitMarker{
+	marker := &WriterCommitMarker{
 		CommitID:    entry.CommitID,
 		Fingerprint: fingerprint,
 		EntryID:     entry.ID,
 		ManifestSeq: entry.Seq,
 		WriterEpoch: entry.Epoch,
-		SeqLo:       entry.SSTable.SeqLo,
-		SeqHi:       entry.SSTable.SeqHi,
 		CommittedAt: entry.Timestamp,
-	}, nil
+	}
+	switch {
+	case entry.Op == LogOpAddSSTable:
+		marker.SeqLo, marker.SeqHi = entry.SSTable.SeqLo, entry.SSTable.SeqHi
+	case len(entry.Compaction.AddSSTables) == 1:
+		// The merged file's range: the surviving entries', within its inputs'.
+		marker.SeqLo, marker.SeqHi = entry.Compaction.AddSSTables[0].SeqLo, entry.Compaction.AddSSTables[0].SeqHi
+	}
+	return marker, nil
+}
+
+// writerEntryFingerprint hashes what a writer commit publishes, so a retry
+// with the same commit ID and different contents is caught.
+func writerEntryFingerprint(entry *ManifestLogEntry) (string, error) {
+	if entry == nil {
+		return "", fmt.Errorf("%w: nil entry", ErrInvalidWriterCommit)
+	}
+	switch entry.Op {
+	case LogOpAddSSTable:
+		if entry.SSTable == nil {
+			return "", fmt.Errorf("%w: missing sstable metadata", ErrInvalidWriterCommit)
+		}
+		return writerCommitFingerprint(entry.SSTable, entry.ChangeBatch)
+	case LogOpCompaction:
+		if !isL0MergePayload(entry.Compaction) {
+			return "", fmt.Errorf("%w: compaction entry is not an L0 merge", ErrInvalidWriterCommit)
+		}
+		return writerL0MergeFingerprint(entry.Compaction)
+	}
+	return "", fmt.Errorf("%w: op=%q has no commit fingerprint", ErrInvalidWriterCommit, entry.Op)
 }
 
 func writerCommitIDForSST(sstableID string) string {
@@ -820,6 +877,79 @@ func writerCommitFingerprint(sstable *SSTMeta, changeBatch *ChangeBatchMeta) (st
 	}
 	sum := sha256.Sum256(payload)
 	return fmt.Sprintf("sha256:%x", sum[:]), nil
+}
+
+func writerL0MergeFingerprint(payload *CompactionLogPayload) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Kind    string               `json:"kind"`
+		Payload CompactionLogPayload `json:"payload"`
+	}{
+		Kind:    "l0_merge",
+		Payload: *payload,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: encode l0 merge fingerprint: %v", ErrInvalidWriterCommit, err)
+	}
+	sum := sha256.Sum256(encoded)
+	return fmt.Sprintf("sha256:%x", sum[:]), nil
+}
+
+// AppendWriterL0Merge idempotently publishes one merged L0 file in place of
+// the run it was built from. It is refused, with ErrInvalidManifest, when the
+// inputs are no longer all present and adjacent in L0, before anything is
+// written. Reusing the commit ID after an uncertain CAS result cannot replace
+// the run twice.
+func (s *Store) AppendWriterL0Merge(ctx context.Context, merge WriterL0Merge) (*ManifestLogEntry, error) {
+	if err := validateWriterL0Merge(merge); err != nil {
+		return nil, err
+	}
+	output := merge.Output
+	output.Level = 0
+	payload := CompactionLogPayload{
+		RemoveSSTableIDs: append([]string(nil), merge.InputIDs...),
+		SourceLevel:      0,
+		DestinationLevel: 0,
+		AddSSTables:      []SSTMeta{output},
+	}
+	if err := validateCompactionPayload(payload); err != nil {
+		return nil, err
+	}
+	entry := &ManifestLogEntry{
+		CommitID:       merge.ID,
+		Op:             LogOpCompaction,
+		Compaction:     &payload,
+		RetiredObjects: append([]RetiredObject(nil), merge.Retired...),
+	}
+	if err := s.AppendWithWriterFence(ctx, entry); err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
+func validateWriterL0Merge(merge WriterL0Merge) error {
+	if merge.ID == "" {
+		return fmt.Errorf("%w: empty commit_id", ErrInvalidWriterCommit)
+	}
+	if len(merge.ID) > maxWriterCommitIDBytes {
+		return fmt.Errorf("%w: commit_id bytes=%d max=%d", ErrInvalidWriterCommit,
+			len(merge.ID), maxWriterCommitIDBytes)
+	}
+	if len(merge.InputIDs) == 0 {
+		return fmt.Errorf("%w: l0 merge has no inputs", ErrInvalidWriterCommit)
+	}
+	if merge.Output.ID == "" {
+		return fmt.Errorf("%w: empty output sstable_id", ErrInvalidWriterCommit)
+	}
+	if merge.Output.SeqHi < merge.Output.SeqLo {
+		return fmt.Errorf("%w: invalid output sequence range %d-%d", ErrInvalidWriterCommit,
+			merge.Output.SeqLo, merge.Output.SeqHi)
+	}
+	for _, id := range merge.InputIDs {
+		if id == merge.Output.ID {
+			return fmt.Errorf("%w: output %q is also an input", ErrInvalidWriterCommit, id)
+		}
+	}
+	return nil
 }
 
 func (s *Store) AppendRemoveSSTablesWithFence(ctx context.Context, sstableIDs []string, retired []RetiredObject) (*ManifestLogEntry, error) {

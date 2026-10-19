@@ -62,6 +62,7 @@ func (c *Current) Clone() *Current {
 		WriterFence:          c.WriterFence.Clone(),
 		CompactorFence:       c.CompactorFence.Clone(),
 		LastWriterCommit:     c.LastWriterCommit.Clone(),
+		LastWriterL0Merge:    c.LastWriterL0Merge.Clone(),
 		MaintenanceReceipt:   c.MaintenanceReceipt.Clone(),
 		MaintenanceScheduler: c.MaintenanceScheduler,
 	}
