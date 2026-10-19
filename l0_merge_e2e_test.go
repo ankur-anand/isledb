@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestL0MergesKeepTheNewestVersion overwrites and deletes the same keys in many
@@ -28,6 +29,7 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 	wopts.Flush.Interval = 0
 	// Small runs, so a 40-save test sees several merges.
 	wopts.L0Merge.TargetBytes = 16 << 10
+	wopts.Metrics = DefaultWriterMetrics(nil)
 	writer, err := db.OpenWriter(ctx, wopts)
 	if err != nil {
 		t.Fatal(err)
@@ -95,21 +97,20 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 	if m.L0SSTCount() >= 40 {
 		t.Fatalf("L0 holds %d SSTs after 40 saves", m.L0SSTCount())
 	}
-	merged := false
-	merges := 0
-	for _, sst := range m.L0SSTs {
-		if isCompactionSSTID(sst.ID) {
-			merges++
-		}
-		if !sst.OldestDataAt.IsZero() {
-			merged = true
-			if !sst.OldestDataAt.Before(sst.CreatedAt) && !sst.OldestDataAt.Equal(sst.CreatedAt) {
-				t.Fatalf("merged SST %s: oldest data %v after creation %v", sst.ID, sst.OldestDataAt, sst.CreatedAt)
-			}
-		}
+	// The writer merged; maintenance may since have drained the results into
+	// L1, so count merges at the writer, and check the age of whatever merged
+	// file is still in L0.
+	merges := int(testutil.ToFloat64(wopts.Metrics.L0MergePublished))
+	if merges == 0 {
+		t.Fatal("no merges published: small saves should have been merged by the writer")
 	}
-	if !merged || merges == 0 {
-		t.Fatal("no merged SST in L0: small saves should have been merged by the writer")
+	for _, sst := range m.L0SSTs {
+		if !isCompactionSSTID(sst.ID) {
+			continue
+		}
+		if sst.OldestDataAt.IsZero() || sst.OldestDataAt.After(sst.CreatedAt) {
+			t.Fatalf("merged SST %s: oldest data %v, created %v", sst.ID, sst.OldestDataAt, sst.CreatedAt)
+		}
 	}
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})

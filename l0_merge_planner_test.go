@@ -110,34 +110,53 @@ func TestL0PlannerDrainsFlushFilesPastTheAgeLimit(t *testing.T) {
 	}
 }
 
-func TestL0PlannerDrainsOnlyBelowTheWritersFiles(t *testing.T) {
+func TestL0PlannerDrainsEverythingBelowTheNewestMergedFile(t *testing.T) {
 	c := plannerOnlyCompactor()
 	m := &manifestState{}
 	now := time.Now()
 	// Oldest first as committed: two merged files, a flush the writer did not
-	// keep a copy of, a merged file, then the writer's current run.
+	// keep a copy of, a merged file, another skipped flush, a merged file,
+	// then the writer's current run.
 	m.AddL0SST(plannerSSTNamed(mergedSSTID(1), 64<<20, now))
 	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 64<<20, now))
 	m.AddL0SST(rawFlush(3, 2<<20, now))
 	m.AddL0SST(plannerSSTNamed(mergedSSTID(4), 64<<20, now))
 	m.AddL0SST(rawFlush(5, 2<<20, now))
-	m.AddL0SST(rawFlush(6, 2<<20, now))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(6), 64<<20, now))
+	m.AddL0SST(rawFlush(7, 2<<20, now))
+	m.AddL0SST(rawFlush(8, 2<<20, now))
 
-	// The drain stops below the first young flush file from the old end: the
-	// merged file above it cannot move to L1 while an older version of a key
-	// may sit in that flush.
+	// The writer merges oldest run first, so a flush file with a merged file
+	// above it is one it skipped: everything from the newest merged file to
+	// the old end drains, skipped files included. The run above stays.
 	got := c.drainableL0(m, now)
-	if want := mergedSSTID(2) + "," + mergedSSTID(1); l0IDList(got) != want {
+	want := strings.Join([]string{mergedSSTID(6), m.L0SSTs[3].ID, mergedSSTID(4), m.L0SSTs[5].ID, mergedSSTID(2), mergedSSTID(1)}, ",")
+	if l0IDList(got) != want {
 		t.Fatalf("drainable %s, want %s", l0IDList(got), want)
 	}
-	// Once that flush ages past the limit, it and the merged file above it
-	// are drainable too; the writer's run still is not.
+	// The run above the line drains only once it is older than the age
+	// limit, as a dead writer's leftovers with no successor do.
 	later := now.Add(c.opts.Trigger.L0MaxAge + time.Second)
-	m.L0SSTs[1].CreatedAt = later // the writer's run stays young
-	m.L0SSTs[0].CreatedAt = later
-	got = c.drainableL0(m, later)
-	if want := strings.Join([]string{mergedSSTID(4), m.L0SSTs[3].ID, mergedSSTID(2), mergedSSTID(1)}, ","); l0IDList(got) != want {
-		t.Fatalf("drainable %s, want %s", l0IDList(got), want)
+	if got := c.drainableL0(m, later); len(got) != len(m.L0SSTs) {
+		t.Fatalf("drainable %d of %d after the age limit", len(got), len(m.L0SSTs))
+	}
+	m.L0SSTs[0].CreatedAt = later // the newest flush is fresh again
+	if got := c.drainableL0(m, later); len(got) != len(m.L0SSTs)-1 {
+		t.Fatalf("drainable %d of %d with one fresh flush on top", len(got), len(m.L0SSTs))
+	}
+}
+
+func TestL0PlannerLeavesARunWithNoMergedFileBelowIt(t *testing.T) {
+	// A fresh database, or a dead writer's leftovers before a successor
+	// adopts them: young flush files and nothing merged. Nothing drains.
+	c := plannerOnlyCompactor()
+	m := &manifestState{}
+	now := time.Now()
+	for i := 3; i >= 0; i-- {
+		m.AddL0SST(rawFlush(i, 2<<20, now))
+	}
+	if got := c.drainableL0(m, now); len(got) != 0 {
+		t.Fatalf("drainable %s, want nothing", l0IDList(got))
 	}
 }
 

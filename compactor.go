@@ -469,23 +469,34 @@ func (c *compactor) l0NeedsPlanning(drainable []sstMetadata) bool {
 	return len(drainable) >= c.opts.Trigger.L0SSTCount
 }
 
-// drainableL0 is the part of L0 maintenance may drain, newest first: from the
-// old end, every file up to the first flush file younger than L0MaxAge. The
-// writer merges its recent flush files from memory and publishes the result
-// under the compaction grammar, so a young flush file is one it still holds.
-// A drain stops below it, not just around it: moving a newer L0 file into L1
-// while an older one stays in L0 would put an older version of a key above a
-// newer one. A flush file older than L0MaxAge is nobody's; it drains like
-// any other.
+// drainableL0 is the part of L0 maintenance may drain, newest first. The
+// writer merges its recent flush files from memory, oldest run first, and
+// publishes each result under the compaction grammar at the run's position.
+// So every flush file the writer still holds is newer than every merged file
+// it has published: a flush file with a merged file above it was skipped or
+// given up, and is nobody's. The drainable part is therefore everything from
+// the newest merged file to the old end, flush files in between included,
+// plus flush files above it that are older than L0MaxAge, which only a dead
+// writer with no successor leaves. A drain stops below the writer's files,
+// not around them: moving a newer L0 file into L1 while an older one stays in
+// L0 would put an older version of a key above a newer one.
 func (c *compactor) drainableL0(m *manifestState, now time.Time) []sstMetadata {
 	if m == nil {
 		return nil
 	}
 	l0 := m.L0SSTs
+	newestMerged := len(l0)
+	for i, sst := range l0 {
+		if isCompactionSSTID(sst.ID) {
+			newestMerged = i
+			break
+		}
+	}
 	start := len(l0)
 	for start > 0 {
 		sst := l0[start-1]
-		if !isCompactionSSTID(sst.ID) && now.Sub(sst.OldestData()) < c.opts.Trigger.L0MaxAge {
+		if start-1 < newestMerged && !isCompactionSSTID(sst.ID) &&
+			now.Sub(sst.OldestData()) < c.opts.Trigger.L0MaxAge {
 			break
 		}
 		start--
