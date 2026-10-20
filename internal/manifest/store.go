@@ -391,10 +391,6 @@ func (s *Store) SuccessorWriterFence() (*FenceToken, uint64) {
 	return s.successorWriterFence.Clone(), s.successorNextSeq
 }
 
-// WriterFenceObservedActive reports whether token still matches the writer
-// fence retained by this Store. It performs no I/O: false means this Store has
-// observed the token being superseded, while true does not replace a remote
-// fence check before publication.
 // PendingWriterCommitID is the commit ID of a writer append whose CAS result
 // is unknown, or empty. Until that commit is retried and settled, no other
 // writer commit can be appended, so the committer retries it first.
@@ -407,6 +403,10 @@ func (s *Store) PendingWriterCommitID() string {
 	return s.pendingWriterCommit.CommitID
 }
 
+// WriterFenceObservedActive reports whether token still matches the writer
+// fence retained by this Store. It performs no I/O: false means this Store has
+// observed the token being superseded, while true does not replace a remote
+// fence check before publication.
 func (s *Store) WriterFenceObservedActive(token *FenceToken) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

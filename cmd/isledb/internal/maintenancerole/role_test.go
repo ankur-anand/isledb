@@ -150,6 +150,10 @@ func TestMaintenanceCompactsWhatTheWriterSaves(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	wopts := isledb.DefaultWriterOptions()
 	wopts.Flush.Interval = 0
+	// The writer merges its own saves and hands maintenance the result; a
+	// short age limit makes that happen within the test.
+	wopts.L0Merge.TargetBytes = 1 << 20
+	wopts.L0Merge.MaxAge = 200 * time.Millisecond
 	writer, err := db.OpenWriter(ctx, wopts)
 	if err != nil {
 		t.Fatal(err)
