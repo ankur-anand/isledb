@@ -113,7 +113,7 @@ func TestWriteMultipleSSTsStreaming_RecordsMetaOffset(t *testing.T) {
 	results, err := writeMultipleSSTsStreaming(context.Background(),
 		&sliceSSTIter{entries: metaOffsetTestEntries(5_000)},
 		sstWriterOptions{BlockSize: 4096, BloomBitsPerKey: 10, Compression: "snappy"},
-		testSSTStreamSetIdentity(1), 16<<10,
+		testSSTStreamSetIdentity(1), 16<<10, 0,
 		func(_ context.Context, id string, r io.Reader) error {
 			data, err := io.ReadAll(r)
 			mu.Lock()

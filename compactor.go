@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -45,6 +46,7 @@ type compactionJob struct {
 	OutputSSTs          []compactionOutput
 	MetadataOnly        bool
 	ForcedLevelCreation bool
+	Oversized           bool
 }
 
 // compactionOutput describes one SST produced or repositioned by a compaction.
@@ -71,6 +73,8 @@ type compactor struct {
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
 	scratch    *compactionScratchWorkspace
+	// oversizedLog rate-limits the warning for oversized jobs.
+	oversizedLog readerDiagnosticLimiter
 
 	closed atomic.Bool
 }
@@ -286,6 +290,9 @@ type levelCompactionPlan struct {
 	destinationSSTs     []sstMetadata
 	metadataOnly        bool
 	forcedLevelCreation bool
+	// oversized marks a rewrite whose inputs are over maxRewriteInputBytes
+	// even with a single source, run because no drain could be planned.
+	oversized bool
 }
 
 // compactionOutputIdentityVersion domain-separates revisions of the attempt-key
@@ -406,6 +413,18 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
 			}
 			plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
+			if err == nil && c.l0DrainTooSmall(plan, inputs) {
+				// When L1 is so full that the job had to leave most of L0
+				// behind, it would rewrite all of L1 to move a sliver of L0.
+				// Drain those L1 files to L2 first; the L0 job then gets
+				// more room next cycle. When no drain can be planned, the
+				// small job still runs, so L0 always makes progress. An L2
+				// created here is ordinary growth of an over-full L1, not a
+				// forced level, so it is not marked as one.
+				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, plan.destinationSSTs); drainErr == nil {
+					plan = drain
+				}
+			}
 			if err != nil {
 				firstPlanningErr = err
 				c.reportPlanningBlocked(0, len(drainable), critical, err)
@@ -675,37 +694,47 @@ func (c *compactor) reportPlanningBlocked(sourceLevel uint32, sstCount int, crit
 }
 
 // buildLevelPlanWithDrain returns the requested promotion when it fits in one
-// manifest entry. If the destination is too fragmented, it recursively moves
-// or compacts that destination downward first. Every successful plan still
-// targets exactly one adjacent level; the caller retries the original
-// promotion on the next maintenance cycle.
+// manifest entry. If the destination is too fragmented, or too large for even
+// one source to be rewritten into it, it recursively moves or compacts that
+// destination downward first. Every successful plan still targets exactly one
+// adjacent level; the caller retries the original promotion on the next
+// maintenance cycle. An oversized plan is returned only when no drain can be
+// planned, so maintenance keeps making progress rather than stalling.
 func (c *compactor) buildLevelPlanWithDrain(
 	m *manifestState,
 	sourceLevel, destinationLevel uint32,
 	candidates []sstMetadata,
 ) (*levelCompactionPlan, error) {
 	plan, err := c.buildLevelPlan(m, sourceLevel, destinationLevel, candidates)
-	if err == nil {
+	if err == nil && !plan.oversized {
 		return plan, nil
 	}
 	if len(candidates) == 0 || destinationLevel == ^uint32(0) {
-		return nil, err
+		return plan, err
 	}
 
-	// buildLevelPlan shrinks to one source before failing. Reproduce that final
-	// source here to identify the exact destination range that must drain.
-	blockingSource := candidates[:1]
-	if sourceLevel == 0 {
-		blockingSource = candidates[len(candidates)-1:]
+	var blockers []sstMetadata
+	if plan != nil {
+		// Only the oversized plan fits: what it would rewrite of the
+		// destination is what must drain.
+		blockers = plan.destinationSSTs
+	} else {
+		// buildLevelPlan shrinks to one source before failing. Reproduce that
+		// final source here to identify the exact destination range that must
+		// drain.
+		blockingSource := candidates[:1]
+		if sourceLevel == 0 {
+			blockingSource = candidates[len(candidates)-1:]
+		}
+		minKey, maxKey := sstBounds(blockingSource)
+		destination := m.Level(destinationLevel)
+		if destination == nil {
+			return nil, err
+		}
+		blockers = destination.OverlappingSSTs(minKey, maxKey)
 	}
-	minKey, maxKey := sstBounds(blockingSource)
-	destination := m.Level(destinationLevel)
-	if destination == nil {
-		return nil, err
-	}
-	blockers := destination.OverlappingSSTs(minKey, maxKey)
 	if len(blockers) == 0 {
-		return nil, err
+		return plan, err
 	}
 	if len(blockers) > maxCompactionSSTsPerJob {
 		blockers = blockers[:maxCompactionSSTsPerJob]
@@ -714,6 +743,9 @@ func (c *compactor) buildLevelPlanWithDrain(
 	drain, drainErr := c.buildLevelPlanWithDrain(
 		m, destinationLevel, destinationLevel+1, blockers)
 	if drainErr != nil {
+		if plan != nil {
+			return plan, nil
+		}
 		return nil, fmt.Errorf("%w; drain L%d first: %v", err, destinationLevel, drainErr)
 	}
 	// A recursively selected drain may reach past the current bottom level.
@@ -740,7 +772,42 @@ func (c *compactor) levelTargetBytes(level uint32) int64 {
 	return target
 }
 
+// l0DrainTooSmall reports whether an L0 plan was cut short to fit one job and
+// moves less L0 than L0ToBaseRatio of the L1 it rewrites. L0 files span most
+// of the key range when keys are random, so every L0 job takes nearly all of
+// L1; once L1 fills most of a job, only one or two L0 files fit beside it.
+//
+// It never fires for a move, for a plan that took every input, or for one
+// that overlaps nothing in L1: none of those rewrite L1 for little gain.
+// L0ToBaseRatio is the same bar l0ShouldDrain uses for when rewriting L1 is
+// worth it. Each drain shrinks L1, so the rule stops once a job moves about
+// as much L0 as the L1 it rewrites.
+func (c *compactor) l0DrainTooSmall(plan *levelCompactionPlan, inputs []sstMetadata) bool {
+	if plan == nil || plan.sourceLevel != 0 || plan.destinationLevel != 1 ||
+		plan.metadataOnly || len(plan.destinationSSTs) == 0 || len(plan.sourceSSTs) == len(inputs) {
+		return false
+	}
+	return float64(sstBytes(plan.sourceSSTs)) < c.opts.Trigger.L0ToBaseRatio*float64(sstBytes(plan.destinationSSTs))
+}
+
+// maxRewriteInputBytes bounds the input of a rewrite. Each output but the last
+// is at least TargetSSTBytes, so inputs this size produce at most
+// maxCompactionSSTsPerJob outputs, as long as output does not outgrow input.
+func (c *compactor) maxRewriteInputBytes() int64 {
+	target := c.opts.Output.TargetSSTBytes
+	if target <= 0 || target > math.MaxInt64/(maxCompactionSSTsPerJob-1) {
+		return math.MaxInt64
+	}
+	return target * (maxCompactionSSTsPerJob - 1)
+}
+
+// buildLevelPlan returns the widest plan from candidates that fits one
+// manifest entry, by count and, for a rewrite, by maxRewriteInputBytes. When
+// only a single source fits by count but not by size, it returns that plan
+// marked oversized; buildLevelPlanWithDrain drains the destination instead
+// when it can.
 func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLevel uint32, candidates []sstMetadata) (*levelCompactionPlan, error) {
+	maxBytes := c.maxRewriteInputBytes()
 	for count := len(candidates); count > 0; count-- {
 		selected := candidates[:count]
 		if sourceLevel == 0 {
@@ -757,14 +824,21 @@ func (c *compactor) buildLevelPlan(m *manifestState, sourceLevel, destinationLev
 		// Checksum validation does not disqualify a move, it only means the
 		// sources are read and verified before the move is committed.
 		metadataOnly := len(destination) == 0 && sstsDoNotOverlap(source)
-		if len(source)+len(destination) <= maxCompactionSSTsPerJob {
-			plan := &levelCompactionPlan{
-				sourceLevel:      sourceLevel,
-				destinationLevel: destinationLevel,
-				sourceSSTs:       source,
-				destinationSSTs:  destination,
-				metadataOnly:     metadataOnly,
-			}
+		if len(source)+len(destination) > maxCompactionSSTsPerJob {
+			continue
+		}
+		plan := &levelCompactionPlan{
+			sourceLevel:      sourceLevel,
+			destinationLevel: destinationLevel,
+			sourceSSTs:       source,
+			destinationSSTs:  destination,
+			metadataOnly:     metadataOnly,
+		}
+		if metadataOnly || sstBytes(source)+sstBytes(destination) <= maxBytes {
+			return plan, nil
+		}
+		if count == 1 {
+			plan.oversized = true
 			return plan, nil
 		}
 	}
@@ -801,6 +875,14 @@ func oldestData(ssts []sstMetadata) time.Time {
 	return oldest.UTC()
 }
 
+func sstBytes(ssts []sstMetadata) int64 {
+	var total int64
+	for _, sst := range ssts {
+		total += sst.Size
+	}
+	return total
+}
+
 func sstBounds(ssts []sstMetadata) ([]byte, []byte) {
 	var minKey, maxKey []byte
 	for i := range ssts {
@@ -835,12 +917,16 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 		DestinationLevel:    plan.destinationLevel,
 		MetadataOnly:        plan.metadataOnly,
 		ForcedLevelCreation: plan.forcedLevelCreation,
+		Oversized:           plan.oversized,
 	}
 	for _, sst := range plan.sourceSSTs {
 		job.InputSSTs = append(job.InputSSTs, sst.ID)
 	}
 	for _, sst := range plan.destinationSSTs {
 		job.InputSSTs = append(job.InputSSTs, sst.ID)
+	}
+	if plan.oversized {
+		c.warnOversized(plan)
 	}
 	if c.opts.OnCompactionStart != nil {
 		c.opts.OnCompactionStart(job)
@@ -927,6 +1013,23 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 		AddSSTables:      outputs,
 	}
 	return c.appendCompaction(ctx, m, payload)
+}
+
+// warnOversized reports a job run over maxRewriteInputBytes: the destination
+// level is too large for even one source and could not be drained first.
+func (c *compactor) warnOversized(plan *levelCompactionPlan) {
+	allowed, suppressed := c.oversizedLog.allow(time.Now())
+	if !allowed {
+		return
+	}
+	slog.Warn("isledb: compaction over the input size limit; running it anyway",
+		"component", "maintenance",
+		"source_level", plan.sourceLevel,
+		"destination_level", plan.destinationLevel,
+		"inputs", len(plan.sourceSSTs)+len(plan.destinationSSTs),
+		"input_bytes", sstBytes(plan.sourceSSTs)+sstBytes(plan.destinationSSTs),
+		"max_input_bytes", c.maxRewriteInputBytes(),
+		"suppressed_since_last_log", suppressed)
 }
 
 func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload) error {
@@ -1199,8 +1302,12 @@ func (c *compactor) writeCompactedSSTs(
 		return err
 	}
 
+	// The writer rejects a compaction with more outputs than one manifest
+	// entry holds. Planning keeps inputs small enough that the cap rarely
+	// engages; when output outgrows input anyway, the last output takes the
+	// rest instead of the job being rejected and planned again.
 	results, err = writeMultipleSSTsStreaming(
-		ctx, adapter, sstOpts, identity, targetSize, uploadFn)
+		ctx, adapter, sstOpts, identity, targetSize, maxCompactionSSTsPerJob, uploadFn)
 	if err != nil {
 		if errors.Is(err, errEmptyIterator) {
 			return nil, nil

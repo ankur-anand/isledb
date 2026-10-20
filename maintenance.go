@@ -264,6 +264,16 @@ type SSTCompactionStats struct {
 	// tracks object-store cost and write amplification. Reading OutputBytes
 	// instead overstates both, by the whole of MovedBytes.
 	RewrittenBytes int64
+	// OversizedJobs is the subset of Jobs whose inputs were over the size
+	// that fits one manifest entry, run because the destination level could
+	// not be drained first. Its last output can be far over TargetSSTBytes.
+	OversizedJobs int
+	// The figures above count a job when it runs. The writer can still
+	// reject its command; RejectedJobs and RejectedBytes count those, in the
+	// cycle that reads the writer's answer. The rejected outputs are deleted
+	// as orphans.
+	RejectedJobs  int
+	RejectedBytes int64
 }
 
 // SSTCleanupStats describes durable retirement handoff and bounded physical
@@ -397,7 +407,10 @@ type MaintenanceStats struct {
 	ChangeFeedRetention ChangeFeedCleanupStats
 	ManifestCheckpoint  ManifestCheckpointStats
 	ManifestCleanup     ManifestCleanupStats
-	Duration            time.Duration
+	// RejectedCommands counts commands of any kind the writer rejected,
+	// in the cycle that reads the writer's answer.
+	RejectedCommands int
+	Duration         time.Duration
 }
 
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
@@ -1302,6 +1315,9 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
 		return true, nil
 	}
+	if current.MaintenanceReceipt.Status == manifest.MaintenanceStatusRejected {
+		m.recordRejection(head.Pending)
+	}
 	changeFeedSafetyMargin := defaultChangeFeedDeletionSafetyMargin
 	if m.changeFeed != nil {
 		changeFeedSafetyMargin = m.changeFeed.opts.DeletionSafetyMargin
@@ -1513,6 +1529,49 @@ func (m *Maintenance) recordCompaction(job compactionJob, err error) {
 	stats.RewrittenBytes += bytes
 	if job.DestinationLevel == 0 {
 		stats.L0Merges++
+	}
+	if job.Oversized {
+		stats.OversizedJobs++
+	}
+}
+
+// recordRejection reports a command the writer rejected. The writer logs why;
+// this names the command so the two can be matched.
+func (m *Maintenance) recordRejection(command *manifest.MaintenanceCommand) {
+	attrs := []any{"component", "maintenance", "command_id", command.ID,
+		"kind", command.Kind, "generation", command.Generation}
+	var rejectedBytes int64
+	compaction := command.Compaction
+	if compaction != nil {
+		payload := compaction.Payload
+		removed := make(map[string]struct{}, len(payload.RemoveSSTableIDs))
+		for _, id := range payload.RemoveSSTableIDs {
+			removed[id] = struct{}{}
+		}
+		for _, sst := range payload.AddSSTables {
+			// A moved file is an input kept, not a new object.
+			if _, moved := removed[sst.ID]; !moved {
+				rejectedBytes += sst.Size
+			}
+		}
+		attrs = append(attrs,
+			"source_level", payload.SourceLevel,
+			"destination_level", payload.DestinationLevel,
+			"inputs", len(payload.RemoveSSTableIDs),
+			"outputs", len(payload.AddSSTables),
+			"output_bytes", rejectedBytes)
+	}
+	slog.Warn("isledb: writer rejected maintenance command", attrs...)
+
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if m.currentStats == nil {
+		return
+	}
+	m.currentStats.RejectedCommands++
+	if compaction != nil {
+		m.currentStats.SSTCompaction.RejectedJobs++
+		m.currentStats.SSTCompaction.RejectedBytes += rejectedBytes
 	}
 }
 

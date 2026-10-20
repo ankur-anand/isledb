@@ -1139,9 +1139,13 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 	}
 	applyCtx, cancel := context.WithTimeout(ctx, maintenanceApplyTimeout)
 	defer cancel()
-	_, err := w.manifestLog.ApplyMaintenanceCommand(applyCtx, *command)
+	result, err := w.manifestLog.ApplyMaintenanceCommand(applyCtx, *command)
 	switch {
 	case err == nil:
+		if result.Reason != "" {
+			slog.Warn("isledb: maintenance command rejected", "component", "writer",
+				"command_id", command.ID, "kind", command.Kind, "reason", result.Reason)
+		}
 		w.stagedMaintenance.CompareAndSwap(command, nil)
 		w.reportRecovery(&w.maintenanceFailures)
 		return nil

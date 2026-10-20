@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -712,4 +713,74 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 func flushApplyingMaintenance(ctx context.Context, w *Writer) error {
 	w.w.pollMaintenance(ctx)
 	return w.Flush(ctx)
+}
+
+// A command the writer rejects is reported with its reason, and maintenance
+// counts it when it reads the receipt, apart from the jobs it ran.
+func TestMaintenanceCountsRejectedCommand(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-rejected-command")
+	defer store.Close()
+
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-rejection"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+
+	if err := maintenance.stageCommand(ctx, manifest.MaintenanceCommand{
+		Kind: manifest.MaintenanceCommandCompaction,
+		Compaction: &manifest.CompactionCommand{Payload: manifest.CompactionLogPayload{
+			RemoveSSTableIDs: []string{"missing-input"},
+			SourceLevel:      0,
+			DestinationLevel: 1,
+			AddSSTables: []manifest.SSTMeta{{
+				ID:     "rejected-output",
+				Level:  1,
+				MinKey: []byte("a"),
+				MaxKey: []byte("z"),
+				Size:   4096,
+			}},
+		},
+			RetiredObjects: []manifest.RetiredObject{{
+				Kind: manifest.RetiredObjectSST, ID: "missing-input", Key: store.SSTPath("missing-input"),
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("stageCommand: %v", err)
+	}
+	result, err := db.manifestStore.ApplyPendingMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("ApplyPendingMaintenance: %v", err)
+	}
+	if result.Status != manifest.MaintenanceStatusRejected || !strings.Contains(result.Reason, "missing-input") {
+		t.Fatalf("apply status=%q reason=%q, want rejected naming the missing input", result.Status, result.Reason)
+	}
+
+	cycle := MaintenanceStats{}
+	maintenance.currentStats = &cycle
+	waiting, err := maintenance.reconcilePendingCommand(ctx)
+	maintenance.currentStats = nil
+	if err != nil {
+		t.Fatalf("reconcilePendingCommand: %v", err)
+	}
+	if waiting {
+		t.Fatal("maintenance still waiting after the writer answered")
+	}
+	if cycle.RejectedCommands != 1 || cycle.SSTCompaction.RejectedJobs != 1 ||
+		cycle.SSTCompaction.RejectedBytes != 4096 {
+		t.Fatalf("rejected commands=%d jobs=%d bytes=%d, want 1, 1, 4096", cycle.RejectedCommands,
+			cycle.SSTCompaction.RejectedJobs, cycle.SSTCompaction.RejectedBytes)
+	}
+	if cycle.SSTCompaction.Jobs != 0 {
+		t.Fatalf("jobs=%d, want 0: reading a rejection runs no job", cycle.SSTCompaction.Jobs)
+	}
 }

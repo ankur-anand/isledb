@@ -301,3 +301,168 @@ func TestLevelPlannerRecursivelyDrainsDeepestBlockingLevel(t *testing.T) {
 		t.Fatal("recursive prerequisite drain into absent L3 was not marked as forced level creation")
 	}
 }
+
+// Inputs a little over TargetSSTBytes each must not fill a job to the input
+// count limit: the outputs, each cut at the target, would then number one more
+// than a manifest entry holds and the writer would reject the job.
+func TestLevelPlannerKeepsRewriteInputsUnderOutputLimit(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 100; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		sst.Size = target + target/20
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 82; i++ {
+		sst := plannerSST(1, i*10, i*10+9)
+		sst.Size = target - target/100
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	plan, err := c.buildLevelPlan(m, 0, 1, m.L0SSTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.oversized {
+		t.Fatal("plan marked oversized, want a smaller source batch")
+	}
+	if got := len(plan.destinationSSTs); got != 82 {
+		t.Fatalf("destination SSTs=%d, want all 82", got)
+	}
+	inputs := len(plan.sourceSSTs) + len(plan.destinationSSTs)
+	if inputs >= maxCompactionSSTsPerJob {
+		t.Fatalf("inputs=%d, want fewer than %d: the count limit alone admits 46 sources", inputs, maxCompactionSSTsPerJob)
+	}
+	if bytes := sstBytes(plan.sourceSSTs) + sstBytes(plan.destinationSSTs); bytes > c.maxRewriteInputBytes() {
+		t.Fatalf("input bytes=%d, over the limit %d", bytes, c.maxRewriteInputBytes())
+	}
+}
+
+// When even one source cannot be rewritten into a destination that large,
+// the planner drains the destination rather than running an oversized job.
+func TestLevelPlannerDrainsDestinationTooLargeToRewrite(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 4; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 100; i++ {
+		sst := plannerSST(1, i*10, i*10+9)
+		sst.Size = 2 * target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	direct, err := c.buildLevelPlan(m, 0, 1, m.L0SSTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !direct.oversized || len(direct.sourceSSTs) != 1 {
+		t.Fatalf("direct plan oversized=%v sources=%d, want one oversized source", direct.oversized, len(direct.sourceSSTs))
+	}
+
+	plan, err := c.buildLevelPlanWithDrain(m, 0, 1, m.L0SSTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.sourceLevel != 1 || plan.destinationLevel != 2 {
+		t.Fatalf("plan L%d to L%d, want the L1 drain", plan.sourceLevel, plan.destinationLevel)
+	}
+	if plan.oversized {
+		t.Fatal("drain plan marked oversized")
+	}
+}
+
+// A move rewrites nothing, so the size limit does not apply to it.
+func TestLevelPlannerSizeLimitSkipsMoves(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	var l1 []sstMetadata
+	for i := 0; i < 100; i++ {
+		sst := plannerSST(1, i*10, i*10+9)
+		sst.Size = 2 * target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	plan, err := c.buildLevelPlan(m, 1, 2, l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.metadataOnly || plan.oversized || len(plan.sourceSSTs) != 100 {
+		t.Fatalf("plan metadataOnly=%v oversized=%v sources=%d, want a move of all 100",
+			plan.metadataOnly, plan.oversized, len(plan.sourceSSTs))
+	}
+}
+
+// A full L1 leaves room for one or two L0 files per job, rewriting all of L1
+// to move them. The planner drains L1 first instead.
+func TestPlannerDrainsFullL1BeforeTinyL0Job(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 120; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		sst.Size = target
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 125; i++ {
+		sst := plannerSST(1, i*7, i*7+6)
+		sst.Size = target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("no candidates")
+	}
+	plan := candidates[0].plan
+	if plan.sourceLevel != 1 || plan.destinationLevel != 2 {
+		t.Fatalf("first plan L%d to L%d with %d sources, want an L1 drain", plan.sourceLevel,
+			plan.destinationLevel, len(plan.sourceSSTs))
+	}
+}
+
+// With room in L1, the L0 job runs as planned even when the count limit cuts
+// it short.
+func TestPlannerKeepsL0JobWhenL1HasRoom(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 120; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		sst.Size = target
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 40; i++ {
+		sst := plannerSST(1, i*20, i*20+19)
+		sst.Size = target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || plan.destinationLevel != 1 || len(plan.sourceSSTs) != 87 {
+		t.Fatalf("plan=%+v, want an L0 job of 87 sources", plan)
+	}
+}
