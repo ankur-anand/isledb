@@ -476,7 +476,7 @@ func (c *compactor) l0NeedsPlanning(drainable []sstMetadata) bool {
 
 // drainableL0 is the part of L0 maintenance may drain, newest first. The
 // writer merges its recent flush files from memory, oldest run first, and
-// publishes each result under the compaction grammar at the run's position.
+// publishes each result under its own name grammar at the run's position.
 // So every flush file the writer still holds is newer than every merged file
 // it has published: a flush file with a merged file above it was skipped or
 // given up, and is nobody's. The drainable part is therefore everything from
@@ -492,7 +492,7 @@ func (c *compactor) drainableL0(m *manifestState, now time.Time) []sstMetadata {
 	l0 := m.L0SSTs
 	newestMerged := len(l0)
 	for i, sst := range l0 {
-		if isCompactionSSTID(sst.ID) {
+		if isOutputSSTID(sst.ID) {
 			newestMerged = i
 			break
 		}
@@ -500,7 +500,7 @@ func (c *compactor) drainableL0(m *manifestState, now time.Time) []sstMetadata {
 	start := len(l0)
 	for start > 0 {
 		sst := l0[start-1]
-		if start-1 < newestMerged && !isCompactionSSTID(sst.ID) &&
+		if start-1 < newestMerged && !isOutputSSTID(sst.ID) &&
 			now.Sub(sst.OldestData()) < c.opts.Trigger.L0MaxAge {
 			break
 		}
@@ -550,9 +550,9 @@ const maxL0CombineGroup = 8
 // limit's worth of files; and when L0 is filling fast enough that the depth
 // limit would be reached before the age limit drains L0 anyway. Only files
 // right of the drain boundary are considered, so the writer's own merging is
-// never contended. A file larger than TargetSSTBytes is one already combined,
-// since the writer never produces one that large; it and any flush file
-// between merged ones end a run.
+// never contended. The writer's merges carry their own name grammar; a
+// maintenance output, which is a combine already, and any flush file between
+// merged ones end a run.
 func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now time.Time) *levelCompactionPlan {
 	ratio, target, depth := c.opts.Trigger.L0ToBaseRatio, c.opts.Output.TargetSSTBytes, c.opts.Trigger.L0MaxDepth
 	overlap := l0OverlapBytes(drainable, m)
@@ -583,15 +583,12 @@ func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now
 		return nil
 	}
 
-	notCombined := func(sst sstMetadata) bool {
-		return isCompactionSSTID(sst.ID) && sst.Size <= target
-	}
-	// From the old end, the first adjacent run of group files not yet
-	// combined. drainable is newest first; the run is collected oldest first
-	// and returned newest first, the order duplicate-key precedence follows.
+	// From the old end, the first adjacent run of group writer merges.
+	// drainable is newest first; the run is collected oldest first and
+	// returned newest first, the order duplicate-key precedence follows.
 	var run []sstMetadata
 	for i := len(drainable) - 1; i >= 0 && len(run) < group; i-- {
-		if !notCombined(drainable[i]) {
+		if !isWriterMergeSSTID(drainable[i].ID) {
 			run = run[:0]
 			continue
 		}

@@ -105,7 +105,7 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 		t.Fatal("no merges published: small saves should have been merged by the writer")
 	}
 	for _, sst := range m.L0SSTs {
-		if !isCompactionSSTID(sst.ID) {
+		if !isOutputSSTID(sst.ID) {
 			continue
 		}
 		if sst.OldestDataAt.IsZero() || sst.OldestDataAt.After(sst.CreatedAt) {
@@ -238,7 +238,7 @@ func waitForNoRawL0(t *testing.T, ctx context.Context, writer *Writer, store *bl
 		}
 		raw := 0
 		for _, sst := range replayManifestForTest(t, ctx, store).L0SSTs {
-			if !isCompactionSSTID(sst.ID) {
+			if !isOutputSSTID(sst.ID) {
 				raw++
 			}
 		}

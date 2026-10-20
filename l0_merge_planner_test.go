@@ -9,9 +9,14 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 )
 
-// mergedSSTID names an L0 file as the writer's merges and compaction outputs
-// are named.
+// mergedSSTID names an L0 file as the writer's merges are named.
 func mergedSSTID(i int) string {
+	return fmt.Sprintf("merged-%064x-%04d.sst", i, 1)
+}
+
+// combinedSSTID names an L0 file as maintenance's outputs are named: a
+// combine of the writer's merges.
+func combinedSSTID(i int) string {
 	return fmt.Sprintf("compacted-%064x-%04d.sst", i, 1)
 }
 
@@ -388,11 +393,11 @@ func TestL0PlannerCombineSkipsCombinedFilesAndStopsAtFlushFiles(t *testing.T) {
 	l1 := plannerSST(1, 0, 100)
 	l1.Size = 4 << 30
 	m.AddLevelSSTs(1, []sstMetadata{l1})
-	// Oldest first: one already combined file, two merged, a skipped flush
-	// below newer merged files, then four merged files. All a minute old, so
-	// the fill rate projects well past the depth limit.
+	// Oldest first: one combine maintenance made, two writer merges, a
+	// skipped flush below newer merged files, then four writer merges. All a
+	// minute old, so the fill rate projects well past the depth limit.
 	at := now.Add(-time.Minute)
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(1), 256<<20, at))
+	m.AddL0SST(plannerSSTNamed(combinedSSTID(1), 256<<20, at))
 	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 64<<20, at))
 	m.AddL0SST(plannerSSTNamed(mergedSSTID(3), 64<<20, at))
 	m.AddL0SST(rawFlush(4, 2<<20, at))
@@ -410,9 +415,30 @@ func TestL0PlannerCombineSkipsCombinedFilesAndStopsAtFlushFiles(t *testing.T) {
 		t.Fatalf("combine %s, want %s", got, want)
 	}
 	// Without the run of four, the pair below the flush is too short and the
-	// combined file is left alone: nothing to combine.
+	// combine is known by its name, whatever its size: nothing to combine.
 	m.L0SSTs = m.L0SSTs[2:]
 	if plan := c.planL0Combine(c.drainableL0(m, now), m, now); plan != nil {
 		t.Fatalf("plan %+v, want none: no adjacent run of four uncombined files", plan)
+	}
+}
+
+func TestL0PlannerCombinesTheWritersRealMergedFiles(t *testing.T) {
+	// A run closes when its held bytes reach the target, so the writer's
+	// merged files land a little above 64 MiB, about 66 MiB; a combine is
+	// known by its name, not its size, so they are combined all the same.
+	c, m := l0Planner(t, repeat(66<<20, 8), 4<<30)
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != 4 {
+		t.Fatalf("plan %+v, want a combine of four 66 MiB merged files", plan)
+	}
+	// A combine that came out small, as heavy deduplication leaves it, is
+	// still a combine and is never combined again.
+	c, m = l0Planner(t, repeat(66<<20, 8), 4<<30)
+	for i := range m.L0SSTs {
+		m.L0SSTs[i].ID = combinedSSTID(i)
+		m.L0SSTs[i].Size = 40 << 20
+	}
+	if plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now()); plan != nil {
+		t.Fatalf("plan %+v, want none: every file is a combine already", plan)
 	}
 }

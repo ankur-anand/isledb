@@ -25,7 +25,7 @@ import (
 // uploaded. The held files form a run: the writer's newest commits, adjacent
 // in L0. When the run reaches L0Merge.TargetBytes, or its oldest file is
 // L0Merge.MaxAge old, the run closes and a background goroutine merges it
-// from memory into one L0 file, uploaded under the compaction grammar. The
+// from memory into one L0 file, uploaded under its own name grammar. The
 // committer then publishes the merge, which replaces the run in L0.
 
 const (
@@ -610,6 +610,7 @@ func (m *l0Merger) identity(
 		OutputKey: hex.EncodeToString(hash.Sum(nil)),
 		Epoch:     epoch,
 		CreatedAt: createdAt.UTC(),
+		Prefix:    writerMergeSSTIDPrefix,
 	}, nil
 }
 

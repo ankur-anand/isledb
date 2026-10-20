@@ -852,6 +852,14 @@ func orphanSSTPredatesCurrentFence(
 		return fence != nil && !fence.ClaimedAt.IsZero() &&
 			modifiedAt.Add(safetyMargin).Before(fence.ClaimedAt)
 	}
+	if isWriterMergeSSTID(id) {
+		// A writer's merge output is retried to a stable name under its
+		// fence; one that predates the current writer's claim can no longer
+		// be published.
+		fence := current.WriterFence
+		return fence != nil && !fence.ClaimedAt.IsZero() &&
+			modifiedAt.Add(safetyMargin).Before(fence.ClaimedAt)
+	}
 	epoch, ok := writerSSTEpoch(id)
 	if !ok || current.WriterFence == nil || epoch >= current.WriterFence.Epoch {
 		return false

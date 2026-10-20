@@ -20,9 +20,13 @@ import (
 
 const (
 	compactionSSTIDPrefix = "compacted-"
-	compactionSSTIDSuffix = ".sst"
-	compactionSSTHashLen  = sha256.Size * 2
-	compactionSSTIndexLen = 4
+	// writerMergeSSTIDPrefix names the writer's merges of its own L0 files.
+	// Three grammars for three producers: a flush, a writer merge, and a
+	// maintenance output. The planner tells them apart by name alone.
+	writerMergeSSTIDPrefix = "merged-"
+	compactionSSTIDSuffix  = ".sst"
+	compactionSSTHashLen   = sha256.Size * 2
+	compactionSSTIndexLen  = 4
 )
 
 func buildSSTIDWithTimestamp(epoch, seqLo, seqHi uint64, ts time.Time) string {
@@ -45,7 +49,7 @@ func newSSTStreamIdentity(epoch, seqLo, seqHi uint64, createdAt time.Time) sstSt
 }
 
 func writerSSTEpoch(id string) (uint64, bool) {
-	if !strings.HasSuffix(id, compactionSSTIDSuffix) || isCompactionSSTID(id) {
+	if !strings.HasSuffix(id, compactionSSTIDSuffix) || isOutputSSTID(id) {
 		return 0, false
 	}
 	parts := strings.Split(strings.TrimSuffix(id, compactionSSTIDSuffix), "-")
@@ -74,29 +78,50 @@ type sstStreamSetIdentity struct {
 	OutputKey string
 	Epoch     uint64
 	CreatedAt time.Time
+	// Prefix names the producer; empty means a maintenance output.
+	Prefix string
 }
 
 func (identity sstStreamSetIdentity) output(index int) (sstStreamIdentity, error) {
 	if identity.OutputKey == "" || identity.Epoch == 0 || identity.CreatedAt.IsZero() || index <= 0 {
 		return sstStreamIdentity{}, errors.New("incomplete multi-SST stream identity")
 	}
+	prefix := identity.Prefix
+	if prefix == "" {
+		prefix = compactionSSTIDPrefix
+	}
 	return sstStreamIdentity{
-		ID: fmt.Sprintf("%s%s-%0*d%s", compactionSSTIDPrefix, identity.OutputKey,
+		ID: fmt.Sprintf("%s%s-%0*d%s", prefix, identity.OutputKey,
 			compactionSSTIndexLen, index, compactionSSTIDSuffix),
 		Epoch:     identity.Epoch,
 		CreatedAt: identity.CreatedAt.UTC(),
 	}, nil
 }
 
-// isCompactionSSTID recognizes the exact immutable output grammar. Writer
-// flushes use a different grammar; newly written compaction outputs use this
-// one, while metadata-only moves retain their existing IDs. Orphan reclamation
-// uses the distinction, so the parser stays beside the formatter.
+// isCompactionSSTID recognizes a maintenance output: a drain into a lower
+// level, or a combine of the writer's merged L0 files. Metadata-only moves
+// retain their existing IDs. Orphan reclamation uses the distinction, so the
+// parser stays beside the formatter.
 func isCompactionSSTID(id string) bool {
-	if !strings.HasPrefix(id, compactionSSTIDPrefix) || !strings.HasSuffix(id, compactionSSTIDSuffix) {
+	return hasOutputSSTGrammar(compactionSSTIDPrefix, id)
+}
+
+// isWriterMergeSSTID recognizes a merge the writer made of its own L0 files.
+func isWriterMergeSSTID(id string) bool {
+	return hasOutputSSTGrammar(writerMergeSSTIDPrefix, id)
+}
+
+// isOutputSSTID recognizes any file that is not a writer flush: a writer merge
+// or a maintenance output.
+func isOutputSSTID(id string) bool {
+	return isCompactionSSTID(id) || isWriterMergeSSTID(id)
+}
+
+func hasOutputSSTGrammar(prefix, id string) bool {
+	if !strings.HasPrefix(id, prefix) || !strings.HasSuffix(id, compactionSSTIDSuffix) {
 		return false
 	}
-	body := strings.TrimSuffix(strings.TrimPrefix(id, compactionSSTIDPrefix), compactionSSTIDSuffix)
+	body := strings.TrimSuffix(strings.TrimPrefix(id, prefix), compactionSSTIDSuffix)
 	hash, index, ok := strings.Cut(body, "-")
 	if !ok || len(hash) != compactionSSTHashLen || len(index) != compactionSSTIndexLen {
 		return false

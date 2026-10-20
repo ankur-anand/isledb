@@ -83,7 +83,7 @@ func compactionNamedSSTs(t *testing.T, store *blobstore.Store) []string {
 	}
 	var ids []string
 	for _, object := range listed.Objects {
-		if id := path.Base(object.Key); isCompactionSSTID(id) {
+		if id := path.Base(object.Key); isWriterMergeSSTID(id) {
 			ids = append(ids, id)
 		}
 	}
@@ -229,8 +229,8 @@ func TestWriterL0Merge_MergesAndPublishesRunAtTargetBytes(t *testing.T) {
 	}
 
 	out := merged.output
-	if !isCompactionSSTID(out.ID) {
-		t.Fatalf("output %s does not use the compaction grammar", out.ID)
+	if !isWriterMergeSSTID(out.ID) {
+		t.Fatalf("output %s does not use the writer merge grammar", out.ID)
 	}
 	if out.Level != 0 {
 		t.Fatalf("output level %d, want 0", out.Level)
@@ -374,8 +374,8 @@ func TestWriterL0Merge_MergesRunAtMaxAge(t *testing.T) {
 	if len(merged.inputs) != 1 {
 		t.Fatalf("merge of %d inputs, want the one held file", len(merged.inputs))
 	}
-	if !isCompactionSSTID(merged.output.ID) {
-		t.Fatalf("output %s does not use the compaction grammar", merged.output.ID)
+	if !isWriterMergeSSTID(merged.output.ID) {
+		t.Fatalf("output %s does not use the writer merge grammar", merged.output.ID)
 	}
 	entries := readMergedSST(t, store, merged.output)
 	if len(entries) != 1 || string(entries[0].Key) != "only" || string(entries[0].Value) != "value" {
@@ -689,7 +689,7 @@ func TestWriterL0Merge_OutputNameIsStableAcrossAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("output: %v", err)
 	}
-	if !isCompactionSSTID(output.ID) || !strings.HasSuffix(output.ID, "-0001.sst") {
+	if !isWriterMergeSSTID(output.ID) || !strings.HasSuffix(output.ID, "-0001.sst") {
 		t.Fatalf("output id %s", output.ID)
 	}
 }
