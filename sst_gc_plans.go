@@ -611,11 +611,16 @@ func (c *sstCleaner) runScheduledOnce(
 		mergeSSTCleanupWorkStats(&stats, &auditStats)
 		err = errors.Join(err, auditErr)
 	}
+	// A pass that stopped on a full batch, not at the end of the due plans,
+	// left due work behind and comes back at the base interval. Only a pass
+	// that ran out of due plans waits for the next deadline, which may be
+	// an audit minutes away.
+	moreDue := !exhausted && stats.NextDue.IsZero()
 	nextDue := stats.NextDue
-	if c.orphanAudit == nil && !c.nextOrphanAudit.IsZero() {
+	if !moreDue && c.orphanAudit == nil && !c.nextOrphanAudit.IsZero() {
 		nextDue = earlierReclamationDeadline(nextDue, c.nextOrphanAudit)
 	}
-	if c.opts.ManifestLog != nil && !c.nextIntentAudit.IsZero() {
+	if !moreDue && c.opts.ManifestLog != nil && !c.nextIntentAudit.IsZero() {
 		nextDue = earlierReclamationDeadline(nextDue, c.nextIntentAudit)
 	}
 	schedule := reclamationLaneSchedule{
