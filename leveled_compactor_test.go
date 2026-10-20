@@ -403,3 +403,66 @@ func TestLevelPlannerSizeLimitSkipsMoves(t *testing.T) {
 			plan.metadataOnly, plan.oversized, len(plan.sourceSSTs))
 	}
 }
+
+// A full L1 leaves room for one or two L0 files per job, rewriting all of L1
+// to move them. The planner drains L1 first instead.
+func TestPlannerDrainsFullL1BeforeTinyL0Job(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 120; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		sst.Size = target
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 125; i++ {
+		sst := plannerSST(1, i*7, i*7+6)
+		sst.Size = target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("no candidates")
+	}
+	plan := candidates[0].plan
+	if plan.sourceLevel != 1 || plan.destinationLevel != 2 {
+		t.Fatalf("first plan L%d to L%d with %d sources, want an L1 drain", plan.sourceLevel,
+			plan.destinationLevel, len(plan.sourceSSTs))
+	}
+}
+
+// With room in L1, the L0 job runs as planned even when the count limit cuts
+// it short.
+func TestPlannerKeepsL0JobWhenL1HasRoom(t *testing.T) {
+	c := plannerOnlyCompactor()
+	target := c.opts.Output.TargetSSTBytes
+	m := &manifestState{}
+	for i := 0; i < 120; i++ {
+		sst := plannerSST(0, 0, 999)
+		sst.ID = fmt.Sprintf("wide-l0-%03d", i)
+		sst.Size = target
+		m.AddL0SST(sst)
+	}
+	var l1 []sstMetadata
+	for i := 0; i < 40; i++ {
+		sst := plannerSST(1, i*20, i*20+19)
+		sst.Size = target
+		l1 = append(l1, sst)
+	}
+	m.AddLevelSSTs(1, l1)
+
+	plan, err := plannedCandidateForLevel(c, m, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || plan.destinationLevel != 1 || len(plan.sourceSSTs) != 87 {
+		t.Fatalf("plan=%+v, want an L0 job of 87 sources", plan)
+	}
+}

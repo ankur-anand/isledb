@@ -413,6 +413,18 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
 			}
 			plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
+			if err == nil && c.l0DrainTooSmall(plan, inputs) {
+				// When L1 is so full that the job had to leave most of L0
+				// behind, it would rewrite all of L1 to move a sliver of L0.
+				// Drain those L1 files to L2 first; the L0 job then gets
+				// more room next cycle. When no drain can be planned, the
+				// small job still runs, so L0 always makes progress. An L2
+				// created here is ordinary growth of an over-full L1, not a
+				// forced level, so it is not marked as one.
+				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, plan.destinationSSTs); drainErr == nil {
+					plan = drain
+				}
+			}
 			if err != nil {
 				firstPlanningErr = err
 				c.reportPlanningBlocked(0, len(drainable), critical, err)
@@ -758,6 +770,24 @@ func (c *compactor) levelTargetBytes(level uint32) int64 {
 		target *= multiplier
 	}
 	return target
+}
+
+// l0DrainTooSmall reports whether an L0 plan was cut short to fit one job and
+// moves less L0 than L0ToBaseRatio of the L1 it rewrites. L0 files span most
+// of the key range when keys are random, so every L0 job takes nearly all of
+// L1; once L1 fills most of a job, only one or two L0 files fit beside it.
+//
+// It never fires for a move, for a plan that took every input, or for one
+// that overlaps nothing in L1: none of those rewrite L1 for little gain.
+// L0ToBaseRatio is the same bar l0ShouldDrain uses for when rewriting L1 is
+// worth it. Each drain shrinks L1, so the rule stops once a job moves about
+// as much L0 as the L1 it rewrites.
+func (c *compactor) l0DrainTooSmall(plan *levelCompactionPlan, inputs []sstMetadata) bool {
+	if plan == nil || plan.sourceLevel != 0 || plan.destinationLevel != 1 ||
+		plan.metadataOnly || len(plan.destinationSSTs) == 0 || len(plan.sourceSSTs) == len(inputs) {
+		return false
+	}
+	return float64(sstBytes(plan.sourceSSTs)) < c.opts.Trigger.L0ToBaseRatio*float64(sstBytes(plan.destinationSSTs))
 }
 
 // maxRewriteInputBytes bounds the input of a rewrite. Each output but the last
