@@ -114,6 +114,9 @@ type MaintenanceApplyResult struct {
 	Generation uint64
 	Status     MaintenanceStatus
 	Changed    bool
+	// Reason is why this call rejected the command; empty otherwise,
+	// including for a rejection an earlier call recorded.
+	Reason string
 }
 
 func (r *MaintenanceReceipt) Matches(command *MaintenanceCommand) bool {
@@ -446,11 +449,13 @@ func (s *Store) ApplyMaintenanceCommand(ctx context.Context, command Maintenance
 
 		updated := current.Clone()
 		status := MaintenanceStatusApplied
+		var reason string
 		if err := s.applyMaintenanceCommand(ctx, updated, &command, &checkpointVerification); err != nil {
 			if !errors.Is(err, ErrMaintenanceCommandRejected) {
 				return MaintenanceApplyResult{}, err
 			}
 			status = MaintenanceStatusRejected
+			reason = err.Error()
 		}
 		updated.MaintenanceReceipt = &MaintenanceReceipt{
 			CommandID:  command.ID,
@@ -496,6 +501,7 @@ func (s *Store) ApplyMaintenanceCommand(ctx context.Context, command Maintenance
 			Generation: command.Generation,
 			Status:     status,
 			Changed:    true,
+			Reason:     reason,
 		}, nil
 	}
 	return MaintenanceApplyResult{}, ErrFenceConflict

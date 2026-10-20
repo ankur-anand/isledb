@@ -326,13 +326,16 @@ func writeSSTStreaming(
 
 // writeMultipleSSTsStreaming builds and uploads multiple SSTs using streaming.
 // Each SST is streamed to the upload function as it's built, with new SSTs
-// started when the current one reaches targetSize.
+// started when the current one reaches targetSize. A positive maxOutputs caps
+// how many SSTs it writes: the last one is never cut and takes whatever
+// remains, however far past targetSize.
 func writeMultipleSSTsStreaming(
 	ctx context.Context,
 	it sstIterator,
 	opts sstWriterOptions,
 	identity sstStreamSetIdentity,
 	targetSize int64,
+	maxOutputs int,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
 ) (results []streamSSTResult, err error) {
 	defer func() {
@@ -521,7 +524,7 @@ func writeMultipleSSTsStreaming(
 
 		state.updateBounds(k, e.Seq)
 
-		if writable.size >= targetSize {
+		if writable.size >= targetSize && (maxOutputs <= 0 || sstIndex < maxOutputs) {
 			if err := finishCurrentSST(); err != nil {
 				return nil, err
 			}

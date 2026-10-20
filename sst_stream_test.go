@@ -180,7 +180,7 @@ func TestWriteMultipleSSTsStreaming_ReturnsWhenUploaderStopsReadingSuccessfully(
 	go func() {
 		_, err := writeMultipleSSTsStreaming(context.Background(),
 			&sliceSSTIter{entries: []internal.MemEntry{{Key: []byte("a"), Seq: 1, Kind: internal.OpPut, Value: bytes.Repeat([]byte("x"), 8192)}}},
-			sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20,
+			sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0,
 			func(context.Context, string, io.Reader) error { return nil })
 		done <- err
 	}()
@@ -423,7 +423,7 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1, 0, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestWriteMultipleSSTsStreaming_SingleSST(t *testing.T) {
 
 	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{
 		BlockSize: 4096, Compression: "none", BloomBitsPerKey: 10,
-	}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestWriteMultipleSSTsStreaming_EmptyIterator(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if !errors.Is(err, errEmptyIterator) {
 		t.Fatalf("expected ErrEmptyIterator, got %v", err)
 	}
@@ -536,7 +536,7 @@ func TestWriteMultipleSSTsStreaming_UploadError(t *testing.T) {
 		return uploadErr
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -567,7 +567,7 @@ func TestWriteMultipleSSTsStreaming_RetryReusesObjectIdentity(t *testing.T) {
 				Epoch:     7,
 				CreatedAt: createdAt,
 			},
-			1<<20,
+			1<<20, 0,
 			func(_ context.Context, sstID string, r io.Reader) error {
 				data, err := io.ReadAll(r)
 				if err != nil {
@@ -627,7 +627,7 @@ func TestWriteMultipleSSTsStreaming_ContextCancellation(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(ctx, it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error due to context cancellation")
 	}
@@ -650,7 +650,7 @@ func TestWriteMultipleSSTsStreaming_HashVerification(t *testing.T) {
 		return nil
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -684,7 +684,7 @@ func TestWriteMultipleSSTsStreaming_ProducerError(t *testing.T) {
 		return nil
 	}
 
-	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	_, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -708,7 +708,7 @@ func TestWriteMultipleSSTsStreaming_CancelsUploaderAfterProducerError(t *testing
 	done := make(chan error, 1)
 	go func() {
 		_, err := writeMultipleSSTsStreaming(ctx, it,
-			sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20,
+			sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0,
 			func(uploadCtx context.Context, _ string, r io.Reader) error {
 				_, _ = io.Copy(io.Discard, r)
 				<-uploadCtx.Done()
@@ -746,11 +746,58 @@ func TestWriteMultipleSSTsStreaming_LargeValue(t *testing.T) {
 		return err
 	}
 
-	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, uploadFn)
+	results, err := writeMultipleSSTsStreaming(context.Background(), it, sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1<<20, 0, uploadFn)
 	if err != nil {
 		t.Fatalf("writeMultipleSSTsStreaming error: %v", err)
 	}
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+// With a cap on outputs, the last output is never cut: it takes every entry
+// left, however far past the target.
+func TestWriteMultipleSSTsStreamingCapsOutputs(t *testing.T) {
+	var entries []internal.MemEntry
+	for i := 0; i < 20; i++ {
+		entries = append(entries, internal.MemEntry{
+			Key:   []byte(fmt.Sprintf("key-%02d", i)),
+			Seq:   uint64(i + 1),
+			Kind:  internal.OpPut,
+			Value: bytes.Repeat([]byte("v"), 8192),
+		})
+	}
+	uploadFn := func(_ context.Context, _ string, r io.Reader) error {
+		_, err := io.Copy(io.Discard, r)
+		return err
+	}
+	opts := sstWriterOptions{BlockSize: 4096, Compression: "none"}
+
+	uncapped, err := writeMultipleSSTsStreaming(context.Background(), &sliceSSTIter{entries: entries},
+		opts, testSSTStreamSetIdentity(1), 1, 0, uploadFn)
+	if err != nil {
+		t.Fatalf("uncapped: %v", err)
+	}
+	if len(uncapped) <= 3 {
+		t.Fatalf("uncapped outputs=%d, want more than the cap of 3", len(uncapped))
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), &sliceSSTIter{entries: entries},
+		opts, testSSTStreamSetIdentity(1), 1, 3, uploadFn)
+	if err != nil {
+		t.Fatalf("capped: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("outputs=%d, want 3", len(results))
+	}
+	for i := 0; i < 2; i++ {
+		if !bytes.Equal(results[i].Meta.MinKey, uncapped[i].Meta.MinKey) ||
+			!bytes.Equal(results[i].Meta.MaxKey, uncapped[i].Meta.MaxKey) {
+			t.Fatalf("output %d differs from the uncapped run", i)
+		}
+	}
+	last := results[2].Meta
+	if !bytes.Equal(last.MinKey, uncapped[2].Meta.MinKey) || string(last.MaxKey) != "key-19" {
+		t.Fatalf("last output covers %s..%s, want %s..key-19", last.MinKey, last.MaxKey, uncapped[2].Meta.MinKey)
 	}
 }
