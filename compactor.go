@@ -389,27 +389,26 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
-	if c.l0NeedsPlanning(m) {
+	now := time.Now()
+	drainable := c.drainableL0(m, now)
+	if c.l0NeedsPlanning(drainable) {
 		// Criticality is a property of L0's depth, not of whether a plan could
 		// be built for it. Computing it before the attempt means a level that
 		// cannot be planned still reports as critical, instead of going quiet
 		// exactly when it is most backed up.
-		critical := l0CompactionCritical(m.L0SSTCount(), c.opts.Trigger.L0SSTCount)
-		if !c.l0ShouldDrain(m, time.Now()) {
-			// Not yet worth rewriting L1: merge new L0 SSTs with each other,
-			// or wait for more to arrive.
-			if plan := c.planL0Merge(m); plan != nil {
-				candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
-			}
-		} else {
-			inputs := m.L0SSTs
+		critical := l0CompactionCritical(len(drainable), c.opts.Trigger.L0SSTCount)
+		// New L0 files are merged with each other by the writer, from memory.
+		// Maintenance drains the result into L1 when a rule fires, combines
+		// merged files first when L1 is large, and otherwise waits.
+		if c.l0ShouldDrain(drainable, m, now) {
+			inputs := drainable
 			if len(inputs) > maxCompactionSSTsPerJob {
 				inputs = inputs[len(inputs)-maxCompactionSSTsPerJob:]
 			}
 			plan, err := c.buildLevelPlanWithDrain(m, 0, 1, inputs)
 			if err != nil {
 				firstPlanningErr = err
-				c.reportPlanningBlocked(0, m.L0SSTCount(), critical, err)
+				c.reportPlanningBlocked(0, len(drainable), critical, err)
 			} else {
 				candidate := compactionCandidate{
 					plan:      plan,
@@ -424,6 +423,10 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				}
 				candidates = append(candidates, candidate)
 			}
+		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
+			// A large L1: the ratio needs more merged files than the depth
+			// limit allows, so combine finished ones first.
+			candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
 		}
 	}
 	plannedLevels := make(map[uint32]struct{}, len(candidates))
@@ -465,48 +468,139 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	return candidates, nil
 }
 
-func (c *compactor) l0NeedsPlanning(m *manifestState) bool {
-	return m != nil && len(m.L0SSTs) >= c.opts.Trigger.L0SSTCount
+// l0NeedsPlanning reports whether the drainable part of L0 holds enough SSTs
+// for an L0 job.
+func (c *compactor) l0NeedsPlanning(drainable []sstMetadata) bool {
+	return len(drainable) >= c.opts.Trigger.L0SSTCount
 }
 
-// l0Work returns how many SSTs L0 held as of the last refresh, and whether
-// that is enough for an L0 job.
-func (c *compactor) l0Work() (ssts int, enough bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.manifest != nil {
-		ssts = len(c.manifest.L0SSTs)
-	}
-	return ssts, c.l0NeedsPlanning(c.manifest)
-}
-
-// planL0Merge returns a merge of the newest L0 SSTs with each other, or nil
-// when no run of two or more qualifies yet.
-//
-// It starts at the newest SST and takes older ones while the next is no
-// larger than everything taken so far: SSTs then grow like a binary counter,
-// each byte is rewritten about log2 times before it reaches L1, and every SST
-// saved since the last cycle is taken by one job however many arrived. The
-// run is adjacent in L0 and its output takes its place.
-func (c *compactor) planL0Merge(m *manifestState) *levelCompactionPlan {
-	if m == nil || len(m.L0SSTs) < 2 {
+// drainableL0 is the part of L0 maintenance may drain, newest first. The
+// writer merges its recent flush files from memory, oldest run first, and
+// publishes each result under its own name grammar at the run's position.
+// So every flush file the writer still holds is newer than every merged file
+// it has published: a flush file with a merged file above it was skipped or
+// given up, and is nobody's. The drainable part is therefore everything from
+// the newest merged file to the old end, flush files in between included,
+// plus flush files above it that are older than L0MaxAge, which only a dead
+// writer with no successor leaves. A drain stops below the writer's files,
+// not around them: moving a newer L0 file into L1 while an older one stays in
+// L0 would put an older version of a key above a newer one.
+func (c *compactor) drainableL0(m *manifestState, now time.Time) []sstMetadata {
+	if m == nil {
 		return nil
 	}
 	l0 := m.L0SSTs
-	total, n := l0[0].Size, 1
-	for n < len(l0) && n < maxCompactionSSTsPerJob &&
-		l0[n].Size <= total && total+l0[n].Size <= c.opts.Output.TargetSSTBytes {
-		total += l0[n].Size
-		n++
+	newestMerged := len(l0)
+	for i, sst := range l0 {
+		if isOutputSSTID(sst.ID) {
+			newestMerged = i
+			break
+		}
 	}
-	if n < 2 {
+	start := len(l0)
+	for start > 0 {
+		sst := l0[start-1]
+		if start-1 < newestMerged && !isOutputSSTID(sst.ID) &&
+			now.Sub(sst.OldestData()) < c.opts.Trigger.L0MaxAge {
+			break
+		}
+		start--
+	}
+	return l0[start:]
+}
+
+// l0Work returns how many drainable SSTs L0 held as of the last refresh, and
+// whether that is enough for an L0 job.
+func (c *compactor) l0Work() (ssts int, enough bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	drainable := c.drainableL0(c.manifest, time.Now())
+	return len(drainable), c.l0NeedsPlanning(drainable)
+}
+
+// l0OverlapBytes is the L1 bytes l0 overlaps: what a drain of l0 rewrites.
+func l0OverlapBytes(l0 []sstMetadata, m *manifestState) int64 {
+	if len(l0) == 0 || m == nil {
+		return 0
+	}
+	var overlap int64
+	minKey, maxKey := sstBounds(l0)
+	if l1 := m.Level(1); l1 != nil {
+		for _, sst := range l1.OverlappingSSTs(minKey, maxKey) {
+			overlap += sst.Size
+		}
+	}
+	return overlap
+}
+
+// maxL0CombineGroup bounds how many merged files one combine takes, and so
+// how large its output gets: a retry redoes the whole output.
+const maxL0CombineGroup = 8
+
+// planL0Combine combines merged L0 files with each other when L1 is large: a
+// drain pays off once L0 holds L0ToBaseRatio of the L1 it overlaps, and if
+// that takes more files of TargetSSTBytes than L0MaxDepth allows, the depth
+// rule would force a drain early and rewrite L1 far more often than needed.
+// Combining finished merged files, in groups just large enough that the
+// ratio is reached within the depth limit, lets the bytes pile up while the
+// count stays low.
+//
+// A combine rewrites every byte once, so it runs only when it saves more than
+// that: when the group is at least three, which is L1 above twice the depth
+// limit's worth of files; and when L0 is filling fast enough that the depth
+// limit would be reached before the age limit drains L0 anyway. Only files
+// right of the drain boundary are considered, so the writer's own merging is
+// never contended. The writer's merges carry their own name grammar; a
+// maintenance output, which is a combine already, and any flush file between
+// merged ones end a run.
+func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now time.Time) *levelCompactionPlan {
+	ratio, target, depth := c.opts.Trigger.L0ToBaseRatio, c.opts.Output.TargetSSTBytes, c.opts.Trigger.L0MaxDepth
+	overlap := l0OverlapBytes(drainable, m)
+	if overlap <= 0 || target <= 0 || depth <= 0 || ratio <= 0 {
 		return nil
 	}
-	return &levelCompactionPlan{
-		sourceLevel:      0,
-		destinationLevel: 0,
-		sourceSSTs:       append([]sstMetadata(nil), l0[:n]...),
+	needed := int(math.Ceil(ratio * float64(overlap) / float64(target)))
+	if needed <= 2*depth {
+		return nil
 	}
+	group := min((needed+depth-1)/depth, maxL0CombineGroup)
+
+	// Fill rate: what has arrived over the age of its oldest data, projected
+	// to the age limit, must reach the depth limit's worth of bytes.
+	var bytes int64
+	var oldest time.Time
+	for _, sst := range drainable {
+		bytes += sst.Size
+		if t := sst.OldestData(); !t.IsZero() && (oldest.IsZero() || t.Before(oldest)) {
+			oldest = t
+		}
+	}
+	age := now.Sub(oldest)
+	if oldest.IsZero() || age <= 0 || c.opts.Trigger.L0MaxAge <= 0 {
+		return nil
+	}
+	if float64(bytes)*float64(c.opts.Trigger.L0MaxAge) < float64(depth)*float64(target)*float64(age) {
+		return nil
+	}
+
+	// From the old end, the first adjacent run of group writer merges.
+	// drainable is newest first; the run is collected oldest first and
+	// returned newest first, the order duplicate-key precedence follows.
+	var run []sstMetadata
+	for i := len(drainable) - 1; i >= 0 && len(run) < group; i-- {
+		if !isWriterMergeSSTID(drainable[i].ID) {
+			run = run[:0]
+			continue
+		}
+		run = append(run, drainable[i])
+	}
+	if len(run) < group {
+		return nil
+	}
+	for i, j := 0, len(run)-1; i < j; i, j = i+1, j-1 {
+		run[i], run[j] = run[j], run[i]
+	}
+	return &levelCompactionPlan{sourceLevel: 0, destinationLevel: 0, sourceSSTs: run}
 }
 
 // l0ShouldDrain reports whether L0 should merge into L1 now: when it holds at
@@ -514,8 +608,7 @@ func (c *compactor) planL0Merge(m *manifestState) *levelCompactionPlan {
 // worth it (always so when it overlaps nothing, as with keys written in
 // order); when some key is covered by L0MaxDepth L0 SSTs; or when L0's oldest
 // data is L0MaxAge old.
-func (c *compactor) l0ShouldDrain(m *manifestState, now time.Time) bool {
-	l0 := m.L0SSTs
+func (c *compactor) l0ShouldDrain(l0 []sstMetadata, m *manifestState, now time.Time) bool {
 	if len(l0) == 0 {
 		return false
 	}

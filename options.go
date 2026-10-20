@@ -41,6 +41,10 @@ type WriterOptions struct {
 	// Values controls key/value limits. Values are stored inline in SSTs.
 	Values ValueOptions
 
+	// L0Merge controls the writer merging the small L0 files it commits into
+	// larger ones from memory.
+	L0Merge WriterL0MergeOptions
+
 	// OnFlushError is called when a commit or a maintenance apply fails: on
 	// the first failure and at most once a minute while failures continue.
 	// Failures are always retried, even ones that need an operator, such as
@@ -78,6 +82,22 @@ type WriterMaintenanceOptions struct {
 	PollInterval time.Duration
 }
 
+// WriterL0MergeOptions controls the writer merging its own L0 files. Each
+// flush is committed as its own small L0 file as usual; the writer also keeps
+// the file's bytes in memory. When the held files reach TargetBytes, or the
+// oldest of them is MaxAge old, it merges them from memory into one L0 file
+// of about TargetBytes.
+type WriterL0MergeOptions struct {
+	// TargetBytes is the held bytes that start a merge and the approximate
+	// size of the merged file. Zero selects the default, 64 MiB. The writer
+	// holds up to twice this much.
+	TargetBytes int64
+
+	// MaxAge is how long a committed file is held before what is held is
+	// merged whatever its size. Zero selects the default, five minutes.
+	MaxAge time.Duration
+}
+
 // ValueOptions controls writer key/value limits. Values are stored inline in
 // SSTs. Zero fields select defaults.
 type ValueOptions struct {
@@ -102,6 +122,10 @@ func DefaultWriterOptions() WriterOptions {
 			PollInterval: time.Second,
 		},
 		Values: defaultWriterValueOptions(),
+		L0Merge: WriterL0MergeOptions{
+			TargetBytes: 64 * 1024 * 1024,
+			MaxAge:      5 * time.Minute,
+		},
 	}
 }
 

@@ -137,8 +137,22 @@ type WriterCommit struct {
 	ChangeBatch *ChangeBatchMeta `json:"change_batch,omitempty"`
 }
 
+// WriterL0Merge is one writer publication of a merged L0 file in place of the
+// adjacent run of its own L0 files the merge was built from. ID stays the
+// same when publication is retried, so an uncertain CAS result cannot
+// replace the run twice. Retired names every input as an object to delete.
+type WriterL0Merge struct {
+	ID       string          `json:"id"`
+	InputIDs []string        `json:"input_ids"`
+	Output   SSTMeta         `json:"output"`
+	Retired  []RetiredObject `json:"retired"`
+}
+
 // WriterCommitMarker is the bounded idempotency receipt retained in CURRENT.
 // Maintenance updates preserve it even when the committed SST is compacted.
+// CURRENT holds one for the last flush commit and one for the last L0 merge:
+// the flush marker's SeqHi is where the writer's commits end, which a merge
+// of older files must not move.
 type WriterCommitMarker struct {
 	CommitID    string      `json:"commit_id"`
 	Fingerprint string      `json:"fingerprint"`
@@ -172,6 +186,7 @@ type Current struct {
 	WriterFence          *FenceToken               `json:"writer_fence,omitempty"`
 	CompactorFence       *FenceToken               `json:"compactor_fence,omitempty"`
 	LastWriterCommit     *WriterCommitMarker       `json:"last_writer_commit,omitempty"`
+	LastWriterL0Merge    *WriterCommitMarker       `json:"last_writer_l0_merge,omitempty"`
 	MaintenanceReceipt   *MaintenanceReceipt       `json:"maintenance_receipt,omitempty"`
 	MaintenanceScheduler MaintenanceSchedulerState `json:"maintenance_scheduler,omitempty"`
 }

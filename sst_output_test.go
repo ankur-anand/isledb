@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
 )
@@ -137,6 +138,7 @@ func TestMixedSSTOutputEncodingsCompactAndRead(t *testing.T) {
 
 	maintenanceOptions := DefaultMaintenanceOptions()
 	maintenanceOptions.SSTCompaction.L0TriggerSSTs = 2
+	maintenanceOptions.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	maintenanceOptions.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOptions.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOptions)

@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/ankur-anand/isledb/blobstore"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestL0MergesKeepTheNewestVersion overwrites and deletes the same keys in many
-// small saves over a larger L1, so maintenance merges L0 SSTs with each other,
-// and checks every lookup and scan still returns the newest version.
+// small saves over a larger L1, so the writer merges its L0 SSTs with each
+// other from memory while maintenance runs, and checks every lookup and scan
+// still returns the newest version.
 func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -25,6 +27,9 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 
 	wopts := DefaultWriterOptions()
 	wopts.Flush.Interval = 0
+	// Small runs, so a 40-save test sees several merges.
+	wopts.L0Merge.TargetBytes = 16 << 10
+	wopts.Metrics = DefaultWriterMetrics(nil)
 	writer, err := db.OpenWriter(ctx, wopts)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +72,6 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 
 	// Small saves that overwrite and delete the same keys again and again,
 	// across the whole key range.
-	var merges int
 	for round := 0; round < 40; round++ {
 		for _, i := range []int{round % 7, 100 + round%11, 250, 499 - round%5} {
 			put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%02d", round))
@@ -79,27 +83,34 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 		if err := writer.Flush(ctx); err != nil {
 			t.Fatal(err)
 		}
-		merges += driveMaintenanceToIdle(t, ctx, maintenance, writer).SSTCompaction.L0Merges
+		stats := driveMaintenanceToIdle(t, ctx, maintenance, writer)
+		if stats.SSTCompaction.L0Merges != 0 {
+			t.Fatalf("maintenance merged within L0: %d jobs; that is the writer's", stats.SSTCompaction.L0Merges)
+		}
 	}
-	if merges == 0 {
-		t.Fatal("no L0 merges: small saves over a large L1 should merge within L0")
+	// One more pass publishes any merge finished after the last save.
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	m := replayManifestForTest(t, ctx, store)
 	if m.L0SSTCount() >= 40 {
-		t.Fatalf("L0 holds %d SSTs after 40 saves and %d merges", m.L0SSTCount(), merges)
+		t.Fatalf("L0 holds %d SSTs after 40 saves", m.L0SSTCount())
 	}
-	merged := false
+	// The writer merged; maintenance may since have drained the results into
+	// L1, so count merges at the writer, and check the age of whatever merged
+	// file is still in L0.
+	merges := int(testutil.ToFloat64(wopts.Metrics.L0MergePublished))
+	if merges == 0 {
+		t.Fatal("no merges published: small saves should have been merged by the writer")
+	}
 	for _, sst := range m.L0SSTs {
-		if !sst.OldestDataAt.IsZero() {
-			merged = true
-			if !sst.OldestDataAt.Before(sst.CreatedAt) && !sst.OldestDataAt.Equal(sst.CreatedAt) {
-				t.Fatalf("merged SST %s: oldest data %v after creation %v", sst.ID, sst.OldestDataAt, sst.CreatedAt)
-			}
+		if !isOutputSSTID(sst.ID) {
+			continue
 		}
-	}
-	if !merged {
-		t.Fatal("no merged SST in L0 carries OldestDataAt")
+		if sst.OldestDataAt.IsZero() || sst.OldestDataAt.After(sst.CreatedAt) {
+			t.Fatalf("merged SST %s: oldest data %v, created %v", sst.ID, sst.OldestDataAt, sst.CreatedAt)
+		}
 	}
 
 	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
@@ -127,4 +138,116 @@ func TestL0MergesKeepTheNewestVersion(t *testing.T) {
 		}
 	}
 	t.Logf("40 saves, %d L0 merges, L0 now %d SSTs, L1 %d SSTs", merges, m.L0SSTCount(), len(m.Levels))
+}
+
+// TestMaintenanceCombinesMergedFilesOverALargeL1 scales the large-L1 case
+// down: a base in L1 many times the merge output size, with a depth limit the
+// ratio cannot be reached within, so maintenance combines the writer's merged
+// files with each other before draining them. Every lookup still returns the
+// newest version.
+func TestMaintenanceCombinesMergedFilesOverALargeL1(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	store := blobstore.NewMemory("l0-combine")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{sstOutput: testSSTOutput("none", 1024)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	wopts := DefaultWriterOptions()
+	wopts.Flush.Interval = 0
+	// Every save becomes its own merged file: the run closes by age on the
+	// pass after the save.
+	wopts.L0Merge.TargetBytes = 1 << 20
+	wopts.L0Merge.MaxAge = time.Millisecond
+	wopts.Metrics = DefaultWriterMetrics(nil)
+	writer, err := db.OpenWriter(ctx, wopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close(ctx) }()
+	mopts := DefaultMaintenanceOptions()
+	mopts.SSTCompaction.L0TriggerSSTs = 1
+	mopts.SSTCompaction.L0MaxDepth = 4
+	mopts.SSTCompaction.TargetSSTBytes = 6 << 10
+	mopts.SSTCompaction.BaseLevelBytes = 1 << 60
+	maintenance, err := db.OpenMaintenance(ctx, mopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = maintenance.Close(ctx) }()
+
+	expected := map[string][]byte{}
+	put := func(key, value string) {
+		if _, err := writer.Put(ctx, []byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = []byte(value)
+	}
+	// A base in L1 of about 60 KiB: with 6 KiB outputs the ratio needs about
+	// ten files, more than twice the depth limit of four, so merged files are
+	// combined three at a time.
+	for i := 0; i < 500; i++ {
+		put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("base-%04d-%0100d", i, i))
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The base is merged by the writer, then drained: it overlaps nothing.
+	waitForNoRawL0(t, ctx, writer, store)
+	driveMaintenanceToIdle(t, ctx, maintenance, writer)
+	if m := replayManifestForTest(t, ctx, store); m.L0SSTCount() != 0 || len(m.Levels) == 0 {
+		t.Fatalf("base not drained: L0=%d levels=%d", m.L0SSTCount(), len(m.Levels))
+	}
+
+	var combines int
+	for round := 0; round < 24; round++ {
+		for _, i := range []int{round % 7, 100 + round%11, 250, 499 - round%5} {
+			put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("round-%02d", round))
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Publish the merge of this save, then let maintenance look.
+		waitForNoRawL0(t, ctx, writer, store)
+		combines += driveMaintenanceToIdle(t, ctx, maintenance, writer).SSTCompaction.L0Merges
+	}
+	if combines == 0 {
+		t.Fatal("maintenance combined no merged files over a large L1")
+	}
+	if int(testutil.ToFloat64(wopts.Metrics.L0MergePublished)) == 0 {
+		t.Fatal("the writer published no merges")
+	}
+
+	reader := openReaderFromDBForTest(t, ctx, store, ReaderOpenOptions{CacheDir: t.TempDir()})
+	defer reader.Close()
+	assertReaderHasAll(t, ctx, reader, expected)
+	t.Logf("%d combines by maintenance, L0 now %d SSTs", combines, replayManifestForTest(t, ctx, store).L0SSTCount())
+}
+
+// waitForNoRawL0 runs writer passes until every L0 file is a merged one: the
+// writer's background merges have finished and been published.
+func waitForNoRawL0(t *testing.T, ctx context.Context, writer *Writer, store *blobstore.Store) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		raw := 0
+		for _, sst := range replayManifestForTest(t, ctx, store).L0SSTs {
+			if !isOutputSSTID(sst.ID) {
+				raw++
+			}
+		}
+		if raw == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d raw L0 files still unmerged", raw)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

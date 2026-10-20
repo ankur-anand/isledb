@@ -219,6 +219,7 @@ func runMultiProcessMaintenance(t testing.TB, parent context.Context, store *blo
 	opts := DefaultMaintenanceOptions()
 	opts.IdleInterval = 5 * time.Millisecond
 	opts.SSTCompaction.L0TriggerSSTs = 4
+	opts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.SSTCompaction.TargetSSTBytes = 32 << 10
 	maintenance, err := db.OpenMaintenance(parent, opts)
@@ -257,6 +258,7 @@ func drainMultiProcessMaintenance(t testing.TB, ctx context.Context, store *blob
 
 	maintenanceOpts := DefaultMaintenanceOptions()
 	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.SSTCompaction.TargetSSTBytes = 32 << 10
 	maintenance, err := db.OpenMaintenance(ctx, maintenanceOpts)

@@ -107,6 +107,7 @@ func TestS3E2E_WriteCompactRead(t *testing.T) {
 	maintenanceOpts := DefaultMaintenanceOptions()
 	maintenanceOpts.IdleInterval = 10 * time.Millisecond
 	maintenanceOpts.SSTCompaction.L0TriggerSSTs = 4
+	maintenanceOpts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	maintenanceOpts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenanceOpts.SSTCompaction.TargetSSTBytes = 2 * 1024
 
@@ -362,6 +363,7 @@ func runKVLifecycleE2E(t testing.TB, ctx context.Context, store *blobstore.Store
 
 	opts := DefaultMaintenanceOptions()
 	opts.SSTCompaction.L0TriggerSSTs = 2
+	opts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.SSTCompaction.TargetSSTBytes = 1 << 20
 	maintenance, err := db.OpenMaintenance(ctx, opts)

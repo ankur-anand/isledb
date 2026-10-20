@@ -188,6 +188,10 @@ func runStorageWriterWorker(
 	// the mutation workload becomes idle.
 	opts.Flush.Interval = 100 * time.Millisecond
 	opts.Maintenance.PollInterval = 100 * time.Millisecond
+	// The writer merges its own saves and hands maintenance the result; a
+	// short age limit makes that happen within the test.
+	opts.L0Merge.TargetBytes = 1 << 20
+	opts.L0Merge.MaxAge = 200 * time.Millisecond
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("open writer: %w", err)
@@ -280,6 +284,9 @@ func runStorageMaintenanceWorker(
 	opts.SSTCompaction.L0TriggerSSTs = 3
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.SSTCompaction.TargetSSTBytes = 64 << 10
+	// Maintenance drains L0 into L1 once its data is this old, so the test
+	// sees compaction without waiting for L0 to outgrow L1.
+	opts.SSTCompaction.L0MaxAge = time.Second
 	opts.OnCycle = func(stats isledb.MaintenanceStats) {
 		sequence := cycleSequence.Add(1)
 		reporter.emit(storageWorkerEvent{
@@ -542,26 +549,42 @@ func runStorageChangeReaderWorker(
 				Payload:  payload.String(),
 			})
 		case "verify_head":
-			page, err := reader.Read(ctx, cursor, isledb.ChangeReadOptions{
-				MaxChanges: 11,
-				MaxBytes:   8 << 10,
-			})
-			if err != nil {
-				return fmt.Errorf("verify change-feed head: %w", err)
-			}
-			if len(page.Changes) != 0 || !page.CaughtUp() {
-				return fmt.Errorf(
-					"change feed not caught up: changes=%d next=%q head=%q",
-					len(page.Changes), page.Next.String(), page.Head.String())
-			}
-			bounds, err := reader.Bounds(ctx)
-			if err != nil {
-				return fmt.Errorf("verify final change bounds: %w", err)
-			}
-			if bounds.Payload != payload || page.Next != bounds.Head {
-				return fmt.Errorf(
-					"final change bounds payload=%s next=%q head=%q",
-					bounds.Payload, page.Next.String(), bounds.Head.String())
+			// The writer is still open, so a merge or an applied compaction
+			// can append a manifest entry with no changes in it between the
+			// read and the bounds call. Read again from where the page
+			// stopped until the two agree; every read must stay empty.
+			var page isledb.ChangePage
+			var bounds isledb.ChangeBounds
+			for attempt := 0; ; attempt++ {
+				var err error
+				page, err = reader.Read(ctx, cursor, isledb.ChangeReadOptions{
+					MaxChanges: 11,
+					MaxBytes:   8 << 10,
+				})
+				if err != nil {
+					return fmt.Errorf("verify change-feed head: %w", err)
+				}
+				if len(page.Changes) != 0 || !page.CaughtUp() {
+					return fmt.Errorf(
+						"change feed not caught up: changes=%d next=%q head=%q",
+						len(page.Changes), page.Next.String(), page.Head.String())
+				}
+				cursor = page.Next
+				bounds, err = reader.Bounds(ctx)
+				if err != nil {
+					return fmt.Errorf("verify final change bounds: %w", err)
+				}
+				if bounds.Payload != payload {
+					return fmt.Errorf("final change bounds payload=%s, want %s", bounds.Payload, payload)
+				}
+				if page.Next == bounds.Head {
+					break
+				}
+				if attempt >= 20 {
+					return fmt.Errorf(
+						"final change bounds never settled: next=%q head=%q",
+						page.Next.String(), bounds.Head.String())
+				}
 			}
 			reporter.emit(storageWorkerEvent{
 				Type:     "change_feed_verified",

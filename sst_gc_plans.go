@@ -28,6 +28,7 @@ const (
 	defaultSSTDeletionPlanBatchSize = 128
 	defaultSSTOrphanAuditEvery      = 24 * time.Hour
 	defaultSSTOrphanGrace           = 24 * time.Hour
+	defaultSSTIntentAuditEvery      = 5 * time.Minute
 	defaultSSTOrphanScanLimit       = 1024
 )
 
@@ -45,12 +46,57 @@ type sstCleanupWorkStats struct {
 	OrphanObjectsScanned int
 	OrphanCandidates     int
 	OrphansDeleted       int
+	// Writer L0 merge intents the audit scanned, settled ones it removed,
+	// and abandoned ones it resolved into deletion plans.
+	IntentsScanned  int
+	IntentsSettled  int
+	IntentsResolved int
 }
 
+// sstDeletionPlanSource is what retired the plan's targets. A maintenance
+// command names its ID, fence epoch and generation. A merge the writer
+// published names its intent record, the writer's fence epoch, and which
+// side of the merge the targets are: the inputs it replaced, or an output
+// that never replaced anything.
 type sstDeletionPlanSource struct {
-	CommandID  string `json:"command_id"`
+	CommandID  string `json:"command_id,omitempty"`
 	Epoch      uint64 `json:"epoch"`
-	Generation uint64 `json:"generation"`
+	Generation uint64 `json:"generation,omitempty"`
+
+	Kind     string `json:"kind,omitempty"`
+	IntentID string `json:"intent_id,omitempty"`
+	Outcome  string `json:"outcome,omitempty"`
+}
+
+const (
+	sstDeletionSourceWriterL0Merge = "writer_l0_merge"
+	sstDeletionOutcomeInputs       = "inputs"
+	sstDeletionOutcomeOutput       = "output"
+)
+
+func validateSSTDeletionPlanSource(source sstDeletionPlanSource) error {
+	switch source.Kind {
+	case "":
+		if source.CommandID == "" || source.Epoch == 0 || source.Generation == 0 {
+			return errors.New("incomplete SST deletion plan source")
+		}
+		if source.IntentID != "" || source.Outcome != "" {
+			return errors.New("SST deletion plan source names a command and an intent")
+		}
+	case sstDeletionSourceWriterL0Merge:
+		if source.IntentID == "" || source.Epoch == 0 {
+			return errors.New("incomplete writer L0 merge deletion plan source")
+		}
+		if source.Outcome != sstDeletionOutcomeInputs && source.Outcome != sstDeletionOutcomeOutput {
+			return fmt.Errorf("unknown writer L0 merge deletion outcome %q", source.Outcome)
+		}
+		if source.CommandID != "" {
+			return errors.New("SST deletion plan source names a command and an intent")
+		}
+	default:
+		return fmt.Errorf("unknown SST deletion plan source kind %q", source.Kind)
+	}
+	return nil
 }
 
 type sstDeletionTarget struct {
@@ -87,6 +133,8 @@ type sstCleanerOptions struct {
 	OrphanAuditEvery time.Duration
 	OrphanGrace      time.Duration
 	OrphanScanLimit  int
+	// IntentAuditEvery is how often writer L0 merge intents are looked at.
+	IntentAuditEvery time.Duration
 	ManifestLog      *manifest.Store
 	Now              func() time.Time
 	Deleter          objectDeleter
@@ -106,6 +154,7 @@ type sstCleaner struct {
 
 	nextOrphanAudit time.Time
 	orphanAudit     *sstOrphanAuditState
+	nextIntentAudit time.Time
 
 	// Control work only signals that a durable plan may have changed the first
 	// ready key. It never waits for reclaim-lane network I/O. Missing or
@@ -128,6 +177,7 @@ func defaultSSTCleanerOptions() sstCleanerOptions {
 		OrphanAuditEvery: defaultSSTOrphanAuditEvery,
 		OrphanGrace:      defaultSSTOrphanGrace,
 		OrphanScanLimit:  defaultSSTOrphanScanLimit,
+		IntentAuditEvery: defaultSSTIntentAuditEvery,
 		Now:              func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -158,6 +208,9 @@ func newSSTCleaner(store *blobstore.Store, opts sstCleanerOptions) *sstCleaner {
 	}
 	if opts.OrphanScanLimit <= 0 {
 		opts.OrphanScanLimit = defaults.OrphanScanLimit
+	}
+	if opts.IntentAuditEvery <= 0 {
+		opts.IntentAuditEvery = defaults.IntentAuditEvery
 	}
 	if opts.Now == nil {
 		opts.Now = defaults.Now
@@ -242,39 +295,60 @@ func buildSSTDeletionPlan(
 		receipt.Status != manifest.MaintenanceStatusApplied {
 		return nil, nil, errors.New("SST deletion plan requires a matching applied receipt")
 	}
-	if len(retired) == 0 || len(retired) > manifest.MaxRetiredObjectsPerEntry {
-		return nil, nil, fmt.Errorf("invalid SST deletion target count=%d", len(retired))
+	targets := make([]sstDeletionTarget, len(retired))
+	for i, object := range retired {
+		targets[i] = sstDeletionTarget{ID: object.ID, Key: object.Key, Size: object.Size}
 	}
-	if observedAt.IsZero() || receipt.AppliedAt.IsZero() || safetyMargin < 0 {
+	source := sstDeletionPlanSource{
+		CommandID:  command.ID,
+		Epoch:      command.Epoch,
+		Generation: command.Generation,
+	}
+	return newSSTDeletionPlan(store, source, receipt.AppliedAt, observedAt,
+		current.PinnedViewAge(), safetyMargin, targets)
+}
+
+// newSSTDeletionPlan builds and encodes one plan. NotBefore is the later of
+// when the targets stopped being referenced and when that was observed, plus
+// the pinned-view age and the safety margin.
+func newSSTDeletionPlan(
+	store *blobstore.Store,
+	source sstDeletionPlanSource,
+	appliedAt, observedAt time.Time,
+	pinnedViewAge, safetyMargin time.Duration,
+	targets []sstDeletionTarget,
+) (*sstDeletionPlan, []byte, error) {
+	if err := validateSSTDeletionPlanSource(source); err != nil {
+		return nil, nil, err
+	}
+	if len(targets) == 0 || len(targets) > manifest.MaxRetiredObjectsPerEntry {
+		return nil, nil, fmt.Errorf("invalid SST deletion target count=%d", len(targets))
+	}
+	if observedAt.IsZero() || appliedAt.IsZero() || safetyMargin < 0 || pinnedViewAge <= 0 {
 		return nil, nil, errors.New("incomplete SST deletion timing")
 	}
 
 	plan := &sstDeletionPlan{
-		Version: sstDeletionPlanVersion,
-		Kind:    sstDeletionPlanKind,
-		Source: sstDeletionPlanSource{
-			CommandID:  command.ID,
-			Epoch:      command.Epoch,
-			Generation: command.Generation,
-		},
-		AppliedAt:     receipt.AppliedAt.UTC(),
+		Version:       sstDeletionPlanVersion,
+		Kind:          sstDeletionPlanKind,
+		Source:        source,
+		AppliedAt:     appliedAt.UTC(),
 		ObservedAt:    observedAt.UTC(),
-		PinnedViewAge: current.PinnedViewAge(),
+		PinnedViewAge: pinnedViewAge,
 		SafetyMargin:  safetyMargin,
-		TargetCount:   len(retired),
-		Targets:       make([]sstDeletionTarget, len(retired)),
+		TargetCount:   len(targets),
+		Targets:       append([]sstDeletionTarget(nil), targets...),
 	}
 	base := plan.AppliedAt
 	if plan.ObservedAt.After(base) {
 		base = plan.ObservedAt
 	}
 	plan.NotBefore = base.Add(plan.PinnedViewAge).Add(plan.SafetyMargin)
-	for i, object := range retired {
-		plan.Targets[i] = sstDeletionTarget{ID: object.ID, Key: object.Key, Size: object.Size}
-		if object.Size > 0 && plan.TargetBytes > int64(^uint64(0)>>1)-object.Size {
+	for _, target := range plan.Targets {
+		if target.Size > 0 && plan.TargetBytes > int64(^uint64(0)>>1)-target.Size {
 			return nil, nil, errors.New("SST deletion target bytes overflow")
 		}
-		plan.TargetBytes += object.Size
+		plan.TargetBytes += target.Size
 	}
 	plan.PlanID = sstDeletionPlanID(*plan)
 	plan.Checksum = sstDeletionPlanChecksum(*plan)
@@ -332,8 +406,8 @@ func validateSSTDeletionPlan(store *blobstore.Store, plan sstDeletionPlan) error
 	if plan.Version != sstDeletionPlanVersion || plan.Kind != sstDeletionPlanKind {
 		return fmt.Errorf("unsupported SST deletion plan version=%d kind=%q", plan.Version, plan.Kind)
 	}
-	if plan.Source.CommandID == "" || plan.Source.Epoch == 0 || plan.Source.Generation == 0 {
-		return errors.New("incomplete SST deletion plan source")
+	if err := validateSSTDeletionPlanSource(plan.Source); err != nil {
+		return err
 	}
 	if plan.PlanID == "" || plan.PlanID != sstDeletionPlanID(plan) {
 		return errors.New("SST deletion plan ID mismatch")
@@ -525,6 +599,12 @@ func (c *sstCleaner) runScheduledOnce(
 		c.pendingPlanKey = ""
 	}
 	remainingDeletes := c.opts.DeleteBatchSize - stats.Attempted
+	if err == nil && c.opts.ManifestLog != nil && (c.nextIntentAudit.IsZero() || !passNow.Before(c.nextIntentAudit)) {
+		intentStats, intentErr := c.runIntentAudit(ctx, passNow)
+		mergeSSTCleanupWorkStats(&stats, &intentStats)
+		err = errors.Join(err, intentErr)
+		c.nextIntentAudit = passNow.Add(c.opts.IntentAuditEvery)
+	}
 	auditDue := c.orphanAudit != nil || c.nextOrphanAudit.IsZero() || !passNow.Before(c.nextOrphanAudit)
 	if err == nil && c.opts.ManifestLog != nil && auditDue && remainingDeletes > 0 {
 		auditStats, auditErr := c.runOrphanAudit(ctx, passNow, remainingDeletes)
@@ -534,6 +614,9 @@ func (c *sstCleaner) runScheduledOnce(
 	nextDue := stats.NextDue
 	if c.orphanAudit == nil && !c.nextOrphanAudit.IsZero() {
 		nextDue = earlierReclamationDeadline(nextDue, c.nextOrphanAudit)
+	}
+	if c.opts.ManifestLog != nil && !c.nextIntentAudit.IsZero() {
+		nextDue = earlierReclamationDeadline(nextDue, c.nextIntentAudit)
 	}
 	schedule := reclamationLaneSchedule{
 		observedAt: c.opts.Now().UTC(),
@@ -554,6 +637,9 @@ func mergeSSTCleanupWorkStats(dst, src *sstCleanupWorkStats) {
 	dst.OrphanObjectsScanned += src.OrphanObjectsScanned
 	dst.OrphanCandidates += src.OrphanCandidates
 	dst.OrphansDeleted += src.OrphansDeleted
+	dst.IntentsScanned += src.IntentsScanned
+	dst.IntentsSettled += src.IntentsSettled
+	dst.IntentsResolved += src.IntentsResolved
 }
 
 func (c *sstCleaner) planAvailable() {
@@ -763,6 +849,14 @@ func orphanSSTPredatesCurrentFence(
 	}
 	if isCompactionSSTID(id) {
 		fence := current.CompactorFence
+		return fence != nil && !fence.ClaimedAt.IsZero() &&
+			modifiedAt.Add(safetyMargin).Before(fence.ClaimedAt)
+	}
+	if isWriterMergeSSTID(id) {
+		// A writer's merge output is retried to a stable name under its
+		// fence; one that predates the current writer's claim can no longer
+		// be published.
+		fence := current.WriterFence
 		return fence != nil && !fence.ClaimedAt.IsZero() &&
 			modifiedAt.Add(safetyMargin).Before(fence.ClaimedAt)
 	}

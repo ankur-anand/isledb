@@ -273,6 +273,7 @@ func maintenancePressureOptions() MaintenanceOptions {
 	opts.IdleInterval = time.Millisecond
 	opts.SSTCompaction.ReadConcurrency = 4
 	opts.SSTCompaction.L0TriggerSSTs = 4
+	opts.SSTCompaction.L0MaxAge = time.Nanosecond // Flush files are nobody's at once: this test drives maintenance over them.
 	// Keep L1 deliberately smaller than the compressed live set so the test
 	// exercises lower-level scheduling even when L0 is drained in wide jobs.
 	opts.SSTCompaction.BaseLevelBytes = 8 << 10
