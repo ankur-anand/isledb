@@ -188,6 +188,10 @@ func runStorageWriterWorker(
 	// the mutation workload becomes idle.
 	opts.Flush.Interval = 100 * time.Millisecond
 	opts.Maintenance.PollInterval = 100 * time.Millisecond
+	// The writer merges its own saves and hands maintenance the result; a
+	// short age limit makes that happen within the test.
+	opts.L0Merge.TargetBytes = 1 << 20
+	opts.L0Merge.MaxAge = 200 * time.Millisecond
 	writer, err := db.OpenWriter(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("open writer: %w", err)
@@ -280,6 +284,9 @@ func runStorageMaintenanceWorker(
 	opts.SSTCompaction.L0TriggerSSTs = 3
 	opts.SSTCompaction.BaseLevelBytes = 1 << 60
 	opts.SSTCompaction.TargetSSTBytes = 64 << 10
+	// Maintenance drains L0 into L1 once its data is this old, so the test
+	// sees compaction without waiting for L0 to outgrow L1.
+	opts.SSTCompaction.L0MaxAge = time.Second
 	opts.OnCycle = func(stats isledb.MaintenanceStats) {
 		sequence := cycleSequence.Add(1)
 		reporter.emit(storageWorkerEvent{
