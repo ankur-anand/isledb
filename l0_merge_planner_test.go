@@ -284,19 +284,12 @@ func TestMaintenanceRevisitsL0OnlyWhileThereIsProgress(t *testing.T) {
 	}
 }
 
-// l0OverLargeL1 builds an L0 of merged files, newest first by size, over an
-// L1 of one SST of l1Bytes covering the same keys.
-func l0OverLargeL1(t *testing.T, sizes []int64, l1Bytes int64) (*compactor, *manifestState) {
-	t.Helper()
-	return l0Planner(t, sizes, l1Bytes)
-}
-
 func TestL0PlannerCombinesMergedFilesForALargeL1(t *testing.T) {
 	// L1 of 4 GiB: the ratio needs 64 files of 64 MiB, the depth limit is 16,
 	// so merged files are combined four at a time. Eight 64 MiB files: not
 	// worth a drain (512 MiB against 4 GiB), not deep, not old; the four
 	// oldest are combined into one.
-	c, m := l0OverLargeL1(t, repeat(64<<20, 8), 4<<30)
+	c, m := l0Planner(t, repeat(64<<20, 8), 4<<30)
 	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -312,8 +305,8 @@ func TestL0PlannerCombinesMergedFilesForALargeL1(t *testing.T) {
 
 func TestL0PlannerDoesNotCombineForTheDefaultL1(t *testing.T) {
 	// L1 of 512 MiB: the ratio needs 8 files, within the depth limit. Eight
-	// files of 64 MiB meet the ratio and drain; four wait, uncombined.
-	c, m := l0OverLargeL1(t, repeat(64<<20, 8), 512<<20)
+	// files of 64 MiB meet the ratio and drain; seven wait, uncombined.
+	c, m := l0Planner(t, repeat(64<<20, 8), 512<<20)
 	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -321,9 +314,7 @@ func TestL0PlannerDoesNotCombineForTheDefaultL1(t *testing.T) {
 	if plan == nil || plan.destinationLevel != 1 {
 		t.Fatalf("plan %+v, want a drain into L1", plan)
 	}
-	c, m = l0OverLargeL1(t, repeat(64<<20, 7), 512<<20)
-	// Under the trigger count there is no L0 planning at all; raise it past
-	// the trigger by lowering the trigger.
+	c, m = l0Planner(t, repeat(64<<20, 7), 512<<20)
 	c.opts.Trigger.L0SSTCount = 2
 	plan, err = plannedCandidateForLevel(c, m, 0)
 	if err != nil {
@@ -332,8 +323,60 @@ func TestL0PlannerDoesNotCombineForTheDefaultL1(t *testing.T) {
 	if plan != nil {
 		t.Fatalf("plan %+v, want to wait: 448 MiB against 512 MiB, 7 deep, no combine needed", plan)
 	}
-	if plan := c.planL0Combine(c.drainableL0(m, time.Now()), m); plan != nil {
-		t.Fatalf("combine %+v for a 512 MiB L1, want none", plan)
+}
+
+func TestL0PlannerCombineNeedsAGroupOfThree(t *testing.T) {
+	// L1 between one and two depth limits' worth, 1.5 GiB: the group would be
+	// two, and a combine of two rewrites as much as it saves. Smaller merged
+	// files, as compression leaves them, must not change that.
+	for _, size := range []int64{64 << 20, 50 << 20} {
+		c, m := l0Planner(t, repeat(size, 8), 3<<29)
+		c.opts.Trigger.L0SSTCount = 2
+		if plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now()); plan != nil {
+			t.Fatalf("%d MiB files over 1.5 GiB: combine %+v, want none", size>>20, plan)
+		}
+	}
+	// Just past twice the depth limit's worth, the group is three.
+	c, m := l0Planner(t, repeat(64<<20, 8), 33*64<<20)
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != 3 {
+		t.Fatalf("plan %+v, want a combine of three", plan)
+	}
+}
+
+func TestL0PlannerCombineGroupIsCapped(t *testing.T) {
+	// L1 of 64 GiB wants groups of 64; one combine never writes more than
+	// eight files' worth.
+	c, m := l0Planner(t, repeat(64<<20, 12), 64<<30)
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != maxL0CombineGroup {
+		t.Fatalf("plan %+v, want a combine of %d", plan, maxL0CombineGroup)
+	}
+}
+
+func TestL0PlannerCombineSkipsSlowWriters(t *testing.T) {
+	// L1 of 4 GiB, four merged files of 64 MiB. Their oldest data is 10
+	// minutes old: 256 MiB in 10 minutes projects to 768 MiB at the 30-minute
+	// age limit, short of the depth limit's 1 GiB, so the age rule drains L0
+	// before the depth rule ever would and a combine saves nothing. At 5
+	// minutes the projection is 1.5 GiB and the combine goes ahead.
+	now := time.Now()
+	for _, tc := range []struct {
+		age  time.Duration
+		want bool
+	}{
+		{10 * time.Minute, false},
+		{5 * time.Minute, true},
+	} {
+		c, m := l0Planner(t, repeat(64<<20, 4), 4<<30)
+		c.opts.Trigger.L0SSTCount = 2
+		for i := range m.L0SSTs {
+			m.L0SSTs[i].CreatedAt = now.Add(-tc.age)
+		}
+		plan := c.planL0Combine(c.drainableL0(m, now), m, now)
+		if (plan != nil) != tc.want {
+			t.Fatalf("oldest data %s old: plan %+v, want combine=%v", tc.age, plan, tc.want)
+		}
 	}
 }
 
@@ -346,17 +389,19 @@ func TestL0PlannerCombineSkipsCombinedFilesAndStopsAtFlushFiles(t *testing.T) {
 	l1.Size = 4 << 30
 	m.AddLevelSSTs(1, []sstMetadata{l1})
 	// Oldest first: one already combined file, two merged, a skipped flush
-	// below newer merged files, then four merged files.
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(1), 256<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 64<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(3), 64<<20, now))
-	m.AddL0SST(rawFlush(4, 2<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(5), 64<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(6), 64<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(7), 64<<20, now))
-	m.AddL0SST(plannerSSTNamed(mergedSSTID(8), 64<<20, now))
+	// below newer merged files, then four merged files. All a minute old, so
+	// the fill rate projects well past the depth limit.
+	at := now.Add(-time.Minute)
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(1), 256<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 64<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(3), 64<<20, at))
+	m.AddL0SST(rawFlush(4, 2<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(5), 64<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(6), 64<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(7), 64<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(8), 64<<20, at))
 
-	plan := c.planL0Combine(c.drainableL0(m, now), m)
+	plan := c.planL0Combine(c.drainableL0(m, now), m, now)
 	if plan == nil || len(plan.sourceSSTs) != 4 {
 		t.Fatalf("plan %+v, want the run of four above the flush file", plan)
 	}
@@ -367,7 +412,7 @@ func TestL0PlannerCombineSkipsCombinedFilesAndStopsAtFlushFiles(t *testing.T) {
 	// Without the run of four, the pair below the flush is too short and the
 	// combined file is left alone: nothing to combine.
 	m.L0SSTs = m.L0SSTs[2:]
-	if plan := c.planL0Combine(c.drainableL0(m, now), m); plan != nil {
+	if plan := c.planL0Combine(c.drainableL0(m, now), m, now); plan != nil {
 		t.Fatalf("plan %+v, want none: no adjacent run of four uncombined files", plan)
 	}
 }

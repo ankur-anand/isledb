@@ -171,7 +171,7 @@ func TestMaintenanceCombinesMergedFilesOverALargeL1(t *testing.T) {
 	mopts := DefaultMaintenanceOptions()
 	mopts.SSTCompaction.L0TriggerSSTs = 1
 	mopts.SSTCompaction.L0MaxDepth = 4
-	mopts.SSTCompaction.TargetSSTBytes = 8 << 10
+	mopts.SSTCompaction.TargetSSTBytes = 6 << 10
 	mopts.SSTCompaction.BaseLevelBytes = 1 << 60
 	maintenance, err := db.OpenMaintenance(ctx, mopts)
 	if err != nil {
@@ -186,9 +186,9 @@ func TestMaintenanceCombinesMergedFilesOverALargeL1(t *testing.T) {
 		}
 		expected[key] = []byte(value)
 	}
-	// A base in L1 of about 60 KiB: with 8 KiB outputs the ratio needs about
-	// eight files and the depth limit is four, so merged files are combined
-	// in pairs.
+	// A base in L1 of about 60 KiB: with 6 KiB outputs the ratio needs about
+	// ten files, more than twice the depth limit of four, so merged files are
+	// combined three at a time.
 	for i := 0; i < 500; i++ {
 		put(fmt.Sprintf("key-%04d", i), fmt.Sprintf("base-%04d-%0100d", i, i))
 	}

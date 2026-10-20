@@ -423,7 +423,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				}
 				candidates = append(candidates, candidate)
 			}
-		} else if plan := c.planL0Combine(drainable, m); plan != nil {
+		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
 			// A large L1: the ratio needs more merged files than the depth
 			// limit allows, so combine finished ones first.
 			candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
@@ -533,32 +533,58 @@ func l0OverlapBytes(l0 []sstMetadata, m *manifestState) int64 {
 	return overlap
 }
 
+// maxL0CombineGroup bounds how many merged files one combine takes, and so
+// how large its output gets: a retry redoes the whole output.
+const maxL0CombineGroup = 8
+
 // planL0Combine combines merged L0 files with each other when L1 is large: a
 // drain pays off once L0 holds L0ToBaseRatio of the L1 it overlaps, and if
 // that takes more files of TargetSSTBytes than L0MaxDepth allows, the depth
 // rule would force a drain early and rewrite L1 far more often than needed.
 // Combining finished merged files, in groups just large enough that the
 // ratio is reached within the depth limit, lets the bytes pile up while the
-// count stays low. Only files right of the drain boundary are considered, so
-// the writer's own merging is never contended; a file already combined, or a
-// flush file between merged ones, breaks a run.
-func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState) *levelCompactionPlan {
+// count stays low.
+//
+// A combine rewrites every byte once, so it runs only when it saves more than
+// that: when the group is at least three, which is L1 above twice the depth
+// limit's worth of files; and when L0 is filling fast enough that the depth
+// limit would be reached before the age limit drains L0 anyway. Only files
+// right of the drain boundary are considered, so the writer's own merging is
+// never contended. A file larger than TargetSSTBytes is one already combined,
+// since the writer never produces one that large; it and any flush file
+// between merged ones end a run.
+func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now time.Time) *levelCompactionPlan {
 	ratio, target, depth := c.opts.Trigger.L0ToBaseRatio, c.opts.Output.TargetSSTBytes, c.opts.Trigger.L0MaxDepth
 	overlap := l0OverlapBytes(drainable, m)
 	if overlap <= 0 || target <= 0 || depth <= 0 || ratio <= 0 {
 		return nil
 	}
 	needed := int(math.Ceil(ratio * float64(overlap) / float64(target)))
-	if needed <= depth {
+	if needed <= 2*depth {
 		return nil
 	}
-	group := min((needed+depth-1)/depth, maxCompactionSSTsPerJob)
-	if group < 2 {
+	group := min((needed+depth-1)/depth, maxL0CombineGroup)
+
+	// Fill rate: what has arrived over the age of its oldest data, projected
+	// to the age limit, must reach the depth limit's worth of bytes.
+	var bytes int64
+	var oldest time.Time
+	for _, sst := range drainable {
+		bytes += sst.Size
+		if t := sst.OldestData(); !t.IsZero() && (oldest.IsZero() || t.Before(oldest)) {
+			oldest = t
+		}
+	}
+	age := now.Sub(oldest)
+	if oldest.IsZero() || age <= 0 || c.opts.Trigger.L0MaxAge <= 0 {
 		return nil
 	}
-	combinedSize := int64(group) * target
+	if float64(bytes)*float64(c.opts.Trigger.L0MaxAge) < float64(depth)*float64(target)*float64(age) {
+		return nil
+	}
+
 	notCombined := func(sst sstMetadata) bool {
-		return isCompactionSSTID(sst.ID) && sst.Size < combinedSize/2
+		return isCompactionSSTID(sst.ID) && sst.Size <= target
 	}
 	// From the old end, the first adjacent run of group files not yet
 	// combined. drainable is newest first; the run is collected oldest first
