@@ -409,6 +409,75 @@ func TestSSTReclaimScheduleUsesThePassClock(t *testing.T) {
 	}
 }
 
+// TestSSTReclaimScheduleReturnsAtOnceWhileDuePlansRemain: a pass that fills
+// its delete batch leaves due plans behind, so it comes back at the base
+// interval rather than sleeping until the next audit.
+func TestSSTReclaimScheduleReturnsAtOnceWhileDuePlansRemain(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("sst-plan-full-batch-schedule")
+	defer store.Close()
+	now := time.Now().UTC()
+
+	const plans = 3
+	for i := 0; i < plans; i++ {
+		current, command, receipt, _ := writeSSTDeletionPlanFixture(t, ctx, store, fmt.Sprintf("due-%d", i))
+		receipt.AppliedAt = now.Add(-4 * time.Hour)
+		plan, _, err := buildSSTDeletionPlan(
+			store, current, command, receipt, command.Compaction.RetiredObjects,
+			now.Add(-3*time.Hour), 0)
+		if err != nil {
+			t.Fatalf("build plan %d: %v", i, err)
+		}
+		plan.ObservedAt = now.Add(-time.Hour).Add(-plan.PinnedViewAge).Add(-plan.SafetyMargin)
+		plan.NotBefore = plan.ObservedAt.Add(plan.PinnedViewAge).Add(plan.SafetyMargin)
+		plan.Checksum = sstDeletionPlanChecksum(*plan)
+		payload, err := encodeSSTDeletionPlan(store, *plan)
+		if err != nil {
+			t.Fatalf("encode plan %d: %v", i, err)
+		}
+		if created, err := storeSSTDeletionPlan(ctx, store, *plan, payload); err != nil || !created {
+			t.Fatalf("store plan %d created=%v error=%v", i, created, err)
+		}
+	}
+
+	cleaner := newSSTCleaner(store, sstCleanerOptions{
+		DeleteBatchSize:  1,
+		IntentAuditEvery: 5 * time.Minute,
+		ManifestLog:      newManifestStore(store, nil),
+		Now:              func() time.Time { return now },
+	})
+	deleted := 0
+	for pass := 0; pass < plans; pass++ {
+		stats, schedule, err := cleaner.runScheduledOnce(ctx)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		deleted += stats.Deleted
+		if stats.Deleted != 1 {
+			t.Fatalf("pass %d stats=%+v, want one deletion", pass, stats)
+		}
+		if schedule.idle || !schedule.nextDue.IsZero() {
+			t.Fatalf("pass %d schedule=%+v, want busy with no deadline", pass, schedule)
+		}
+		delay, _ := nextReclamationDelay(time.Second, time.Second, schedule.observedAt, schedule.nextDue, schedule.idle)
+		if delay != time.Second {
+			t.Fatalf("pass %d delay=%s, want the base interval", pass, delay)
+		}
+	}
+	if deleted != plans {
+		t.Fatalf("deleted=%d want=%d", deleted, plans)
+	}
+
+	// Out of due plans, the lane waits for the intent audit.
+	stats, schedule, err := cleaner.runScheduledOnce(ctx)
+	if err != nil {
+		t.Fatalf("final pass: %v", err)
+	}
+	if stats.Deleted != 0 || !schedule.idle || !schedule.nextDue.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("final stats=%+v schedule=%+v, want idle until the intent audit", stats, schedule)
+	}
+}
+
 func TestSSTReclaimScheduleIsNotIdleOnError(t *testing.T) {
 	ctx := context.Background()
 	store := blobstore.NewMemory("sst-plan-error-not-idle")
