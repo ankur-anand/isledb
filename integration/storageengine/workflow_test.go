@@ -549,26 +549,42 @@ func runStorageChangeReaderWorker(
 				Payload:  payload.String(),
 			})
 		case "verify_head":
-			page, err := reader.Read(ctx, cursor, isledb.ChangeReadOptions{
-				MaxChanges: 11,
-				MaxBytes:   8 << 10,
-			})
-			if err != nil {
-				return fmt.Errorf("verify change-feed head: %w", err)
-			}
-			if len(page.Changes) != 0 || !page.CaughtUp() {
-				return fmt.Errorf(
-					"change feed not caught up: changes=%d next=%q head=%q",
-					len(page.Changes), page.Next.String(), page.Head.String())
-			}
-			bounds, err := reader.Bounds(ctx)
-			if err != nil {
-				return fmt.Errorf("verify final change bounds: %w", err)
-			}
-			if bounds.Payload != payload || page.Next != bounds.Head {
-				return fmt.Errorf(
-					"final change bounds payload=%s next=%q head=%q",
-					bounds.Payload, page.Next.String(), bounds.Head.String())
+			// The writer is still open, so a merge or an applied compaction
+			// can append a manifest entry with no changes in it between the
+			// read and the bounds call. Read again from where the page
+			// stopped until the two agree; every read must stay empty.
+			var page isledb.ChangePage
+			var bounds isledb.ChangeBounds
+			for attempt := 0; ; attempt++ {
+				var err error
+				page, err = reader.Read(ctx, cursor, isledb.ChangeReadOptions{
+					MaxChanges: 11,
+					MaxBytes:   8 << 10,
+				})
+				if err != nil {
+					return fmt.Errorf("verify change-feed head: %w", err)
+				}
+				if len(page.Changes) != 0 || !page.CaughtUp() {
+					return fmt.Errorf(
+						"change feed not caught up: changes=%d next=%q head=%q",
+						len(page.Changes), page.Next.String(), page.Head.String())
+				}
+				cursor = page.Next
+				bounds, err = reader.Bounds(ctx)
+				if err != nil {
+					return fmt.Errorf("verify final change bounds: %w", err)
+				}
+				if bounds.Payload != payload {
+					return fmt.Errorf("final change bounds payload=%s, want %s", bounds.Payload, payload)
+				}
+				if page.Next == bounds.Head {
+					break
+				}
+				if attempt >= 20 {
+					return fmt.Errorf(
+						"final change bounds never settled: next=%q head=%q",
+						page.Next.String(), bounds.Head.String())
+				}
 			}
 			reporter.emit(storageWorkerEvent{
 				Type:     "change_feed_verified",
