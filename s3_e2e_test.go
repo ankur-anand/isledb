@@ -36,16 +36,27 @@ func setupFakeS3BucketURL(t testing.TB) string {
 
 func setupFakeS3BucketURLWithObserver(t testing.TB, observe func(*http.Request)) string {
 	t.Helper()
+	if observe == nil {
+		return setupFakeS3BucketURLWithHandler(t, nil)
+	}
+	return setupFakeS3BucketURLWithHandler(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			observe(r)
+			next.ServeHTTP(w, r)
+		})
+	})
+}
+
+// setupFakeS3BucketURLWithHandler serves a fake S3 bucket, its handler wrapped
+// by wrap when not nil.
+func setupFakeS3BucketURLWithHandler(t testing.TB, wrap func(http.Handler) http.Handler) string {
+	t.Helper()
 
 	backend := s3mem.New()
 	fake := gofakes3.New(backend)
-	baseHandler := fake.Server()
-	handler := baseHandler
-	if observe != nil {
-		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			observe(r)
-			baseHandler.ServeHTTP(w, r)
-		})
+	handler := fake.Server()
+	if wrap != nil {
+		handler = wrap(handler)
 	}
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
