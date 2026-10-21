@@ -324,11 +324,37 @@ func writeSSTStreaming(
 	return result, nil
 }
 
+// maxFinishedSSTUploads is how many finished SSTs may still be uploading while
+// the next one is built. Building does not wait for an upload to complete, so
+// an output's request time overlaps the work on the next; each upload in
+// flight holds its own request buffer.
+const maxFinishedSSTUploads = 1
+
+// sstUpload is one output's upload, running while the output is built and,
+// once it is finished, while the next one is.
+type sstUpload struct {
+	done   chan struct{}
+	err    atomic.Value
+	cancel context.CancelFunc
+	result streamSSTResult
+}
+
+// wait waits for the upload to complete and returns its error.
+func (u *sstUpload) wait() error {
+	<-u.done
+	u.cancel()
+	if v := u.err.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
+}
+
 // writeMultipleSSTsStreaming builds and uploads multiple SSTs using streaming.
 // Each SST is streamed to the upload function as it's built, with new SSTs
 // started when the current one reaches targetSize. A positive maxOutputs caps
 // how many SSTs it writes: the last one is never cut and takes whatever
-// remains, however far past targetSize.
+// remains, however far past targetSize. Results are in output order and only
+// include SSTs whose upload completed.
 func writeMultipleSSTsStreaming(
 	ctx context.Context,
 	it sstIterator,
@@ -338,7 +364,16 @@ func writeMultipleSSTsStreaming(
 	maxOutputs int,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
 ) (results []streamSSTResult, err error) {
+	// Finished SSTs whose uploads may still be running, oldest first.
+	var finished []*sstUpload
 	defer func() {
+		if err != nil {
+			for _, u := range finished {
+				u.cancel()
+				<-u.done
+			}
+			results = nil
+		}
 		err = errors.Join(err, it.Close())
 	}()
 
@@ -351,16 +386,18 @@ func writeMultipleSSTsStreaming(
 	var state *sstBuildState
 	bloomKeys := newSSTBloomKeys(opts.BloomBitsPerKey)
 	var sstID string
-	var uploadErr atomic.Value
-	var uploadDone chan struct{}
-	var uploadCancel context.CancelFunc
+	var upload *sstUpload
 	var started bool
 	var sstIndex int
 
-	getUploadErr := func() error {
-		if v := uploadErr.Load(); v != nil {
-			return v.(error)
+	// settleOldest waits for the oldest finished upload and records its SST.
+	settleOldest := func() error {
+		u := finished[0]
+		finished = finished[1:]
+		if err := u.wait(); err != nil {
+			return fmt.Errorf("sst upload: %w", err)
 		}
+		results = append(results, u.result)
 		return nil
 	}
 
@@ -377,20 +414,18 @@ func writeMultipleSSTsStreaming(
 		sst = sstable.NewWriter(writable, wo)
 		state = newSSTBuildState()
 		bloomKeys.reset()
-		uploadErr = atomic.Value{}
-		uploadDone = make(chan struct{})
 		uploadCtx, cancelUpload := context.WithCancel(ctx)
-		uploadCancel = cancelUpload
+		upload = &sstUpload{done: make(chan struct{}), cancel: cancelUpload}
 		started = true
 
-		go func(id string, reader *io.PipeReader, done chan struct{}, errVal *atomic.Value) {
-			defer close(done)
+		go func(id string, reader *io.PipeReader, u *sstUpload) {
+			defer close(u.done)
 			err := uploadFn(uploadCtx, id, reader)
 			if err != nil {
-				errVal.Store(err)
+				u.err.Store(err)
 			}
 			_ = reader.CloseWithError(err)
-		}(sstID, pr, uploadDone, &uploadErr)
+		}(sstID, pr, upload)
 		return nil
 	}
 
@@ -401,8 +436,8 @@ func writeMultipleSSTsStreaming(
 
 		if err := sst.Close(); err != nil {
 			pw.CloseWithError(err)
-			uploadCancel()
-			<-uploadDone
+			upload.cancel()
+			<-upload.done
 			return err
 		}
 
@@ -414,22 +449,19 @@ func writeMultipleSSTsStreaming(
 		}
 		if err != nil {
 			pw.CloseWithError(err)
-			uploadCancel()
-			<-uploadDone
+			upload.cancel()
+			<-upload.done
 			return err
 		}
 
-		closeErr := pw.Close()
-
-		<-uploadDone
-		uploadCancel()
-		if ue := getUploadErr(); ue != nil {
-			return fmt.Errorf("sst upload: %w", ue)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close sst upload stream: %w", closeErr)
+		if err := pw.Close(); err != nil {
+			upload.cancel()
+			<-upload.done
+			return fmt.Errorf("close sst upload stream: %w", err)
 		}
 
+		// Every byte has gone into the pipe, so the hash is complete; the
+		// upload may still be sending them.
 		hashBytes := writable.sumBytes()
 		hashStr := hex.EncodeToString(hashBytes)
 
@@ -449,9 +481,15 @@ func writeMultipleSSTsStreaming(
 			},
 		}
 
-		results = append(results, result)
+		upload.result = result
+		finished = append(finished, upload)
 		started = false
-		pr, pw, writable, sst, state, uploadDone, uploadCancel = nil, nil, nil, nil, nil, nil, nil
+		pr, pw, writable, sst, state, upload = nil, nil, nil, nil, nil, nil
+		for len(finished) > maxFinishedSSTUploads {
+			if err := settleOldest(); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -475,15 +513,12 @@ func writeMultipleSSTsStreaming(
 		if pr != nil {
 			pr.CloseWithError(abortErr)
 		}
-		if uploadCancel != nil {
-			uploadCancel()
-		}
-
-		if uploadDone != nil {
-			<-uploadDone
+		if upload != nil {
+			upload.cancel()
+			<-upload.done
 		}
 		started = false
-		pr, pw, writable, sst, state, uploadDone, uploadCancel = nil, nil, nil, nil, nil, nil, nil
+		pr, pw, writable, sst, state, upload = nil, nil, nil, nil, nil, nil
 	}
 
 	for it.Next() {
@@ -543,6 +578,11 @@ func writeMultipleSSTsStreaming(
 	} else if started {
 		// IMP: Fix goroutine leak for exhausted iterator.
 		abortCurrentSST()
+	}
+	for len(finished) > 0 {
+		if err := settleOldest(); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(results) == 0 {
