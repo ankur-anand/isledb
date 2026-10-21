@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -407,6 +408,8 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 	}
 	it := &sliceSSTIter{entries: entries}
 
+	// Uploads overlap, so they record under a lock.
+	var mu sync.Mutex
 	var uploadedSSTs []struct {
 		id   string
 		data []byte
@@ -416,6 +419,8 @@ func TestWriteMultipleSSTsStreaming_Basic(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		uploadedSSTs = append(uploadedSSTs, struct {
 			id   string
 			data []byte
@@ -799,5 +804,92 @@ func TestWriteMultipleSSTsStreamingCapsOutputs(t *testing.T) {
 	last := results[2].Meta
 	if !bytes.Equal(last.MinKey, uncapped[2].Meta.MinKey) || string(last.MaxKey) != "key-19" {
 		t.Fatalf("last output covers %s..%s, want %s..key-19", last.MinKey, last.MaxKey, uncapped[2].Meta.MinKey)
+	}
+}
+
+func overlapTestEntries() []internal.MemEntry {
+	var entries []internal.MemEntry
+	for i := 0; i < 6; i++ {
+		entries = append(entries, internal.MemEntry{
+			Key:   []byte(fmt.Sprintf("key-%02d", i)),
+			Seq:   uint64(i + 1),
+			Kind:  internal.OpPut,
+			Value: bytes.Repeat([]byte("v"), 8192),
+		})
+	}
+	return entries
+}
+
+// Building the next SST does not wait for the previous one's upload: the
+// first upload completes only once the second has started.
+func TestWriteMultipleSSTsStreamingOverlapsUploads(t *testing.T) {
+	secondStarted := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	order := map[string]int{}
+	var calls int
+	uploadFn := func(_ context.Context, id string, r io.Reader) error {
+		mu.Lock()
+		calls++
+		call := calls
+		order[id] = call
+		mu.Unlock()
+		if call == 2 {
+			once.Do(func() { close(secondStarted) })
+		}
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			return err
+		}
+		if call == 1 {
+			select {
+			case <-secondStarted:
+			case <-time.After(5 * time.Second):
+				return errors.New("second upload never started while the first was in flight")
+			}
+		}
+		return nil
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), &sliceSSTIter{entries: overlapTestEntries()},
+		sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1, 0, uploadFn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) < 3 {
+		t.Fatalf("outputs=%d, want several", len(results))
+	}
+	for i, result := range results {
+		if order[result.Meta.ID] != i+1 {
+			t.Fatalf("result %d is upload %d, want results in output order", i, order[result.Meta.ID])
+		}
+	}
+}
+
+// An upload that fails after the next SST has started still fails the write.
+func TestWriteMultipleSSTsStreamingReportsEarlierUploadFailure(t *testing.T) {
+	uploadErr := errors.New("first upload failed")
+	var mu sync.Mutex
+	var calls int
+	uploadFn := func(_ context.Context, _ string, r io.Reader) error {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			return err
+		}
+		if call == 1 {
+			return uploadErr
+		}
+		return nil
+	}
+
+	results, err := writeMultipleSSTsStreaming(context.Background(), &sliceSSTIter{entries: overlapTestEntries()},
+		sstWriterOptions{BlockSize: 4096, Compression: "none"}, testSSTStreamSetIdentity(1), 1, 0, uploadFn)
+	if !errors.Is(err, uploadErr) {
+		t.Fatalf("err=%v, want %v", err, uploadErr)
+	}
+	if results != nil {
+		t.Fatalf("results=%d, want none on failure", len(results))
 	}
 }
