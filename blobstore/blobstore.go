@@ -403,11 +403,11 @@ func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes,
 const minUploadBufferBytes = 5 << 20
 
 // UploadInOneRequest returns WriteReader options that send an object of up to
-// size bytes in one request on S3 and GCS, and in one block and its commit on
-// Azure. Without them each driver uploads in parts of 5 MiB (S3), 8 MiB
-// (Azure) or 16 MiB (GCS), each a billed request. A larger object is sent in
-// parts of about size bytes. An upload holds a buffer of about size bytes
-// while it runs.
+// size bytes in one request on S3, GCS and Azure. Without them each driver
+// uploads in parts of 5 MiB (S3), 8 MiB (Azure) or 16 MiB (GCS), each a
+// billed request, and Azure adds one more to commit them. A larger object is
+// sent in parts of about size bytes. An upload holds a buffer of about size
+// bytes while it runs.
 func UploadInOneRequest(size int64) *blob.WriterOptions {
 	return &blob.WriterOptions{
 		ContentType: "application/octet-stream",

@@ -3,14 +3,23 @@
 package blobstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/azureblob"
 )
 
@@ -155,4 +164,67 @@ func TestAzure_WriteIfMatch_ConcurrentWriters(t *testing.T) {
 	}
 
 	_ = store.Delete(ctx, key)
+}
+
+func TestAzure_UploadInOneRequestSendsOneRequest(t *testing.T) {
+	ensureAzureContainer(t)
+	ctx := context.Background()
+
+	// Record the write requests Azurite is sent: Put Blob has no comp
+	// parameter, Put Block is comp=block and Put Block List comp=blocklist.
+	var mu sync.Mutex
+	var puts []string
+	target, _ := url.Parse("http://" + azuriteDomain)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "uploads") {
+			mu.Lock()
+			puts = append(puts, r.URL.Query().Get("comp"))
+			mu.Unlock()
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	bucketURL := fmt.Sprintf("azblob://%s?protocol=http&domain=%s&localemu=true",
+		azuriteContainer, strings.TrimPrefix(server.URL, "http://"))
+	store, err := Open(ctx, bucketURL, "uploads")
+	if err != nil {
+		t.Fatalf("failed to open azure store: %v", err)
+	}
+	defer store.Close()
+
+	big := bytes.Repeat([]byte("0123456789abcdef"), 12<<20/16) // 12 MiB
+	run := fmt.Sprintf("%d", time.Now().UnixNano())
+	for _, c := range []struct {
+		name string
+		data []byte
+		opts *blob.WriterOptions
+		want []string
+	}{
+		{"default blocks", big, nil, []string{"block", "block", "blocklist"}},
+		{"one request", big, UploadInOneRequest(int64(len(big))), []string{""}},
+		{"small default", []byte(`{"v":1}`), nil, []string{""}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mu.Lock()
+			puts = nil
+			mu.Unlock()
+			key := store.SSTPath(c.name + "-" + run)
+			if _, err := store.WriteReader(ctx, key, bytes.NewReader(c.data), c.opts); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			got := append([]string(nil), puts...)
+			mu.Unlock()
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("write requests (comp=) %q, want %q", got, c.want)
+			}
+			read, _, err := store.Read(ctx, key)
+			if err != nil || !bytes.Equal(read, c.data) {
+				t.Fatalf("read back %d bytes, err %v; want the %d written", len(read), err, len(c.data))
+			}
+			_ = store.Delete(ctx, key)
+		})
+	}
 }
