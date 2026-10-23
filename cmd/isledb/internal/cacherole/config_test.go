@@ -57,3 +57,18 @@ func TestConfigRefusesMistakes(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigRefusesPrefetchBesideOtherDatabases(t *testing.T) {
+	cfg, err := load(append(base, "-db", "a", "-db", "b"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Databases[0].Prefetch = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "prefetch needs a cache serving only this database") {
+		t.Fatalf("prefetch beside another database: %v, want refused", err)
+	}
+	cfg.Databases = cfg.Databases[:1]
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("prefetch of the only database: %v", err)
+	}
+}
