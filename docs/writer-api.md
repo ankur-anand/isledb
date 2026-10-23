@@ -126,8 +126,8 @@ Content-Type: application/json
 - `op` is `put` or `delete`.
 - Give the key as `key`, text, or as `key_base64`, base64 bytes; not both.
   Text is stored as its UTF-8 bytes, so for any other bytes use base64. A
-  body that is not valid UTF-8 is refused with `400`; text must also be valid
-  Unicode (no lone `\uD800`–`\uDFFF` escapes).
+  body that is not valid UTF-8 is refused with `400`, and so is one with a
+  lone `\uD800`–`\uDFFF` escape, half a surrogate pair, which is not text.
 - A `put`'s value works the same way: `value` or `value_base64`, not both.
   Without either, the value is empty.
 - `ttl` is optional on a `put`.

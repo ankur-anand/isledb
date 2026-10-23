@@ -337,6 +337,11 @@ func decodeBatch(body []byte) (*isledb.Batch, error) {
 	if !utf8.Valid(body) {
 		return nil, errors.New("the body is not valid UTF-8: send keys and values that are not UTF-8 text as key_base64 or value_base64")
 	}
+	// Likewise for an escape of half a surrogate pair, \ud800 to \udfff
+	// alone: the decoder would store U+FFFD, so two keys would become one.
+	if loneSurrogateEscape(body) {
+		return nil, errors.New("the body holds a lone surrogate escape (\\ud800 to \\udfff): send keys and values that are not Unicode text as key_base64 or value_base64")
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := expectDelim(dec, '{'); err != nil {
@@ -384,6 +389,40 @@ func decodeBatch(body []byte) (*isledb.Batch, error) {
 		return nil, errors.New("data after the JSON object")
 	}
 	return b, nil
+}
+
+// loneSurrogateEscape reports whether body holds a \u escape of a surrogate
+// that is not half of a high-low pair. Every backslash outside a string is a
+// syntax error the decoder reports, so the escapes are found by stepping over
+// each backslash and the character it escapes.
+func loneSurrogateEscape(body []byte) bool {
+	unit := func(i int) (rune, bool) {
+		if i+6 > len(body) || body[i] != '\\' || body[i+1] != 'u' {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(string(body[i+2:i+6]), 16, 16)
+		return rune(v), err == nil
+	}
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\\' {
+			continue
+		}
+		r, ok := unit(i)
+		switch {
+		case !ok:
+			i++ // an escape such as \\ or \": skip the escaped character
+		case r >= 0xd800 && r <= 0xdbff:
+			if low, ok := unit(i + 6); !ok || low < 0xdc00 || low > 0xdfff {
+				return true
+			}
+			i += 11
+		case r >= 0xdc00 && r <= 0xdfff:
+			return true
+		default:
+			i += 5
+		}
+	}
+	return false
 }
 
 func expectDelim(dec *json.Decoder, want json.Delim) error {

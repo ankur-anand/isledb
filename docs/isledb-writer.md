@@ -155,10 +155,12 @@ the default.
 
 ## Memory
 
-Plan for about 720 MiB of memory with the default settings. Most of it is
+Plan for about 910 MiB of memory with the default settings. Most of it is
 data waiting to be saved, and requests being read and applied, which
 `writes.max_inflight_bytes` bounds: a batch is counted at 4 times its body,
-for the copies made while decoding and applying it. If you raise
+for the copies made while decoding and applying it. The writer also keeps
+its recent saves in memory until it has combined them into one larger file,
+about 64 MiB at a time, which takes up to about 190 MiB. If you raise
 `writes.max_inflight_bytes` or `memtable.target_bytes`, raise the memory
 limit too.
 
@@ -170,7 +172,8 @@ The writer won't start without authentication unless you set
 - **Tokens:** put accepted tokens in the file named by
   `writer.auth.token_file`, one per line. Lines starting with `#` are ignored.
   Clients send `Authorization: Bearer <token>`. To reload the file without
-  restarting, send the writer `SIGHUP`.
+  restarting, send the writer `SIGHUP`. A `SIGHUP` never stops a service,
+  with or without a token file.
 - **Client certificates:** with `writer.tls.client_ca`, clients must also
   present a certificate signed by that CA.
 

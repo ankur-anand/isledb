@@ -25,14 +25,24 @@ func newWriterMetrics() (*isledb.WriterMetrics, []prometheus.Collector) {
 		FlushBytes: counter("commit_bytes_total", "Bytes of SSTs committed."),
 		// PutErrors is left unset: writes arrive as batches, whose refusals
 		// isledb_writer_http_requests_total counts by status.
-		PutTotal:          counter("puts_total", "Puts accepted."),
-		BackPressureTotal: counter("backpressure_total", "Writes refused because too many memtables waited to commit."),
-		DeleteTotal:       counter("deletes_total", "Deletes accepted."),
-		CommittedSequence: gauge("committed_sequence", "Highest sequence committed to storage."),
-		OldestUncommitted: gauge("oldest_uncommitted_timestamp_seconds", "Unix time the oldest write not yet committed was accepted, 0 when none is waiting."),
+		PutTotal:            counter("puts_total", "Puts accepted."),
+		BackPressureTotal:   counter("backpressure_total", "Writes refused because too many memtables waited to commit."),
+		DeleteTotal:         counter("deletes_total", "Deletes accepted."),
+		CommittedSequence:   gauge("committed_sequence", "Highest sequence committed to storage."),
+		OldestUncommitted:   gauge("oldest_uncommitted_timestamp_seconds", "Unix time the oldest write not yet committed was accepted, 0 when none is waiting."),
+		L0MergeTotal:        counter("l0_merges_total", "Merged L0 files the writer uploaded."),
+		L0MergeErrors:       counter("l0_merge_errors_total", "L0 merge attempts that failed; they are retried."),
+		L0MergeBytes:        counter("l0_merge_bytes_total", "Bytes of merged L0 files uploaded."),
+		L0MergeSkippedBytes: counter("l0_merge_skipped_bytes_total", "Bytes of flushes committed without a held copy because the held limit was reached."),
+		L0MergeHeldBytes:    gauge("l0_merge_held_bytes", "Bytes of committed flushes held in memory for merging."),
+		L0MergePublished:    counter("l0_merges_published_total", "Merged L0 files that replaced their inputs in L0."),
+		L0MergeRefused:      counter("l0_merges_refused_total", "Merges refused because their inputs were no longer a run in L0."),
+		L0MergeDropped:      counter("l0_merges_dropped_total", "Held runs and unpublished merges given up because maintenance took their files."),
 	}
 	return m, []prometheus.Collector{m.FlushTotal, m.FlushErrors, m.FlushLatency, m.FlushBytes, m.PutTotal,
-		m.BackPressureTotal, m.DeleteTotal, m.CommittedSequence, m.OldestUncommitted}
+		m.BackPressureTotal, m.DeleteTotal, m.CommittedSequence, m.OldestUncommitted,
+		m.L0MergeTotal, m.L0MergeErrors, m.L0MergeBytes, m.L0MergeSkippedBytes, m.L0MergeHeldBytes,
+		m.L0MergePublished, m.L0MergeRefused, m.L0MergeDropped}
 }
 
 // collector reports the writer's state as it is at each scrape.
