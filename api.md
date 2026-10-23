@@ -636,6 +636,7 @@ func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int
 func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
 func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
 func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
+func (r *Reader) ChangeHead(ctx context.Context) (ChangeCursor, error)
 func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
 func (r *Reader) PruneDiskCache(ctx context.Context) (int, error)
 func (r *Reader) Refresh(ctx context.Context) error
@@ -795,6 +796,9 @@ if err := saveCheckpointCursor(view.Cursor.String()); err != nil {
   enough that `Cursor` is still there when you start consuming.
 - Like `Snapshot`, it uses the reader's current view; call `Refresh` first if
   you need the very latest commit.
+- `ChangeHead` returns only the cursor, without a snapshot: the first
+  position the reader's view does not hold. A consumer at that cursor has
+  every change this reader has loaded. It returns the same errors.
 
 ### Prefetch SSTs to disk
 
@@ -1081,6 +1085,7 @@ const (
 
 type Change struct {
     Sequence  uint64
+    Revision  ViewPosition
     Operation ChangeOperation
     Key       []byte
     Value     []byte
@@ -1093,6 +1098,7 @@ type ChangeCursor struct { /* opaque */ }
 func ParseChangeCursor(value string) (ChangeCursor, error)
 func (c ChangeCursor) String() string
 func (c ChangeCursor) IsZero() bool
+func (c ChangeCursor) Compare(other ChangeCursor) int
 func (c ChangeCursor) MarshalText() ([]byte, error)
 func (c *ChangeCursor) UnmarshalText(text []byte) error
 
@@ -1115,6 +1121,13 @@ In keys-only mode, a PUT has `HasValue == false` and a nil `Value`. In
 full-values mode, `HasValue` tells an empty value apart from a missing one.
 Deletes never carry a value.
 
+`Revision` is the lowest view position that holds the change, that of the
+commit holding it; changes committed together share it. A `Reader` whose
+`ViewPosition` is at or past it sees the change. A write's `WaitCommitted`
+returns this position or a later one.
+In keys-only mode, read the key from a reader at or past `Revision`: one
+behind it can still return the old value.
+
 ### Read pages
 
 ```go
@@ -1128,6 +1141,7 @@ func DefaultChangeReadOptions() ChangeReadOptions
 func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error)
 func (r *ChangeReader) Read(ctx context.Context, from ChangeCursor, opts ChangeReadOptions) (ChangePage, error)
 func (r *ChangeReader) WaitForChanges(ctx context.Context, from ChangeCursor) error
+func (r *ChangeReader) LoadedHead() ChangeCursor
 func (r *ChangeReader) Close() error
 ```
 
@@ -1162,6 +1176,16 @@ func (r *ChangeReader) Close() error
   caught-up reader reads it on each `Read`, to see new commits. Retention
   that advances meanwhile shows at the next view reload, as `Bounds` does;
   the changes the held view names stay in storage until it expires.
+- With a read cache, a cursor past the head of the cache's copy of `CURRENT`
+  is checked against `CURRENT` in storage before `Read` returns
+  `ErrInvalidChangeCursor`, so a cursor from a newer view, such as another
+  reader's, is never refused.
+- `LoadedHead` returns the head of the newest view the reader has loaded,
+  without a request: every cursor up to it was in the feed. It is zero before
+  the first load.
+- `Compare` orders two cursors: -1, 0 or +1 as the first comes before, at or
+  after the second. A zero cursor, which reads from the oldest change, comes
+  first.
 
 ### Read the feed through a read cache
 

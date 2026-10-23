@@ -88,7 +88,14 @@ func (c *Config) Start(ctx context.Context, common service.Common, log *slog.Log
 	closers = append(closers, reader.Close)
 	log.Info("reader open", "prefix", c.Prefix, "position", reader.ViewPosition(), "read_cache", c.ReadCache.URL != "")
 
-	handler, err := readhttp.NewHandler(reader, readhttp.Options{MaxConcurrent: c.Reads.MaxConcurrent, ReadTimeout: readDeadline})
+	// The feed opens on its first read, so a reader may start before the
+	// writer turns it on; its head is the reader's view.
+	changes := readhttp.NewChanges(func(ctx context.Context) (*isledb.ChangeReader, error) {
+		return db.OpenChangeReader(ctx, isledb.ChangeReaderOptions{ReadCache: opts.ReadCache})
+	})
+	closers = append(closers, changes.Close)
+
+	handler, err := readhttp.NewHandler(reader, readhttp.Options{MaxConcurrent: c.Reads.MaxConcurrent, ReadTimeout: readDeadline, Changes: changes})
 	if err != nil {
 		return nil, err
 	}

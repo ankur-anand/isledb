@@ -33,9 +33,10 @@ Without a valid token, the reader answers `401`.
 | `GET /v1/kv/{key}` | Reads one key. The response body is the value. |
 | `HEAD /v1/kv/{key}` | The same, without the body: whether the key exists, and its size. |
 | `GET /v1/kv?prefix=…` | Lists keys and their values, a page at a time. |
+| `GET /v1/changes?from=…` | Reads the database's change feed, a page at a time. |
 
 The paths match the writer's, so a gateway can serve one API: send `GET` and
-`HEAD` requests for `/v1/kv` and `/v1/kv/…` to readers, and everything else, including
+`HEAD` requests for `/v1/kv`, `/v1/kv/…` and `/v1/changes` to readers, and everything else, including
 `GET /v1/writes/…`, to the writer.
 
 ## Read a key
@@ -121,6 +122,73 @@ GET /v1/kv?prefix=order/                       every key starting with order/
 - **Values in query parameters are URL-encoded**, so any byte can be part of
   a prefix or bound.
 
+## Follow the change feed
+
+When the database has a change feed (the writer's `change_feed.payload`),
+readers serve it:
+
+```
+GET /v1/changes?from=oldest&limit=2
+```
+```
+200 OK
+Content-Type: application/json
+
+{"changes":[{"sequence":41,"revision":1042,"op":"put","key":"user/42","value":"{\"name\":\"a\"}"},
+            {"sequence":42,"revision":1043,"op":"delete","key":"user/7"}],
+ "next":"cf1_AAAAAAAAAAIAAAAAAAAAAA",
+ "caught_up":true}
+```
+
+| Parameter | Meaning |
+|---|---|
+| `from` | Where to read from: a `next` from an earlier page, `oldest` for every change still kept, or `head` for only changes from now on. Required. |
+| `limit` | The most changes in a page: 1 to 10000, 1000 by default. |
+
+- **Changes come in the order they were written.** Each has its `sequence`,
+  its `revision` (the lowest revision that includes it, at or below the one
+  the writer returned; changes written together share one), its `op` (`put` or `delete`), and its key as `key` or
+  `key_base64`, as in a scan.
+- **A put carries its value** as `value` or `value_base64` when the feed keeps
+  values; a keys-only feed sends only the key. A put with a TTL has
+  `expires_at`.
+- **With a keys-only feed, check the revision when you read the key.** A
+  replica can still be behind the change. If the read's `Isledb-Revision` is
+  below the change's `revision`, it does not hold the change yet: read again
+  shortly. A `404` below that revision means the same, not that the key is
+  gone.
+- **Keep your place with `next`.** After applying a page, save its `next` and
+  send it as `from` for the following page. A cursor works on any reader
+  replica. Choose your start once, save the first `next` before applying
+  anything, and from then on always resume from your saved cursor: starting
+  again from `head` after a restart would skip what changed meanwhile.
+- **`caught_up: true` means there is nothing newer yet.** Poll again with the
+  same `next`, for example every second. A reader answers a caught-up poll
+  from what it has loaded, without reading storage, so polling often costs
+  nothing. New changes reach a poll within about a second of being written
+  (about two on Google Cloud Storage).
+- **`head` is about a second behind,** like any read: a consumer starting at
+  `head` may also get the changes of the last second.
+- **A page may hold fewer than `limit` changes,** even none, while more
+  follow: it also stops at about 1 MiB of keys and values, and some writes
+  record no changes. Keep reading until `caught_up` is true.
+
+**When your cursor is too old.** If the database's change-feed retention has
+deleted changes after your cursor, the answer is `410` with
+`{"error":"cursor_expired","oldest":"<cursor>",…}`. Either continue from
+`oldest`, accepting the gap, or rebuild your copy of the data (below).
+
+**Start from the data, then follow the feed.** To build a copy of the
+database and keep it current:
+
+1. Read `GET /v1/changes?from=head` and save its `next`.
+2. Copy every key with a [scan](#scan-keys).
+3. Follow the feed from the saved cursor, applying each `put` as "set this
+   key" and each `delete` as "remove this key".
+
+Changes made during the scan are applied again, but the feed holds every
+later change too, so the copy ends up right.
+
 ## How fresh a read is
 
 A reader answers from the newest data it has loaded. It loads the latest
@@ -150,10 +218,12 @@ Error responses are JSON:
 
 | Status | `error` | Meaning | What to do |
 |---|---|---|---|
-| 400 | `bad_request` | The request is malformed: an empty key, a key not encoded correctly, a query parameter on a key read, or a scan parameter that is unknown, repeated, empty or out of range, or a `page` from another scan. | Fix the request. |
+| 400 | `bad_request` | The request is malformed: an empty key, a key not encoded correctly, a query parameter on a key read, a scan parameter that is unknown, repeated, empty or out of range, a `page` from another scan, or a change-feed `from` or `limit` that isn't valid. | Fix the request. |
 | 401 | | The token is missing or wrong. The body is plain text. | Send a valid token. |
 | 404 | `key_not_found` | The key doesn't exist, or its TTL has passed. | |
 | 404 | `not_found` | There is no such endpoint. | Check the path. |
-| 405 | `method_not_allowed` | A write was sent to a reader, or a scan wasn't a `GET`. | Send writes to the writer. |
+| 404 | `change_feed_off` | The database has no change feed. | Turn it on in the writer's `change_feed.payload`. |
+| 410 | `cursor_expired` | Changes after your cursor are no longer kept. The body's `oldest` is where the feed starts now. | See [When your cursor is too old](#follow-the-change-feed). |
+| 405 | `method_not_allowed` | A write was sent to a reader, or a scan or change-feed read wasn't a `GET`. | Send writes to the writer. |
 | 503 | `backpressure` | The reader is busy. | Retry after `Retry-After` seconds, or on another replica. |
 | 503 | `unavailable` | The reader has no current data to read from, for example while starting, or after losing access to storage for longer than the database's `max_pinned_view_age` (1 hour by default); or reading storage failed, or took longer than a minute. | Retry after `Retry-After` seconds, or on another replica. |

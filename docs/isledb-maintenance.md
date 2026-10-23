@@ -133,10 +133,13 @@ Served on `admin_listen`, without authentication.
 | `isledb_maintenance_cycles_total`, `isledb_maintenance_cycle_errors_total` | Rounds of work, and rounds that failed and are retried. |
 | `isledb_maintenance_last_cycle_timestamp_seconds` | When the last round completed. |
 | `isledb_maintenance_waiting_for_writer` | `1` while finished work waits for the writer to publish it. |
-| `isledb_maintenance_compaction_jobs_total` | Compactions. |
+| `isledb_maintenance_compaction_jobs_total` | Compactions, counted when they run, including any the writer then rejects. |
 | `isledb_maintenance_compaction_l0_merges_total`, `isledb_maintenance_compaction_moves_total` | Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them. |
 | `isledb_maintenance_compaction_read_bytes_total`, `isledb_maintenance_compaction_rewritten_bytes_total` | Bytes compaction read from and wrote to storage: most of maintenance's storage cost. |
 | `isledb_maintenance_compaction_moved_bytes_total` | Bytes moved without being rewritten. |
+| `isledb_maintenance_compaction_oversized_jobs_total` | Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file. |
+| `isledb_maintenance_commands_rejected_total` | Finished work the writer refused to publish. The writer logs why. |
+| `isledb_maintenance_compaction_rejected_bytes_total` | Bytes compaction wrote for work the writer refused. The files are deleted later. |
 | `isledb_maintenance_checkpoints_total` | Checkpoints of the database's metadata prepared for the writer to publish. |
 | `isledb_maintenance_deleted_objects_total{kind}`, `isledb_maintenance_delete_failures_total{kind}` | Objects deleted from storage, and deletes that failed and are retried, by kind: `sst`, `change_batch`, `snapshot`, `page`. |
 
@@ -147,6 +150,10 @@ What to alert on:
   problem, or no space in `scratch_dir`; the log says which.
 - **No writer:** `waiting_for_writer` at `1` for minutes. Maintenance's work
   is ready but no writer is publishing it, so files pile up.
+- **Refused work:** `commands_rejected_total` rising steadily. An occasional
+  refusal is normal: the writer refuses work on files that changed while it
+  was being done, and maintenance redoes it. A steady rise means work is being
+  thrown away; the writer's log says why.
 - **Replaced:** `isledb_maintenance_running` at `0`: another maintenance
   process took over, and this one does no more work. See
   [Run one maintenance per database](#run-one-maintenance-per-database).

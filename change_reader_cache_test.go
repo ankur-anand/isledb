@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ankur-anand/isledb/internal/cacheclient"
+	"github.com/ankur-anand/isledb/internal/diskcache"
+	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/ankur-anand/isledb/internal/readcache"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -128,4 +132,93 @@ func TestOpenChangeReaderRefusesBadOptions(t *testing.T) {
 		t.Fatalf("no options: %v", err)
 	}
 	_ = reader.Close()
+}
+
+func TestChangeCursorCompare(t *testing.T) {
+	oldest := ChangeCursor{}
+	a, aMid, b := changeCursorAt(5, 0), changeCursorAt(5, 3), changeCursorAt(6, 0)
+	for _, c := range []struct {
+		x, y ChangeCursor
+		want int
+	}{
+		{oldest, oldest, 0}, {oldest, a, -1}, {a, oldest, 1},
+		{a, a, 0}, {a, aMid, -1}, {aMid, b, -1}, {b, a, 1},
+	} {
+		if got := c.x.Compare(c.y); got != c.want {
+			t.Errorf("%q vs %q: %d, want %d", c.x, c.y, got, c.want)
+		}
+	}
+}
+
+// TestChangeReaderReadsCurrentFromStorageForACursorPastTheCachesCopy: a
+// cursor from a newer CURRENT than the cache holds, as another reader can
+// hand out, is read against storage's CURRENT, not refused.
+func TestChangeReaderReadsCurrentFromStorageForACursorPastTheCachesCopy(t *testing.T) {
+	ctx := context.Background()
+	store, db, writer := openChangeReaderTestDB(t, "change-read-cache-behind")
+	put := func(key string) {
+		t.Helper()
+		if _, err := writer.Put(ctx, []byte(key), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("a")
+
+	// A cache whose copy of CURRENT stays where it is polled once, here.
+	disk, err := diskcache.Open(diskcache.Options{Dir: t.TempDir(), MaxBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = disk.Close() })
+	objects, err := readcache.NewObjects(store, disk, readcache.ObjectsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := readcache.NewRelay(manifest.NewBlobStoreBackend(store), time.Hour)
+	if err := relay.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := readcache.NewHandler(objects, map[string]*readcache.Relay{store.Prefix(): relay}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	cached, err := db.OpenChangeReader(ctx, ChangeReaderOptions{ReadCache: ReadCacheOptions{URL: server.URL, Timeout: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cached.Close() }()
+	if _, err := cached.Bounds(ctx); err != nil { // holds the cache's view, at a
+		t.Fatal(err)
+	}
+
+	put("b")
+	direct, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = direct.Close() }()
+	bounds, err := direct.Bounds(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := cached.Read(ctx, bounds.Head, ChangeReadOptions{})
+	if err != nil {
+		t.Fatalf("read from storage's head with the cache behind it: %v", err)
+	}
+	if !page.CaughtUp() || len(page.Changes) != 0 || page.Next != bounds.Head {
+		t.Fatalf("page %+v, want caught up at %q", page, bounds.Head)
+	}
+	if got := cached.LoadedHead(); got != bounds.Head {
+		t.Fatalf("loaded head %q, want %q", got, bounds.Head)
+	}
+	if _, err := cached.Read(ctx, changeCursorAt(bounds.Head.entry+5, 0), ChangeReadOptions{}); !errors.Is(err, ErrInvalidChangeCursor) {
+		t.Fatalf("a cursor past storage's head: %v, want ErrInvalidChangeCursor", err)
+	}
 }

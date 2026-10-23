@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -56,7 +57,10 @@ func (op ChangeOperation) String() string {
 
 // Change is one committed mutation in writer sequence order.
 type Change struct {
-	Sequence  uint64
+	Sequence uint64
+	// Revision is the lowest view position that holds the change, that of
+	// the commit holding it: a Reader at or past it sees it.
+	Revision  ViewPosition
 	Operation ChangeOperation
 	Key       []byte
 	Value     []byte
@@ -102,6 +106,21 @@ func (c ChangeCursor) String() string {
 
 func (c ChangeCursor) IsZero() bool {
 	return !c.set
+}
+
+// Compare returns -1, 0 or +1 as c comes before, at or after other in the
+// feed. A zero cursor, which reads from the oldest change kept, comes first.
+func (c ChangeCursor) Compare(other ChangeCursor) int {
+	if c.set != other.set {
+		if c.set {
+			return 1
+		}
+		return -1
+	}
+	if c.entry != other.entry {
+		return cmp.Compare(c.entry, other.entry)
+	}
+	return cmp.Compare(c.index, other.index)
 }
 
 func (c ChangeCursor) MarshalText() ([]byte, error) {
@@ -284,6 +303,12 @@ func (r *ChangeReader) Read(
 	}
 
 	page, err := r.readPage(ctx, from, opts, false)
+	if r.cache != nil && errors.Is(err, manifest.ErrChangeFeedPosition) {
+		// The cache's copy of CURRENT may be behind the one the cursor came
+		// from, such as another reader's: only storage's CURRENT can tell
+		// that the cursor is past the head.
+		page, err = r.readPage(ctx, from, opts, true)
+	}
 	if !errors.Is(err, blobstore.ErrNotFound) {
 		return page, err
 	}
@@ -434,6 +459,7 @@ func (r *ChangeReader) readPage(
 						return page, nil
 					}
 					change := publicChange(record, &pageData)
+					change.Revision = ViewPosition(entry.Seq + 1)
 					page.Changes = append(page.Changes, change)
 					pageBytes += changeBytes
 					next = changeCursorAt(entry.Seq, globalIndex+1)
@@ -458,6 +484,18 @@ func (r *ChangeReader) clearBatchView() {
 	r.batchEntry = 0
 	r.batchView = nil
 	r.batchMu.Unlock()
+}
+
+// LoadedHead returns the head of the newest view the reader has loaded,
+// without reading storage: every cursor up to it was in the feed. It is zero
+// before the first load.
+func (r *ChangeReader) LoadedHead() ChangeCursor {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	if r.view == nil {
+		return ChangeCursor{}
+	}
+	return changeCursorAt(r.view.Head(), 0)
 }
 
 // heldView returns the view the reader holds when it still serves a read
