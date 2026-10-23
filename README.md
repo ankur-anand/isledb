@@ -281,7 +281,17 @@ feed, err := db.OpenChangeReader(ctx, isledb.ChangeReaderOptions{
 
 ## Run it as services
 
-One binary runs each service:
+One binary, `isledb`, runs each service. Get it from the
+[latest release](https://github.com/ankur-anand/isledb/releases/latest),
+for Linux (amd64, arm64) and macOS (arm64), or run the container image:
+
+```bash
+docker run ghcr.io/ankur-anand/isledb:0.19.0 help
+```
+
+The image is tagged with each release's exact version, such as `0.19.0`, and
+with its minor version, such as `0.19`; there is no `latest` tag. With Go
+installed, you can also build it:
 
 ```bash
 go install github.com/ankur-anand/isledb/cmd/isledb@latest
