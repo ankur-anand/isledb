@@ -2,6 +2,7 @@ package readhttp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -254,6 +255,14 @@ func TestRouteNamesEveryEndpoint(t *testing.T) {
 // hold every slot.
 func TestReadThatRunsOutOfTimeGivesUpItsSlot(t *testing.T) {
 	f := newFixture(t, Options{ReadTimeout: time.Nanosecond})
+	// The filler makes the SST too large to be fetched whole. A small SST is
+	// fetched whole by the Bloom filter's load in the background, which can
+	// put k on disk before the read gets there.
+	filler := make([]byte, 5<<20)
+	_, _ = rand.Read(filler)
+	if _, err := f.writer.Put(f.ctx, []byte("filler"), filler); err != nil {
+		t.Fatal(err)
+	}
 	f.commit(t, "k", "v") // a new SST: the read must go to storage
 	r := f.do(t, http.MethodGet, kvPathFor("k"))
 	r.wantError(t, http.StatusServiceUnavailable, ErrorUnavailable)
