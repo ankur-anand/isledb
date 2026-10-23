@@ -1,8 +1,9 @@
-package cacherole
+package readcache
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/diskcache"
 	"github.com/ankur-anand/isledb/internal/manifest"
-	"github.com/ankur-anand/isledb/internal/readcache"
 )
 
 // prefetchFixture is a database of the given prefix and a cache over its
@@ -19,7 +19,7 @@ import (
 type prefetchFixture struct {
 	store    *blobstore.Store
 	manifest *manifest.Store
-	objects  *readcache.Objects
+	objects  *Objects
 	disk     *diskcache.Cache
 	seq      uint64
 }
@@ -37,7 +37,7 @@ func newPrefetchFixture(t *testing.T, diskBytes int64) *prefetchFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = disk.Close() })
-	objects, err := readcache.NewObjects(bucket, disk, readcache.ObjectsOptions{})
+	objects, err := NewObjects(bucket, disk, ObjectsOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,9 +76,8 @@ func (f *prefetchFixture) current(t *testing.T) []byte {
 	return data
 }
 
-func (f *prefetchFixture) prefetcher(relay *readcache.Relay) *prefetcher {
-	return &prefetcher{relay: relay, manifest: manifest.NewStore(f.store), store: f.store,
-		objects: f.objects, disk: f.disk, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+func (f *prefetchFixture) prefetcher(relay *Relay) *Prefetcher {
+	return NewPrefetcher(relay, f.store, f.objects, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func TestPrefetchReadsVisibleSSTsOnce(t *testing.T) {
@@ -173,12 +172,12 @@ func TestPrefetchEvictsReplacedSSTs(t *testing.T) {
 func TestPrefetchFollowsTheRelay(t *testing.T) {
 	f := newPrefetchFixture(t, 64<<20)
 	f.addSST(t, "000001.sst", 200<<10)
-	relay := readcache.NewRelay(manifest.NewBlobStoreBackend(f.store), 10*time.Millisecond)
+	relay := NewRelay(manifest.NewBlobStoreBackend(f.store), 10*time.Millisecond)
 	ctx, stop := context.WithCancel(context.Background())
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan struct{}, 2)
 	go func() { relay.Run(ctx, log); done <- struct{}{} }()
-	go func() { f.prefetcher(relay).run(ctx); done <- struct{}{} }()
+	go func() { f.prefetcher(relay).Run(ctx); done <- struct{}{} }()
 	defer func() {
 		stop()
 		<-done
@@ -212,13 +211,13 @@ func TestPrefetchRetriesMissedSSTWithoutNewCurrent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	relay := readcache.NewRelay(manifest.NewBlobStoreBackend(f.store), 10*time.Millisecond)
+	relay := NewRelay(manifest.NewBlobStoreBackend(f.store), 10*time.Millisecond)
 	ctx, stop := context.WithCancel(context.Background())
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan struct{}, 2)
 	go func() { relay.Run(ctx, log); done <- struct{}{} }()
 	p := f.prefetcher(relay)
-	go func() { p.run(ctx); done <- struct{}{} }()
+	go func() { p.Run(ctx); done <- struct{}{} }()
 	defer func() {
 		stop()
 		<-done
@@ -249,7 +248,7 @@ func TestPrefetchSizesSSTsFromTheManifest(t *testing.T) {
 	// An SST followed by a Bloom sidecar and its trailer, as writers store it.
 	const sstBytes, bloomBytes = 300 << 10, 4 << 10
 	meta := manifest.SSTMeta{ID: "000001.sst", Epoch: 1, SeqLo: 1, SeqHi: 1, Size: sstBytes, CreatedAt: time.Now(),
-		Bloom: manifest.BloomMeta{Offset: sstBytes, Length: bloomBytes}}
+		MetaOffset: sstBytes - 8<<10, Bloom: manifest.BloomMeta{Offset: sstBytes, Length: bloomBytes}}
 	key := f.store.SSTPath(meta.ID)
 	if _, err := f.store.Write(ctx, key, bytes.Repeat([]byte{1}, int(meta.ObjectSize()))); err != nil {
 		t.Fatal(err)
@@ -297,5 +296,27 @@ func TestPrefetchChecksEverySSTAfterAPause(t *testing.T) {
 	}
 	if !p.paused.Load() || p.done != nil {
 		t.Fatalf("after a pass too large: paused %v, done %v; want paused and done cleared", p.paused.Load(), p.done)
+	}
+}
+
+func TestPrefetchReadsManySSTsAtOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newPrefetchFixture(t, 64<<20)
+	var keys []string
+	for i := range 3 * prefetchParallel {
+		keys = append(keys, f.addSST(t, fmt.Sprintf("%06d.sst", i+1), 200<<10+i))
+	}
+	p := f.prefetcher(nil)
+	if err := p.pass(ctx, f.current(t)); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		size, _ := f.objects.Size(ctx, key)
+		if !f.objects.Cached(key, size) {
+			t.Fatalf("%s is not on disk after a pass", key)
+		}
+	}
+	if len(p.done) != len(keys) {
+		t.Fatalf("done holds %d SSTs, want %d", len(p.done), len(keys))
 	}
 }

@@ -309,6 +309,19 @@ func (o *Objects) WriteRange(ctx context.Context, w io.Writer, key string, size,
 	return nil
 }
 
+// Cached reports whether all of key, an object of size bytes, is on disk,
+// without counting a hit or a miss.
+func (o *Objects) Cached(key string, size int64) bool {
+	object := objectID(key, size)
+	for index := int64(0); index*chunkSize < size; index++ {
+		k := diskcache.Key{Object: object, Kind: diskcache.KindChunk, Index: uint32(index)}
+		if !o.disk.Contains(k, min(chunkSize, size-index*chunkSize)) {
+			return false
+		}
+	}
+	return true
+}
+
 func objectID(key string, size int64) [32]byte {
 	return sha256.Sum256([]byte(key + "\x00" + strconv.FormatInt(size, 10)))
 }

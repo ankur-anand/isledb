@@ -12,7 +12,7 @@ type collector struct {
 	disk    *diskcache.Cache
 	relays  map[string]*readcache.Relay
 	// prefetchers holds the databases with prefetch on, by prefix.
-	prefetchers map[string]*prefetcher
+	prefetchers map[string]*readcache.Prefetcher
 	names       map[string]string // prefix to its label: "/" for the root
 	handler     *readcache.Handler
 }
@@ -75,12 +75,12 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	for prefix, p := range c.prefetchers {
 		db := c.names[prefix]
 		paused := 0.0
-		if p.paused.Load() {
+		if p.Paused() {
 			paused = 1
 		}
 		gauge(descPrefetchPaused, paused, db)
-		counter(descPrefetchBytes, p.readBytes.Load(), db)
-		counter(descPrefetchFails, p.failures.Load(), db)
+		counter(descPrefetchBytes, p.ReadBytes(), db)
+		counter(descPrefetchFails, p.Failures(), db)
 	}
 	gauge(descLongPolls, float64(c.handler.LongPollsHeld()))
 	d := c.disk.Stats(diskcache.TierData)

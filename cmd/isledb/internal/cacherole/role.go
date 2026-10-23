@@ -74,7 +74,7 @@ func (c *Config) Start(_ context.Context, common service.Common, log *slog.Logge
 	})
 	relays := map[string]*readcache.Relay{}
 	names := map[string]string{}
-	prefetchers := map[string]*prefetcher{}
+	prefetchers := map[string]*readcache.Prefetcher{}
 	for _, db := range c.Databases {
 		poll := time.Duration(c.Current.Poll)
 		if db.CurrentPoll > 0 {
@@ -86,10 +86,9 @@ func (c *Config) Start(_ context.Context, common service.Common, log *slog.Logge
 		names[db.prefix()] = db.name()
 		relaysDone.Go(func() { relay.Run(relayCtx, log.With("db", db.name())) })
 		if db.Prefetch {
-			p := &prefetcher{relay: relay, manifest: manifest.NewStore(dbStore), store: dbStore,
-				objects: objects, disk: disk, log: log.With("db", db.name())}
+			p := readcache.NewPrefetcher(relay, dbStore, objects, log.With("db", db.name()))
 			prefetchers[db.prefix()] = p
-			relaysDone.Go(func() { p.run(relayCtx) })
+			relaysDone.Go(func() { p.Run(relayCtx) })
 		}
 	}
 	handler, err := readcache.NewHandler(objects, relays, time.Duration(c.Current.LongPoll))
