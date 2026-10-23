@@ -74,15 +74,22 @@ func (c *Config) Start(_ context.Context, common service.Common, log *slog.Logge
 	})
 	relays := map[string]*readcache.Relay{}
 	names := map[string]string{}
+	prefetchers := map[string]*readcache.Prefetcher{}
 	for _, db := range c.Databases {
 		poll := time.Duration(c.Current.Poll)
 		if db.CurrentPoll > 0 {
 			poll = time.Duration(db.CurrentPoll)
 		}
-		relay := readcache.NewRelay(manifest.NewBlobStoreBackend(blobstore.New(store.Bucket(), "", db.prefix())), poll)
+		dbStore := blobstore.New(store.Bucket(), "", db.prefix())
+		relay := readcache.NewRelay(manifest.NewBlobStoreBackend(dbStore), poll)
 		relays[db.prefix()] = relay
 		names[db.prefix()] = db.name()
 		relaysDone.Go(func() { relay.Run(relayCtx, log.With("db", db.name())) })
+		if db.Prefetch {
+			p := readcache.NewPrefetcher(relay, dbStore, objects, log.With("db", db.name()))
+			prefetchers[db.prefix()] = p
+			relaysDone.Go(func() { p.Run(relayCtx) })
+		}
 	}
 	handler, err := readcache.NewHandler(objects, relays, time.Duration(c.Current.LongPoll))
 	if err != nil {
@@ -109,7 +116,7 @@ func (c *Config) Start(_ context.Context, common service.Common, log *slog.Logge
 			return true
 		},
 		Collectors: []prometheus.Collector{responses,
-			&collector{objects: objects, disk: disk, relays: relays, names: names, handler: handler}},
+			&collector{objects: objects, disk: disk, relays: relays, prefetchers: prefetchers, names: names, handler: handler}},
 		OnShutdown: handler.StopLongPolls,
 		Close:      closeAll,
 	}, nil

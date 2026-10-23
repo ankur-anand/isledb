@@ -68,10 +68,7 @@ func newSSTObject(store *blobstore.Store, meta sstMetadata, smallLimit int64) ss
 		key: sha256.Sum256([]byte(meta.ID + "\x00" + meta.Checksum + "\x00" +
 			strconv.FormatInt(meta.Size, 10))),
 	}
-	o.objectSize = meta.Size
-	if meta.Bloom.Length > 0 {
-		o.objectSize = meta.Bloom.Offset + meta.Bloom.Length + bloomTrailerLen
-	}
+	o.objectSize = meta.ObjectSize()
 	if hasUsableBloom(meta) {
 		o.bloomOffset, o.bloomLength, o.bloomChecksum = meta.Bloom.Offset, meta.Bloom.Length, meta.Bloom.Checksum
 	}

@@ -96,6 +96,7 @@ listener off.
 | `log_level` | `--log-level` | `ISLEDB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `cache.databases[].prefix` | `--db` (repeat) | `ISLEDB_CACHE_DATABASES` (comma-separated) | required | Databases served, by prefix; `/` for the bucket root |
 | `cache.databases[].current_poll` | – | – | `cache.current.poll` | Per-database poll interval |
+| `cache.databases[].prefetch` | – | – | `false` | Keep the database's data files on disk ahead of reads; see [Prefetch](#prefetch) |
 | `cache.listen` | `--listen` | `ISLEDB_CACHE_LISTEN` | `:8090` | API address |
 | `cache.admin_listen` | `--admin-listen` | `ISLEDB_CACHE_ADMIN_LISTEN` | `127.0.0.1:8091` | Admin address; empty for none |
 | `cache.disk.dir` | `--disk-dir` | `ISLEDB_CACHE_DISK_DIR` | required | Chunk directory, on local disk |
@@ -113,6 +114,36 @@ listener off.
 
 Sizes are bytes or binary units: `512KiB`, `256MiB`, `200GiB`, `2TiB`.
 Durations are Go durations: `250ms`, `30s`, `2m`.
+
+## Prefetch
+
+With `prefetch: true`, the cache copies all of the database's data files to
+disk at startup, then each new one as soon as it appears, so a reader's
+first read of a file is served from disk.
+
+```yaml
+cache:
+  databases:
+    - prefix: prod/flags
+      prefetch: true
+```
+
+- **A prefetched database gets its own cache.** `prefetch` can only be set
+  when it is the only database in `cache.databases`; otherwise the cache
+  refuses to start.
+- **The database must fit in `cache.disk.bytes`.** A larger one is cached as
+  it is read instead, a warning is logged, and
+  `isledb_cache_prefetch_paused{db}` is 1. Prefetch resumes once it fits
+  again.
+- **Leave headroom above the database's data files.** The disk also holds
+  what readers fetch besides them: change batches, and data files that
+  compaction replaced but slower readers still use. Without room for those,
+  prefetched files no reader has used yet are evicted first, and are read
+  from storage on a reader's first use.
+- **It shares `cache.reads.max_bytes` with readers,** using at most 16 MiB
+  of it at a time.
+- **A file it can't read is tried again within 30 seconds,** and counted in
+  `isledb_cache_prefetch_failures_total{db}`.
 
 ## Authentication
 
@@ -159,6 +190,9 @@ operators and scrapers reach.
 | `isledb_cache_current_poll_errors_total{db}` | Failed reads of `CURRENT` |
 | `isledb_cache_long_polls_held` | Long polls waiting now |
 | `isledb_cache_disk_bytes`, `isledb_cache_disk_max_bytes`, `isledb_cache_disk_entries`, `isledb_cache_disk_evictions_total`, `isledb_cache_disk_failures_total` | The chunk store |
+| `isledb_cache_prefetch_read_bytes_total{db}` | Bytes prefetch read from storage |
+| `isledb_cache_prefetch_failures_total{db}` | Data files prefetch could not read, and failed reads of the database's file list |
+| `isledb_cache_prefetch_paused{db}` | 1 while prefetch is paused because the database doesn't fit on disk |
 | `isledb_cache_http_requests_total{route,code}`, `isledb_cache_http_request_seconds{route}` | Requests; `route` is `current`, `current_long_poll`, `object` or `other` |
 
 What to watch:

@@ -1319,6 +1319,16 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	return s.replayCurrent(ctx, current, false)
 }
 
+// ReplayCurrentData replays the manifest from data, the bytes of a CURRENT
+// already read, instead of reading CURRENT again.
+func (s *Store) ReplayCurrentData(ctx context.Context, data []byte) (*Manifest, error) {
+	current, err := s.observeCurrentData(data)
+	if err != nil {
+		return nil, err
+	}
+	return s.replayCurrent(ctx, current, false)
+}
+
 // ReplayWithArtifactValidation replays the manifest while validating the SST
 // and Bloom metadata required by Reader cache and origin paths. Artifact
 // validation is folded into the existing level-validation traversal.
@@ -2196,6 +2206,12 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 		}
 		return nil, err
 	}
+	return s.observeCurrentData(data)
+}
+
+// observeCurrentData decodes data as CURRENT and records it as the latest
+// CURRENT this store has seen.
+func (s *Store) observeCurrentData(data []byte) (*Current, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: CURRENT object is empty", ErrCurrentUnavailable)
 	}

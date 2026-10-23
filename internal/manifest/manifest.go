@@ -86,6 +86,21 @@ type SSTMeta struct {
 	Level uint32 `json:"level"`
 }
 
+// BloomTrailerLen is the length of the trailer stored after an SST's Bloom
+// sidecar.
+const BloomTrailerLen = 16
+
+// ObjectSize returns the length of the SST's stored object: the SST, then
+// any Bloom sidecar and the sidecar's trailer. That holds whatever the
+// sidecar's format, as the trailer is stored for every format, including
+// ones readers skip. Readers name an object's cached chunks by this size.
+func (s SSTMeta) ObjectSize() int64 {
+	if s.Bloom.Length > 0 {
+		return s.Bloom.Offset + s.Bloom.Length + BloomTrailerLen
+	}
+	return s.Size
+}
+
 // OldestData returns when the oldest data in the SST was written.
 func (s SSTMeta) OldestData() time.Time {
 	if !s.OldestDataAt.IsZero() {

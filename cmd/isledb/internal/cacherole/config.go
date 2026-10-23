@@ -46,6 +46,11 @@ type Database struct {
 	Prefix string `yaml:"prefix"`
 	// CurrentPoll overrides current.poll for this database.
 	CurrentPoll service.Duration `yaml:"current_poll,omitempty"`
+	// Prefetch reads each of the database's SSTs onto disk once CURRENT
+	// shows it, instead of on its first read, while the database fits on the
+	// disk. Only a cache serving this one database may set it: other
+	// databases' reads would evict the SSTs it reads ahead.
+	Prefetch bool `yaml:"prefetch,omitempty"`
 }
 
 func NewConfig() service.Config {
@@ -109,6 +114,9 @@ func (c *Config) Validate() error {
 		seen[db.prefix()] = true
 		if db.CurrentPoll < 0 {
 			fail("database %q: current_poll is negative", db.Prefix)
+		}
+		if db.Prefetch && len(c.Databases) > 1 {
+			fail("database %q: prefetch needs a cache serving only this database", db.Prefix)
 		}
 	}
 	if c.Disk.Dir == "" {

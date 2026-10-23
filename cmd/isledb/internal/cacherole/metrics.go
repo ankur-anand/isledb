@@ -11,8 +11,10 @@ type collector struct {
 	objects *readcache.Objects
 	disk    *diskcache.Cache
 	relays  map[string]*readcache.Relay
-	names   map[string]string // prefix to its label: "/" for the root
-	handler *readcache.Handler
+	// prefetchers holds the databases with prefetch on, by prefix.
+	prefetchers map[string]*readcache.Prefetcher
+	names       map[string]string // prefix to its label: "/" for the root
+	handler     *readcache.Handler
 }
 
 var (
@@ -31,12 +33,16 @@ var (
 	descDiskEntries    = prometheus.NewDesc("isledb_cache_disk_entries", "Chunks on disk.", nil, nil)
 	descDiskEvictions  = prometheus.NewDesc("isledb_cache_disk_evictions_total", "Chunks evicted from disk.", nil, nil)
 	descDiskFailures   = prometheus.NewDesc("isledb_cache_disk_failures_total", "Chunks that could not be written to disk.", nil, nil)
+	descPrefetchPaused = prometheus.NewDesc("isledb_cache_prefetch_paused", "1 while prefetch is paused because the database is larger than the disk.", []string{"db"}, nil)
+	descPrefetchBytes  = prometheus.NewDesc("isledb_cache_prefetch_read_bytes_total", "Bytes prefetch read from storage.", []string{"db"}, nil)
+	descPrefetchFails  = prometheus.NewDesc("isledb_cache_prefetch_failures_total", "Data files prefetch could not read, and manifest replays that failed; retried.", []string{"db"}, nil)
 )
 
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{descChunks, descSizeLookups, descStorageReads, descStorageBytes,
 		descStorageQueued, descStorageReading, descPosition, descAge, descPollErrors, descLongPolls,
-		descDiskBytes, descDiskMaxBytes, descDiskEntries, descDiskEvictions, descDiskFailures} {
+		descDiskBytes, descDiskMaxBytes, descDiskEntries, descDiskEvictions, descDiskFailures,
+		descPrefetchPaused, descPrefetchBytes, descPrefetchFails} {
 		ch <- d
 	}
 }
@@ -65,6 +71,16 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			gauge(descAge, current.Age.Seconds(), db)
 		}
 		counter(descPollErrors, relay.PollErrors(), db)
+	}
+	for prefix, p := range c.prefetchers {
+		db := c.names[prefix]
+		paused := 0.0
+		if p.Paused() {
+			paused = 1
+		}
+		gauge(descPrefetchPaused, paused, db)
+		counter(descPrefetchBytes, p.ReadBytes(), db)
+		counter(descPrefetchFails, p.Failures(), db)
 	}
 	gauge(descLongPolls, float64(c.handler.LongPollsHeld()))
 	d := c.disk.Stats(diskcache.TierData)

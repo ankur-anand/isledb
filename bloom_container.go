@@ -8,11 +8,12 @@ import (
 	"io"
 	"strings"
 
+	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cespare/xxhash/v2"
 )
 
 const bloomTrailerMagic = "ISLEBLM1"
-const bloomTrailerLen = 16
+const bloomTrailerLen = manifest.BloomTrailerLen
 
 // maxBloomSidecarBytes bounds a sidecar's size, and so the work to build or
 // parse one. Real filters are far smaller; a larger object is corrupt rather

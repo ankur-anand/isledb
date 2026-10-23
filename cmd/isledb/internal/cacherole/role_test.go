@@ -137,3 +137,70 @@ func TestCacheRoleServesAndShutsDownCleanly(t *testing.T) {
 		t.Fatalf("shutdown took %s with a long poll held, want well under the 10s long poll", took)
 	}
 }
+
+func TestCacheRolePrefetchesItsDatabase(t *testing.T) {
+	bucket := "file://" + t.TempDir()
+	store, err := blobstore.Open(context.Background(), bucket, "prod/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	ms := manifest.NewStore(store)
+	if _, err := ms.ClaimWriter(context.Background(), "test-writer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Write(context.Background(), store.SSTPath("000001.sst"), bytes.Repeat([]byte("isle"), 100_000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.AppendAddSSTableWithFence(context.Background(), manifest.SSTMeta{
+		ID: "000001.sst", Epoch: 1, SeqLo: 1, SeqHi: 1, Size: 400_000, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := NewConfig().(*Config)
+	cfg.Server.Listen, cfg.Server.AdminListen = "127.0.0.1:0", "127.0.0.1:0"
+	cfg.Server.Auth.Insecure = true
+	cfg.Server.ShutdownDrain = 0
+	cfg.Disk = Disk{Dir: t.TempDir(), Bytes: 64 << 20}
+	cfg.Databases = []Database{{Prefix: "prod/a", Prefetch: true}}
+	cfg.Current = Current{Poll: service.Duration(20 * time.Millisecond), LongPoll: service.Duration(10 * time.Second)}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, stop := context.WithCancel(context.Background())
+	addrs := make(chan [2]net.Addr, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- service.Serve(ctx, Role, cfg, service.Common{BucketURL: bucket}, slog.New(slog.NewTextHandler(io.Discard, nil)),
+			func(api, admin net.Addr) { addrs <- [2]net.Addr{api, admin} })
+	}()
+	defer func() {
+		stop()
+		if err := <-done; err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+	admin := "http://" + (<-addrs)[1].String()
+	want := []string{
+		`isledb_cache_prefetch_read_bytes_total{db="prod/a"} 400000`,
+		`isledb_cache_prefetch_paused{db="prod/a"} 0`,
+		`isledb_cache_prefetch_failures_total{db="prod/a"} 0`,
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		_, metrics := call(t, admin+"/metrics", "")
+		missing := ""
+		for _, w := range want {
+			if !strings.Contains(metrics, w) {
+				missing = w
+			}
+		}
+		if missing == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metrics lack %q", missing)
+		}
+	}
+}
