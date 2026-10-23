@@ -340,6 +340,9 @@ curl -H "Authorization: Bearer $TOKEN" 'http://isledb-reader:8080/v1/kv?prefix=u
 # {"items":[{"key":"user/42","value":"{\"name\":\"a\"}"}]}
 ```
 
+If the database has a change feed, readers also serve it at
+`/v1/changes?from=…`, so consumers in any language can follow it.
+
 The paths match the writer's, so one gateway can route `GET` to readers and
 writes to the writer. A read is usually within a second of the writer (about
 two on Google Cloud Storage), and its `Isledb-Revision` header says which

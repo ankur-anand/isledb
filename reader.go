@@ -1085,26 +1085,59 @@ func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error) {
 		return nil, err
 	}
 	defer done()
-
-	if err := r.checkManifestView(ctx); err != nil {
+	view, err := r.changeFeedView(ctx)
+	if err != nil {
 		return nil, err
 	}
-	m, version, position, cursor, changeFeed, expiresAt := r.currentBootstrapState()
-	if m == nil {
-		return nil, errors.New("manifest not loaded")
-	}
-	if !changeFeed {
-		return nil, ErrChangeFeedDisabled
-	}
-	if !time.Now().Before(expiresAt) {
-		return nil, ErrReadViewExpired
-	}
-	snapshot := newSnapshot(r, m, version, position, expiresAt)
 	return &BootstrapView{
-		Snapshot: snapshot,
-		Cursor:   cursor,
-		Version:  version,
+		Snapshot: newSnapshot(r, view.manifest, view.version, view.position, view.expiresAt),
+		Cursor:   view.cursor,
+		Version:  view.version,
 	}, nil
+}
+
+// ChangeHead returns the change-feed cursor at the head of the reader's view:
+// the first change the view does not hold. Like Snapshot, it follows the
+// reader's freshness policy, and reads storage only when the view must be
+// refreshed first.
+func (r *Reader) ChangeHead(ctx context.Context) (ChangeCursor, error) {
+	done, err := r.beginRead()
+	if err != nil {
+		return ChangeCursor{}, err
+	}
+	defer done()
+	view, err := r.changeFeedView(ctx)
+	if err != nil {
+		return ChangeCursor{}, err
+	}
+	return view.cursor, nil
+}
+
+// changeFeedState is the view a BootstrapView or ChangeHead is taken from.
+type changeFeedState struct {
+	manifest  *manifestState
+	version   Version
+	position  ViewPosition
+	cursor    ChangeCursor
+	expiresAt time.Time
+}
+
+// changeFeedView returns the reader's view once it is fresh enough to read,
+// unexpired, and holds a change feed. The caller holds a read.
+func (r *Reader) changeFeedView(ctx context.Context) (changeFeedState, error) {
+	if err := r.checkManifestView(ctx); err != nil {
+		return changeFeedState{}, err
+	}
+	m, version, position, cursor, changeFeed, expiresAt := r.currentBootstrapState()
+	switch {
+	case m == nil:
+		return changeFeedState{}, errors.New("manifest not loaded")
+	case !time.Now().Before(expiresAt):
+		return changeFeedState{}, ErrReadViewExpired
+	case !changeFeed:
+		return changeFeedState{}, ErrChangeFeedDisabled
+	}
+	return changeFeedState{manifest: m, version: version, position: position, cursor: cursor, expiresAt: expiresAt}, nil
 }
 
 // Get returns the value for key if present and not deleted/expired.

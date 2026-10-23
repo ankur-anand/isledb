@@ -41,6 +41,14 @@ With an `isledb cache` in the same region (`read_cache.url`), replicas read
 through it instead: they usually load new data within a second of each
 write, and storage sees reads from the cache rather than from every replica.
 
+If the database has a change feed, every replica also serves it at
+`/v1/changes`; see [reader-api.md](reader-api.md#follow-the-change-feed). The
+feed's newest position comes from the same loads as the data, and new
+changes show at the same time as new data. Consumers that have caught up are
+answered from memory: polling costs about one read per new position per
+replica, however many consumers poll. A change feed turned on later shows at
+the next load.
+
 ## Configuration
 
 You can set each option in a YAML file, as an environment variable, or as a

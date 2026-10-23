@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -128,19 +127,19 @@ type scanResponse struct {
 
 func newScanItem(key, value []byte) scanItem {
 	var item scanItem
-	if utf8.Valid(key) {
-		s := string(key)
-		item.Key = &s
-	} else {
-		item.KeyBase64 = bytes.Clone(key)
-	}
-	if utf8.Valid(value) {
-		s := string(value)
-		item.Value = &s
-	} else {
-		item.ValueBase64 = bytes.Clone(value)
-	}
+	item.Key, item.KeyBase64 = textOrBase64(key)
+	item.Value, item.ValueBase64 = textOrBase64(value)
 	return item
+}
+
+// textOrBase64 returns b as text when it is valid UTF-8, else as bytes to
+// send as base64.
+func textOrBase64(b []byte) (*string, []byte) {
+	if utf8.Valid(b) {
+		s := string(b)
+		return &s, nil
+	}
+	return nil, bytes.Clone(b)
 }
 
 // serveScan answers one page from a snapshot. The page is built before it is
@@ -176,9 +175,5 @@ func (h *Handler) serveScan(w http.ResponseWriter, r *http.Request, req scanRequ
 		return
 	}
 	w.Header().Set(HeaderRevision, strconv.FormatUint(uint64(snap.ViewPosition()), 10))
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }

@@ -21,12 +21,14 @@ import (
 
 // Error codes, the "error" field of an error body.
 const (
-	ErrorBadRequest   = "bad_request"   // a malformed request
-	ErrorKeyNotFound  = "key_not_found" // the key does not exist, or expired
-	ErrorNotFound     = "not_found"     // no such endpoint
-	ErrorMethod       = "method_not_allowed"
-	ErrorBackpressure = "backpressure" // too many reads in progress; retry
-	ErrorUnavailable  = "unavailable"  // the read could not be answered now; retry
+	ErrorBadRequest    = "bad_request"   // a malformed request
+	ErrorKeyNotFound   = "key_not_found" // the key does not exist, or expired
+	ErrorNotFound      = "not_found"     // no such endpoint
+	ErrorMethod        = "method_not_allowed"
+	ErrorBackpressure  = "backpressure"    // too many reads in progress; retry
+	ErrorUnavailable   = "unavailable"     // the read could not be answered now; retry
+	ErrorChangeFeedOff = "change_feed_off" // the database has no change feed
+	ErrorCursorExpired = "cursor_expired"  // changes after the cursor are no longer kept
 )
 
 // HeaderRevision names the view position that answered a read.
@@ -41,6 +43,9 @@ type Options struct {
 	// ReadTimeout bounds a read, storage included: one that hangs gives up
 	// its slot and is answered 503.
 	ReadTimeout time.Duration
+	// Changes, if set, serves the change feed at /v1/changes; nil answers
+	// 404 there.
+	Changes *Changes
 }
 
 // Handler serves the read API:
@@ -48,6 +53,7 @@ type Options struct {
 //	GET  /v1/kv/{key}   the value, as the body
 //	HEAD /v1/kv/{key}   the same, without the body
 //	GET  /v1/kv?prefix=  one page of the keys in a range, as JSON
+//	GET  /v1/changes?from=  one page of the change feed, as JSON
 //
 // Each read is answered from a snapshot of the reader's current view, whose
 // position is sent as Isledb-Revision, also with a 404. A scan's pages are
@@ -59,6 +65,7 @@ type Handler struct {
 	reader      *isledb.Reader
 	slots       chan struct{}
 	readTimeout time.Duration
+	changes     *Changes
 }
 
 // NewHandler returns a Handler reading through reader.
@@ -71,23 +78,29 @@ func NewHandler(reader *isledb.Reader, opts Options) (*Handler, error) {
 	case opts.ReadTimeout <= 0:
 		return nil, fmt.Errorf("readhttp: read timeout %s, want above 0", opts.ReadTimeout)
 	}
-	return &Handler{reader: reader, slots: make(chan struct{}, opts.MaxConcurrent), readTimeout: opts.ReadTimeout}, nil
+	return &Handler{reader: reader, slots: make(chan struct{}, opts.MaxConcurrent), readTimeout: opts.ReadTimeout, changes: opts.Changes}, nil
 }
 
 // InProgress is how many reads are being served now.
 func (h *Handler) InProgress() int { return len(h.slots) }
 
 const (
-	kvPath   = "/v1/kv/"
-	scanPath = "/v1/kv"
+	kvPath      = "/v1/kv/"
+	scanPath    = "/v1/kv"
+	changesPath = "/v1/changes"
 )
 
 // Route names the endpoint r is for, as a metrics label: kv_get, kv_head,
-// kv_scan, or other.
+// kv_scan, changes, or other.
 func Route(r *http.Request) string {
 	path := r.URL.EscapedPath()
-	if path == scanPath && r.Method == http.MethodGet {
-		return "kv_scan"
+	if r.Method == http.MethodGet {
+		switch path {
+		case scanPath:
+			return "kv_scan"
+		case changesPath:
+			return "changes"
+		}
 	}
 	if strings.HasPrefix(path, kvPath) {
 		switch r.Method {
@@ -106,6 +119,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	path := r.URL.EscapedPath()
 	switch {
+	case path == changesPath:
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeError(w, http.StatusMethodNotAllowed, ErrorMethod, "the change feed is read with GET")
+			return
+		}
+		if h.changes == nil {
+			writeError(w, http.StatusNotFound, ErrorChangeFeedOff, "this reader does not serve the change feed")
+			return
+		}
+		req, err := parseChanges(r.URL.RawQuery)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, ErrorBadRequest, err.Error())
+			return
+		}
+		if h.takeSlot(w) {
+			defer h.releaseSlot()
+			h.serveChanges(w, r, req)
+		}
 	case path == scanPath:
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
@@ -205,7 +237,7 @@ func readFailed(w http.ResponseWriter, err error) {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "the read did not finish in time; retry")
 	case errors.Is(err, isledb.ErrReadViewExpired), errors.Is(err, isledb.ErrSnapshotExpired),
-		errors.Is(err, isledb.ErrReaderClosed):
+		errors.Is(err, isledb.ErrReaderClosed), errors.Is(err, isledb.ErrChangeReaderClosed):
 		writeError(w, http.StatusServiceUnavailable, ErrorUnavailable, "no current view to read from; retry")
 	default:
 		// Not the key or path: keys can be sensitive, and logs travel.
@@ -220,7 +252,13 @@ type errorResponse struct {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, errorResponse{Error: code, Message: message})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{Error: code, Message: message})
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
 }

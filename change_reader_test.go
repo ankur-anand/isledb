@@ -1297,3 +1297,53 @@ func testChangeWriterOptions() WriterOptions {
 	opts.Memtable.TargetBytes = 16 << 20
 	return opts
 }
+
+// TestChangeRevisionIsTheCommitsPosition: each change carries its commit's
+// position, shared by the changes of a commit. WaitCommitted, called before
+// the next commit, returns that position.
+func TestChangeRevisionIsTheCommitsPosition(t *testing.T) {
+	ctx := context.Background()
+	_, db, writer := openChangeReaderTestDB(t, "change-revision")
+	commit := func(keys ...string) ViewPosition {
+		t.Helper()
+		var seq uint64
+		for _, key := range keys {
+			var err error
+			if seq, err = writer.Put(ctx, []byte(key), []byte("v")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		position, err := writer.WaitCommitted(ctx, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return position
+	}
+	first := commit("a", "b")
+	second := commit("c")
+
+	reader, err := db.OpenChangeReader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	page, err := reader.Read(ctx, ChangeCursor{}, ChangeReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]ViewPosition{"a": first, "b": first, "c": second}
+	if len(page.Changes) != len(want) {
+		t.Fatalf("read %d changes, want %d", len(page.Changes), len(want))
+	}
+	for _, ch := range page.Changes {
+		if ch.Revision != want[string(ch.Key)] {
+			t.Errorf("%s: revision %d, want %d", ch.Key, ch.Revision, want[string(ch.Key)])
+		}
+	}
+	if second <= first {
+		t.Fatalf("second commit at %d, not after the first at %d", second, first)
+	}
+}
