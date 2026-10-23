@@ -829,3 +829,30 @@ func TestBatchRefusesInvalidUTF8Text(t *testing.T) {
 		t.Fatalf("key %q = %q, %t, %v; want the exact bytes", raw, got, found, err)
 	}
 }
+
+// TestBatchRefusesLoneSurrogateEscapes: the JSON decoder would store "\ud800"
+// and "\udfff" both as U+FFFD, so two keys would become one. A valid pair,
+// and a backslash escaped before a "u", are accepted as written.
+func TestBatchRefusesLoneSurrogateEscapes(t *testing.T) {
+	f := newFixture(t, 10*time.Millisecond, Options{})
+	for _, key := range []string{`\ud800`, `\udfff`, `a\ud800b`, `\ud800A`, `\udc00\ud800`, `x\ud83d`} {
+		r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"put","key":"`+key+`"}]}`))
+		r.want(t, http.StatusBadRequest, ErrorBadRequest)
+		if !strings.Contains(r.body["message"], "surrogate") {
+			t.Fatalf("%s: message %q, want it to name the surrogate", key, r.body["message"])
+		}
+	}
+	if r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(`{"ops":[{"op":"put","key":"k","value":"\ud800"}]}`)); r.status != http.StatusBadRequest {
+		t.Fatalf("a lone surrogate in a value: %d %v, want 400", r.status, r.body)
+	}
+	body := `{"ops":[{"op":"put","key":"😀","value":"pair"},{"op":"put","key":"\\ud800","value":"text"}]}`
+	if r := do(t, f.server, http.MethodPost, "/v1/kv", []byte(body)); r.status != http.StatusOK {
+		t.Fatalf("a valid pair and an escaped backslash: %d %v", r.status, r.body)
+	}
+	reader := f.reader(t)
+	for key, want := range map[string]string{"😀": "pair", `\ud800`: "text"} {
+		if got, found, err := reader.Get(f.ctx, []byte(key)); err != nil || !found || string(got) != want {
+			t.Fatalf("key %q = %q, %t, %v; want %q", key, got, found, err, want)
+		}
+	}
+}

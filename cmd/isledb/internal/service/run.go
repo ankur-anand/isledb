@@ -178,6 +178,7 @@ func Main(roles []Role, args []string, stdout io.Writer) error {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: common.Level()}))
 	slog.SetDefault(log)
+	keepHangups()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	context.AfterFunc(ctx, stop)
@@ -341,6 +342,13 @@ func adminHandler(registry *prometheus.Registry, ready func() bool) http.Handler
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	return mux
+}
+
+// keepHangups stops SIGHUP ending the process, its default, for the whole
+// run: without a token file to reload, during start, and during shutdown.
+// The channel is never read; a hangup sent to it is dropped.
+func keepHangups() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
 }
 
 func reloadOnHangup(ctx context.Context, tokens *TokenAuth, log *slog.Logger) {
