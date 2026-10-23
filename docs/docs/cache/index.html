@@ -1,0 +1,1683 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>Run the IsleDB Read Cache: Serve Many Readers from One Copy</title>
+    <meta name="description" content="Run isledb cache, the regional read cache that serves many IsleDB readers from one copy of each object, and the HTTP API readers use with it." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="https://isledb.com/docs/cache/" />
+    <meta property="og:title" content="Read cache · IsleDB" />
+    <meta property="og:description" content="Run isledb cache, the regional read cache that serves many IsleDB readers from one copy of each object, and the HTTP API readers use with it." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://isledb.com/docs/cache/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Read cache · IsleDB" />
+    <meta name="twitter:description" content="Run isledb cache, the regional read cache that serves many IsleDB readers from one copy of each object, and the HTTP API readers use with it." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "TechArticle",
+            "headline": "Read cache",
+            "description": "Run isledb cache, the regional read cache that serves many IsleDB readers from one copy of each object, and the HTTP API readers use with it.",
+            "url": "https:\/\/isledb.com\/docs\/cache\/",
+            "about": { "@id": "https://isledb.com/#software" },
+            "isPartOf": { "@id": "https://isledb.com/#website" }
+          },
+          {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+              { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+              { "@type": "ListItem", "position": 2, "name": "Read cache", "item": "https:\/\/isledb.com\/docs\/cache\/" }
+            ]
+          }
+        ]
+      }
+    </script>
+    
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+       
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+       
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main toc";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+       
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+         
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+       
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          <h2>Start</h2>
+          <ul>
+            <li><a href="/getting-started/">Get started</a></li>
+          </ul>
+          <h2>Build</h2>
+          <ul>
+            <li><a href="/docs/http-api/">HTTP API</a></li>
+            <li><a href="/docs/go-api/">Go API</a></li>
+          </ul>
+          <h2>Operate</h2>
+          <ul>
+            <li><a href="/docs/object-storage/">Object storage</a></li>
+            <li><a href="/docs/writer/">Writer service</a></li>
+            <li><a href="/docs/reader/">Reader service</a></li>
+            <li><a href="/docs/maintenance/">Maintenance service</a></li>
+            <li><a href="/docs/cache/" aria-current="page">Read cache</a></li>
+          </ul>
+          <h2>Reference</h2>
+          <ul>
+            <li><a href="/docs/storage-layout/">Storage layout</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main id="main" class="reference">
+        <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / Read cache</p>
+        <h1>Read cache</h1>
+<h2 class="part" id="run">Run the cache</h2>
+<p><code>isledb cache</code> is the regional read cache as a service. It relays <code>CURRENT</code>
+for each database it serves, reading it from storage every 500 ms, and serves
+immutable objects from 128 KiB chunks on local disk. The HTTP API is in
+<a href="/docs/cache/#api">read-cache-api.md</a>.</p>
+<pre><code>isledb cache --config /etc/isledb/isledb.yaml
+</code></pre>
+<p>or, without a file:</p>
+<pre><code>isledb cache \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --db prod/policy --db prod/flags \
+  --disk-dir /var/cache/isledb --disk-bytes 200GiB \
+  --auth-token-file /etc/isledb/tokens
+</code></pre>
+<p>Storage credentials come from the provider's usual environment (for S3, the
+AWS SDK chain: environment variables, shared config, instance or pod role).
+They are never set in the cache's own configuration.</p>
+<h3 id="run-configuration">Configuration</h3>
+<p>Each setting can come from the YAML file, an environment variable or a flag.
+A flag overrides the environment, the environment overrides the file, and the
+file overrides the default. <code>--db</code> on the command line, or
+<code>ISLEDB_CACHE_DATABASES</code>, replaces the file's list of databases rather than
+adding to it.</p>
+<p>One file can configure every isledb role: settings all roles share sit at the
+top, and each role reads its own section. The cache reads <code>cache:</code>.</p>
+<pre><code class="language-yaml">bucket_url: s3://my-bucket?region=us-east-1
+log_level: info
+
+cache:
+  listen: :8090
+  admin_listen: 127.0.0.1:8091
+
+  disk:
+    dir: /var/cache/isledb
+    bytes: 200GiB
+
+  reads:
+    max_bytes: 256MiB
+    max_wait: 5s
+
+  current:
+    poll: 500ms
+    long_poll: 30s
+
+  databases:
+    - prefix: prod/policy
+    - prefix: prod/flags
+      current_poll: 250ms
+
+  auth:
+    token_file: /etc/isledb/tokens
+
+  tls:
+    cert: /etc/isledb/tls/cert.pem
+    key: /etc/isledb/tls/key.pem
+    client_ca: /etc/isledb/tls/clients.pem
+
+  shutdown_drain: 5s
+</code></pre>
+<p>Unknown keys are an error, at the top and inside <code>cache:</code>, so a misspelled
+key stops the cache at start rather than being ignored. Sections of the
+other roles this binary has are left for them; a section named after no role
+is an error too. The file holds paths, never secrets: tokens and keys stay
+in their own files.</p>
+<p>A database at the root of the bucket is written <code>/</code>. An empty prefix is an
+error, so a blank value never names the root, and so is one with an empty,
+<code>.</code> or <code>..</code> segment (<code>prod//a</code>, <code>prod/../a</code>), whose keys would never match.</p>
+<p><code>isledb cache --config isledb.yaml --check</code> validates the configuration,
+prints it as resolved from every source, and exits.</p>
+<p><strong>Naming.</strong> A setting's environment variable is <code>ISLEDB_</code> followed by its
+key, upper case with dots as underscores: the shared settings as they are
+(<code>bucket_url</code> → <code>ISLEDB_BUCKET_URL</code>), the cache's after <code>CACHE_</code>
+(<code>cache.disk.bytes</code> → <code>ISLEDB_CACHE_DISK_BYTES</code>). An environment variable
+set to an empty value counts: <code>ISLEDB_CACHE_ADMIN_LISTEN=</code> turns the admin
+listener off.</p>
+<table>
+<thead>
+<tr>
+<th>File key</th>
+<th>Flag</th>
+<th>Environment</th>
+<th>Default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bucket_url</code></td>
+<td><code>--bucket-url</code></td>
+<td><code>ISLEDB_BUCKET_URL</code></td>
+<td>required</td>
+<td>Bucket holding the databases</td>
+</tr>
+<tr>
+<td><code>log_level</code></td>
+<td><code>--log-level</code></td>
+<td><code>ISLEDB_LOG_LEVEL</code></td>
+<td><code>info</code></td>
+<td><code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code></td>
+</tr>
+<tr>
+<td><code>cache.databases[].prefix</code></td>
+<td><code>--db</code> (repeat)</td>
+<td><code>ISLEDB_CACHE_DATABASES</code> (comma-separated)</td>
+<td>required</td>
+<td>Databases served, by prefix; <code>/</code> for the bucket root</td>
+</tr>
+<tr>
+<td><code>cache.databases[].current_poll</code></td>
+<td>–</td>
+<td>–</td>
+<td><code>cache.current.poll</code></td>
+<td>Per-database poll interval</td>
+</tr>
+<tr>
+<td><code>cache.listen</code></td>
+<td><code>--listen</code></td>
+<td><code>ISLEDB_CACHE_LISTEN</code></td>
+<td><code>:8090</code></td>
+<td>API address</td>
+</tr>
+<tr>
+<td><code>cache.admin_listen</code></td>
+<td><code>--admin-listen</code></td>
+<td><code>ISLEDB_CACHE_ADMIN_LISTEN</code></td>
+<td><code>127.0.0.1:8091</code></td>
+<td>Admin address; empty for none</td>
+</tr>
+<tr>
+<td><code>cache.disk.dir</code></td>
+<td><code>--disk-dir</code></td>
+<td><code>ISLEDB_CACHE_DISK_DIR</code></td>
+<td>required</td>
+<td>Chunk directory, on local disk</td>
+</tr>
+<tr>
+<td><code>cache.disk.bytes</code></td>
+<td><code>--disk-bytes</code></td>
+<td><code>ISLEDB_CACHE_DISK_BYTES</code></td>
+<td>required</td>
+<td>Disk budget</td>
+</tr>
+<tr>
+<td><code>cache.reads.max_bytes</code></td>
+<td><code>--max-read-bytes</code></td>
+<td><code>ISLEDB_CACHE_READS_MAX_BYTES</code></td>
+<td><code>256MiB</code></td>
+<td>Bytes read from storage at once; at least <code>4MiB</code></td>
+</tr>
+<tr>
+<td><code>cache.reads.max_wait</code></td>
+<td><code>--max-read-wait</code></td>
+<td><code>ISLEDB_CACHE_READS_MAX_WAIT</code></td>
+<td><code>5s</code></td>
+<td>Longest a storage read waits for budget. About half the readers' timeout to the cache.</td>
+</tr>
+<tr>
+<td><code>cache.current.poll</code></td>
+<td><code>--current-poll</code></td>
+<td><code>ISLEDB_CACHE_CURRENT_POLL</code></td>
+<td><code>500ms</code></td>
+<td>How often <code>CURRENT</code> is read</td>
+</tr>
+<tr>
+<td><code>cache.current.long_poll</code></td>
+<td><code>--long-poll</code></td>
+<td><code>ISLEDB_CACHE_CURRENT_LONG_POLL</code></td>
+<td><code>30s</code></td>
+<td>Longest a long poll is held, at most <code>30s</code></td>
+</tr>
+<tr>
+<td><code>cache.auth.token_file</code></td>
+<td><code>--auth-token-file</code></td>
+<td><code>ISLEDB_CACHE_AUTH_TOKEN_FILE</code></td>
+<td></td>
+<td>Bearer tokens, one per line</td>
+</tr>
+<tr>
+<td><code>cache.auth.insecure</code></td>
+<td><code>--insecure</code></td>
+<td><code>ISLEDB_CACHE_AUTH_INSECURE</code></td>
+<td><code>false</code></td>
+<td>No authentication, for development</td>
+</tr>
+<tr>
+<td><code>cache.tls.cert</code>, <code>cache.tls.key</code></td>
+<td><code>--tls-cert</code>, <code>--tls-key</code></td>
+<td><code>ISLEDB_CACHE_TLS_CERT</code>, <code>ISLEDB_CACHE_TLS_KEY</code></td>
+<td></td>
+<td>Serve TLS</td>
+</tr>
+<tr>
+<td><code>cache.tls.client_ca</code></td>
+<td><code>--tls-client-ca</code></td>
+<td><code>ISLEDB_CACHE_TLS_CLIENT_CA</code></td>
+<td></td>
+<td>Require client certificates signed by this CA</td>
+</tr>
+<tr>
+<td><code>cache.shutdown_drain</code></td>
+<td><code>--shutdown-drain</code></td>
+<td><code>ISLEDB_CACHE_SHUTDOWN_DRAIN</code></td>
+<td><code>5s</code></td>
+<td>Not-ready time before shutting down</td>
+</tr>
+<tr>
+<td>–</td>
+<td><code>--config</code></td>
+<td><code>ISLEDB_CONFIG</code></td>
+<td></td>
+<td>YAML file</td>
+</tr>
+</tbody>
+</table>
+<p>Sizes are bytes or binary units: <code>512KiB</code>, <code>256MiB</code>, <code>200GiB</code>, <code>2TiB</code>.
+Durations are Go durations: <code>250ms</code>, <code>30s</code>, <code>2m</code>.</p>
+<h3 id="run-authentication">Authentication</h3>
+<p>The cache refuses to start without authentication unless <code>cache.auth.insecure</code> is set.</p>
+<ul>
+<li><strong>Tokens.</strong> <code>cache.auth.token_file</code> holds one token per line; blank lines and
+lines starting with <code>#</code> are skipped. Clients send
+<code>Authorization: Bearer &lt;token&gt;</code>. Send <code>SIGHUP</code> to reread the file; if the
+new file cannot be read or holds no tokens, the tokens in use stay.</li>
+<li><strong>Client certificates.</strong> With <code>cache.tls.client_ca</code>, clients must present a
+certificate it signed. With both tokens and client certificates set, both
+are required. An <code>isledb reader</code> presents one with <code>read_cache.cert</code> and
+<code>read_cache.key</code>, and trusts a cache certificate from a private CA with
+<code>read_cache.ca_file</code>.</li>
+</ul>
+<p>Each database is served only its own objects: those right under its prefix,
+not those of a database nested under it (<code>prod/a/b</code> under <code>prod/a</code>), and,
+for the root, not those of the databases under prefixes. A client can read
+through the cache only the databases it is configured to serve.</p>
+<h3 id="run-admin-endpoints">Admin endpoints</h3>
+<p>On <code>admin_listen</code>, without authentication; keep it on an address only
+operators and scrapers reach.</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/healthz</code></td>
+<td>200 while the process runs</td>
+</tr>
+<tr>
+<td><code>/readyz</code></td>
+<td>200 once every database's <code>CURRENT</code> has been read once; 503 before, and while shutting down. It stays 200 while storage is down: the cache keeps serving its copy, and readers judge its age.</td>
+</tr>
+<tr>
+<td><code>/metrics</code></td>
+<td>Prometheus</td>
+</tr>
+<tr>
+<td><code>/debug/pprof/</code></td>
+<td>Go profiles</td>
+</tr>
+</tbody>
+</table>
+<h3 id="run-metrics">Metrics</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_cache_chunks_total{source}</code></td>
+<td>Chunks served: <code>disk</code>, <code>storage</code>, <code>shared</code>, <code>bridged</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_object_responses_total{status}</code></td>
+<td>Object responses by <code>Isledb-Cache</code>: <code>hit</code>, <code>shared</code>, <code>miss</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_reads_total</code>, <code>isledb_cache_storage_read_bytes_total</code></td>
+<td>Storage range reads and bytes</td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_reads_queued_total</code></td>
+<td>Storage reads that waited for <code>cache.reads.max_bytes</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_bytes_reading</code></td>
+<td>Bytes being read now</td>
+</tr>
+<tr>
+<td><code>isledb_cache_size_lookups_total</code></td>
+<td>Sizes asked of storage, for requests without <code>Isledb-Object-Size</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_current_position{db}</code>, <code>isledb_cache_current_age_seconds{db}</code></td>
+<td>The relayed <code>CURRENT</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_current_poll_errors_total{db}</code></td>
+<td>Failed reads of <code>CURRENT</code></td>
+</tr>
+<tr>
+<td><code>isledb_cache_long_polls_held</code></td>
+<td>Long polls waiting now</td>
+</tr>
+<tr>
+<td><code>isledb_cache_disk_bytes</code>, <code>isledb_cache_disk_max_bytes</code>, <code>isledb_cache_disk_entries</code>, <code>isledb_cache_disk_evictions_total</code>, <code>isledb_cache_disk_failures_total</code></td>
+<td>The chunk store</td>
+</tr>
+<tr>
+<td><code>isledb_cache_http_requests_total{route,code}</code>, <code>isledb_cache_http_request_seconds{route}</code></td>
+<td>Requests; <code>route</code> is <code>current</code>, <code>current_long_poll</code>, <code>object</code> or <code>other</code></td>
+</tr>
+</tbody>
+</table>
+<p>What to watch:</p>
+<ul>
+<li><strong><code>current_age_seconds</code> rising</strong> means storage is not answering; readers
+stop accepting the copy once it is older than their age limit.</li>
+<li><strong><code>storage_reads_queued_total</code> rising</strong> means reads wait for budget: raise
+<code>cache.reads.max_bytes</code>, or add replicas, before waits reach <code>cache.reads.max_wait</code>
+and turn into 502s.</li>
+<li><strong><code>disk_evictions_total</code> rising fast</strong> with a low hit share means the disk
+is too small for the working set.</li>
+</ul>
+<h3 id="run-shutdown">Shutdown</h3>
+<p>On <code>SIGTERM</code> or <code>SIGINT</code> the cache:</p>
+<ol>
+<li>reports not ready on <code>/readyz</code>;</li>
+<li>waits <code>cache.shutdown_drain</code> for load balancers to notice;</li>
+<li>answers every held long poll with the position it has;</li>
+<li>finishes requests in flight, for up to 30 seconds, and exits.</li>
+</ol>
+<p>A second <code>SIGTERM</code> or <code>SIGINT</code> during these steps ends the process at once.</p>
+<p>Chunks on disk are kept. After a restart, requests carrying
+<code>Isledb-Object-Size</code> are served from them at once.</p>
+<h3 id="run-deploying">Deploying</h3>
+<ul>
+<li><strong>Disk.</strong> Put <code>cache.disk.dir</code> on local SSD. One process per directory: the
+chunk store locks it.</li>
+<li><strong>Timeouts in front of the cache.</strong> Load balancers and proxies must allow
+idle connections longer than <code>cache.current.long_poll</code>, or they cut long polls
+off. An <code>isledb reader</code> waits up to 10 seconds for the cache, then reads
+storage itself. <code>cache.reads.max_wait</code>, 5 seconds by default, is about half
+that, so a read that waited for its turn still has time to fetch and
+answer. Raise it only for clients that wait longer, to about half their
+timeout.</li>
+<li><strong>Several replicas.</strong> Round-robin works: each replica relays <code>CURRENT</code> on
+its own, and readers treat a copy behind their view as nothing new. Each
+replica then caches every hot chunk. Hashing object requests by path at
+the load balancer (Envoy ring hash, NGINX <code>hash $uri consistent</code>) puts
+each chunk on one replica, so their disks add up instead of repeating
+each other. <code>/v1/current</code> can stay round-robin.</li>
+<li><strong>Readiness.</strong> Route traffic by <code>/readyz</code>, not <code>/healthz</code>.</li>
+</ul>
+<h3 id="run-kubernetes">Kubernetes</h3>
+<p>The admin address defaults to <code>127.0.0.1:8091</code>, which the kubelet's probes
+cannot reach from outside the container. Bind it to all interfaces in the
+pod, and keep it off the Service.</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: isledb-cache
+spec:
+  serviceName: isledb-cache
+  replicas: 2
+  selector:
+    matchLabels: { app: isledb-cache }
+  template:
+    metadata:
+      labels: { app: isledb-cache }
+    spec:
+      # Longer than cache.shutdown_drain (5s) plus the 30s given to
+      # requests in flight.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: cache
+          image: isledb:latest
+          args: [&quot;cache&quot;, &quot;--config&quot;, &quot;/etc/isledb/isledb.yaml&quot;]
+          env:
+            - name: ISLEDB_CACHE_ADMIN_LISTEN
+              value: &quot;0.0.0.0:8091&quot;
+          ports:
+            - { name: api, containerPort: 8090 }
+            - { name: admin, containerPort: 8091 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/isledb, readOnly: true }
+            - { name: chunks, mountPath: /var/cache/isledb }
+      volumes:
+        - name: config
+          projected:
+            sources:
+              - configMap: { name: isledb-config }   # isledb.yaml
+              - secret: { name: isledb-tokens }      # tokens
+  volumeClaimTemplates:
+    - metadata: { name: chunks }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-ssd
+        resources: { requests: { storage: 200Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: isledb-cache
+spec:
+  selector: { app: isledb-cache }
+  ports:
+    - { name: api, port: 8090, targetPort: api }   # the admin port is not here
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isledb-cache-admin
+spec:
+  podSelector:
+    matchLabels: { app: isledb-cache }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ port: 8090 }]                 # the API, from anywhere it is routed
+    - ports: [{ port: 8091 }]                 # the admin port, from monitoring only
+      from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+</code></pre>
+<ul>
+<li><strong>Why a StatefulSet.</strong> Each replica keeps its own chunk volume across
+restarts, so a restarted pod serves hits from disk at once.</li>
+<li><strong>Probes.</strong> Readiness uses <code>/readyz</code>, so a pod takes traffic only once it
+has read <code>CURRENT</code> for every database; liveness uses <code>/healthz</code>, which
+does not depend on storage, so a storage outage never restarts the pods.
+Kubelet probes come from the node, which most network plugins let
+through regardless of policy; if yours does not, allow the node's
+addresses on port 8091.</li>
+<li><strong>Admin port.</strong> Not in the Service, and only the monitoring namespace may
+reach it: it serves <code>/debug/pprof</code>. Scrape <code>/metrics</code> through the pod's
+<code>admin</code> port.</li>
+<li><strong>Shutdown.</strong> The cache drains on its own: on <code>SIGTERM</code> it reports not
+ready, waits <code>cache.shutdown_drain</code>, then answers held long polls. No
+<code>preStop</code> hook is needed.</li>
+<li><strong>Mixed versions.</strong> A pod whose binary lacks a role named in a shared
+<code>isledb.yaml</code> refuses to start, so roll the image before adding a new
+role's section to the shared file.</li>
+</ul>
+<h2 class="part" id="api">Cache HTTP API</h2>
+<p>The read cache sits between IsleDB readers in one region and object storage.
+It serves two things:</p>
+<ul>
+<li><strong><code>CURRENT</code></strong>, the one mutable object, relayed from a single copy the cache
+reads from storage every 500 ms.</li>
+<li><strong>Immutable objects</strong> (SSTs, change batches, manifest pages and snapshots),
+by byte range, from 128 KiB chunks kept on the cache's disk.</li>
+</ul>
+<p>Running it: <a href="/docs/cache/#run">isledb-cache.md</a>.</p>
+<p>Version: <code>v1</code>. Every path starts with <code>/v1/</code>.</p>
+<h3 id="api-endpoints">Endpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Method and path</th>
+<th>Serves</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/current?db=P</code></td>
+<td>The cache's copy of database <code>P</code>'s <code>CURRENT</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/current?db=P&amp;after=N</code></td>
+<td>Its position only, once it passes <code>N</code> (long poll)</td>
+</tr>
+<tr>
+<td><code>GET /v1/object/{key}</code></td>
+<td>Bytes of an immutable object, whole or by range</td>
+</tr>
+</tbody>
+</table>
+<p><code>P</code> is a database's prefix in the bucket, as configured on the cache, and
+<code>/</code> for a database at the bucket root. <code>db</code> may be left out when the cache
+serves one database.</p>
+<p><code>{key}</code> is the object's full storage key, including the database prefix,
+exactly as the reader's store names it, for example
+<code>db/sstable/a3f/000123.sst</code>. Only objects of a database the cache serves are
+answered (see below).</p>
+<h3 id="api-authentication">Authentication</h3>
+<p>Every request to these endpoints carries <code>Authorization: Bearer &lt;token&gt;</code>, or
+comes over TLS with a client certificate, as the cache is configured. A
+request without valid credentials answers <strong>401</strong> with
+<code>WWW-Authenticate: Bearer</code>.</p>
+<h3 id="api-get-v1current"><code>GET /v1/current</code></h3>
+<p>Returns the cache's copy of <code>CURRENT</code>, or, as a long poll, only its
+position once it passes a given one. A long poll is a doorbell: a reader
+that sees a new position reads <code>CURRENT</code> with a plain <code>GET /v1/current</code>, so
+<code>CURRENT</code> reaches readers by one path, where the client rules below apply.</p>
+<p><strong>Log position.</strong> The position is <code>CURRENT</code>'s <code>next_seq</code>: the sequence
+number the next manifest log entry will get. Every entry appended to the
+manifest log raises it by one, in the same conditional write of <code>CURRENT</code>
+that adds the entry. Entries record changes to the database's structure:
+a flush adding an SST (with its change batch), a compaction, SSTs removed,
+a checkpoint, or a writer or compactor taking ownership. User writes do not
+move it until a flush. It never goes down. Some rewrites of <code>CURRENT</code> add no
+entry and keep the position, such as folding the log into a new snapshot.</p>
+<p><strong>Query</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>after=N</code></td>
+<td>Optional. Long poll: hold the request until the copy's log position is above <code>N</code>, or until the server's long-poll timeout, at most 30 seconds, then answer with the position only. <code>N</code> is a log position.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response headers</strong></p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Without <code>after</code></th>
+<th>With <code>after</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Isledb-Position</code></td>
+<td>Log position of the <code>CURRENT</code> returned: its <code>next_seq</code></td>
+<td>The copy's log position</td>
+</tr>
+<tr>
+<td><code>Isledb-Age-Ms</code></td>
+<td>Milliseconds since the cache read this <code>CURRENT</code> from storage, rounded up. Measured on the cache's monotonic clock; not a timestamp.</td>
+<td>The copy's age, the same way</td>
+</tr>
+<tr>
+<td><code>Content-Type</code></td>
+<td><code>application/json</code></td>
+<td>–</td>
+</tr>
+</tbody>
+</table>
+<p>Without <code>after</code>, the body is <code>CURRENT</code>'s bytes as stored. With <code>after</code>, the
+body is empty.</p>
+<p><strong>Status</strong></p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>200</td>
+<td>The copy, with position and age; or, for a long poll, the position. A long poll that timed out also answers 200, with a position not above <code>N</code>.</td>
+</tr>
+<tr>
+<td>400</td>
+<td><code>after</code> is not a number, or <code>db</code> is missing on a cache serving several databases</td>
+</tr>
+<tr>
+<td>401</td>
+<td>No valid credentials</td>
+</tr>
+<tr>
+<td>404</td>
+<td><code>db</code> names a database the cache does not serve</td>
+</tr>
+<tr>
+<td>503</td>
+<td>The cache has not read <code>CURRENT</code> once yet; a long poll gets it at once, not after the timeout</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Behaviour</strong></p>
+<ul>
+<li>The copy never moves back. A <code>CURRENT</code> in storage at a lower position is
+refused and logged; a store recreated under the same prefix needs the cache
+restarted.</li>
+<li>A <code>CURRENT</code> at the same position with other bytes, such as one rewritten
+around a new snapshot, replaces the copy. It does not answer long polls, which wait for a higher
+position; the next request gets the new bytes.</li>
+<li>When storage cannot be read, the cache keeps serving its copy, and its age
+grows. Readers decide whether it is still young enough.</li>
+</ul>
+<p><strong>Client rules</strong> (enforced by the reader, so a faulty cache cannot break it)</p>
+<ol>
+<li><strong>Age limit.</strong> Reject a <code>CURRENT</code> whose age is above 5 seconds and read
+storage directly.</li>
+<li><strong>Load time = the time the request was sent (own clock) − the age.</strong> This
+is when the view's <code>MaxPinnedViewAge</code> starts.</li>
+<li><strong>Older means read storage.</strong> A <code>CURRENT</code> from the cache at a position
+below the reader's published view, as a lagging replica can give, is not
+replayed: the refresh reads <code>CURRENT</code> from storage instead, which also
+renews the view.</li>
+<li><strong><code>Refresh</code> reads storage directly.</strong> The relay can be up to one poll
+interval behind.</li>
+<li><strong>Long poll.</strong> Ask with <code>after=&lt;published position&gt;</code>; on an answer above
+it, call <code>RequestRefresh</code> and ask again. <code>RequestRefresh</code> reads <code>CURRENT</code>
+with a plain <code>GET</code>, where rules 1 to 3 apply. Give up on a long poll
+unanswered after 45 seconds: the connection is dead. An answer not above
+it whose age is past the limit of rule 1 means the cache cannot read
+storage and will not ring for new commits: read <code>CURRENT</code>, which then
+goes to storage. After a timeout or error, wait a random 0 to 1 second
+before asking again.</li>
+<li><strong>Fallback.</strong> On a connection error, a timeout or a 5xx, read storage
+directly.</li>
+</ol>
+<p><strong>Example</strong></p>
+<pre><code>$ curl -si -H &quot;Authorization: Bearer $TOKEN&quot; 'http://cache:8090/v1/current?db=prod/policy&amp;after=41'
+HTTP/1.1 200 OK
+Isledb-Age-Ms: 3
+Isledb-Position: 42
+Content-Length: 0
+
+$ curl -si -H &quot;Authorization: Bearer $TOKEN&quot; 'http://cache:8090/v1/current?db=prod/policy'
+HTTP/1.1 200 OK
+Content-Type: application/json
+Isledb-Age-Ms: 212
+Isledb-Position: 42
+
+{&quot;layout_version&quot;:…,&quot;next_seq&quot;:42,…}
+</code></pre>
+<h3 id="api-get-v1objectkey"><code>GET /v1/object/{key}</code></h3>
+<p>Returns bytes of an immutable object.</p>
+<p><strong>Keys served.</strong> Only objects that are never rewritten, each a fixed shape
+right after its database's prefix <code>P</code> (nothing before the shape for the
+root):</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>Key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SST</td>
+<td><code>P/sstable/{bucket}/{id}</code>, where <code>{bucket}</code> is the one <code>id</code> maps to</td>
+</tr>
+<tr>
+<td>Change batch</td>
+<td><code>P/changes/{bucket}/{id}</code>, same rule</td>
+</tr>
+<tr>
+<td>Manifest snapshot</td>
+<td><code>P/manifest/snapshots/{name}.manifest.zst</code></td>
+</tr>
+<tr>
+<td>Manifest page</td>
+<td><code>P/manifest/pages/l{NN}/{name}.page.zst</code></td>
+</tr>
+</tbody>
+</table>
+<p>A key is answered only when what comes before its shape is exactly a
+database the cache serves. So each database is served only its own objects:
+serving <code>prod/a</code> does not serve <code>prod/a/b/sstable/…</code> of a database nested
+under it, and serving the root does not serve <code>prod/a/sstable/…</code>. Anything
+else, including <code>manifest/CURRENT</code> and <code>maintenance/HEAD</code>, answers 403.</p>
+<p><strong>Request headers</strong></p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Range</code></td>
+<td>Optional. One range: <code>bytes=a-b</code>, <code>bytes=a-</code> or <code>bytes=-n</code>. Without it, the whole object. Several ranges in one header are refused (416).</td>
+</tr>
+<tr>
+<td><code>Isledb-Object-Size</code></td>
+<td>Optional. The object's size in bytes, its full stored length, at most 5 TiB. With it, the cache does not ask storage for the size. IsleDB readers always send it.</td>
+</tr>
+<tr>
+<td><code>Isledb-No-Cache</code></td>
+<td>Optional, any value. Serve the bytes without keeping what is read from storage. Chunks already on disk are still used. For scans.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response headers</strong></p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Content-Range</code></td>
+<td>On 206: <code>bytes a-b/size</code>. On 416: <code>bytes */size</code>.</td>
+</tr>
+<tr>
+<td><code>Content-Length</code></td>
+<td>Bytes in the body</td>
+</tr>
+<tr>
+<td><code>Isledb-Error</code></td>
+<td>On an error response, its kind where the status alone does not say: <code>size-mismatch</code> on a 400</td>
+</tr>
+<tr>
+<td><code>Isledb-Cache</code></td>
+<td>How the first 4 MiB of the response were served: <code>hit</code> (all from disk), <code>shared</code> (read from storage by another request in flight, none by this one), <code>miss</code> (this request read from storage)</td>
+</tr>
+<tr>
+<td><code>Accept-Ranges</code></td>
+<td><code>bytes</code></td>
+</tr>
+<tr>
+<td><code>Content-Type</code></td>
+<td><code>application/octet-stream</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Status</strong></p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>When</th>
+<th>Client should</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>200</td>
+<td>Whole object</td>
+<td>Use it</td>
+</tr>
+<tr>
+<td>206</td>
+<td>The range asked for</td>
+<td>Use it</td>
+</tr>
+<tr>
+<td>400</td>
+<td><code>Isledb-Object-Size</code> is not a positive number up to 5 TiB, or is not the object's size in storage; the latter carries <code>Isledb-Error: size-mismatch</code></td>
+<td>Read storage directly; report a bug</td>
+</tr>
+<tr>
+<td>401</td>
+<td>No valid credentials</td>
+<td>Fix the token or certificate; read storage directly meanwhile</td>
+</tr>
+<tr>
+<td>403</td>
+<td>Not an immutable object of a database the cache serves</td>
+<td>Read storage directly; report a bug</td>
+</tr>
+<tr>
+<td>404</td>
+<td>The object is not in storage</td>
+<td>Retry storage directly once, then report not found</td>
+</tr>
+<tr>
+<td>405</td>
+<td><code>HEAD</code> request; only <code>GET</code> is served (<code>Allow: GET</code>)</td>
+<td>Use <code>GET</code></td>
+</tr>
+<tr>
+<td>416</td>
+<td>Range outside the object, or several ranges</td>
+<td>Report a bug</td>
+</tr>
+<tr>
+<td>502</td>
+<td>Storage failed</td>
+<td>Read storage directly</td>
+</tr>
+<tr>
+<td>other 5xx, connection error, timeout</td>
+<td>The cache is unhealthy</td>
+<td>Read storage directly</td>
+</tr>
+</tbody>
+</table>
+<p>A 404 is retried against storage because a cache pointed at the wrong
+bucket or prefix would answer 404 for everything; readers must not trust it
+alone.</p>
+<p><strong>The size</strong></p>
+<ul>
+<li>The size must be the object's full stored length. For an SST with a Bloom
+sidecar that is <code>BloomOffset + BloomLength + 16</code>: the sidecar follows the
+SST's <code>Size</code>, and a 16-byte trailer follows the sidecar. Without one, it is
+<code>Size</code>. For a change batch it is the batch's <code>Size</code>.</li>
+<li>Chunks are kept per key and size. A request with a wrong size never reads
+or replaces chunks kept for the right one.</li>
+<li>Every read from storage checks the size against the size storage reports,
+at no extra request. A wrong size is refused (400) and nothing is kept, so
+only bytes read under the right size are ever served from disk.</li>
+<li>Without the header the cache asks storage once (a HEAD) and remembers the
+size in memory until restart.</li>
+<li>A wrong size larger than the object can instead fail at storage, which
+refuses a range past the end; the cache then answers 502.</li>
+</ul>
+<p><strong>Behaviour</strong></p>
+<ul>
+<li>Objects are kept as 128 KiB chunks, aligned at offset 0, the same size as
+the reader's own chunks. The last chunk is shorter.</li>
+<li>Missing chunks next to each other are read from storage in one request,
+up to 32 chunks (4 MiB). A request also reads again up to 8 chunks it
+already has, to join two missing runs into one request.</li>
+<li>Concurrent requests for the same missing chunk share one storage read.</li>
+<li>A storage read is not tied to the request that started it: a client that
+disconnects does not fail others waiting on the same chunks.</li>
+<li>Storage reads in progress are capped in bytes (<code>MaxReadBytes</code>, default
+256 MiB). Past the cap, a read waits its turn, in arrival order, for at most
+<code>MaxReadWait</code> (default 5 seconds), and then fails with 502. The wait does
+not shorten the storage request's own 30-second timeout. Set <code>MaxReadWait</code>
+to about half the readers' timeout to the cache (10 seconds by default), so
+a read that gets its turn still has time to fetch and answer: a queued read
+keeps its place after its reader gives up, so a longer wait spends budget
+on fetches whose requesters have left, ahead of requests still waiting.
+Hits are never queued.</li>
+<li>A response is sent 4 MiB at a time. The status and headers are sent once
+the first 4 MiB are in hand, so an error there gets its own status. A
+failure after that ends the body early; the client sees fewer bytes than
+<code>Content-Length</code>.</li>
+<li>The cache does not check object contents. Readers verify every object as
+they do when reading storage directly (SST, Bloom, page, snapshot and
+change-index checksums, and Pebble block checksums).</li>
+</ul>
+<p><strong>Examples</strong></p>
+<p>A lookup's chunk, cold and then warm:</p>
+<pre><code>$ curl -si -H &quot;Authorization: Bearer $TOKEN&quot; http://cache:8090/v1/object/db/sstable/a3f/000123.sst \
+    -H 'Range: bytes=131072-262143' -H 'Isledb-Object-Size: 8421376'
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 131072-262143/8421376
+Content-Length: 131072
+Isledb-Cache: miss
+…
+</code></pre>
+<p>The next request for that chunk answers <code>Isledb-Cache: hit</code>.</p>
+<p>A manifest page, whole:</p>
+<pre><code>$ curl -s -H &quot;Authorization: Bearer $TOKEN&quot; http://cache:8090/v1/object/db/manifest/pages/l00/p17.page.zst \
+    -H 'Isledb-Object-Size: 20381' -o p17.page.zst
+</code></pre>
+<p>A scan that should not fill the cache:</p>
+<pre><code>$ curl -s -H &quot;Authorization: Bearer $TOKEN&quot; http://cache:8090/v1/object/db/sstable/a3f/000123.sst \
+    -H 'Range: bytes=0-4194303' -H 'Isledb-Object-Size: 8421376' \
+    -H 'Isledb-No-Cache: 1'
+</code></pre>
+<h3 id="api-reader-support">Reader support</h3>
+<p>Readers configured with a read cache read SSTs, manifest pages and snapshots
+through it, with fallback to storage, and refresh through the relay with the
+client rules above and the long poll. Change readers configured with a read
+cache read change batch indexes and blocks, the feed's view and its manifest
+pages through it, with the same rules and fallback, and wait for changes
+with the long poll.</p>
+
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        <details open>
+        <summary><strong>On this page</strong></summary>
+        <ol>
+          <li class="l1"><a href="#run">Run the cache</a></li>
+          <li class="l3"><a href="#run-configuration">Configuration</a></li>
+          <li class="l3"><a href="#run-authentication">Authentication</a></li>
+          <li class="l3"><a href="#run-admin-endpoints">Admin endpoints</a></li>
+          <li class="l3"><a href="#run-metrics">Metrics</a></li>
+          <li class="l3"><a href="#run-shutdown">Shutdown</a></li>
+          <li class="l3"><a href="#run-deploying">Deploying</a></li>
+          <li class="l3"><a href="#run-kubernetes">Kubernetes</a></li>
+          <li class="l1"><a href="#api">Cache HTTP API</a></li>
+          <li class="l3"><a href="#api-endpoints">Endpoints</a></li>
+          <li class="l3"><a href="#api-authentication">Authentication</a></li>
+          <li class="l3"><a href="#api-get-v1current">GET /v1/current</a></li>
+          <li class="l3"><a href="#api-get-v1objectkey">GET /v1/object/{key}</a></li>
+          <li class="l3"><a href="#api-reader-support">Reader support</a></li>
+        </ol>
+        </details>
+      </aside>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>

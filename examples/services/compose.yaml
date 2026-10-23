@@ -1,0 +1,67 @@
+# One IsleDB database run as services on your machine: an S3-compatible
+# store, a writer, a reader and maintenance.
+#
+#   docker compose up -d
+#   curl -X PUT --data 'hello' localhost:8070/v1/kv/greeting
+#   curl localhost:8080/v1/kv/greeting
+#
+# The services run without authentication, for trying IsleDB locally only.
+
+x-isledb: &isledb
+  image: ghcr.io/ankur-anand/isledb:0.19.0
+  environment:
+    ISLEDB_BUCKET_URL: s3://isledb?endpoint=http://silo:9000&region=us-east-1&use_path_style=true
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+  depends_on:
+    create-bucket:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  # SILO is a maintained, S3-compatible fork of the MinIO server.
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - silo-data:/data
+
+  create-bucket:
+    image: minio/mc:RELEASE.2025-03-12T17-29-24Z
+    depends_on:
+      - silo
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://silo:9000 minioadmin minioadmin; do sleep 1; done
+        mc mb --ignore-existing local/isledb
+
+  writer:
+    <<: *isledb
+    command: [writer, --prefix, demo, --change-feed, values, --insecure]
+    ports:
+      - "8070:8070"
+
+  reader:
+    <<: *isledb
+    command: [reader, --prefix, demo, --cache-dir, /home/nonroot/cache, --insecure]
+    ports:
+      - "8080:8080"
+    # The image runs as user nonroot, which owns /home/nonroot.
+    volumes:
+      - reader-cache:/home/nonroot
+
+  maintenance:
+    <<: *isledb
+    command: [maintenance, --prefix, demo, --scratch-dir, /home/nonroot/scratch]
+    volumes:
+      - maintenance-scratch:/home/nonroot
+
+volumes:
+  silo-data:
+  reader-cache:
+  maintenance-scratch:

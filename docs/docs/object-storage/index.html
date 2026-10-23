@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>Set Up Object Storage for IsleDB: S3, GCS, Azure Blob, and MinIO</title>
+    <meta name="description" content="Which object stores IsleDB works with, and how to create a bucket, set permissions, and connect IsleDB to S3, Google Cloud Storage, Azure Blob, or MinIO." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="https://isledb.com/docs/object-storage/" />
+    <meta property="og:title" content="Set up object storage · IsleDB" />
+    <meta property="og:description" content="Which object stores IsleDB works with, and how to create a bucket, set permissions, and connect IsleDB to S3, Google Cloud Storage, Azure Blob, or MinIO." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://isledb.com/docs/object-storage/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Set up object storage · IsleDB" />
+    <meta name="twitter:description" content="Which object stores IsleDB works with, and how to create a bucket, set permissions, and connect IsleDB to S3, Google Cloud Storage, Azure Blob, or MinIO." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "TechArticle",
+            "headline": "Set up object storage",
+            "description": "Which object stores IsleDB works with, and how to create a bucket, set permissions, and connect IsleDB to S3, Google Cloud Storage, Azure Blob, or MinIO.",
+            "url": "https:\/\/isledb.com\/docs\/object-storage\/",
+            "about": { "@id": "https://isledb.com/#software" },
+            "isPartOf": { "@id": "https://isledb.com/#website" }
+          },
+          {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+              { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+              { "@type": "ListItem", "position": 2, "name": "Set up object storage", "item": "https:\/\/isledb.com\/docs\/object-storage\/" }
+            ]
+          }
+        ]
+      }
+    </script>
+    
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+       
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+       
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main toc";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+       
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+         
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+       
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          <h2>Start</h2>
+          <ul>
+            <li><a href="/getting-started/">Get started</a></li>
+          </ul>
+          <h2>Build</h2>
+          <ul>
+            <li><a href="/docs/http-api/">HTTP API</a></li>
+            <li><a href="/docs/go-api/">Go API</a></li>
+          </ul>
+          <h2>Operate</h2>
+          <ul>
+            <li><a href="/docs/object-storage/" aria-current="page">Object storage</a></li>
+            <li><a href="/docs/writer/">Writer service</a></li>
+            <li><a href="/docs/reader/">Reader service</a></li>
+            <li><a href="/docs/maintenance/">Maintenance service</a></li>
+            <li><a href="/docs/cache/">Read cache</a></li>
+          </ul>
+          <h2>Reference</h2>
+          <ul>
+            <li><a href="/docs/storage-layout/">Storage layout</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main id="main" class="reference">
+        <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / Set up object storage</p>
+        <h1>Set up object storage</h1>
+<p>IsleDB keeps each database in one object-storage bucket, below one prefix.
+This guide says which object stores work, how to create a bucket for IsleDB,
+and which bucket features to leave off.</p>
+<p>For what IsleDB stores and where, see
+<a href="/docs/storage-layout/">object-store-schema.md</a>.</p>
+<h2 id="what-isledb-needs-from-a-store">What IsleDB needs from a store</h2>
+<ul>
+<li><strong>Conditional writes.</strong> IsleDB writes &quot;only if this object is unchanged&quot; and
+&quot;only if this object doesn't exist yet&quot;. This is what keeps two writers from
+overwriting each other's commits. A store that ignores these conditions
+can lose data, so it isn't supported.</li>
+<li><strong>Strong consistency.</strong> A read or a listing right after a write sees that
+write.</li>
+<li><strong>One object rewritten on every save.</strong> The writer rewrites
+<code>manifest/CURRENT</code>, a small object, each time it saves a group of writes:
+up to several times a second while writes keep arriving. Features that keep
+a copy of every overwritten object (versioning, soft delete) turn this into
+a pile of stored copies that grows with every save.</li>
+<li><strong>Many deletes.</strong> IsleDB deletes data files it no longer needs. Features
+that block or delay deletes (retention locks, holds, minimum storage
+durations) make storage grow.</li>
+</ul>
+<h2 id="which-stores-work">Which stores work</h2>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Works?</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Amazon S3 (general purpose buckets)</td>
+<td>Yes</td>
+<td></td>
+</tr>
+<tr>
+<td>Google Cloud Storage</td>
+<td>Yes</td>
+<td>The writer saves at most once per second.</td>
+</tr>
+<tr>
+<td>Azure Blob Storage</td>
+<td>Yes</td>
+<td>Use a standard account without hierarchical namespace.</td>
+</tr>
+<tr>
+<td>MinIO and MinIO AIStor</td>
+<td>Yes</td>
+<td>Self-hosted.</td>
+</tr>
+<tr>
+<td>Tigris</td>
+<td>Yes</td>
+<td>Use a single-region or multi-region bucket, not global or dual-region.</td>
+</tr>
+<tr>
+<td>Cloudflare R2</td>
+<td>Readers yes; writer not yet recommended</td>
+<td>R2 allows about one write per second to an object, and the writer can exceed it.</td>
+</tr>
+<tr>
+<td>Ceph Object Gateway (RGW)</td>
+<td>Not recommended</td>
+<td>Current releases have known bugs in conditional writes under contention.</td>
+</tr>
+<tr>
+<td>Amazon S3 Express One Zone (directory buckets)</td>
+<td>Untested</td>
+<td></td>
+</tr>
+<tr>
+<td>Wasabi, Hetzner, Scaleway, SeaweedFS, IBM Cloud Object Storage, Akamai</td>
+<td>Untested</td>
+<td>Check conditional writes before using one; see <a href="#check-a-store-yourself">Check a store yourself</a>.</td>
+</tr>
+<tr>
+<td>Backblaze B2, DigitalOcean Spaces, Oracle Cloud (S3 API), Garage</td>
+<td>No</td>
+<td>They don't support conditional writes, or ignore them.</td>
+</tr>
+<tr>
+<td>Local directory (<code>file://</code>)</td>
+<td>Development only</td>
+<td>One process at a time.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="settings-for-every-bucket">Settings for every bucket</h2>
+<p>Whatever the store, create the bucket like this:</p>
+<ul>
+<li><strong>Use a bucket, or a prefix, for IsleDB alone.</strong> Lifecycle rules and other
+bucket-wide settings then can't touch the database by accident.</li>
+<li><strong>Turn versioning off.</strong> Leave it off for the bucket's lifetime: on S3 it
+can be suspended but never turned off again.</li>
+<li><strong>Turn soft delete off,</strong> or keep it as short as the store allows.</li>
+<li><strong>Don't add retention policies, object locks, legal holds or default
+holds.</strong> They stop IsleDB deleting data it no longer needs, or stop the
+writer saving at all.</li>
+<li><strong>Don't add lifecycle rules that delete or move objects under the
+database's prefix.</strong> A rule that deletes old objects deletes live data. A
+rule that moves objects to a colder class makes reads slow.
+One rule is safe, and recommended on S3: abort incomplete multipart uploads
+after a day.</li>
+<li><strong>Use the standard storage class</strong> (Standard on S3 and GCS, Hot on Azure).
+Infrequent-access and archive classes charge minimum storage durations and
+retrieval fees, which IsleDB triggers constantly.</li>
+<li><strong>Put the bucket in the same region as the writer and readers.</strong> Every
+save waits for a round trip to storage.</li>
+<li><strong>Don't use bucket replication as a failover copy.</strong> Replication copies
+objects one by one, in no particular order, so a replica can be missing
+data that its <code>manifest/CURRENT</code> refers to. Use it for backups you restore
+and check, not as a database you switch to.</li>
+<li><strong>Don't turn on requester pays.</strong></li>
+</ul>
+<h2 id="amazon-s3">Amazon S3</h2>
+<p><strong>Bucket URL:</strong></p>
+<pre><code>s3://my-isledb?region=us-west-2
+</code></pre>
+<p><strong>Create the bucket.</strong> Versioning is off on a new bucket.</p>
+<pre><code class="language-bash">aws s3api create-bucket --bucket my-isledb --region us-west-2 \
+  --create-bucket-configuration LocationConstraint=us-west-2
+
+# Clean up uploads left by a crash.
+aws s3api put-bucket-lifecycle-configuration --bucket my-isledb \
+  --lifecycle-configuration '{&quot;Rules&quot;:[{&quot;ID&quot;:&quot;abort-incomplete-uploads&quot;,&quot;Status&quot;:&quot;Enabled&quot;,&quot;Filter&quot;:{},&quot;AbortIncompleteMultipartUpload&quot;:{&quot;DaysAfterInitiation&quot;:1}}]}'
+</code></pre>
+<p><strong>Permissions.</strong> For a database at the prefix <code>prod/orders</code>:</p>
+<pre><code class="language-json">{
+  &quot;Version&quot;: &quot;2012-10-17&quot;,
+  &quot;Statement&quot;: [
+    {
+      &quot;Effect&quot;: &quot;Allow&quot;,
+      &quot;Action&quot;: [&quot;s3:GetObject&quot;, &quot;s3:PutObject&quot;, &quot;s3:DeleteObject&quot;],
+      &quot;Resource&quot;: &quot;arn:aws:s3:::my-isledb/prod/orders/*&quot;
+    },
+    {
+      &quot;Effect&quot;: &quot;Allow&quot;,
+      &quot;Action&quot;: &quot;s3:ListBucket&quot;,
+      &quot;Resource&quot;: &quot;arn:aws:s3:::my-isledb&quot;,
+      &quot;Condition&quot;: {&quot;StringLike&quot;: {&quot;s3:prefix&quot;: &quot;prod/orders/*&quot;}}
+    }
+  ]
+}
+</code></pre>
+<p>Readers need only <code>s3:GetObject</code> and <code>s3:ListBucket</code>.</p>
+<p><strong>Encryption.</strong> The default (SSE-S3) works. With SSE-KMS, turn on S3 Bucket
+Keys: without them every read and write is also a KMS request, which counts
+against your KMS quota.</p>
+<p><strong>Versioning, if you must have it.</strong> Add a lifecycle rule that deletes
+noncurrent versions after a day, and one that removes expired delete markers.
+Expect to keep a day of copies of <code>manifest/CURRENT</code>. Without the rule,
+that object gains a version on every save, and S3 slows down the whole
+bucket once an object has hundreds of thousands of versions.</p>
+<p><strong>Request limits.</strong> S3 handles at least 3,500 writes and 5,500 reads per
+second per prefix, and answers <code>503 SlowDown</code> while it scales up; IsleDB
+retries those.</p>
+<h2 id="google-cloud-storage">Google Cloud Storage</h2>
+<p><strong>Bucket URL:</strong></p>
+<pre><code>gs://my-isledb
+</code></pre>
+<p><strong>Create the bucket.</strong> Versioning is off on a new bucket, but soft delete is
+on, for 7 days. It keeps a copy of every overwritten object, so turn it off.</p>
+<pre><code class="language-bash">gcloud storage buckets create gs://my-isledb --location=us-central1 \
+  --default-storage-class=STANDARD --uniform-bucket-level-access
+gcloud storage buckets update gs://my-isledb --clear-soft-delete
+</code></pre>
+<p>Leave hierarchical namespace off (the default).</p>
+<p><strong>Permissions.</strong> Grant the writer <code>roles/storage.objectUser</code> on the bucket.
+Readers need only <code>roles/storage.objectViewer</code>.</p>
+<p><strong>One save per second.</strong> Cloud Storage allows about one write per second to
+an object, so the writer saves at most once per second there.
+<code>flush.interval</code> defaults to 1s on <code>gs://</code> buckets and can't be set lower;
+see <a href="/docs/writer/#choose-the-flush-interval">isledb-writer.md</a>.</p>
+<p><strong>Request limits.</strong> A new bucket handles about 1,000 writes and 5,000 reads
+per second at first, and scales up over minutes as traffic grows.</p>
+<h2 id="azure-blob-storage">Azure Blob Storage</h2>
+<p><strong>Bucket URL</strong> (the container <code>isledb</code> in the storage account <code>myisledb</code>):</p>
+<pre><code>azblob://isledb?storage_account=myisledb
+</code></pre>
+<p><strong>Create the account and container.</strong> Use a standard general-purpose v2
+account with hierarchical namespace off. Accounts created in the Azure portal
+have blob soft delete on by default; it keeps a copy of every overwritten
+blob, so turn it off.</p>
+<pre><code class="language-bash">az storage account create --name myisledb --resource-group my-rg \
+  --location westus2 --sku Standard_ZRS --kind StorageV2 \
+  --hns false --access-tier Hot
+az storage account blob-service-properties update \
+  --account-name myisledb --resource-group my-rg \
+  --enable-delete-retention false --enable-versioning false
+az storage container create --account-name myisledb --name isledb --auth-mode login
+</code></pre>
+<p>Keeping container soft delete on is fine: it protects against deleting the
+whole container and doesn't affect the database's objects.</p>
+<p><strong>Permissions.</strong> Grant the writer the <em>Storage Blob Data Contributor</em> role on
+the container. Readers need only <em>Storage Blob Data Reader</em>.</p>
+<p><strong>Also avoid:</strong></p>
+<ul>
+<li>Leases on IsleDB's blobs: a leased <code>manifest/CURRENT</code> stops every save.</li>
+<li>Immutability policies and object replication on the container.</li>
+<li>Cool, Cold and Archive tiers.</li>
+</ul>
+<p><strong>Premium block blob accounts</strong> give lower, steadier latency for the writer's
+saves. They have no geo-redundancy.</p>
+<p><strong>Geo-redundant accounts (GRS, GZRS).</strong> After an unplanned failover, the
+secondary region may be missing recent writes, and its objects may not match
+each other. Check the database before using it again.</p>
+<h2 id="s3-compatible-stores">S3-compatible stores</h2>
+<p>IsleDB uses the S3 API for these. Point it at the store's endpoint:</p>
+<pre><code>s3://my-isledb?endpoint=https://s3.example.com&amp;region=us-east-1&amp;use_path_style=true&amp;request_checksum_calculation=when_required&amp;response_checksum_validation=when_required
+</code></pre>
+<ul>
+<li><strong><code>endpoint</code></strong> is the store's S3 endpoint.</li>
+<li><strong><code>use_path_style=true</code></strong> is needed by most self-hosted stores.</li>
+<li><strong><code>request_checksum_calculation=when_required</code> and
+<code>response_checksum_validation=when_required</code></strong> turn off checksums that
+recent S3 clients send by default and that many S3-compatible stores
+reject.</li>
+</ul>
+<h3 id="minio">MinIO</h3>
+<pre><code>s3://my-isledb?endpoint=http://minio:9000&amp;region=us-east-1&amp;use_path_style=true&amp;request_checksum_calculation=when_required&amp;response_checksum_validation=when_required
+</code></pre>
+<p>Keep versioning off on the bucket. The open-source MinIO repository is no
+longer maintained; use MinIO AIStor, or pin a release you have tested.</p>
+<h3 id="tigris">Tigris</h3>
+<pre><code>s3://my-isledb?endpoint=&lt;your Tigris S3 endpoint&gt;&amp;region=auto&amp;request_checksum_calculation=when_required&amp;response_checksum_validation=when_required
+</code></pre>
+<p>Create a single-region or multi-region bucket. Global and dual-region buckets
+are only eventually consistent between regions, which IsleDB doesn't
+support.</p>
+<h3 id="cloudflare-r2">Cloudflare R2</h3>
+<pre><code>s3://my-isledb?endpoint=https://&lt;account-id&gt;.r2.cloudflarestorage.com&amp;region=auto&amp;request_checksum_calculation=when_required&amp;response_checksum_validation=when_required
+</code></pre>
+<p>Readers work. The writer isn't recommended on R2 yet: R2 allows about one
+write per second to an object and answers faster writes with <code>429</code>, and the
+writer can save more often than that, even with <code>flush.interval: 1s</code>.</p>
+<p>Don't read through a custom domain with caching turned on: cached reads can
+be stale.</p>
+<h3 id="ceph-object-gateway">Ceph Object Gateway</h3>
+<p>Not recommended yet. Current releases can answer a losing conditional write
+with a server error, or report success for a write that didn't happen. If you
+run Ceph, use the latest release and test it as below before trusting it
+with data.</p>
+<h2 id="check-a-store-yourself">Check a store yourself</h2>
+<p>Before using a store this guide marks as untested, check that it honours
+conditional writes. With the AWS CLI:</p>
+<pre><code class="language-bash">B=my-isledb; E=--endpoint-url=https://s3.example.com
+echo one &gt; /tmp/one; echo two &gt; /tmp/two
+
+# 1. Creating an object that exists must fail with 412.
+aws s3api put-object $E --bucket $B --key probe --body /tmp/one
+aws s3api put-object $E --bucket $B --key probe --body /tmp/two --if-none-match '*'
+
+# 2. Overwriting with a stale ETag must fail with 412.
+aws s3api put-object $E --bucket $B --key probe --body /tmp/two --if-match '&quot;0000&quot;'
+
+# 3. Overwriting with the current ETag must succeed.
+ETAG=$(aws s3api head-object $E --bucket $B --key probe --query ETag --output text)
+aws s3api put-object $E --bucket $B --key probe --body /tmp/two --if-match &quot;$ETAG&quot;
+
+aws s3api delete-object $E --bucket $B --key probe
+</code></pre>
+<p>If step 1 or 2 succeeds, the store ignores conditional writes and can't be
+used for IsleDB.</p>
+
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        <details open>
+        <summary><strong>On this page</strong></summary>
+        <ol>
+          <li class="l2"><a href="#what-isledb-needs-from-a-store">What IsleDB needs from a store</a></li>
+          <li class="l2"><a href="#which-stores-work">Which stores work</a></li>
+          <li class="l2"><a href="#settings-for-every-bucket">Settings for every bucket</a></li>
+          <li class="l2"><a href="#amazon-s3">Amazon S3</a></li>
+          <li class="l2"><a href="#google-cloud-storage">Google Cloud Storage</a></li>
+          <li class="l2"><a href="#azure-blob-storage">Azure Blob Storage</a></li>
+          <li class="l2"><a href="#s3-compatible-stores">S3-compatible stores</a></li>
+          <li class="l2"><a href="#check-a-store-yourself">Check a store yourself</a></li>
+        </ol>
+        </details>
+      </aside>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>

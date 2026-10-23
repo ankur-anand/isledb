@@ -1,0 +1,212 @@
+        <p>
+          The first part starts a database on your machine with Docker and uses it over HTTP. The
+          second part does the same from Go. Each takes a few minutes.
+        </p>
+
+        <h2 id="services">Run it as services</h2>
+        <p>
+          A database is served by three services: one <strong>writer</strong> takes writes, any
+          number of <strong>readers</strong> serve reads, and one <strong>maintenance</strong>
+          service keeps the database compact. They share nothing but the bucket.
+        </p>
+
+        <h3 id="start">Start a database on your machine</h3>
+        <p>
+          You need Docker. Download the example Compose file and start it:
+        </p>
+        <pre><code>curl -O https://raw.githubusercontent.com/ankur-anand/isledb/main/examples/services/compose.yaml
+docker compose up -d</code></pre>
+        <p>It starts four containers:</p>
+        <table>
+          <thead>
+            <tr><th>Container</th><th>What it does</th><th>Address</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>silo</code></td><td>An S3-compatible object store, holding the <code>isledb</code> bucket</td><td>internal</td></tr>
+            <tr><td><code>writer</code></td><td>Takes writes for the database <code>demo</code></td><td><code>localhost:8070</code></td></tr>
+            <tr><td><code>reader</code></td><td>Serves reads of the same database</td><td><code>localhost:8080</code></td></tr>
+            <tr><td><code>maintenance</code></td><td>Compacts the database in the background</td><td>none</td></tr>
+          </tbody>
+        </table>
+        <div class="note">
+          <p>
+            This setup runs without authentication, for trying IsleDB on your own machine. A real
+            deployment gives each service a token file; see <a href="#your-bucket">Use your bucket</a>.
+          </p>
+        </div>
+
+        <h3 id="write-read">Write and read</h3>
+        <p>Write a key to the writer. The answer comes once the write is durable in the bucket:</p>
+        <pre><code>curl -X PUT --data 'hello' localhost:8070/v1/kv/greeting
+<span class="out">{"write_id":"1.1","revision":"2"}</span></code></pre>
+        <p>Read it from the reader:</p>
+        <pre><code>curl -i localhost:8080/v1/kv/greeting
+<span class="out">HTTP/1.1 200 OK
+…
+Isledb-Revision: 2
+
+hello</span></code></pre>
+        <p>
+          A reader picks up new writes within about a second. Its <code>Isledb-Revision</code>
+          header says how far it has read: a read includes every write whose
+          <code>revision</code> is at or below it. Until then, a new key answers <code>404</code>.
+        </p>
+        <p>List keys by prefix with a scan:</p>
+        <pre><code>curl 'localhost:8080/v1/kv?prefix=gree'
+<span class="out">{"items":[{"key":"greeting","value":"hello"}]}</span></code></pre>
+        <p>
+          Keys and values can be any bytes. A single read returns the value as it is; in a scan,
+          keys and values that are not valid UTF-8 come back as <code>key_base64</code> and
+          <code>value_base64</code>.
+        </p>
+
+        <h3 id="changes">Follow changes</h3>
+        <p>
+          The example's writer turns on the change feed, so the reader also serves every committed
+          change, in order:
+        </p>
+        <pre><code>curl 'localhost:8080/v1/changes?from=oldest'
+<span class="out">{"changes":[{"sequence":1,"revision":2,"op":"put","key":"greeting","value":"hello"}],
+ "next":"cf1_AAAAAAAAAAIAAAAAAAAAAA","caught_up":true}</span></code></pre>
+        <p>
+          Save <code>next</code>, and poll with <code>from=</code> that cursor to get only newer
+          changes. Each consumer keeps its own cursor, and any reader accepts it.
+        </p>
+        <p>When you are done, stop everything and delete its data:</p>
+        <pre><code>docker compose down -v</code></pre>
+
+        <h3 id="your-bucket">Use your bucket</h3>
+        <p>
+          Download <code>isledb</code> for Linux or macOS from the
+          <a href="https://github.com/ankur-anand/isledb/releases/latest">latest release</a>, or use
+          the <code>ghcr.io/ankur-anand/isledb</code> image. Point each service at your bucket and a
+          database prefix, and give it a file of bearer tokens, one per line:
+        </p>
+        <pre><code>isledb writer \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts \
+  --auth-token-file /etc/isledb/tokens
+
+isledb reader \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts \
+  --cache-dir /var/cache/isledb \
+  --auth-token-file /etc/isledb/tokens
+
+isledb maintenance \
+  --bucket-url 's3://my-bucket?region=us-east-1' \
+  --prefix prod/accounts</code></pre>
+        <p>Requests then send one of the tokens:</p>
+        <pre><code>curl -H "Authorization: Bearer $TOKEN" https://isledb-reader.example.com/v1/kv/greeting</code></pre>
+        <table>
+          <thead>
+            <tr><th>Object store</th><th>Bucket URL</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Amazon S3</td><td><code>s3://my-bucket?region=us-east-1</code></td></tr>
+            <tr><td>Google Cloud Storage</td><td><code>gs://my-bucket</code></td></tr>
+            <tr><td>Azure Blob Storage</td><td><code>azblob://my-container</code></td></tr>
+            <tr><td>MinIO and other S3-compatible stores</td><td><code>s3://my-bucket?endpoint=https://…&amp;region=us-east-1&amp;use_path_style=true</code></td></tr>
+          </tbody>
+        </table>
+        <p>
+          Credentials come from the provider's usual environment variables or instance roles. Run
+          one writer and one maintenance service per database, and as many readers as you need.
+        </p>
+
+        <h2 id="go">Embed it in Go</h2>
+        <p>
+          In a Go program, the same database is a library: no services, no network hop. Use Go 1.25
+          or newer:
+        </p>
+        <pre><code>mkdir isledb-start &amp;&amp; cd isledb-start
+go mod init example.com/isledb-start
+go get github.com/ankur-anand/isledb</code></pre>
+        <p>Save this as <code>main.go</code>:</p>
+        <pre><code><span class="k">package</span> main
+
+<span class="k">import</span> (
+	<span class="s">"context"</span>
+	<span class="s">"fmt"</span>
+	<span class="s">"log"</span>
+
+	<span class="s">"github.com/ankur-anand/isledb"</span>
+)
+
+<span class="k">func</span> <span class="f">main</span>() {
+	ctx := context.<span class="f">Background</span>()
+
+	<span class="c">// mem:// keeps the database in memory, for a first run.</span>
+	db, err := isledb.<span class="f">Open</span>(ctx, <span class="s">"mem://"</span>, isledb.DBOptions{Prefix: <span class="s">"demo"</span>})
+	<span class="k">if</span> err != nil {
+		log.<span class="f">Fatal</span>(err)
+	}
+	<span class="k">defer</span> db.<span class="f">Close</span>()
+
+	w, err := db.<span class="f">OpenWriter</span>(ctx, isledb.<span class="f">DefaultWriterOptions</span>())
+	<span class="k">if</span> err != nil {
+		log.<span class="f">Fatal</span>(err)
+	}
+	<span class="k">defer</span> w.<span class="f">Close</span>(ctx)
+
+	<span class="k">if</span> _, err := w.<span class="f">Put</span>(ctx, []byte(<span class="s">"greeting"</span>), []byte(<span class="s">"hello"</span>)); err != nil {
+		log.<span class="f">Fatal</span>(err)
+	}
+	<span class="k">if</span> err := w.<span class="f">Flush</span>(ctx); err != nil { <span class="c">// durable once Flush returns</span>
+		log.<span class="f">Fatal</span>(err)
+	}
+
+	r, err := db.<span class="f">OpenReader</span>(ctx, isledb.<span class="f">DefaultReaderOpenOptions</span>(<span class="s">"./reader-cache"</span>))
+	<span class="k">if</span> err != nil {
+		log.<span class="f">Fatal</span>(err)
+	}
+	<span class="k">defer</span> r.<span class="f">Close</span>()
+
+	value, found, err := r.<span class="f">Get</span>(ctx, []byte(<span class="s">"greeting"</span>))
+	<span class="k">if</span> err != nil {
+		log.<span class="f">Fatal</span>(err)
+	}
+	fmt.<span class="f">Println</span>(string(value), found)
+}</code></pre>
+        <p>Run it:</p>
+        <pre><code>go run .
+<span class="out">hello true</span></code></pre>
+        <p>
+          To keep the data, replace <code>mem://</code> with your bucket URL, from the table above.
+          The writer, readers and maintenance can then run in separate processes, each opening the
+          same bucket and prefix.
+        </p>
+        <div class="note">
+          <p>
+            <code>mem://</code> and <code>file://</code> buckets are for one process only. Use a
+            cloud or S3-compatible bucket as soon as more than one process opens the database.
+          </p>
+        </div>
+
+        <h2 id="next">Next steps</h2>
+        <ul class="next">
+          <li>
+            <a href="/docs/http-api/#writer">Writer HTTP API</a>
+            <span>Batches, deletes, TTLs, and waiting for a write.</span>
+          </li>
+          <li>
+            <a href="/docs/http-api/#reader">Reader HTTP API</a>
+            <span>Reads, scans, freshness, and the change feed.</span>
+          </li>
+          <li>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/docs/isledb-writer.md">Running the services</a>
+            <span>Configuration, authentication, and metrics for each service.</span>
+          </li>
+          <li>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/docs/isledb-cache.md">Shared read cache</a>
+            <span>Serve many readers in a region from one copy of each read.</span>
+          </li>
+          <li>
+            <a href="/docs/go-api/">Go API</a>
+            <span>Writers, readers, snapshots, the change feed, and maintenance.</span>
+          </li>
+          <li>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <span>Complete programs, including separate services on MinIO.</span>
+          </li>
+        </ul>

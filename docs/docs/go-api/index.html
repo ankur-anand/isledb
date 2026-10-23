@@ -1,0 +1,3169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>IsleDB Go API Reference: Key-Value Database for S3, GCS &amp; Azure Blob</title>
+    <meta name="description" content="The IsleDB Go API: open a database on S3, GCS, or Azure Blob, write and read keys, follow the change feed, and run maintenance." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="https://isledb.com/docs/go-api/" />
+    <meta property="og:title" content="Go API reference · IsleDB" />
+    <meta property="og:description" content="The IsleDB Go API: open a database on S3, GCS, or Azure Blob, write and read keys, follow the change feed, and run maintenance." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://isledb.com/docs/go-api/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Go API reference · IsleDB" />
+    <meta name="twitter:description" content="The IsleDB Go API: open a database on S3, GCS, or Azure Blob, write and read keys, follow the change feed, and run maintenance." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "TechArticle",
+            "headline": "Go API reference",
+            "description": "The IsleDB Go API: open a database on S3, GCS, or Azure Blob, write and read keys, follow the change feed, and run maintenance.",
+            "url": "https:\/\/isledb.com\/docs\/go-api\/",
+            "about": { "@id": "https://isledb.com/#software" },
+            "isPartOf": { "@id": "https://isledb.com/#website" }
+          },
+          {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+              { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+              { "@type": "ListItem", "position": 2, "name": "Go API reference", "item": "https:\/\/isledb.com\/docs\/go-api\/" }
+            ]
+          }
+        ]
+      }
+    </script>
+    
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+       
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+       
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main toc";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+       
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+         
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+       
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          <h2>Start</h2>
+          <ul>
+            <li><a href="/getting-started/">Get started</a></li>
+          </ul>
+          <h2>Build</h2>
+          <ul>
+            <li><a href="/docs/http-api/">HTTP API</a></li>
+            <li><a href="/docs/go-api/" aria-current="page">Go API</a></li>
+          </ul>
+          <h2>Operate</h2>
+          <ul>
+            <li><a href="/docs/object-storage/">Object storage</a></li>
+            <li><a href="/docs/writer/">Writer service</a></li>
+            <li><a href="/docs/reader/">Reader service</a></li>
+            <li><a href="/docs/maintenance/">Maintenance service</a></li>
+            <li><a href="/docs/cache/">Read cache</a></li>
+          </ul>
+          <h2>Reference</h2>
+          <ul>
+            <li><a href="/docs/storage-layout/">Storage layout</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main id="main" class="reference">
+        <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / Go API reference</p>
+        <h1>Go API reference</h1>
+        <p class="lede">Embed IsleDB in a Go program: open a database on your bucket, write and read keys, follow the change feed, and run maintenance.</p>
+<p>This guide covers the public API most applications use, with the behavior
+that affects correctness: when writes are durable, when readers see them, how
+long a read view lasts, how change-feed cursors work, and how maintenance runs
+in its own process.</p>
+<pre><code class="language-go">import &quot;github.com/ankur-anand/isledb&quot;
+</code></pre>
+<h2 id="overview">Overview</h2>
+<p>An IsleDB database is one object-store bucket (or container) plus a prefix.
+A <code>DB</code> value is the local runtime for that prefix, and it hands out four kinds
+of handle:</p>
+<table>
+<thead>
+<tr>
+<th>Handle</th>
+<th align="right">Per <code>DB</code></th>
+<th>Safe for concurrent use</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Writer</code></td>
+<td align="right">One</td>
+<td>Yes</td>
+<td>Buffer writes and commit them</td>
+</tr>
+<tr>
+<td><code>Reader</code></td>
+<td align="right">One</td>
+<td>Yes</td>
+<td>Point reads, scans, iterators, snapshots</td>
+</tr>
+<tr>
+<td><code>ChangeReader</code></td>
+<td align="right">Any number</td>
+<td>Yes; each caller owns its cursors</td>
+<td>Consume the feed of committed writes</td>
+</tr>
+<tr>
+<td><code>Maintenance</code></td>
+<td align="right">One</td>
+<td><code>Close</code> may run alongside <code>Run</code> or <code>RunOnce</code></td>
+<td>Compact, checkpoint, retain, reclaim</td>
+</tr>
+</tbody>
+</table>
+<p>Writer and maintenance ownership are also fenced through the object store, so
+two processes can never act as the same owner at once. Readers and change
+readers scale freely: open the same prefix from as many processes as you
+like.</p>
+<p>How a write becomes visible:</p>
+<pre><code class="language-text">Put / Delete
+    -&gt; buffered in the writer
+    -&gt; Flush, background flush, Drain or Close
+    -&gt; committed to the manifest
+    -&gt; visible to a newly opened or refreshed reader
+</code></pre>
+<h2 id="quick-start">Quick start</h2>
+<p>This example turns off timed background flushing, so the explicit <code>Flush</code> is
+the moment the write becomes durable and visible.</p>
+<pre><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;log&quot;
+
+    &quot;github.com/ankur-anand/isledb&quot;
+)
+
+func main() {
+    if err := run(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+}
+
+func run(ctx context.Context) error {
+    db, err := isledb.Open(
+        ctx,
+        &quot;s3://my-bucket?region=us-east-1&quot;,
+        isledb.DBOptions{Prefix: &quot;accounts&quot;},
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = db.Close() }()
+
+    writerOptions := isledb.DefaultWriterOptions()
+    writerOptions.Flush.Interval = 0
+
+    writer, err := db.OpenWriter(ctx, writerOptions)
+    if err != nil {
+        return err
+    }
+    if _, err := writer.Put(ctx, []byte(&quot;user:1&quot;), []byte(&quot;Ankur&quot;)); err != nil {
+        return err
+    }
+    if err := writer.Flush(ctx); err != nil {
+        return err
+    }
+    if err := writer.Close(ctx); err != nil {
+        return err
+    }
+
+    reader, err := db.OpenReader(
+        ctx,
+        isledb.DefaultReaderOpenOptions(&quot;./isledb-cache&quot;),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = reader.Close() }()
+
+    value, found, err := reader.Get(ctx, []byte(&quot;user:1&quot;))
+    if err != nil {
+        return err
+    }
+    if found {
+        fmt.Printf(&quot;user:1 = %s\n&quot;, value)
+    }
+    return nil
+}
+</code></pre>
+<p><code>Open</code> takes a <a href="https://gocloud.dev/howto/blob/">Go Cloud bucket URL</a>. The
+production schemes are <code>s3://</code>, <code>gs://</code> and <code>azblob://</code> (S3-compatible stores
+work through <code>s3://</code>). Credentials come from the matching Go Cloud driver and
+cloud SDK.</p>
+<p><code>file://</code> and <code>mem://</code> buckets are for development and tests. They behave
+correctly within one process, but across processes their conditional writes
+are not atomic: never point two processes at the same <code>file://</code> directory,
+and never use either in production.</p>
+<h2 id="open-and-close-a-database">Open and close a database</h2>
+<pre><code class="language-go">func Open(ctx context.Context, bucketURL string, opts DBOptions) (*DB, error)
+func OpenBucket(ctx context.Context, bucket *blob.Bucket, bucketName string, opts DBOptions) (*DB, error)
+
+type DBOptions struct {
+    Prefix     string
+    ChangeFeed *ChangeFeedOptions
+    SSTOutput  SSTOutputOptions
+    Policy     StorePolicy
+}
+
+type StorePolicy struct {
+    MaxPinnedViewAge time.Duration
+}
+</code></pre>
+<ul>
+<li><code>Open</code> creates the bucket connection and <code>DB.Close</code> closes it. <code>OpenBucket</code>
+borrows a <code>*blob.Bucket</code> you already have; closing it stays your job.</li>
+<li><code>Prefix</code> is the database's root inside the bucket. Give each database its
+own prefix.</li>
+<li><code>ChangeFeed</code> turns on the <a href="#change-feed">change feed</a>.</li>
+<li><code>SSTOutput</code> sets how new SST files are encoded; see
+<a href="#appendix-sst-output-policy">SST output policy</a>.</li>
+<li><code>MaxPinnedViewAge</code> is the longest a loaded manifest view stays usable. Zero
+selects <code>DefaultMaxPinnedViewAge</code>, one hour. The first writer stores this
+policy; a later writer with a different value fails to open with
+<code>ErrStorePolicyMismatch</code>. Readers and the deletion of retired objects
+(including change-feed batches) both use it, so an old view never refers to
+an object that has been deleted.</li>
+</ul>
+<pre><code class="language-go">func (db *DB) OpenWriter(ctx context.Context, opts WriterOptions) (*Writer, error)
+func (db *DB) OpenReader(ctx context.Context, opts ReaderOpenOptions) (*Reader, error)
+func (db *DB) OpenChangeReader(ctx context.Context, opts ...ChangeReaderOptions) (*ChangeReader, error)
+func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Maintenance, error)
+func (db *DB) Close() error
+</code></pre>
+<p><code>DB.Close</code> closes any handles still open on that <code>DB</code>. It is process-level
+cleanup: close your handles yourself when their errors matter. An open writer
+is closed with a fixed 30-second deadline and no retry, so if writes may be
+in flight, run <code>Drain</code> and <code>Writer.Close</code> first; see
+<a href="#shutting-down">Shutting down</a>.</p>
+<h2 id="write-data">Write data</h2>
+<pre><code class="language-go">func (w *Writer) Put(ctx context.Context, key, value []byte) (uint64, error)
+func (w *Writer) PutWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) (uint64, error)
+func (w *Writer) Delete(ctx context.Context, key []byte) (uint64, error)
+func (w *Writer) Apply(ctx context.Context, b *Batch) (uint64, error)
+func (w *Writer) Flush(ctx context.Context) error
+func (w *Writer) WaitCommitted(ctx context.Context, seq uint64) (ViewPosition, error)
+func (w *Writer) CommittedSequence() uint64
+func (w *Writer) AcceptedSequence() uint64
+func (w *Writer) Epoch() uint64
+func (w *Writer) CommitStatus(epoch, seq uint64) (CommitStatus, error)
+func (w *Writer) State() WriterState
+func (w *Writer) StopWrites()
+func (w *Writer) Drain(ctx context.Context) error
+func (w *Writer) Close(ctx context.Context) error
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Put</code>, <code>PutWithTTL</code>, <code>Delete</code></td>
+<td>Buffer the write in memory and return its sequence number</td>
+</tr>
+<tr>
+<td><code>Apply</code></td>
+<td>Buffer a batch of writes so they commit together; return the last sequence</td>
+</tr>
+<tr>
+<td><code>Flush</code></td>
+<td>Commit everything buffered so far, and wait for it</td>
+</tr>
+<tr>
+<td><code>WaitCommitted</code></td>
+<td>Wait until a given sequence is committed</td>
+</tr>
+<tr>
+<td><code>CommittedSequence</code></td>
+<td>The highest committed sequence, without waiting</td>
+</tr>
+<tr>
+<td><code>AcceptedSequence</code></td>
+<td>The highest sequence handed out, committed or not</td>
+</tr>
+<tr>
+<td><code>Epoch</code></td>
+<td>The writer's fence epoch, one above the writer before it</td>
+</tr>
+<tr>
+<td><code>CommitStatus</code></td>
+<td>Whether a write, named by epoch and sequence, was committed</td>
+</tr>
+<tr>
+<td><code>State</code></td>
+<td>One consistent snapshot of the writer, for probes and dashboards</td>
+</tr>
+<tr>
+<td><code>StopWrites</code></td>
+<td>Refuse new writes from now on; keep committing the ones accepted</td>
+</tr>
+<tr>
+<td><code>Drain</code></td>
+<td><code>StopWrites</code>, then commit everything accepted, retrying until ctx ends</td>
+</tr>
+<tr>
+<td><code>Close</code></td>
+<td>Make one last commit attempt and finish the writer</td>
+</tr>
+</tbody>
+</table>
+<p>Every method is safe to call from any goroutine.</p>
+<p><strong>Sequences.</strong> Each write gets the next sequence number, in the order writes
+are accepted. Sequences continue across writers from the highest committed
+one, and a change-feed consumer sees the same number as <code>Change.Sequence</code>. A
+writer taking over reuses the sequences its predecessor accepted but did not
+commit, so a sequence names a write only together with the writer's <code>Epoch</code>.</p>
+<p><strong>Validation.</strong> An empty or oversized key, an oversized value, or a negative
+TTL returns an error wrapping <code>ErrInvalidMutation</code>, so you know not to retry
+it. A TTL of zero means no expiration.</p>
+<p><strong>TTLs.</strong> Readers hide expired values. Expiry does not delete anything
+immediately; compaction removes expired data later.</p>
+<h3 id="write-several-keys-atomically">Write several keys atomically</h3>
+<p><code>Put</code> and <code>Delete</code> each commit on their own: between two of them the writer
+can start a new memtable, so a reader may see the first without the second.
+<code>Apply</code> buffers a whole batch under one lock and in one memtable, so readers
+see all of it or none of it, and the change feed publishes it all at once, in
+one change batch. A feed consumer that reads with a limit may still receive
+the batch over several pages; the feed does not mark where a batch ends.</p>
+<pre><code class="language-go">b := isledb.NewBatch() // or: var b isledb.Batch
+b.Put([]byte(&quot;order/42&quot;), order)
+b.Put([]byte(&quot;stock/7&quot;), stock)
+b.Delete([]byte(&quot;cart/42&quot;))
+
+last, err := writer.Apply(ctx, b)
+if err != nil {
+    return err // nothing was applied; see below
+}
+position, err := writer.WaitCommitted(ctx, last) // durable, all of it
+</code></pre>
+<ul>
+<li><strong>It does not flush.</strong> Like <code>Put</code>, the batch commits with the next
+background flush, <code>Flush</code>, <code>Drain</code> or <code>Close</code>; wait with <code>WaitCommitted</code> on
+the last sequence. Mutation <code>i</code> has sequence <code>last - b.Len() + 1 + i</code>.</li>
+<li><strong>Whole or nothing.</strong> On any error nothing was applied and the same batch
+can be retried: <code>ErrInvalidMutation</code> names the first bad mutation (or an
+empty batch), <code>ErrBackpressure</code> means wait for commits, and
+<code>ErrBatchTooLarge</code> means it does not fit one memtable: split it.</li>
+<li><strong>Not a transaction.</strong> There are no reads or conditions, and a later write
+can overwrite any key in it. A key written twice in one batch keeps its
+last write.</li>
+<li><strong>Size.</strong> A batch must fit in <code>Memtable.TargetBytes</code>, or in the largest
+single write if that is bigger, so a one-entry batch takes anything <code>Put</code>
+does. Each entry's memtable overhead counts, so many tiny entries reach the
+limit sooner than their bytes suggest.</li>
+<li><strong>The <code>Batch</code>.</strong> Adding copies keys and values; <code>Grow(n)</code> makes room for
+<code>n</code> bytes of them first, when you know the total. <code>Apply</code> does not change
+the batch or keep its memory, so drop it or <code>Reset</code> it for reuse. A <code>Batch</code>
+is for one goroutine.</li>
+</ul>
+<h3 id="is-my-write-durable">Is my write durable?</h3>
+<p>A write is durable once it is committed to object storage. To acknowledge a
+client only then:</p>
+<pre><code class="language-go">seq, err := writer.Put(ctx, key, value)
+if err != nil {
+    return err
+}
+position, err := writer.WaitCommitted(ctx, seq)
+if err != nil {
+    return err // see the table below
+}
+// The write is in object storage, visible to any reader at or past position.
+</code></pre>
+<p><code>WaitCommitted(ctx, seq)</code> waits until that write, and every one before it, is
+committed. It does not flush by itself: writes commit with the next
+background flush, <code>Flush</code>, <code>Drain</code> or <code>Close</code>, so many waiters share one
+commit, and with healthy storage the wait is at most one flush interval.
+Without a flush interval, call <code>Flush</code>.</p>
+<table>
+<thead>
+<tr>
+<th><code>WaitCommitted</code> returns</th>
+<th>The write</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a position, <code>nil</code></td>
+<td>is committed, and visible at that view position</td>
+</tr>
+<tr>
+<td><code>ErrFenced</code></td>
+<td>was not committed and never will be: another writer took over (if more than two took over before this one learned of it, ask the current writer's <code>CommitStatus</code>)</td>
+</tr>
+<tr>
+<td>a context error</td>
+<td>is not known yet: it is still being retried and may land</td>
+</tr>
+<tr>
+<td><code>ErrWriterClosed</code></td>
+<td>is not known: <code>Close</code> finished the writer before confirming it, and its last attempt may have landed</td>
+</tr>
+</tbody>
+</table>
+<p>Treat an unknown write as unknown, not lost, and make retries idempotent (for
+example, <code>Put</code> the same key and value again).</p>
+<p><strong>Read your own writes.</strong> The position <code>WaitCommitted</code> returns is a
+manifest log position: a <code>Reader</code> whose <code>ViewPosition()</code> is at or past it sees
+the write. Hand it to the client with the write's acknowledgement; a read
+that carries it is served once the reader's view has caught up, after a
+<code>Refresh</code> or the read cache's next ring. Unlike sequences, positions are never
+reused by a later writer.</p>
+<h3 id="did-it-commit-after-a-failover">Did it commit after a failover?</h3>
+<p>A client whose wait ended without an answer can ask the writer that holds
+the database now. Keep the epoch with each sequence handed out:</p>
+<pre><code class="language-go">seq, err := writer.Put(ctx, key, value)
+token := WriteToken{Epoch: writer.Epoch(), Seq: seq} // your type
+
+// Later, on whichever writer is current:
+status, err := current.CommitStatus(token.Epoch, token.Seq)
+</code></pre>
+<p>Each writer's fence records where the writer before it stopped, and where
+the one before that did, so <code>CommitStatus</code> answers exactly for this writer
+and the two before it:</p>
+<table>
+<thead>
+<tr>
+<th>Write of</th>
+<th><code>CommitStatus</code> returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>this writer</td>
+<td><code>CommitDone</code> or <code>CommitPending</code>; once fenced, <code>CommitDone</code> or <code>CommitNever</code></td>
+</tr>
+<tr>
+<td>one or two takeovers back</td>
+<td><code>CommitDone</code> or <code>CommitNever</code></td>
+</tr>
+<tr>
+<td>three or more takeovers back</td>
+<td><code>CommitNever</code> above the highest sequence committed when this writer took over; <code>CommitUnknown</code> at or below it, since a writer in between may have reused it</td>
+</tr>
+<tr>
+<td>a later writer</td>
+<td><code>ErrFenced</code>: ask that one</td>
+</tr>
+</tbody>
+</table>
+<p><code>CommitStatus</code> does no I/O, so an HTTP endpoint on the writer can answer
+from memory. A fenced writer learns where its commits ended from the fence
+that replaced it, a commit whose response was lost included, and
+<code>WaitCommitted</code> returns <code>nil</code> for those writes rather than <code>ErrFenced</code>. Where
+every write's outcome must stay knowable across any number of takeovers,
+store a request ID in the value written, and read it back after <code>Refresh</code>.</p>
+<h3 id="writer-lifecycle">Writer lifecycle</h3>
+<p><code>State().Status</code> reports where the writer is:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Entered by</th>
+<th><code>Put</code> / <code>Delete</code></th>
+<th><code>Flush</code></th>
+<th>Commits</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WriterOpen</code></td>
+<td><code>OpenWriter</code></td>
+<td>accepted</td>
+<td>works</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>WriterStopped</code></td>
+<td><code>StopWrites</code>, <code>Drain</code>, or <code>Close</code> starting</td>
+<td><code>ErrWritesStopped</code></td>
+<td>works</td>
+<td>yes, including background flushes</td>
+</tr>
+<tr>
+<td><code>WriterClosed</code></td>
+<td><code>Close</code> finishing</td>
+<td><code>ErrWriterClosed</code></td>
+<td><code>ErrWriterClosed</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>WriterFenced</code></td>
+<td>another writer taking over</td>
+<td><code>ErrFenced</code></td>
+<td><code>ErrFenced</code></td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p>Status only moves forward. <code>WriterStopped</code> is one-way: there is no reopening.
+Storage errors never end a writer; only <code>Close</code> and losing the fence do.</p>
+<p><code>State</code> returns everything in one consistent snapshot:</p>
+<pre><code class="language-go">type WriterState struct {
+    Epoch             uint64       // the writer's fence epoch, as Epoch returns
+    Status            WriterStatus // WriterOpen, WriterStopped, WriterClosed, WriterFenced
+    Accepted          uint64       // highest sequence handed out
+    Committed         uint64       // highest sequence in object storage
+    PendingMemtables  int          // memtables not yet committed, the active one included
+    PendingBytes      int64        // their approximate in-memory size, before compression
+    OldestUncommitted time.Time    // when the oldest uncommitted write arrived; zero if none
+}
+</code></pre>
+<p>Use it for readiness probes (stop routing writes once the status is not
+<code>WriterOpen</code>), to show drain progress, and to slow producers before
+<code>PendingMemtables</code> reaches <code>MaxPendingMemtables</code>. It can be out of date as
+soon as it returns.</p>
+<h3 id="failures-and-retries">Failures and retries</h3>
+<p><strong>One committer.</strong> A single goroutine inside the writer does every commit:
+background flushes, <code>Flush</code>, <code>Drain</code>, <code>Close</code>, and applying maintenance
+commands. <code>Flush</code> asks it for a commit and waits. Your context bounds only the
+wait, not the commit: a <code>Flush</code> that times out or is cancelled returns at
+once, and the commit carries on.</p>
+<p><strong>A failed commit is retried, never dropped.</strong> The writes stay queued.
+Background flushes retry with a delay that doubles from the flush interval up
+to 30 seconds. A failed <code>Flush</code> returns its error; calling it again retries
+at once. Every attempt first checks whether the previous one landed before
+its response was lost, so a commit never lands twice.</p>
+<p><strong>Every attempt has a deadline</strong> of 30 seconds plus one second per MiB to
+upload, so a hung storage request costs one attempt, not the writer. Each
+attempt in a row that times out doubles the next one's deadline, up to 10
+minutes, so a slow link still gets a commit through; a successful commit
+resets it. A timed-out attempt is reported, and returned by a <code>Flush</code> waiting
+on it, as <code>ErrCommitTimeout</code>. That error does not wrap
+<code>context.DeadlineExceeded</code>: it is the writer's deadline, not yours.</p>
+<p><strong>Backpressure.</strong> While commits keep failing, writes pile up in memory. Once
+<code>MaxPendingMemtables</code> frozen memtables are waiting, a write that needs
+another one returns <code>ErrBackpressure</code> without being accepted. Retry after a
+delay, or call <code>Flush</code>.</p>
+<p><strong>Reporting.</strong> <code>OnFlushError</code> receives every commit and maintenance failure,
+such as an expired credential, an unavailable bucket or a timed-out attempt:
+the first failure of a run, then at most once a minute while failures
+continue. Commit failures and maintenance failures are separate runs, and
+each ends, with a log line, at its next success. Without <code>OnFlushError</code>, the
+writer logs a warning instead. Your own cancellation or deadline in <code>Flush</code>
+is returned to you, not reported.</p>
+<p><code>OnFlushError</code> runs on its own goroutine. It may call <code>Close</code>, and it may run
+after <code>Close</code> returns, so it must not use anything you tear down on close.</p>
+<p><strong>Some failures need a person.</strong> Missing permissions, a deleted bucket, a
+manifest entry the storage rejects, or <code>ErrCommitIndeterminate</code> will not fix
+themselves. The writer still never gives up: it retries every 30 seconds, and
+<code>Put</code> keeps succeeding until <code>ErrBackpressure</code>. Alert on <code>OnFlushError</code>, or
+on <code>isledb_writer_oldest_uncommitted_timestamp_seconds</code> (see
+<a href="#prometheus-metrics">metrics</a>), fix the cause, or close the writer.</p>
+<p><strong>Maintenance commands</strong> are applied by the same committer, in order with
+data commits. A failure to apply one is reported and retried; it never holds
+up data commits. See <a href="#run-maintenance">Run maintenance</a>.</p>
+<h3 id="shutting-down">Shutting down</h3>
+<p><code>Drain</code> stops new writes and commits everything accepted, retrying while
+there is time; <code>Close</code> then finishes the writer:</p>
+<pre><code class="language-go">func shutdownWriter(ctx context.Context, w *isledb.Writer) error {
+    // 1. Take no more writes, and commit every accepted one. Put and Delete
+    //    now return ErrWritesStopped; failed attempts are retried until ctx.
+    drainErr := w.Drain(ctx)
+
+    // 2. Finish the writer: one attempt, then everything it runs stops.
+    closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+    return errors.Join(drainErr, w.Close(closeCtx))
+}
+</code></pre>
+<ul>
+<li><strong>Spend most of the shutdown window in <code>Drain</code>.</strong> It returns nil once every
+write the writer accepted is in object storage; <code>ErrFenced</code> at once if
+another writer took over; or the context's error, with the last commit
+failure, when time runs out. It works without a flush interval.</li>
+<li><strong>Rolling your own:</strong> <code>Drain</code> is <code>StopWrites</code> plus a retry loop. Call
+<code>StopWrites</code> first, then wait for <code>WaitCommitted(ctx, w.AcceptedSequence())</code>,
+calling <code>Flush</code> if there is no flush interval. Without <code>StopWrites</code>, other
+goroutines can keep calling <code>Put</code> while you flush, and <code>Flush</code> only covers
+writes accepted before it was called.</li>
+<li><strong>Give <code>Close</code> its own deadline,</strong> long enough for one commit attempt (30
+seconds plus one second per MiB pending). After a successful <code>Drain</code> it has
+nothing left to commit.</li>
+<li><strong><code>Close</code> always finishes the writer,</strong> whether or not its attempt
+succeeds; after it returns, nothing of the writer is running. It returns
+nil when everything is committed. Otherwise its error names the sequence
+range not known to be committed: those writes are unknown, not confirmed
+lost, and the range tells you what to check or replay.</li>
+<li><strong>Do not pass <code>Close</code> a context that has already ended:</strong> it then finishes
+the writer without attempting a commit.</li>
+</ul>
+<p><code>DB.Close</code> is cleanup, not the durability step. It closes a writer still open
+with a fixed 30-second deadline and no retry, and returns the writer's error.
+That is enough when nothing is pending; otherwise call <code>Drain</code> and
+<code>Writer.Close</code> yourself first.</p>
+<p>To keep a crash cheap, set <code>Flush.Interval</code> so at most one interval of writes
+is unflushed.</p>
+<h3 id="writer-options">Writer options</h3>
+<pre><code class="language-go">type WriterOptions struct {
+    OwnerID      string
+    Memtable     WriterMemtableOptions
+    Flush        WriterFlushOptions
+    Maintenance  WriterMaintenanceOptions
+    Values       ValueOptions
+    OnFlushError func(error)
+    Metrics      *WriterMetrics
+}
+
+type WriterMemtableOptions struct {
+    TargetBytes         int64
+    MaxPendingMemtables int
+}
+
+type WriterFlushOptions struct {
+    Interval time.Duration
+}
+
+type WriterMaintenanceOptions struct {
+    PollInterval time.Duration
+}
+
+type ValueOptions struct {
+    MaxKeyBytes   int
+    MaxValueBytes int64
+}
+
+func DefaultWriterOptions() WriterOptions
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th align="right">Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>OwnerID</code></td>
+<td align="right">generated</td>
+<td>Stable identity stored in the writer fence</td>
+</tr>
+<tr>
+<td><code>Memtable.TargetBytes</code></td>
+<td align="right">16 MiB</td>
+<td>Size at which the active memtable is frozen and queued</td>
+</tr>
+<tr>
+<td><code>Memtable.MaxPendingMemtables</code></td>
+<td align="right">4</td>
+<td>Frozen memtables waiting to commit before <code>ErrBackpressure</code></td>
+</tr>
+<tr>
+<td><code>Flush.Interval</code></td>
+<td align="right">1 second</td>
+<td>Background commit cadence; <strong>zero turns it off</strong></td>
+</tr>
+<tr>
+<td><code>Maintenance.PollInterval</code></td>
+<td align="right">1 second</td>
+<td>How often the writer checks for maintenance commands</td>
+</tr>
+<tr>
+<td><code>Values.MaxKeyBytes</code></td>
+<td align="right">64 KiB</td>
+<td>Largest accepted key</td>
+</tr>
+<tr>
+<td><code>Values.MaxValueBytes</code></td>
+<td align="right">16 MiB</td>
+<td>Largest accepted value</td>
+</tr>
+<tr>
+<td><code>OnFlushError</code></td>
+<td align="right"><code>nil</code></td>
+<td>Callback for commit and maintenance failures; see <a href="#failures-and-retries">Failures and retries</a></td>
+</tr>
+<tr>
+<td><code>Metrics</code></td>
+<td align="right"><code>nil</code></td>
+<td>Optional Prometheus observations</td>
+</tr>
+</tbody>
+</table>
+<p><code>Flush.Interval</code> is the one option where zero does not mean &quot;default&quot;: it
+disables background flushing. Start from <code>DefaultWriterOptions</code> when you want
+every default.</p>
+<h2 id="read-data">Read data</h2>
+<pre><code class="language-go">type ReaderOpenOptions struct {
+    CacheDir       string
+    DiskCacheSize  int64
+    BlockCacheSize int64
+    BloomCacheSize int64
+    Views          ReaderViewPolicy
+    ReadCache      ReadCacheOptions
+    Metrics        *ReaderMetrics
+}
+
+type ReaderViewPolicy struct {
+    RefreshAfter time.Duration
+    Manual       bool
+    MaxLag       time.Duration
+}
+
+type ReadCacheOptions struct {
+    URL           string
+    Token         string
+    HTTPClient    *http.Client
+    Timeout       time.Duration
+    MaxCurrentAge time.Duration
+}
+
+func DefaultReaderOpenOptions(cacheDir string) ReaderOpenOptions
+</code></pre>
+<p><code>CacheDir</code> is required, and only one live reader process may use it. Zero
+sizes select the defaults; negative sizes are rejected.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th align="right">Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DiskCacheSize</code></td>
+<td align="right">8 GiB</td>
+<td>Bytes kept on disk: SST metadata, Bloom filters and SST data. Kept across restarts; the reader never deletes stale SSTs from it on its own (see <code>PruneDiskCache</code> under <a href="#prefetch-ssts-to-disk">Prefetch SSTs to disk</a>)</td>
+</tr>
+<tr>
+<td><code>BlockCacheSize</code></td>
+<td align="right">256 MiB</td>
+<td>Decoded SST blocks kept in memory</td>
+</tr>
+<tr>
+<td><code>BloomCacheSize</code></td>
+<td align="right">64 MiB</td>
+<td>Parsed Bloom filters kept in memory</td>
+</tr>
+<tr>
+<td><code>Views.RefreshAfter</code></td>
+<td align="right">1 minute</td>
+<td>How often the view is refreshed in the background (at least 1 second)</td>
+</tr>
+<tr>
+<td><code>Views.Manual</code></td>
+<td align="right"><code>false</code></td>
+<td>Leave publishing newer views to the application; see <a href="#prepare-views-before-reads-switch-to-them">Prepare views before reads switch to them</a></td>
+</tr>
+<tr>
+<td><code>Views.MaxLag</code></td>
+<td align="right">5 minutes, or a quarter of <code>MaxPinnedViewAge</code> if shorter</td>
+<td>In manual mode, how long the published view may stay outdated before the reader publishes the newest view itself. A value set explicitly must be below half the store's <code>MaxPinnedViewAge</code>, or open fails with <code>ErrInvalidReaderOptions</code>; if the store's first writer later sets a shorter age, half of it is used and a warning logged once</td>
+</tr>
+<tr>
+<td><code>ReadCache.URL</code></td>
+<td align="right">empty</td>
+<td>A regional read cache (<code>isledb cache</code>) to read SSTs and manifest pages and snapshots through before storage; empty reads storage directly</td>
+</tr>
+<tr>
+<td><code>ReadCache.Token</code></td>
+<td align="right">empty</td>
+<td>Sent as <code>Authorization: Bearer &lt;token&gt;</code></td>
+</tr>
+<tr>
+<td><code>ReadCache.HTTPClient</code></td>
+<td align="right"><code>nil</code></td>
+<td>For TLS, client certificates or a custom transport; <code>nil</code> selects a client with connection reuse</td>
+</tr>
+<tr>
+<td><code>ReadCache.Timeout</code></td>
+<td align="right">10 seconds</td>
+<td>How long a read waits for the cache before reading storage instead</td>
+</tr>
+<tr>
+<td><code>ReadCache.MaxCurrentAge</code></td>
+<td align="right">5 seconds</td>
+<td>The oldest copy of <code>CURRENT</code> a refresh takes from the cache</td>
+</tr>
+<tr>
+<td><code>Metrics</code></td>
+<td align="right"><code>nil</code></td>
+<td>Optional Prometheus observations</td>
+</tr>
+</tbody>
+</table>
+<p>With a read cache, every read of an SST, a manifest page or a manifest
+snapshot is sent to it first: a read the cache
+cannot answer, for any reason (down, slow, refused, missing object), is read
+from storage instead, and everything read is verified as it is from storage,
+so the cache can make reads slower but never wrong. A scan's reads past the
+first 64 KiB of each SST ask the cache not to keep what it reads.
+A cache that stops answering costs a few reads one timeout each, then is
+bypassed: after 3 timeouts or connection failures in a row, reads go
+straight to storage for 5 seconds, then one read tries the cache again, and
+the first answer from it ends the bypass. Refusals and size mismatches do
+not cause a bypass; the cache is answering, and the next read would fail the
+same way.</p>
+<p>Damaged bytes from the cache do not fail reads. A manifest page or snapshot,
+a small SST read whole, or a Bloom filter that fails its checksum is read
+again from storage. Any other part of an SST is checked later, by its block
+checksums; when that finds damage, the reader reads that SST from storage
+for the next ten minutes, and its retry succeeds.</p>
+<p><code>ReaderMetrics.ReadCacheReads</code> counts reads the cache answered and
+<code>ReadCacheFallbacks</code> those that went to storage, by reason: <code>timeout</code>,
+<code>unavailable</code>, <code>not_found</code>, <code>size_mismatch</code>, <code>refused</code>, <code>invalid</code>,
+<code>bypassed</code> while the cache is skipped, <code>checksum_mismatch</code> for bytes from
+the cache that failed their checksum, or <code>after_damage</code> for reads of an SST
+found damaged recently. A steady count of the last two points at damaged
+chunks on the cache's disk. <code>ReadCacheCurrent</code> counts refreshes that asked
+the cache for <code>CURRENT</code>, by outcome: <code>relayed</code>, or <code>too_old</code>, <code>behind</code> or
+<code>failed</code>, which read storage instead; <code>ReadCacheCurrentAge</code> is the age of the
+last copy the cache gave; <code>ReadCacheDoorbells</code> counts long-poll answers:
+<code>rang</code>, <code>quiet</code> or <code>error</code>. A refused read or a size mismatch
+points at a misconfiguration and is also logged, at most once a minute; the
+start and end of a bypass are logged too. A bad URL fails <code>OpenReader</code> with
+<code>ErrInvalidReaderOptions</code>.</p>
+<p><strong>Refreshes through the cache.</strong> A refresh reads <code>CURRENT</code> from the cache's
+copy, which the cache reads from storage twice a second. The copy comes with
+its age, and the view's lifetime is counted from when the cache read it from
+storage, never from when the reader got it. A copy older than
+<code>MaxCurrentAge</code>, from a cache that cannot reach storage, or behind the view
+the reader already has, is not taken: the refresh reads storage instead.
+<code>Refresh</code> always reads storage, so it sees every commit made before it was
+called. Opening a reader reads storage too. Because the age is subtracted, a reader that
+refreshes through the cache shows a view loaded a little earlier, by the
+copy's age, than one that reads storage: <code>view_loaded_timestamp</code> sits behind on cached
+readers by the copy's age, normally under a second, by design.</p>
+<p>The reader also holds a long poll on the cache, which answers as soon as the
+cache sees a new commit; the reader then refreshes as <code>RequestRefresh</code> does.
+New commits reach readers within about half a second, with <code>RefreshAfter</code>
+left as a safety net that can be set long. If the long poll fails, the
+reader retries it after a random wait of up to a few seconds, growing to 30
+seconds while it keeps failing; refreshes on <code>RefreshAfter</code> go on regardless.</p>
+<pre><code class="language-go">func (r *Reader) Get(ctx context.Context, key []byte) ([]byte, bool, error)
+func (r *Reader) Scan(ctx context.Context, minKey, maxKey []byte) ([]KV, error)
+func (r *Reader) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
+func (r *Reader) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
+func (r *Reader) Snapshot(ctx context.Context) (*Snapshot, error)
+func (r *Reader) BootstrapView(ctx context.Context) (*BootstrapView, error)
+func (r *Reader) ChangeHead(ctx context.Context) (ChangeCursor, error)
+func (r *Reader) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
+func (r *Reader) PruneDiskCache(ctx context.Context) (int, error)
+func (r *Reader) Refresh(ctx context.Context) error
+func (r *Reader) RequestRefresh()
+func (r *Reader) ViewPosition() ViewPosition
+func (r *Reader) NextView(ctx context.Context) (*NextView, error)
+func (r *Reader) DiskCacheStats() DiskCacheStats
+func (r *Reader) BlockCacheStats() CacheStats
+func (r *Reader) OpenSSTCacheStats() CacheStats
+func (r *Reader) BloomCacheStats() CacheStats
+func (r *Reader) ManifestPageCacheStats() CacheStats
+func (r *Reader) Close() error
+
+type KV struct {
+    Key   []byte
+    Value []byte
+}
+</code></pre>
+<ul>
+<li><code>Get</code> returns <code>found == false</code> for a key that is missing, deleted or
+expired.</li>
+<li><strong>Every range is half-open, <code>[minKey, maxKey)</code>:</strong> <code>Scan</code>, <code>ScanLimit</code>,
+<code>IteratorOptions</code>, <code>Snapshot.ScanLimit</code>, snapshot iterators and
+<code>PrefetchOptions.Range</code>. A nil or empty bound leaves that side open. Because
+the upper bound is exclusive, <code>PrefixRange(prefix)</code> can be passed to any
+range API as is.</li>
+<li><code>Scan</code> builds the whole result in memory. <code>ScanLimit</code> stops after <code>limit</code>
+results; zero or a negative limit means no limit. For large ranges, use an
+iterator.</li>
+<li><code>Refresh</code> loads the latest commits now; see
+<a href="#freshness-and-outages">Freshness and outages</a>.</li>
+<li><code>Prefetch</code> downloads only into the disk cache's free space, so it never
+evicts what is already cached. SSTs that do not fit are counted in
+<code>PrefetchStats.SkippedSSTs</code> and load on demand.</li>
+<li>When a refresh retires SSTs, after a compaction, the reader deletes them
+from its disk cache in the background, at most 1,000 files a second so the
+deletes do not slow lookups, keeping the space for data a view can read.
+<code>isledb_reader_dead_ssts_pending</code> shows how many are still queued.</li>
+</ul>
+<h3 id="iterate-without-loading-the-whole-range">Iterate without loading the whole range</h3>
+<pre><code class="language-go">iter, err := reader.NewIterator(ctx, isledb.IteratorOptions{
+    MinKey: []byte(&quot;user:&quot;), // inclusive; nil means the beginning
+    MaxKey: []byte(&quot;user;&quot;), // exclusive; nil means the end
+})
+if err != nil {
+    return err
+}
+defer func() { _ = iter.Close() }()
+
+for iter.Next() {
+    key, value := iter.Key(), iter.Value()
+    _, _ = key, value
+}
+if err := iter.Err(); err != nil {
+    return err
+}
+</code></pre>
+<pre><code class="language-go">func (it *Iterator) Next() bool
+func (it *Iterator) SeekGE(target []byte) bool
+func (it *Iterator) Key() []byte
+func (it *Iterator) Value() []byte
+func (it *Iterator) Valid() bool
+func (it *Iterator) Err() error
+func (it *Iterator) Close() error
+</code></pre>
+<h3 id="consistent-snapshots">Consistent snapshots</h3>
+<p>A snapshot pins one loaded view. It does not move when its reader refreshes.</p>
+<pre><code class="language-go">type Version struct { /* opaque */ }
+
+func (v Version) String() string
+func (v Version) IsZero() bool
+
+func (s *Snapshot) Version() Version
+func (s *Snapshot) ViewPosition() ViewPosition
+func (s *Snapshot) Get(ctx context.Context, key []byte) ([]byte, bool, error)
+func (s *Snapshot) ScanLimit(ctx context.Context, minKey, maxKey []byte, limit int) ([]KV, error)
+func (s *Snapshot) NewIterator(ctx context.Context, opts IteratorOptions) (*Iterator, error)
+func (s *Snapshot) Close() error
+</code></pre>
+<p><code>ViewPosition</code> is the position of the view the snapshot reads, fixed when it
+was taken, unlike <code>Reader.ViewPosition</code>, which moves with refreshes. Report
+it beside a read to say exactly which view answered: a write whose
+<code>WaitCommitted</code> position is at or below it is included.</p>
+<p>A snapshot and its iterators share the view's fixed deadline
+(<code>MaxPinnedViewAge</code> after it was loaded); opening another handle does not
+extend it. Past it, operations return <code>ErrSnapshotExpired</code>,
+<code>ErrIteratorExpired</code> or <code>ErrReadViewExpired</code>: take a new snapshot rather than
+retrying. Closing the reader invalidates its snapshots and iterators.</p>
+<p>A snapshot of an older view keeps reading correctly after the reader moves
+on: object storage keeps its SSTs for <code>MaxPinnedViewAge</code>. Once a refresh
+retires those SSTs, the reader deletes them from its disk cache, so the
+snapshot may fetch them again from object storage. A long <code>BootstrapView</code>
+load running across a compaction is where that shows.</p>
+<h3 id="load-state-then-follow-the-change-feed">Load state, then follow the change feed</h3>
+<p><code>BootstrapView</code> gives you a snapshot and the exact change-feed position that
+follows it, both from the same manifest:</p>
+<pre><code class="language-go">type BootstrapView struct {
+    Snapshot *Snapshot
+    Cursor   ChangeCursor
+    Version  Version
+}
+</code></pre>
+<p>The snapshot holds every write committed before <code>Cursor</code>; <code>Cursor</code> is the
+first feed position the snapshot does not contain. <code>Version</code> matches
+<code>Snapshot.Version()</code> and is handy in checkpoint metadata. Build a local copy
+from the snapshot, save <code>Cursor</code> with it, and then consume only later
+changes:</p>
+<pre><code class="language-go">view, err := reader.BootstrapView(ctx)
+if err != nil {
+    return err
+}
+defer view.Snapshot.Close()
+
+iterator, err := view.Snapshot.NewIterator(ctx, isledb.IteratorOptions{})
+if err != nil {
+    return err
+}
+defer iterator.Close()
+
+for iterator.Next() {
+    if err := materialize(iterator.Key(), iterator.Value()); err != nil {
+        return err
+    }
+}
+if err := iterator.Err(); err != nil {
+    return err
+}
+
+if err := saveCheckpointCursor(view.Cursor.String()); err != nil {
+    return err
+}
+</code></pre>
+<ul>
+<li>Do not build this pair from <code>Snapshot()</code> and <code>ChangeReader.Bounds()</code>
+separately: a commit landing between the two calls gives a cursor newer
+than the snapshot, and you would skip that change.</li>
+<li>The change feed must be enabled, or this returns <code>ErrChangeFeedDisabled</code>.</li>
+<li>Finish before the snapshot's deadline, and keep change-feed retention long
+enough that <code>Cursor</code> is still there when you start consuming.</li>
+<li>Like <code>Snapshot</code>, it uses the reader's current view; call <code>Refresh</code> first if
+you need the very latest commit.</li>
+<li><code>ChangeHead</code> returns only the cursor, without a snapshot: the first
+position the reader's view does not hold. A consumer at that cursor has
+every change this reader has loaded. It returns the same errors.</li>
+</ul>
+<h3 id="prefetch-ssts-to-disk">Prefetch SSTs to disk</h3>
+<pre><code class="language-go">type KeyRange struct {
+    Min []byte // inclusive; nil means the beginning
+    Max []byte // exclusive; nil means the end
+}
+
+func PrefixRange(prefix []byte) KeyRange
+
+type PrefetchOptions struct {
+    Range       KeyRange
+    All         bool
+    MaxSSTs     int
+    MaxBytes    int64
+    Concurrency int
+}
+
+type PrefetchStats struct {
+    MatchedSSTs int
+    CachedSSTs  int
+    SkippedSSTs int
+    BytesRead   int64
+}
+</code></pre>
+<pre><code class="language-go">stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{
+    Range:       isledb.PrefixRange([]byte(&quot;user:&quot;)),
+    MaxBytes:    256 &lt;&lt; 20,
+    Concurrency: 4,
+})
+</code></pre>
+<p><code>Prefetch</code> downloads the selected SSTs (metadata, Bloom filter and data) into
+the disk cache, fetching only what is missing and sharing requests with
+concurrent reads.</p>
+<ul>
+<li>Use <code>All: true</code> to prefetch the whole keyspace.</li>
+<li>Zero <code>MaxSSTs</code> or <code>MaxBytes</code> means no limit beyond the disk cache itself.
+<code>MaxBytes</code> bounds what this call downloads, each SST's Bloom filter
+included, so repeated calls warm a large range in steps.</li>
+<li>It skips SSTs already on disk and selects only what fits in the disk
+cache's free space, each SST counted with its Bloom filter, so repeating a
+prefetch larger than the cache keeps what the last one cached. SSTs left
+out count in <code>SkippedSSTs</code>.</li>
+<li><code>CachedSSTs</code> counts selected SSTs wholly on disk when it returns;
+<code>BytesRead</code> counts bytes it fetched.</li>
+<li>It uses the reader's current view and does not force a refresh.</li>
+<li><strong>Reusing a <code>CacheDir</code> across restarts.</strong> The disk cache keeps its files,
+so a restarted reader can find it full of SSTs that compactions replaced
+while it was down. Prefetch never evicts, so it would cache nothing. Call
+<code>PruneDiskCache</code> after opening and before the start-up prefetch: it deletes
+every SST that neither the published view nor a view held for <code>NextView</code>
+names, and returns how many cache entries it deleted. It deletes without
+pacing, so call it before serving reads; a snapshot of an older view
+fetches again what it needs. The reader never prunes on its own, at open
+or later.</li>
+<li><strong>Stale entries on a long-running reader.</strong> The reader deletes a retired
+SST's files once, at the publish that retires it. A snapshot, iterator or
+<code>BootstrapView</code> opened before that publish that reads the SST afterwards
+caches it again, and nothing deletes it a second time. Such entries are
+evicted first when lookups need space, so reads are unaffected, but until
+then they take free space that prefetch and <code>NextView.Prefetch</code> could use.
+A reader that serves long reads of older views across compactions and
+also warms views can call <code>PruneDiskCache</code> periodically; with nothing to
+delete it only scans the cache's index in memory.</li>
+<li><strong>Partly cached SSTs count at full size.</strong> An SST with some parts already
+on disk, from an interrupted prefetch or from lookups, is selected only if
+its whole size fits in free space. On a nearly full cache it may be
+skipped and load on demand.</li>
+</ul>
+<pre><code class="language-go">reader, err := db.OpenReader(ctx, opts)
+if err != nil {
+    return err
+}
+if _, err := reader.PruneDiskCache(ctx); err != nil {
+    return err
+}
+stats, err := reader.Prefetch(ctx, isledb.PrefetchOptions{All: true})
+</code></pre>
+<ul>
+<li>A reader runs one prefetch at a time, <code>NextView.Prefetch</code> included; another
+waits for it, or for its context to end. Each then sees the space the last
+one used, so two never fill the same free space.</li>
+</ul>
+<h3 id="freshness-and-outages">Freshness and outages</h3>
+<p>A reader answers from a loaded view of the manifest. The view is refreshed in
+the background every <code>Views.RefreshAfter</code>; reads never start a refresh or wait
+for one.</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>What reads do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Refreshes succeed</td>
+<td>The view is never older than <code>RefreshAfter</code>.</td>
+</tr>
+<tr>
+<td>A refresh fails, or takes over 30 seconds</td>
+<td>Reads keep using the loaded view, and count in <code>stale_reads_total</code>. The next refresh is tried about 30 seconds later (15 to 45, or <code>RefreshAfter</code> if that is shorter). A warning is logged at most once a minute, and an info line when refreshes recover.</td>
+</tr>
+<tr>
+<td>The view is older than <code>MaxPinnedViewAge</code></td>
+<td>A read waits for a refresh and fails if it fails, or with <code>ErrReadViewExpired</code> if storage's <code>CURRENT</code> is behind the view. Background refreshes keep trying, so reads work again as soon as storage answers.</td>
+</tr>
+</tbody>
+</table>
+<p>So during an outage reads can be up to <code>MaxPinnedViewAge</code> old, and they stay
+correct: every SST a view names is kept until the view expires.</p>
+<p><strong>Spread-out refreshes.</strong> Each reader picks a random offset within
+<code>RefreshAfter</code> when it opens and refreshes exactly once per interval at that
+offset. Readers started together by a deploy stay spread evenly; neither a
+forced <code>Refresh</code> nor a failure moves the schedule, and retries after an
+outage stay on the reader's own offset. N readers read <code>CURRENT</code> a steady
+N / <code>RefreshAfter</code> times a second. The one exception is opening: each reader
+loads its first view as it opens.</p>
+<p>An idle reader still reads <code>CURRENT</code> once per interval.</p>
+<p><strong><code>Refresh</code></strong> always reloads, waits and returns any failure, so a caller that
+needs the latest commits learns when it cannot have them. It reflects every
+commit made before the call, even when it joins a refresh already in
+progress.</p>
+<p><strong><code>RequestRefresh</code></strong> starts the background refresh now instead of at the next
+interval and returns at once. Use it when something tells you the data
+changed, such as a message from the writer, so readers pick up the change
+without polling more often. It runs the refresh the interval would run, so in
+manual mode the newer view is held for <code>NextView</code> and warmed before it is
+published. Requests within a second of the last are merged into one refresh at
+the end of that second, never dropped. Failures are logged and counted, as for
+any background refresh. Keep <code>RefreshAfter</code> as the safety net for a missed
+request.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>Refresh</code></th>
+<th><code>RequestRefresh</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Caller waits</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td>In manual mode</td>
+<td>publishes at once</td>
+<td>holds the view for <code>NextView</code></td>
+</tr>
+<tr>
+<td>Errors</td>
+<td>returned</td>
+<td>logged and counted</td>
+</tr>
+<tr>
+<td>Use for</td>
+<td>read-your-writes</td>
+<td>&quot;the data changed&quot; notifications</td>
+</tr>
+</tbody>
+</table>
+<p>Internals of how a reader fetches and caches data are in
+<a href="#appendix-how-a-reader-reads-ssts">the appendix</a>.</p>
+<h3 id="prepare-views-before-reads-switch-to-them">Prepare views before reads switch to them</h3>
+<p>A compaction rewrites data into new SSTs. When reads switch to a view naming
+them, the first lookups of hot keys each wait for object storage. In manual
+mode the application takes each newer view the reader loads, prepares it, for
+example by downloading its new SSTs, and only then switches reads to it.</p>
+<pre><code class="language-go">type ViewPosition uint64
+
+type SSTInfo struct {
+    ID             string
+    Level          int
+    Size           int64 // in the manifest
+    BloomSize      int64 // stored after Size in the same object
+    MinKey, MaxKey []byte
+}
+
+func (v *NextView) Previous() ViewPosition
+func (v *NextView) Next() ViewPosition
+func (v *NextView) Version() Version
+func (v *NextView) Added() []SSTInfo
+func (v *NextView) Removed() []SSTInfo
+func (v *NextView) Snapshot() (*Snapshot, error)
+func (v *NextView) Prefetch(ctx context.Context, opts PrefetchOptions) (PrefetchStats, error)
+func (v *NextView) Publish() error
+func (v *NextView) Discard()
+</code></pre>
+<pre><code class="language-go">opts := isledb.DefaultReaderOpenOptions(&quot;/var/cache/isledb&quot;)
+opts.Views.Manual = true
+reader, err := db.OpenReader(ctx, opts)
+if err != nil {
+    return err
+}
+for {
+    next, err := reader.NextView(ctx) // waits for the reader's next newer load
+    if err != nil {
+        return err // ctx ended or the reader closed
+    }
+    if _, err := next.Prefetch(ctx, isledb.PrefetchOptions{All: true}); err != nil {
+        log.Printf(&quot;warming view %d: %v&quot;, next.Next(), err) // still correct, only colder
+    }
+    switch err := next.Publish(); {
+    case err == nil, errors.Is(err, isledb.ErrViewChanged), errors.Is(err, isledb.ErrNextViewExpired):
+        // Published, or another view was; take the next one.
+    default:
+        return err
+    }
+}
+</code></pre>
+<ul>
+<li><strong>The reader keeps loading.</strong> Every <code>RefreshAfter</code> it loads the manifest
+and renews an unchanged view, as in the default mode. A newer view is kept
+unpublished for the application instead of replacing the published one.</li>
+<li><strong><code>NextView</code></strong> returns a loaded view newer than the published one, waiting
+for the reader's next such load if none is pending. Each load is handed out
+once: after a view is taken, published or not, the next call waits for a
+later load, at most <code>RefreshAfter</code> away, so two goroutines calling it get
+different loads. Outside manual mode it returns <code>ErrNotManual</code>.</li>
+<li><strong>Positions.</strong> A <code>ViewPosition</code> is the manifest log position a view
+reflects; two views at the same position hold the same data.
+<code>Reader.ViewPosition()</code> returns the published one without a lock, so state
+prepared per view can be checked on every read. <code>Previous</code> is the published
+position when the view was handed out, <code>Next</code> the view's own.</li>
+<li><strong><code>Added</code> and <code>Removed</code></strong> list the SSTs the view names that the published
+one does not, and the reverse. An SST moved between levels is in neither.
+Caching an SST downloads <code>Size + BloomSize</code> bytes.</li>
+<li><strong><code>Prefetch</code></strong> downloads the <code>Added</code> SSTs, as <code>Reader.Prefetch</code> does, into
+the disk cache's free space only, so it never evicts what reads are using.
+Give the disk cache room for the largest compaction's output beside the
+live data, up to twice the store when a compaction rewrites all of it, or
+warming covers only part of a view and the rest loads on demand.</li>
+<li><strong><code>Snapshot</code></strong> reads the view before it is published. It never refreshes.</li>
+<li><strong><code>Publish</code></strong> is a compare-and-swap: it switches reads to the view only if
+the published view is still at <code>Previous</code>. Otherwise it returns
+<code>ErrViewChanged</code>. A view past its readable life, <code>MaxPinnedViewAge</code> from
+when it was loaded, returns <code>ErrNextViewExpired</code>. After <code>Publish</code> or
+<code>Discard</code>, every method that acts returns <code>ErrNextViewDone</code>. <code>Discard</code>
+releases nothing, so it is optional.</li>
+<li><strong><code>Refresh</code> publishes at once</strong> in manual mode too, for read-your-writes.
+A pending <code>Publish</code> then gets <code>ErrViewChanged</code>. To load a newer view early
+and still warm it, call <code>RequestRefresh</code> instead.</li>
+<li><strong>The safety net.</strong> If the published view has been outdated for <code>MaxLag</code>,
+the reader publishes the newest view it loaded itself, at that time and
+without reading object storage, so a stuck application loop costs
+freshness, never availability. If the published view expires while a
+newer, valid view is loaded, the reader publishes that view, even when
+refreshes are failing.</li>
+<li><strong>The cost is visibility.</strong> A change reaches reads after the next refresh
+plus the time to prepare it, at most <code>MaxLag</code>.</li>
+</ul>
+<h2 id="change-feed">Change feed</h2>
+<p>The change feed is optional. Open the database with it, then open the
+writer: the writer turns it on.</p>
+<pre><code class="language-go">db, err := isledb.Open(ctx, bucketURL, isledb.DBOptions{
+    Prefix: &quot;accounts&quot;,
+    ChangeFeed: &amp;isledb.ChangeFeedOptions{
+        Payload: isledb.ChangeFeedFullValues,
+    },
+})
+</code></pre>
+<pre><code class="language-go">type ChangeFeedPayload uint8
+
+const (
+    ChangeFeedKeysOnly ChangeFeedPayload = iota + 1
+    ChangeFeedFullValues
+)
+
+type ChangeFeedOptions struct {
+    Payload ChangeFeedPayload
+}
+</code></pre>
+<ul>
+<li><code>ChangeFeedKeysOnly</code> records the operation, key, sequence and expiry. It
+suits invalidation and &quot;fetch the current value&quot; consumers.</li>
+<li><code>ChangeFeedFullValues</code> also records PUT values, for replaying history.</li>
+</ul>
+<p>Only a writer turns the feed on: <code>OpenWriter</code>, on a <code>DB</code> opened with
+<code>ChangeFeed</code>, turns it on once it holds the database, before it takes any
+write. Opening a <code>DB</code> with <code>ChangeFeed</code> and no writer, for a reader, a change
+reader or maintenance, only checks the mode; it doesn't turn the feed on, so a
+running writer without the feed keeps committing.</p>
+<p>The payload mode is stored when the feed is turned on and cannot change.
+Reopening with a different mode returns <code>ErrChangeFeedPayloadMismatch</code>;
+reopening with <code>ChangeFeed == nil</code> adopts the stored mode. Turning the feed on
+for an existing database starts it at the current head; older history is not
+added.</p>
+<h3 id="types">Types</h3>
+<pre><code class="language-go">type ChangeOperation uint8
+
+const (
+    ChangePut ChangeOperation = iota + 1
+    ChangeDelete
+)
+
+type Change struct {
+    Sequence  uint64
+    Revision  ViewPosition
+    Operation ChangeOperation
+    Key       []byte
+    Value     []byte
+    HasValue  bool
+    ExpiresAt time.Time
+}
+
+type ChangeCursor struct { /* opaque */ }
+
+func ParseChangeCursor(value string) (ChangeCursor, error)
+func (c ChangeCursor) String() string
+func (c ChangeCursor) IsZero() bool
+func (c ChangeCursor) Compare(other ChangeCursor) int
+func (c ChangeCursor) MarshalText() ([]byte, error)
+func (c *ChangeCursor) UnmarshalText(text []byte) error
+
+type ChangeBounds struct {
+    Oldest  ChangeCursor
+    Head    ChangeCursor
+    Payload ChangeFeedPayload
+}
+
+type ChangePage struct {
+    Changes []Change
+    Next    ChangeCursor
+    Head    ChangeCursor
+}
+
+func (p ChangePage) CaughtUp() bool
+</code></pre>
+<p>In keys-only mode, a PUT has <code>HasValue == false</code> and a nil <code>Value</code>. In
+full-values mode, <code>HasValue</code> tells an empty value apart from a missing one.
+Deletes never carry a value.</p>
+<p><code>Revision</code> is the lowest view position that holds the change, that of the
+commit holding it; changes committed together share it. A <code>Reader</code> whose
+<code>ViewPosition</code> is at or past it sees the change. A write's <code>WaitCommitted</code>
+returns this position or a later one.
+In keys-only mode, read the key from a reader at or past <code>Revision</code>: one
+behind it can still return the old value.</p>
+<h3 id="read-pages">Read pages</h3>
+<pre><code class="language-go">type ChangeReadOptions struct {
+    MaxChanges int
+    MaxBytes   int64
+}
+
+func DefaultChangeReadOptions() ChangeReadOptions
+
+func (r *ChangeReader) Bounds(ctx context.Context) (ChangeBounds, error)
+func (r *ChangeReader) Read(ctx context.Context, from ChangeCursor, opts ChangeReadOptions) (ChangePage, error)
+func (r *ChangeReader) WaitForChanges(ctx context.Context, from ChangeCursor) error
+func (r *ChangeReader) LoadedHead() ChangeCursor
+func (r *ChangeReader) Close() error
+</code></pre>
+<ul>
+<li>Default page limits: 1,024 changes and 16 MiB. <code>MaxChanges</code> is capped at
+65,536. <code>MaxBytes</code> counts key and value bytes, not Go allocation overhead.
+A single change larger than <code>MaxBytes</code> is returned alone, so the cursor
+always moves.</li>
+<li>Zero fields select defaults; negative ones return
+<code>ErrInvalidChangeReadOptions</code>.</li>
+<li>A cursor is an opaque resume position: a manifest entry plus an index
+within its change batch. It is not <code>Change.Sequence</code>, and you cannot seek by
+sequence.</li>
+<li><code>Read</code> does not wait for new writes. A page may be empty yet still move the
+cursor past manifest entries with no user writes. Keep reading until
+<code>CaughtUp()</code> is true, then call <code>WaitForChanges</code> with the page's <code>Next</code>
+cursor, or poll at your own interval.</li>
+<li><code>WaitForChanges</code> returns once the view a <code>Read</code> would use has its head
+past the cursor. With a read cache it waits on the cache's long poll and
+returns within about half a second of a commit; with cache replicas that
+lag one another it waits, checking once a second, until the replica
+serving <code>CURRENT</code> has the commit too. Without a cache, or while the cache
+does not answer, it reads <code>CURRENT</code> every second. A cursor behind the view
+the reader holds returns at once, without a request. If a view cannot be
+loaded (storage failing while the cache does not answer), it returns that
+error; call it again to keep waiting. The head also moves for commits
+without user changes, so the next <code>Read</code> may return an empty page. It
+returns the context's error when the context ends, and
+<code>ErrChangeReaderClosed</code> when the reader closes.</li>
+<li><code>Read</code> reads <code>CURRENT</code> only when the cursor has reached the head of the
+view the reader holds, or that view has expired (<code>MaxPinnedViewAge</code>
+after it was read). Catching up through a backlog reads it about once; a
+caught-up reader reads it on each <code>Read</code>, to see new commits. Retention
+that advances meanwhile shows at the next view reload, as <code>Bounds</code> does;
+the changes the held view names stay in storage until it expires.</li>
+<li>With a read cache, a cursor past the head of the cache's copy of <code>CURRENT</code>
+is checked against <code>CURRENT</code> in storage before <code>Read</code> returns
+<code>ErrInvalidChangeCursor</code>, so a cursor from a newer view, such as another
+reader's, is never refused.</li>
+<li><code>LoadedHead</code> returns the head of the newest view the reader has loaded,
+without a request: every cursor up to it was in the feed. It is zero before
+the first load.</li>
+<li><code>Compare</code> orders two cursors: -1, 0 or +1 as the first comes before, at or
+after the second. A zero cursor, which reads from the oldest change, comes
+first.</li>
+</ul>
+<h3 id="read-the-feed-through-a-read-cache">Read the feed through a read cache</h3>
+<pre><code class="language-go">type ChangeReaderOptions struct {
+    ReadCache ReadCacheOptions
+    Metrics   *ReaderMetrics
+}
+</code></pre>
+<p><code>OpenChangeReader</code> takes at most one <code>ChangeReaderOptions</code>. With
+<code>ReadCache.URL</code> set, a change reader reads through the regional read cache
+(see <code>ReadCacheOptions</code> under <a href="#read-data">Read data</a>) before storage:</p>
+<ul>
+<li>The change batches a page needs, their indexes and blocks. Many readers
+tailing the feed read the same recent batches, which the cache keeps once
+for all of them. Every index and block has a checksum: bytes from the
+cache that fail it are read again from storage.</li>
+<li>The feed's view, <code>CURRENT</code>, under a Reader's rules: a copy older than
+<code>MaxCurrentAge</code>, or behind the view the reader holds, is read from storage
+instead, and the view's lifetime is counted from when the cache read it
+from storage. A retry after a missing batch reads storage.</li>
+<li>The manifest pages holding older change entries, checked against their
+reference.</li>
+<li><code>WaitForChanges</code>, through the cache's long poll.</li>
+</ul>
+<p>Any read the cache cannot answer is read from storage, so the feed returns
+the same changes either way. <code>Metrics</code> counts the cache's reads and
+fallbacks (<code>ReadCacheReads</code>, <code>ReadCacheFallbacks</code>), its <code>CURRENT</code> copies
+(<code>ReadCacheCurrent</code>, <code>ReadCacheCurrentAge</code>) and the long poll's answers
+(<code>ReadCacheDoorbells</code>). A bad URL fails <code>OpenChangeReader</code> with
+<code>ErrInvalidReaderOptions</code>. Each change reader with a read cache keeps its
+own in-memory cache of manifest pages, of up to 1,024 pages, as each Reader
+does.</p>
+<ul>
+<li>Change batches are split into compressed, checksummed blocks; a read fetches
+only the blocks its page needs and reuses decoded blocks from a bounded
+cache.</li>
+</ul>
+<h3 id="choose-where-to-start">Choose where to start</h3>
+<p>A zero cursor means &quot;no saved position&quot;, not &quot;start at the latest change&quot;.
+Pick the starting policy explicitly:</p>
+<pre><code class="language-go">bounds, err := reader.Bounds(ctx)
+if err != nil {
+    return err
+}
+
+// Replay every change still retained.
+replayCursor := bounds.Oldest
+
+// Skip existing history; consume only changes published after Bounds.
+tailCursor := bounds.Head
+</code></pre>
+<p><code>Oldest</code> is the first retained position. <code>Head</code> is just past everything
+<code>Bounds</code> saw, so a first read from it is usually empty and caught up. (A zero
+cursor passed to <code>Read</code> starts at <code>Oldest</code>, but calling <code>Bounds</code> makes the
+choice explicit.)</p>
+<p><strong>Save the starting cursor before you poll.</strong> Otherwise a process that picks
+<code>Head</code>, crashes before saving it, and restarts would pick a newer head and
+silently skip changes. After that, save <code>page.Next</code> only once the whole page
+has been applied.</p>
+<pre><code class="language-go">func drainChanges(
+    ctx context.Context,
+    reader *isledb.ChangeReader,
+    savedCursor string,
+    startAtHead bool,
+    apply func(isledb.Change) error,
+    saveCursor func(string) error,
+) error {
+    cursor, err := isledb.ParseChangeCursor(savedCursor)
+    if err != nil {
+        return err
+    }
+
+    if cursor.IsZero() {
+        bounds, err := reader.Bounds(ctx)
+        if err != nil {
+            return err
+        }
+        if startAtHead {
+            cursor = bounds.Head
+        } else {
+            cursor = bounds.Oldest
+        }
+        if err := saveCursor(cursor.String()); err != nil {
+            return err
+        }
+    }
+
+    options := isledb.DefaultChangeReadOptions()
+    for {
+        page, err := reader.Read(ctx, cursor, options)
+        if err != nil {
+            return err
+        }
+        for _, change := range page.Changes {
+            if err := apply(change); err != nil {
+                return err
+            }
+        }
+        if err := saveCursor(page.Next.String()); err != nil {
+            return err
+        }
+        cursor = page.Next
+        if page.CaughtUp() {
+            return nil
+        }
+    }
+}
+</code></pre>
+<h3 id="when-a-cursor-expires">When a cursor expires</h3>
+<p>If retention deletes changes past a saved cursor, <code>Read</code> refreshes its view
+and returns <code>ErrChangeCursorExpired</code>: there is a gap between your position
+and the oldest retained one. You can:</p>
+<ul>
+<li>restart from <code>Bounds().Oldest</code>, accepting the gap;</li>
+<li>rebuild derived state from a KV snapshot, then resume the feed (see
+<a href="#load-state-then-follow-the-change-feed">BootstrapView</a>);</li>
+<li>or, if you need every historical event, stop and recover explicitly; a
+current-state snapshot cannot recreate intermediate updates or deletes.</li>
+</ul>
+<h2 id="run-maintenance">Run maintenance</h2>
+<p>Maintenance compacts, checkpoints, applies change-feed retention and deletes
+retired objects. It is designed to run in its own process, against the same
+bucket and prefix:</p>
+<pre><code class="language-text">writer process       -&gt; buffers writes and commits them
+reader processes     -&gt; load views and read independently
+maintenance process  -&gt; prepares compaction, checkpoints and retention
+reclamation workers  -&gt; delete retired objects at their own bounded pace
+</code></pre>
+<p><strong>How its work is published.</strong> Maintenance never edits the manifest itself.
+It does the heavy work (for example, writing compacted SSTs), then stages a
+command in a small mailbox object, <code>maintenance/HEAD</code>. The active writer
+checks the mailbox in the background every
+<code>WriterOptions.Maintenance.PollInterval</code> (one second by default, each check
+bounded to 5 seconds) and applies the command with its next commit, in order
+with data commits. <code>Flush</code> never waits on the mailbox, so a slow or hung
+mailbox cannot delay commits. <code>Close</code> checks it once more so a command staged
+just before shutdown is not left behind, and a command superseded by a later
+one is skipped. Without a flush interval, a fetched command is applied at the
+next <code>Flush</code>, <code>Drain</code> or <code>Close</code>.</p>
+<p><strong>Deletion runs separately.</strong> SSTs, change batches, manifest snapshots and
+manifest pages are deleted in independent lanes at their own pace, so slow
+deletes never block compaction.</p>
+<pre><code class="language-go">func (m *Maintenance) Run(ctx context.Context) error
+func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error)
+func (m *Maintenance) Close(ctx context.Context) error
+</code></pre>
+<p><code>Run</code> continues until its context ends, <code>Close</code> is called, or another
+process takes over maintenance. Close with a fresh context, since the run
+context is usually already cancelled:</p>
+<pre><code class="language-go">func runMaintenance(ctx context.Context, db *isledb.DB) error {
+    maintenance, err := db.OpenMaintenance(ctx, isledb.DefaultMaintenanceOptions())
+    if err != nil {
+        return err
+    }
+
+    runErr := maintenance.Run(ctx)
+
+    closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    closeErr := maintenance.Close(closeCtx)
+
+    if errors.Is(runErr, context.Canceled) {
+        runErr = nil
+    }
+    return errors.Join(runErr, closeErr)
+}
+</code></pre>
+<p>For a scheduled job, call <code>RunOnce</code> instead:</p>
+<pre><code class="language-go">stats, err := maintenance.RunOnce(ctx)
+</code></pre>
+<p><code>RunOnce</code> makes one control pass and one bounded pass of each deletion lane.
+If it returns <code>MaintenanceWaitingForWriter</code>, it has staged a command that the
+writer must apply; the next run picks up from there. One scheduled run is a
+bounded step of progress, not a promise to clear the whole backlog.</p>
+<h3 id="maintenance-options">Maintenance options</h3>
+<pre><code class="language-go">type MaintenanceOptions struct {
+    IdleInterval        time.Duration
+    SSTCompaction       SSTCompactionOptions
+    ManifestCheckpoint  ManifestCheckpointOptions
+    ChangeFeedRetention *ChangeFeedRetentionOptions
+    Reclamation         ReclamationOptions
+    OnCycle             func(MaintenanceStats)
+    OnReclamationCycle  func(ReclamationCycleStats)
+    OnError             func(error)
+}
+
+type SSTCompactionOptions struct {
+    ReadConcurrency   int
+    ScratchDir        string
+    L0TriggerSSTs     int
+    BaseLevelBytes    int64
+    LevelGrowthFactor int
+    TargetSSTBytes    int64
+    L0ToBaseRatio     float64
+    L0MaxDepth        int
+    L0MaxAge          time.Duration
+}
+
+type ManifestCheckpointOptions struct {
+    TargetReplayPages uint64
+    TargetReplayBytes uint64
+}
+
+type ReclamationOptions struct {
+    MaxConcurrentDeletes int
+    SST                  DeleterOptions
+    ChangeFeed           DeleterOptions
+    Manifest             ManifestDeleterOptions
+}
+
+type DeleterOptions struct {
+    PollInterval      time.Duration
+    MaxObjectsPerPass int
+}
+
+type ManifestDeleterOptions struct {
+    DeleterOptions
+    AuditInterval time.Duration
+}
+
+func DefaultMaintenanceOptions() MaintenanceOptions
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th align="right">Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>IdleInterval</code></td>
+<td align="right">5 seconds</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.ReadConcurrency</code></td>
+<td align="right">4</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.ScratchDir</code></td>
+<td align="right">user cache directory, falling back to a per-user temporary directory</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.L0TriggerSSTs</code></td>
+<td align="right">8</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.BaseLevelBytes</code></td>
+<td align="right">512 MiB</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.LevelGrowthFactor</code></td>
+<td align="right">8</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.TargetSSTBytes</code></td>
+<td align="right">64 MiB</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.L0ToBaseRatio</code></td>
+<td align="right">1</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.L0MaxDepth</code></td>
+<td align="right">16 L0 files</td>
+</tr>
+<tr>
+<td><code>SSTCompaction.L0MaxAge</code></td>
+<td align="right">30 minutes</td>
+</tr>
+<tr>
+<td><code>ManifestCheckpoint.TargetReplayPages</code></td>
+<td align="right">64 pages</td>
+</tr>
+<tr>
+<td><code>ManifestCheckpoint.TargetReplayBytes</code></td>
+<td align="right">32 MiB</td>
+</tr>
+<tr>
+<td><code>ChangeFeedRetention</code></td>
+<td align="right"><code>nil</code>: history kept forever</td>
+</tr>
+<tr>
+<td><code>Reclamation.MaxConcurrentDeletes</code></td>
+<td align="right">4, shared by all lanes</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Deletion lane</th>
+<th align="right">Poll interval</th>
+<th align="right">Most objects per pass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SST</td>
+<td align="right">1 second</td>
+<td align="right">128</td>
+</tr>
+<tr>
+<td>Change feed</td>
+<td align="right">5 seconds</td>
+<td align="right">128</td>
+</tr>
+<tr>
+<td>Manifest snapshots and pages</td>
+<td align="right">1 minute</td>
+<td align="right">128</td>
+</tr>
+</tbody>
+</table>
+<p>The manifest lane also audits for orphaned objects once an hour
+(<code>AuditInterval</code>). <code>MaxObjectsPerPass</code> bounds normal work, but one SST
+retirement plan, already bounded, may finish in a single pass even if it goes
+over.</p>
+<p><strong>Scratch space.</strong> Compaction streams its inputs to <code>ScratchDir</code>, so a job is
+not limited by memory. Each store, role and fence epoch gets a private
+session directory below it. A clean close removes the session; a later epoch
+tries to remove abandoned ones, and a failed cleanup never stops maintenance
+from opening. IsleDB never deletes the configured directory itself or
+anything below it that it did not create.</p>
+<p><strong>How L0 is compacted.</strong> The writer saves a small L0 file at each flush.
+Once L0 holds <code>L0TriggerSSTs</code> files, each maintenance cycle does one of two
+things:</p>
+<ul>
+<li><strong>Merge L0 into L1</strong> when L0 holds at least <code>L0ToBaseRatio</code> of the L1 bytes
+it overlaps, when some key is covered by <code>L0MaxDepth</code> L0 files, or when L0's
+oldest data is <code>L0MaxAge</code> old. Files that overlap nothing in L1, as with
+keys written in order, move without being rewritten.</li>
+<li><strong>Otherwise, merge the newest L0 files with each other</strong> into one L0 file,
+so L1 isn't rewritten for a little new data. L0 then stays a few files deep,
+and each byte is rewritten a few times in small merges on its way to L1.</li>
+</ul>
+<p>With random keys, L0 overlaps nearly all of L1, so <code>L0ToBaseRatio</code> rarely
+triggers and <code>L0MaxDepth</code> decides when L0 is merged into L1.</p>
+<p>While L0 has work and is changing, maintenance runs a cycle every 2 seconds
+(5 seconds on Cloud Storage) instead of every <code>IdleInterval</code>.
+<code>SSTCompactionStats.L0Merges</code> counts the merges within L0.</p>
+<p>The first merge within L0 moves the database to layout version 3. Releases
+before this one refuse to open it from then on, so upgrade every process
+that opens the database before running this release's maintenance.</p>
+<p>Compacted SSTs are encoded with <code>DBOptions.SSTOutput.Compacted</code>. The
+compaction planner's limits are described in
+<a href="#appendix-compaction-limits">the appendix</a>.</p>
+<p><code>OnCycle</code> receives statistics for each control pass and <code>OnReclamationCycle</code>
+for each deletion pass; the types are in
+<a href="#appendix-maintenance-statistics">the appendix</a>.</p>
+<h3 id="change-feed-retention">Change-feed retention</h3>
+<p>Retention is off until <code>ChangeFeedRetention</code> is set:</p>
+<pre><code class="language-go">type ChangeFeedRetentionOptions struct {
+    RetainFor time.Duration
+}
+
+func DefaultChangeFeedRetentionOptions() ChangeFeedRetentionOptions
+
+options := isledb.DefaultMaintenanceOptions()
+retention := isledb.DefaultChangeFeedRetentionOptions() // seven days
+retention.RetainFor = 15 * 24 * time.Hour
+options.ChangeFeedRetention = &amp;retention
+</code></pre>
+<p><code>RetainFor</code> is a minimum age, not an exact deletion time: publishing,
+view-safety rules and paced deletion can keep objects longer.</p>
+<h2 id="prometheus-metrics">Prometheus metrics</h2>
+<pre><code class="language-go">func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics
+func DefaultReaderMetrics(constLabels prometheus.Labels) *ReaderMetrics
+</code></pre>
+<p>Set the result as <code>WriterOptions.Metrics</code> or <code>ReaderOpenOptions.Metrics</code>. The
+constructors create the collectors but do not register them; register them
+with your <code>prometheus.Registerer</code>.</p>
+<p><strong>Writer metrics</strong> cover puts, deletes, backpressure, flush counts, errors,
+latency and bytes, plus:</p>
+<ul>
+<li><code>isledb_writer_committed_sequence</code>: the highest sequence committed and
+visible to readers. Set at open from the manifest and after each commit, so
+it never counts writes still in memory and continues across a failover.</li>
+<li><code>isledb_writer_oldest_uncommitted_timestamp_seconds</code>: the Unix time the
+oldest uncommitted write was accepted, or 0 when everything is committed.
+Alert when commits keep failing:</li>
+</ul>
+<pre><code class="language-promql">time() - (isledb_writer_oldest_uncommitted_timestamp_seconds &gt; 0) &gt; 120
+</code></pre>
+<p><strong>Change-feed lag.</strong> Every <code>Change</code> carries the writer's sequence, so a
+consumer that exports its last applied <code>Change.Sequence</code> gets its lag from
+Prometheus with no extra reads. With several databases, label each one's
+metrics through <code>constLabels</code> and match on it:</p>
+<pre><code class="language-promql">clamp_min(
+  max by (db) (isledb_writer_committed_sequence)
+    - on(db) group_right isledb_follower_applied_sequence,
+  0)
+</code></pre>
+<p><code>clamp_min</code> hides brief negative values caused by scrape timing. Lag counts
+changes committed but not yet applied; writes still buffered in the writer
+are not committed and not counted.</p>
+<p><strong>Reader metrics</strong> cover refreshes, point reads, scans and SST range reads,
+plus:</p>
+<ul>
+<li><code>stale_reads_total</code>: reads answered from a view whose refresh failed (see
+<a href="#freshness-and-outages">Freshness and outages</a>);</li>
+<li><code>view_loaded_timestamp_seconds</code>: when the current view was loaded;
+<code>time() - isledb_reader_view_loaded_timestamp_seconds</code> is its age;</li>
+<li><code>dead_ssts_pending</code>: SSTs a publish retired that are not yet deleted from
+the disk cache. It rises after a compaction and drains; one that keeps
+rising means deletes fall behind compactions.</li>
+</ul>
+<p>In <a href="#prepare-views-before-reads-switch-to-them">manual mode</a>:</p>
+<ul>
+<li><code>next_view_publishes_total{result}</code>: <code>NextView.Publish</code> calls by result,
+<code>published</code>, <code>changed</code> or <code>expired</code>. Calls on a view already done, or on a
+closed reader, are not counted.</li>
+<li><code>view_outdated_since_timestamp_seconds</code>: when the published view became
+outdated, the load time of a newer view not yet published, or 0 when it is
+the newest loaded. Alert when preparation falls behind:</li>
+</ul>
+<pre><code class="language-promql">time() - (isledb_reader_view_outdated_since_timestamp_seconds &gt; 0) &gt; 60
+</code></pre>
+<ul>
+<li><code>view_safety_publishes_total</code>: views the reader published itself after
+<code>MaxLag</code>. A rising count means the application's loop is stuck or too
+slow.</li>
+</ul>
+<h2 id="error-reference">Error reference</h2>
+<p>Check sentinel errors with <code>errors.Is</code>:</p>
+<pre><code class="language-go">if errors.Is(err, isledb.ErrBackpressure) {
+    // Retry according to the application's admission policy.
+}
+</code></pre>
+<p>Storage and context errors can also be returned, wrapped. Log the complete
+error.</p>
+<h3 id="database-and-configuration">Database and configuration</h3>
+<table>
+<thead>
+<tr>
+<th>Error</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ErrInvalidDBOptions</code></td>
+<td>Invalid store policy, feed mode, SST encoding, or <code>OpenBucket</code> input</td>
+</tr>
+<tr>
+<td><code>ErrWriterAlreadyOpen</code></td>
+<td>This <code>DB</code> already has a writer</td>
+</tr>
+<tr>
+<td><code>ErrReaderAlreadyOpen</code></td>
+<td>This <code>DB</code> already has a KV reader</td>
+</tr>
+<tr>
+<td><code>ErrChangeFeedDisabled</code></td>
+<td>The change feed is not enabled</td>
+</tr>
+<tr>
+<td><code>ErrChangeFeedPayloadMismatch</code></td>
+<td>Requested payload differs from the stored mode</td>
+</tr>
+<tr>
+<td><code>ErrStorePolicyMismatch</code></td>
+<td>Writer policy differs from the stored store policy</td>
+</tr>
+<tr>
+<td><code>ErrCommitIndeterminate</code></td>
+<td>An uncertain commit can no longer be proven, because the manifest entries that would show it were retired</td>
+</tr>
+</tbody>
+</table>
+<h3 id="writer">Writer</h3>
+<table>
+<thead>
+<tr>
+<th>Error</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ErrBackpressure</code></td>
+<td>Too many memtables waiting to commit; the write was not accepted</td>
+</tr>
+<tr>
+<td><code>ErrInvalidMutation</code></td>
+<td>Empty or oversized key, oversized value, negative TTL, or an empty batch</td>
+</tr>
+<tr>
+<td><code>ErrBatchTooLarge</code></td>
+<td><code>Apply</code>: every mutation is valid but the batch does not fit one memtable; split it</td>
+</tr>
+<tr>
+<td><code>ErrInvalidWriterOptions</code></td>
+<td>Invalid limits, interval, identity, or memory settings</td>
+</tr>
+<tr>
+<td><code>ErrWritesStopped</code></td>
+<td>A write after <code>StopWrites</code>, <code>Drain</code> or while <code>Close</code> runs; accepted writes are still committing</td>
+</tr>
+<tr>
+<td><code>ErrWriterClosed</code></td>
+<td>The writer was closed</td>
+</tr>
+<tr>
+<td><code>ErrCommitTimeout</code></td>
+<td>A commit attempt ran out of its own deadline; the writes stay queued and are retried</td>
+</tr>
+<tr>
+<td><code>ErrFenced</code></td>
+<td>Another writer took over; this one commits nothing more</td>
+</tr>
+<tr>
+<td><code>ErrNilContext</code></td>
+<td>A nil context was passed</td>
+</tr>
+</tbody>
+</table>
+<h3 id="reader-and-snapshots">Reader and snapshots</h3>
+<table>
+<thead>
+<tr>
+<th>Error</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ErrInvalidReaderOptions</code></td>
+<td>Negative or sub-second refresh interval, negative <code>MaxLag</code>, or <code>MaxLag</code> not below half the store's <code>MaxPinnedViewAge</code></td>
+</tr>
+<tr>
+<td><code>ErrReaderClosed</code></td>
+<td>The reader was closed</td>
+</tr>
+<tr>
+<td><code>ErrNotManual</code></td>
+<td><code>NextView</code> on a reader not in manual mode</td>
+</tr>
+<tr>
+<td><code>ErrViewChanged</code></td>
+<td><code>Publish</code> found another view published since the view was handed out</td>
+</tr>
+<tr>
+<td><code>ErrNextViewExpired</code></td>
+<td>The next view passed <code>MaxPinnedViewAge</code> from its load before it was published</td>
+</tr>
+<tr>
+<td><code>ErrNextViewDone</code></td>
+<td>The next view was already published or discarded</td>
+</tr>
+<tr>
+<td><code>ErrReadViewExpired</code></td>
+<td>The reader's view passed <code>MaxPinnedViewAge</code></td>
+</tr>
+<tr>
+<td><code>ErrSnapshotClosed</code></td>
+<td>The snapshot was closed</td>
+</tr>
+<tr>
+<td><code>ErrSnapshotExpired</code></td>
+<td>The snapshot's view passed its deadline</td>
+</tr>
+<tr>
+<td><code>ErrIteratorExpired</code></td>
+<td>The iterator's view passed its deadline</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-feed-1">Change feed</h3>
+<table>
+<thead>
+<tr>
+<th>Error</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ErrChangeReaderClosed</code></td>
+<td>The change reader was closed</td>
+</tr>
+<tr>
+<td><code>ErrInvalidChangeCursor</code></td>
+<td>Cursor text is malformed or unsupported</td>
+</tr>
+<tr>
+<td><code>ErrChangeCursorExpired</code></td>
+<td>Retention deleted changes past the cursor</td>
+</tr>
+<tr>
+<td><code>ErrInvalidChangeReadOptions</code></td>
+<td>Negative page limit</td>
+</tr>
+<tr>
+<td><code>ErrCorruptChangeFeed</code></td>
+<td>Feed metadata in the manifest is inconsistent</td>
+</tr>
+<tr>
+<td><code>ErrCorruptChangeBatch</code></td>
+<td>A change batch's index, block or checksum is invalid</td>
+</tr>
+</tbody>
+</table>
+<h3 id="maintenance">Maintenance</h3>
+<table>
+<thead>
+<tr>
+<th>Error</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ErrMaintenanceAlreadyOpen</code></td>
+<td>This <code>DB</code> already has a maintenance handle</td>
+</tr>
+<tr>
+<td><code>ErrMaintenanceClosed</code></td>
+<td>Maintenance was closed</td>
+</tr>
+<tr>
+<td><code>ErrMaintenanceRunning</code></td>
+<td><code>Run</code> or <code>RunOnce</code> is already running</td>
+</tr>
+<tr>
+<td><code>ErrInvalidMaintenanceOptions</code></td>
+<td>Invalid interval, concurrency, or work bound</td>
+</tr>
+</tbody>
+</table>
+<h2 id="appendix-how-a-reader-reads-ssts">Appendix: how a reader reads SSTs</h2>
+<p>Every SST is read from object storage by byte range, through four caches:</p>
+<table>
+<thead>
+<tr>
+<th>Cache</th>
+<th>Holds</th>
+<th>Bounded by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open SSTs</td>
+<td>Parsed SST readers, up to 1,024, least recently used out first</td>
+<td>count</td>
+</tr>
+<tr>
+<td>Block cache</td>
+<td>Decoded index and data blocks</td>
+<td><code>BlockCacheSize</code></td>
+</tr>
+<tr>
+<td>Bloom cache</td>
+<td>Parsed Bloom filters</td>
+<td><code>BloomCacheSize</code></td>
+</tr>
+<tr>
+<td>Disk cache, under <code>CacheDir</code></td>
+<td>SST metadata and Bloom filters; whole small SSTs and 128 KiB chunks of larger ones. One budget; data is evicted first, never metadata to make room for data</td>
+<td><code>DiskCacheSize</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fetching.</strong></p>
+<ul>
+<li>An SST of up to 4 MiB is fetched whole, with its Bloom filter, in one
+request, and its SHA-256 is checked against the manifest.</li>
+<li>A larger SST's metadata and Bloom filter are fetched in one request each;
+its data in aligned 128 KiB chunks. A lookup fetches the chunk holding its
+block.</li>
+<li>A scan reads ahead: each request fetches twice as many chunks as the last,
+up to 4 MiB, and a seek elsewhere starts small again.</li>
+<li>No request repeats bytes already on disk or being fetched, and concurrent
+reads of the same part share one request.</li>
+<li>Data blocks of large SSTs are checked by their own checksums, which catch
+damaged bytes but not a different, internally valid object stored under the
+SST's name.</li>
+</ul>
+<p><strong>What gets cached.</strong> A point lookup caches the blocks it reads, in memory
+and on disk. A scan, and each iterator seek, caches only its first 64 KiB of
+keys and values in each SST, so short reads (a page, a prefix, a seek) are
+warm when repeated. Reading further uses buffers of its own, still drawing on
+what is cached: a long scan adds at most about 64 KiB per SST to memory and
+two chunks to disk, and never evicts what lookups reuse.</p>
+<p><strong>Speed and eviction.</strong> A read of an already-open SST parses no metadata; a
+warm lookup takes about 1 µs. Each cache evicts least recently used first.
+Nothing is dropped when an SST leaves the manifest, so a snapshot still
+reading it stays warm. A cached part that proves damaged is dropped and
+fetched again; a lookup that meets damaged cache bytes retries once from
+object storage instead of failing.</p>
+<p><strong>The disk cache</strong> survives restarts and holds no files open: each read
+opens, reads and closes, so the budget is exact.</p>
+<ul>
+<li>A fetched part is written before the read returns, to a temporary file
+renamed into place without <code>fsync</code>. On a local SSD that adds about 2–4% to
+a cold read and nothing to a warm one.</li>
+<li>Each file name carries its size, so startup only lists directories: about
+0.1 s for a 10 GiB cache, a few seconds at 100 GiB.</li>
+<li>After a crash, startup drops unfinished writes. A file shorter than its
+name says fails the read that reaches past its end and is dropped then;
+checksums catch damaged bytes.</li>
+<li>Fetched bytes are never held in memory waiting to be written; if the disk
+cannot store a part, a later read fetches it again.</li>
+<li>Opening logs a warning when the filesystem cannot hold <code>DiskCacheSize</code>.</li>
+</ul>
+<p><strong>Block cache memory.</strong> The block cache is Pebble's. With cgo it lives outside
+the Go heap: it counts toward resident memory but not toward <code>GOMEMLIMIT</code> or
+heap profiles. Without cgo (<code>CGO_ENABLED=0</code>) it is ordinary Go heap, which the
+garbage collector lets grow to about twice the live heap under the default
+<code>GOGC</code>; set <code>GOMEMLIMIT</code> to bound the process.</p>
+<h3 id="cache-statistics">Cache statistics</h3>
+<pre><code class="language-go">type CacheStats struct {
+    Hits        int64
+    Misses      int64
+    Bytes       int64
+    MaxBytes    int64
+    EntryCount  int
+    MaxEntries  int
+    Evictions   int64
+    Corruptions int64
+    Bypasses    int64
+    Failures    int64
+}
+
+type DiskCacheStats struct {
+    Meta     CacheStats // SST metadata and Bloom filters
+    Data     CacheStats // whole small SSTs and chunks of larger SSTs' data
+    SSTDrops int64      // reads that failed on damaged bytes and dropped the SST
+}
+</code></pre>
+<ul>
+<li><code>BlockCacheStats</code> counts hits and misses on index and data blocks. The
+metaindex and properties blocks, read on every SST open and never cached,
+are not counted. <code>OpenSSTCacheStats</code> reports how many reads found their SST
+already open.</li>
+<li>Byte-bounded caches report <code>MaxEntries == 0</code>; the open-SST cache, bounded by
+count, reports <code>MaxBytes == 0</code>.</li>
+<li>The disk cache has one budget, <code>DiskCacheSize</code>, shared by metadata and
+data: <code>Meta.MaxBytes</code> and <code>Data.MaxBytes</code> both report it, and
+<code>Meta.Bytes + Data.Bytes</code> is what is in use. Data is evicted first, and data
+is never stored by evicting metadata.</li>
+<li>For the disk cache: <code>Corruptions</code> counts entries it found damaged itself (a
+wrong size, or a Bloom filter failing its checksum); <code>Bypasses</code> entries not
+stored, because they are larger than the whole cache, are data that would
+fit only by evicting metadata, or belong to an SST whose files are being
+deleted; <code>Failures</code> entries that could not be written.
+Bypassed and failed entries are still served, just not kept, so a disk that
+keeps failing means each later read fetches them again.</li>
+<li><code>SSTDrops</code> counts reads that failed on what looked like damaged bytes; each
+drops the SST from every layer, so the next read fetches it again. It counts
+drops, not distinct SSTs: concurrent readers of one damaged SST each count,
+a lookup whose retry also fails counts twice, and an SST read in chunks that
+is damaged in object storage, or fails to open the same way every time,
+counts on every read. A small SST damaged in object storage fails its
+whole-object checksum when fetched, so it fails reads without counting. A
+steadily rising count points at an SST in one of those states.</li>
+</ul>
+<h2 id="appendix-sst-output-policy">Appendix: SST output policy</h2>
+<p>How new SST files are encoded is a runtime setting. It applies to files
+written from now on and is not stored in the manifest; every file describes
+its own encoding, so readers handle a mix.</p>
+<pre><code class="language-go">type SSTOutputOptions struct {
+    L0        SSTEncodingOptions
+    Compacted SSTEncodingOptions
+}
+
+type SSTEncodingOptions struct {
+    Compression     string
+    BlockBytes      int
+    BloomBitsPerKey int
+}
+
+func DefaultSSTOutputOptions() SSTOutputOptions
+</code></pre>
+<p>Compression is <code>&quot;none&quot;</code>, <code>&quot;snappy&quot;</code> or <code>&quot;zstd&quot;</code>. Zero fields select the
+defaults:</p>
+<table>
+<thead>
+<tr>
+<th>SST class</th>
+<th>Compression</th>
+<th align="right">Data block target</th>
+<th align="right">Bloom bits/key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Writer output (L0)</td>
+<td>Snappy</td>
+<td align="right">4 KiB</td>
+<td align="right">10</td>
+</tr>
+<tr>
+<td>Compacted output</td>
+<td>Snappy</td>
+<td align="right">4 KiB</td>
+<td align="right">10</td>
+</tr>
+</tbody>
+</table>
+<p>The writer and maintenance can use different settings:</p>
+<pre><code class="language-go">dbOptions := isledb.DBOptions{
+    Prefix: &quot;accounts&quot;,
+    SSTOutput: isledb.SSTOutputOptions{
+        L0: isledb.SSTEncodingOptions{
+            Compression:     &quot;snappy&quot;,
+            BlockBytes:      4 &lt;&lt; 10,
+            BloomBitsPerKey: 10,
+        },
+        Compacted: isledb.SSTEncodingOptions{
+            Compression:     &quot;zstd&quot;,
+            BlockBytes:      16 &lt;&lt; 10,
+            BloomBitsPerKey: 10,
+        },
+    },
+}
+</code></pre>
+<p>Separate writer and maintenance processes each pass their own <code>DBOptions</code>.
+Different settings are safe, though one shared configuration makes
+performance easier to predict.</p>
+<h2 id="appendix-compaction-limits">Appendix: compaction limits</h2>
+<p>One manifest entry can remove at most 128 objects and add at most 128. This is
+a fixed format rule, not a tuning option. The planner picks the widest source
+batch whose whole overlap with the next level fits. If even one source SST
+overlaps too many files below it, the planner first compacts that destination
+level further down and retries the original move on a later cycle.</p>
+<p>If that drain reaches the bottom of the tree, IsleDB creates one deeper
+level. For sorted levels this is usually a metadata-only move: the SSTs keep
+their IDs and bytes, and only their level changes. It is a correctness escape
+hatch for the 128-object limit, not normal level sizing. Doing it repeatedly
+can deepen reads and delay merging tombstones and overwritten values, so it is
+counted in <code>SSTCompactionStats.ForcedLevelCreations</code>, with
+<code>DeepestForcedLevel</code> recording the deepest level reached. Ordinary creation of
+a new bottom level by size is not counted. As with every compaction, the
+statistic counts a staged job; the new layout is visible only once the writer
+applies it.</p>
+<h2 id="appendix-maintenance-statistics">Appendix: maintenance statistics</h2>
+<pre><code class="language-go">type MaintenanceState uint8
+
+const (
+    MaintenanceIdle MaintenanceState = iota
+    MaintenanceWaitingForWriter
+)
+
+type MaintenanceTask uint8
+
+const (
+    MaintenanceTaskNone MaintenanceTask = iota
+    MaintenanceTaskSSTCompaction
+    MaintenanceTaskManifestCheckpoint
+)
+
+type ReclamationFamily string
+
+const (
+    ReclamationSST        ReclamationFamily = &quot;sst&quot;
+    ReclamationChangeFeed ReclamationFamily = &quot;change_feed&quot;
+    ReclamationManifest   ReclamationFamily = &quot;manifest&quot;
+)
+</code></pre>
+<p><code>MaintenanceState</code>, <code>MaintenanceTask</code>, <code>ChangeOperation</code>, <code>ChangeFeedPayload</code>
+and <code>WriterStatus</code> implement <code>String</code>.</p>
+<pre><code class="language-go">type MaintenanceStats struct {
+    State               MaintenanceState
+    Scheduling          MaintenanceScheduleStats
+    SSTCompaction       SSTCompactionStats
+    SSTCleanup          SSTCleanupStats
+    ChangeFeedRetention ChangeFeedCleanupStats
+    ManifestCheckpoint  ManifestCheckpointStats
+    ManifestCleanup     ManifestCleanupStats
+    Duration            time.Duration
+}
+
+type ReclamationCycleStats struct {
+    Family     ReclamationFamily
+    SST        SSTCleanupStats
+    ChangeFeed ChangeFeedCleanupStats
+    Manifest   ManifestCleanupStats
+    Duration   time.Duration
+}
+
+type MaintenanceScheduleStats struct {
+    Selected              MaintenanceTask
+    CompactionSourceLevel uint32
+    CompactionWorkUnits   uint32
+    CompactionCritical    bool
+    CheckpointEligible    bool
+    CheckpointUrgent      bool
+    ReplayPages           uint64
+    ReplayBytes           uint64
+}
+
+type SSTCompactionStats struct {
+    Jobs                 int
+    InputSSTs            int
+    OutputSSTs           int
+    ForcedLevelCreations int
+    DeepestForcedLevel   uint32
+    OutputBytes          int64
+    MovedJobs            int
+    MovedBytes           int64
+    ReadBytes            int64
+    L0Merges             int
+    RewrittenBytes       int64
+}
+
+type SSTCleanupStats struct {
+    SSTsPlanned    int
+    PlansPrepared  int
+    PlansScanned   int
+    PlansCompleted int
+    DeleteAttempts int
+    SSTsDeleted    int
+    DeferredPlans  int
+    Failures       int
+}
+
+type ManifestCheckpointStats struct {
+    Staged      bool
+    ReplayPages uint64
+    ReplayBytes uint64
+}
+
+type ChangeFeedCleanupStats struct {
+    EntriesRetired  int
+    BatchesPlanned  int
+    BatchesDeleted  int
+    BlockedRetained int
+    FailedDeletes   int
+    Duration        time.Duration
+}
+
+type ManifestCleanupStats struct {
+    Snapshots ManifestSnapshotCleanupStats
+    Pages     ManifestPageCleanupStats
+}
+
+type ManifestSnapshotCleanupStats struct {
+    SnapshotsMarked  int
+    DeleteAttempts   int
+    SnapshotsDeleted int
+    Protected        int
+    Deferred         int
+    Failures         int
+    MarkersScanned   int
+    MarkersCleared   int
+    ObjectsScanned   int
+    Duration         time.Duration
+}
+
+type ManifestPageCleanupStats struct {
+    PagesMarked      int
+    PagesDeleted     int
+    Protected        int
+    Deferred         int
+    Failures         int
+    MarkersScanned   int
+    MarkersCleared   int
+    ObjectsScanned   int
+    DeleteAttempts   int
+    ReachabilityGETs int
+    Duration         time.Duration
+}
+</code></pre>
+<h2 id="appendix-the-blobstore-package">Appendix: the blobstore package</h2>
+<p>Most applications should use <code>isledb.Open</code> or <code>isledb.OpenBucket</code>. The
+<code>github.com/ankur-anand/isledb/blobstore</code> package is for storage adapters,
+integration tests and operational tools.</p>
+<pre><code class="language-go">func blobstore.Open(ctx context.Context, bucketURL, prefix string) (*blobstore.Store, error)
+func blobstore.New(bucket *blob.Bucket, bucketName, prefix string) *blobstore.Store
+func blobstore.NewMemory(prefix string) *blobstore.Store
+</code></pre>
+<p>Object operations:</p>
+<pre><code class="language-go">func (s *Store) Read(ctx context.Context, key string) ([]byte, Attributes, error)
+func (s *Store) ReadStream(ctx context.Context, key string) (*blob.Reader, error)
+func (s *Store) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+func (s *Store) ReadRangeStream(ctx context.Context, key string, offset, length int64) (*blob.Reader, error)
+func (s *Store) Attributes(ctx context.Context, key string) (Attributes, error)
+func (s *Store) Exists(ctx context.Context, key string) (bool, error)
+func (s *Store) Write(ctx context.Context, key string, data []byte) (Attributes, error)
+func (s *Store) WriteReader(ctx context.Context, key string, r io.Reader, opts *blob.WriterOptions) (Attributes, error)
+func (s *Store) WriteIfMatch(ctx context.Context, key string, data []byte, etag string) (Attributes, error)
+func (s *Store) WriteIfNotExist(ctx context.Context, key string, data []byte) (Attributes, error)
+func (s *Store) Delete(ctx context.Context, key string) error
+func (s *Store) BatchDelete(ctx context.Context, keys []string) error
+</code></pre>
+<p>Listing operations:</p>
+<pre><code class="language-go">type ListOptions struct {
+    Prefix    string
+    Delimiter string
+}
+
+type ObjectInfo struct {
+    Key   string
+    Size  int64
+    IsDir bool
+}
+
+type ListResult struct {
+    Objects []ObjectInfo
+}
+
+func (s *Store) List(ctx context.Context, opts ListOptions) (*ListResult, error)
+func (s *Store) NewListIterator(opts ListOptions) *ListIterator
+func (it *ListIterator) Next(ctx context.Context) (ObjectInfo, error)
+func (s *Store) Walk(ctx context.Context, opts ListOptions, visit func(ObjectInfo) (bool, error)) error
+</code></pre>
+<p><code>List</code> loads every matching object into memory; prefer <code>NewListIterator</code> or
+<code>Walk</code> for large listings.</p>
+<pre><code class="language-go">type Attributes struct {
+    Size       int64
+    ETag       string
+    ModTime    time.Time
+    Generation int64
+}
+
+type BatchDeleteError struct {
+    Failed map[string]error
+}
+</code></pre>
+<ul>
+<li>Sentinel errors: <code>blobstore.ErrNotFound</code>, <code>blobstore.ErrPreconditionFailed</code>
+and <code>blobstore.ErrBucketNameRequired</code>.</li>
+<li><code>Delete</code> succeeds for an object that does not exist.</li>
+<li><code>BatchDeleteError</code> names each key that failed.</li>
+<li>For backends without native conditional writes (the in-memory and file
+stores), <code>Read</code> returns the MD5 of the content as the ETag, which is what
+<code>WriteIfMatch</code> compares against.</li>
+</ul>
+<h2 id="related-documentation">Related documentation</h2>
+<ul>
+<li><a href="https://github.com/ankur-anand/isledb/blob/main/README.md">Project overview</a></li>
+<li><a href="/docs/storage-layout/">Object-store schema</a></li>
+</ul>
+
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        <details open>
+        <summary><strong>On this page</strong></summary>
+        <ol>
+          <li class="l2"><a href="#overview">Overview</a></li>
+          <li class="l2"><a href="#quick-start">Quick start</a></li>
+          <li class="l2"><a href="#open-and-close-a-database">Open and close a database</a></li>
+          <li class="l2"><a href="#write-data">Write data</a></li>
+          <li class="l2"><a href="#read-data">Read data</a></li>
+          <li class="l2"><a href="#change-feed">Change feed</a></li>
+          <li class="l2"><a href="#run-maintenance">Run maintenance</a></li>
+          <li class="l2"><a href="#prometheus-metrics">Prometheus metrics</a></li>
+          <li class="l2"><a href="#error-reference">Error reference</a></li>
+          <li class="l2"><a href="#appendix-how-a-reader-reads-ssts">Appendix: how a reader reads SSTs</a></li>
+          <li class="l2"><a href="#appendix-sst-output-policy">Appendix: SST output policy</a></li>
+          <li class="l2"><a href="#appendix-compaction-limits">Appendix: compaction limits</a></li>
+          <li class="l2"><a href="#appendix-maintenance-statistics">Appendix: maintenance statistics</a></li>
+          <li class="l2"><a href="#appendix-the-blobstore-package">Appendix: the blobstore package</a></li>
+          <li class="l2"><a href="#related-documentation">Related documentation</a></li>
+        </ol>
+        </details>
+      </aside>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>
