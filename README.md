@@ -395,6 +395,16 @@ See [Running `isledb cache`](docs/isledb-cache.md) and the
 An `isledb reader` uses it through `read_cache.url`; a Go program, through
 [`ReadCacheOptions`](#reading-through-the-shared-cache).
 
+## Versions and support
+
+IsleDB is before 1.0. A minor release, such as 0.19 to 0.20, may change the
+Go API, the services' flags and configuration, the HTTP API, or metrics; its
+release notes say what changed and how to move to it. A patch release, such
+as 0.19.0 to 0.19.1, only fixes problems.
+
+Fixes go into the next release; earlier releases are not patched. Run a
+recent release, and name its exact version wherever you deploy it.
+
 ## Documentation
 
 Library:
