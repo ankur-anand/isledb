@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/ankur-anand/isledb/cmd/isledb/internal/cacherole"
 	"github.com/ankur-anand/isledb/cmd/isledb/internal/maintenancerole"
@@ -21,7 +22,25 @@ import (
 
 var roles = []service.Role{cacherole.Role, maintenancerole.Role, readerrole.Role, writerrole.Role}
 
+// version is set by release builds; a go install build reports the module
+// version it was built from.
+var version = ""
+
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return "unknown"
+}
+
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "version" || os.Args[1] == "--version") {
+		fmt.Println("isledb", versionString())
+		return
+	}
 	err := service.Main(roles, os.Args[1:], os.Stdout)
 	switch {
 	case err == nil, errors.Is(err, flag.ErrHelp):

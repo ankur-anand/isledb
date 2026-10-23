@@ -1,0 +1,41 @@
+# Builds the isledb service binary for each release tag and attaches the
+# archives to the tag's GitHub release. The container image is built by the
+# release workflow from the Dockerfile.
+version: 2
+
+project_name: isledb
+
+builds:
+  - id: isledb
+    main: ./cmd/isledb
+    binary: isledb
+    env:
+      - CGO_ENABLED=0
+    # Linux for servers, macOS on Apple silicon for trying it out.
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: isledb
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  # Releases are written by hand: keep their notes, add the archives.
+  mode: keep-existing

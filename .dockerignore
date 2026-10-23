@@ -1,0 +1,7 @@
+.git
+dist
+docs
+tla
+contrib
+scripts
+**/*_test.go

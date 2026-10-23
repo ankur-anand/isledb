@@ -138,7 +138,7 @@ func Usage(roles []Role) string {
 	for _, r := range roles {
 		fmt.Fprintf(&b, "  %-12s %s\n", r.Name, r.Summary)
 	}
-	b.WriteString("\nRun \"isledb <role> -h\" for a role's flags.\n")
+	b.WriteString("\nRun \"isledb <role> -h\" for a role's flags, \"isledb version\" for the version.\n")
 	return b.String()
 }
 
