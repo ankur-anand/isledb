@@ -43,6 +43,27 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestL0MergeSettings(t *testing.T) {
+	cfg, err := load(base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := isledb.DefaultWriterOptions().L0Merge
+	if int64(cfg.L0Merge.TargetBytes) != d.TargetBytes || time.Duration(cfg.L0Merge.MaxAge) != d.MaxAge {
+		t.Fatalf("defaults %+v, want the library's %+v", cfg.L0Merge, d)
+	}
+	cfg, err = load(append(base, "-l0-merge-bytes", "16MiB"), map[string]string{"ISLEDB_WRITER_L0_MERGE_MAX_AGE": "1m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.L0Merge.TargetBytes != 16<<20 || time.Duration(cfg.L0Merge.MaxAge) != time.Minute {
+		t.Fatalf("overrides: %+v", cfg.L0Merge)
+	}
+}
+
 func TestFlushIntervalOnGCS(t *testing.T) {
 	gcs := []string{"-bucket-url", "gs://b", "-prefix", "prod/a", "-insecure"}
 	cfg, err := load(gcs, nil)
@@ -86,6 +107,8 @@ func TestConfigRefusesMistakes(t *testing.T) {
 		{"long key", []string{"-max-key-bytes", "65528"}, "values.max_key_bytes"},
 		{"long owner", []string{"-owner-id", strings.Repeat("o", 257)}, "owner_id"},
 		{"negative view age", []string{"-max-pinned-view-age", "-1s"}, "policy.max_pinned_view_age"},
+		{"no merge size", []string{"-l0-merge-bytes", "0"}, "l0_merge"},
+		{"no merge age", []string{"-l0-merge-max-age", "0s"}, "l0_merge"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			args := c.args

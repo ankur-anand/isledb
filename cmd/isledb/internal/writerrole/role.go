@@ -68,6 +68,8 @@ func (c *Config) Start(ctx context.Context, common service.Common, log *slog.Log
 	opts.Flush.Interval = c.flushInterval()
 	opts.Memtable.TargetBytes = int64(c.Memtable.TargetBytes)
 	opts.Memtable.MaxPendingMemtables = c.Memtable.MaxPending
+	opts.L0Merge.TargetBytes = int64(c.L0Merge.TargetBytes)
+	opts.L0Merge.MaxAge = time.Duration(c.L0Merge.MaxAge)
 	opts.Values.MaxKeyBytes = c.Values.MaxKeyBytes
 	opts.Values.MaxValueBytes = int64(c.Values.MaxValueBytes)
 	opts.Metrics = metrics

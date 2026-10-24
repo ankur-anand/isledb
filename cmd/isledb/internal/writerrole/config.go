@@ -26,6 +26,7 @@ type Config struct {
 	OwnerID    string     `yaml:"owner_id"`
 	Flush      Flush      `yaml:"flush"`
 	Memtable   Memtable   `yaml:"memtable"`
+	L0Merge    L0Merge    `yaml:"l0_merge"`
 	Values     Values     `yaml:"values"`
 	ChangeFeed ChangeFeed `yaml:"change_feed"`
 	Policy     Policy     `yaml:"policy"`
@@ -44,6 +45,17 @@ type Flush struct {
 type Memtable struct {
 	TargetBytes service.ByteSize `yaml:"target_bytes"`
 	MaxPending  int              `yaml:"max_pending"`
+}
+
+// L0Merge is the writer combining the small files its commits write into
+// larger ones, from the copies it keeps in memory.
+type L0Merge struct {
+	// TargetBytes is how much it keeps before combining, and about the size
+	// of the combined file. It keeps up to twice this much.
+	TargetBytes service.ByteSize `yaml:"target_bytes"`
+	// MaxAge is how long a commit's file is kept before what is kept is
+	// combined whatever its size.
+	MaxAge service.Duration `yaml:"max_age"`
 }
 
 type Values struct {
@@ -100,6 +112,10 @@ func NewConfig() service.Config {
 			TargetBytes: service.ByteSize(defaults.Memtable.TargetBytes),
 			MaxPending:  defaults.Memtable.MaxPendingMemtables,
 		},
+		L0Merge: L0Merge{
+			TargetBytes: service.ByteSize(defaults.L0Merge.TargetBytes),
+			MaxAge:      service.Duration(defaults.L0Merge.MaxAge),
+		},
 		Values: Values{
 			MaxKeyBytes:   defaults.Values.MaxKeyBytes,
 			MaxValueBytes: service.ByteSize(defaults.Values.MaxValueBytes),
@@ -135,6 +151,10 @@ func (c *Config) Settings() []service.Setting {
 		service.Setting{Flag: "memtable-bytes", Path: "memtable.target_bytes", Usage: "memtable size that starts a new one, e.g. 16MiB", Set: c.Memtable.TargetBytes.Parse},
 		service.Setting{Flag: "max-pending-memtables", Path: "memtable.max_pending", Usage: "memtables waiting to commit before writes get 503",
 			Set: func(v string) error { return parseInt(v, &c.Memtable.MaxPending) }},
+		service.Setting{Flag: "l0-merge-bytes", Path: "l0_merge.target_bytes", Usage: "commits' files kept in memory before they are combined into one, e.g. 64MiB",
+			Set: c.L0Merge.TargetBytes.Parse},
+		service.Setting{Flag: "l0-merge-max-age", Path: "l0_merge.max_age", Usage: "how long a commit's file is kept before what is kept is combined, e.g. 5m",
+			Set: c.L0Merge.MaxAge.Parse},
 		service.Setting{Flag: "max-key-bytes", Path: "values.max_key_bytes", Usage: "largest key accepted",
 			Set: func(v string) error { return parseInt(v, &c.Values.MaxKeyBytes) }},
 		service.Setting{Flag: "max-value-bytes", Path: "values.max_value_bytes", Usage: "largest value accepted, e.g. 16MiB", Set: c.Values.MaxValueBytes.Parse},
@@ -225,6 +245,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Memtable.TargetBytes <= 0 || c.Memtable.MaxPending <= 0 {
 		fail("memtable.target_bytes and memtable.max_pending must be positive")
+	}
+	if c.L0Merge.TargetBytes <= 0 || c.L0Merge.MaxAge <= 0 {
+		fail("l0_merge.target_bytes and l0_merge.max_age must be positive")
 	}
 	if c.Values.MaxKeyBytes <= 0 || c.Values.MaxValueBytes <= 0 {
 		fail("values.max_key_bytes and values.max_value_bytes must be positive")
