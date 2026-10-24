@@ -1,0 +1,81 @@
+name: tools/stress
+
+# The stress harness is its own Go module and imports nothing of isledb: it
+# drives the isledb binary. Its end-to-end test builds cmd/isledb from the
+# same commit and runs a small spec against it, so it runs on core changes
+# too.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'tools/stress/**'
+      - '.golangci.yml'
+      - '.github/workflows/tools-stress.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '**.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'tools/stress/**'
+      - '.golangci.yml'
+      - '.github/workflows/tools-stress.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: tools/stress
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/stress/go.mod
+          cache-dependency-path: tools/stress/go.sum
+
+      - name: Check go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "Run gofmt on these files:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.3
+          working-directory: tools/stress
+          args: --fix=false --max-issues-per-linter=0 --max-same-issues=0
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/stress/go.mod
+          cache-dependency-path: |
+            tools/stress/go.sum
+            go.sum
+
+      # Includes the end-to-end run, which builds isledb from this commit.
+      - name: Test the harness
+        run: go test -count=1 -race ./...
