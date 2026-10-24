@@ -1,0 +1,30 @@
+# A few minutes on a directory bucket: no S3 server, no latency proxies.
+# For checking the harness and a build quickly, not for measuring.
+name: local-smoke
+workload:
+  shape: random
+  values: mixed
+  target: 64MiB
+  batch_keys: 16
+  delete_permille: 100
+  rate: 8MiB
+  workers: 128
+readers:
+  - {name: uniform, rate: 200, workers: 8, scan_ratio: 0.05, scan_limit: 100}
+storage:
+  bucket_url: file:///tmp/isledb-stress-bucket
+isledb:
+  readers: 1
+  config:
+    writer:
+      memtable: {target_bytes: 3MiB}
+      flush: {interval: 250ms}
+phases:
+  - load:
+      events:
+        - {after: 4s, role: writer, kill: true, down: 1s}
+  - update: {rounds: 1}
+  - settle: {quiet: 5s, max: 1m}
+  - verify: {parts: 8}
+sample_every: 5s
+checkpoints: [16MiB, 32MiB, 64MiB]

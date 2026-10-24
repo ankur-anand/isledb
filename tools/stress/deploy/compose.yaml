@@ -1,0 +1,23 @@
+# S3-compatible storage for stress runs: SILO, a maintained fork of the MinIO
+# server. Its data goes under STRESS_DATA, which should be on the disk under
+# test, and it listens on 127.0.0.1 only.
+#
+#   STRESS_DATA=/nvme/stress ./up.sh
+name: isledb-stress
+
+services:
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:${SILO_PORT:-19000}:9000"
+      - "127.0.0.1:${SILO_CONSOLE_PORT:-19001}:9001"
+    # A bind mount on the disk under test: a named volume would live under
+    # /var/lib/docker, often on a small root disk.
+    volumes:
+      - ${STRESS_DATA:?set STRESS_DATA}/silo:/data
+    cpus: ${SILO_CPUS:-3}
+    restart: unless-stopped

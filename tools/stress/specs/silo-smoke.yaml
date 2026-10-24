@@ -1,0 +1,28 @@
+# The 12 MiB/s small-file profile against SILO, behind latency proxies,
+# small enough to finish in a few minutes. Start SILO with deploy/up.sh.
+name: silo-smoke
+workload:
+  shape: random
+  values: mixed
+  target: 512MiB
+  batch_keys: 16
+  rate: 12MiB
+  workers: 128
+readers:
+  - {name: uniform, rate: 200, workers: 16, scan_ratio: 0.05, scan_limit: 100}
+storage:
+  bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
+  endpoint: http://127.0.0.1:19000
+  latency: {min: 15ms, max: 40ms}
+isledb:
+  readers: 1
+  config:
+    writer:
+      memtable: {target_bytes: 3MiB}
+      flush: {interval: 250ms}
+phases:
+  - load: {}
+  - settle: {quiet: 30s, max: 10m}
+  - verify: {parts: 16}
+sample_every: 10s
+checkpoints: [128MiB, 256MiB, 512MiB]

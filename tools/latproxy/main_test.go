@@ -128,3 +128,114 @@ func TestRejectsBadSettings(t *testing.T) {
 		}
 	}
 }
+
+func send(t *testing.T, method, url, body string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestCountsUploadsByMethod(t *testing.T) {
+	proxy, _ := startProxy(t, 0, 0)
+	send(t, http.MethodPut, proxy.URL+"/bucket/authz/sstable/a.sst", strings.Repeat("x", 1000))
+	send(t, http.MethodPut, proxy.URL+"/bucket/authz/sstable/b.sst", strings.Repeat("x", 500))
+	get(t, proxy.URL+"/bucket/authz/sstable/a.sst")
+	sst := readStats(t, proxy.URL)["sst"]
+	if sst.Requests != 3 {
+		t.Fatalf("sst requests %d, want 3", sst.Requests)
+	}
+	if put := sst.Methods["PUT"]; put.Requests != 2 || put.UploadedBytes != 1500 {
+		t.Fatalf("PUT %+v, want 2 requests and 1500 uploaded bytes", put)
+	}
+	if g := sst.Methods["GET"]; g.Requests != 1 || g.UploadedBytes != 0 || g.Bytes == 0 {
+		t.Fatalf("GET %+v, want 1 request with a response and no upload", g)
+	}
+}
+
+func setFaults(t *testing.T, base, body string) int {
+	t.Helper()
+	code, _ := send(t, http.MethodPut, base+"/_latproxy/faults", body)
+	return code
+}
+
+func TestInjectedRefusalIsNotForwarded(t *testing.T) {
+	proxy, hits := startProxy(t, 0, 0)
+	if code := setFaults(t, proxy.URL, `{"methods":["PUT"],"kinds":["sst"],"error_rate":1}`); code != http.StatusOK {
+		t.Fatalf("setting faults: %d", code)
+	}
+	code, body := send(t, http.MethodPut, proxy.URL+"/bucket/authz/sstable/a.sst", "data")
+	if code != http.StatusServiceUnavailable || !strings.Contains(body, "<Code>SlowDown</Code>") {
+		t.Fatalf("got %d %q, want a 503 SlowDown", code, body)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a refused request reached the target")
+	}
+	// Requests the faults don't match pass.
+	if code, _ := send(t, http.MethodGet, proxy.URL+"/bucket/authz/sstable/a.sst", ""); code != http.StatusOK || hits.Load() != 1 {
+		t.Fatalf("an unmatched GET got %d, %d hits", code, hits.Load())
+	}
+	put := readStats(t, proxy.URL)["sst"].Methods["PUT"]
+	if put.Injected != 1 || put.ServerErrors != 1 || put.UploadedBytes != 0 {
+		t.Fatalf("PUT %+v, want one injected refusal and nothing uploaded", put)
+	}
+}
+
+func TestDroppedAnswerIsForwarded(t *testing.T) {
+	proxy, hits := startProxy(t, 0, 0)
+	setFaults(t, proxy.URL, `{"kinds":["manifest"],"drop_rate":1}`)
+	code, body := send(t, http.MethodPut, proxy.URL+"/bucket/authz/manifest/log/1", "entry")
+	if code != http.StatusInternalServerError || !strings.Contains(body, "InternalError") {
+		t.Fatalf("got %d %q, want a 500 InternalError", code, body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("target saw %d requests, want the dropped one forwarded", hits.Load())
+	}
+	put := readStats(t, proxy.URL)["manifest"].Methods["PUT"]
+	if put.Dropped != 1 || put.UploadedBytes != int64(len("entry")) {
+		t.Fatalf("PUT %+v, want one dropped answer with its body uploaded", put)
+	}
+	// Clearing the faults restores forwarding.
+	setFaults(t, proxy.URL, `{}`)
+	if code, _ := send(t, http.MethodPut, proxy.URL+"/bucket/authz/manifest/log/2", "e"); code != http.StatusOK {
+		t.Fatalf("after clearing faults: %d", code)
+	}
+}
+
+func TestRejectsBadFaults(t *testing.T) {
+	proxy, _ := startProxy(t, 0, 0)
+	for _, body := range []string{
+		`{"error_rate":0.6,"drop_rate":0.6}`,
+		`{"error_rate":-0.1}`,
+		`{"methods":["PATCH"]}`,
+		`{"kinds":["blob"]}`,
+		`{"extra_delay":"soon"}`,
+		`{"rate":1}`,
+	} {
+		if code := setFaults(t, proxy.URL, body); code != http.StatusBadRequest {
+			t.Errorf("faults %s: %d, want 400", body, code)
+		}
+	}
+	code, got := send(t, http.MethodGet, proxy.URL+"/_latproxy/faults", "")
+	if code != http.StatusOK || strings.TrimSpace(got) != `{}` {
+		t.Fatalf("faults after refusals: %d %q, want none set", code, got)
+	}
+}
+
+func TestExtraDelay(t *testing.T) {
+	proxy, _ := startProxy(t, 0, 0)
+	setFaults(t, proxy.URL, `{"kinds":["current"],"extra_delay":"80ms"}`)
+	start := time.Now()
+	get(t, proxy.URL+"/bucket/authz/manifest/CURRENT")
+	if took := time.Since(start); took < 80*time.Millisecond {
+		t.Fatalf("took %s, want at least the 80ms extra delay", took)
+	}
+}

@@ -1,0 +1,28 @@
+# real-defaults with fewer rewrites: L0 collects longer, a 4 GiB L1.
+name: real6
+workload:
+  shape: random
+  values: mixed
+  target: 20GiB
+  batch_keys: 16
+  rate: 12MiB
+  workers: 128
+readers:
+  - {name: uniform, rate: 200, workers: 16, scan_ratio: 0.05, scan_limit: 100}
+storage:
+  bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
+  endpoint: http://127.0.0.1:19000
+  latency: {min: 15ms, max: 40ms}
+isledb:
+  readers: 1
+  config:
+    writer:
+      memtable: {target_bytes: 3MiB}
+      flush: {interval: 250ms}
+    maintenance:
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}
+phases:
+  - load: {}
+  - settle: {quiet: 5m, max: 1h}
+  - verify: {parts: 32}
+checkpoints: [1GiB, 5GiB, 10GiB, 20GiB]
