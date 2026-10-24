@@ -5,7 +5,7 @@ This guide says which object stores work, how to create a bucket for IsleDB,
 and which bucket features to leave off.
 
 For what IsleDB stores and where, see
-[object-store-schema.md](object-store-schema.md).
+[the storage layout](object-store-schema.md).
 
 ## What IsleDB needs from a store
 
@@ -149,7 +149,7 @@ Readers need only `roles/storage.objectViewer`.
 **One save per second.** Cloud Storage allows about one write per second to
 an object, so the writer saves at most once per second there.
 `flush.interval` defaults to 1s on `gs://` buckets and can't be set lower;
-see [isledb-writer.md](isledb-writer.md#choose-the-flush-interval).
+see [Choose the flush interval](isledb-writer.md#choose-the-flush-interval).
 
 **Request limits.** A new bucket handles about 1,000 writes and 5,000 reads
 per second at first, and scales up over minutes as traffic grows.

@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/" aria-current="page">Storage layout</a></li>
           </ul>
         </details>

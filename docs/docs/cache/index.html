@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/" aria-current="page">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -744,10 +760,11 @@
         <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / Read cache</p>
         <h1>Read cache</h1>
 <h2 class="part" id="run">Run the cache</h2>
-<p><code>isledb cache</code> is the regional read cache as a service. It relays <code>CURRENT</code>
-for each database it serves, reading it from storage every 500 ms, and serves
-immutable objects from 128 KiB chunks on local disk. The HTTP API is in
-<a href="/docs/cache/#api">read-cache-api.md</a>.</p>
+<p><code>isledb cache</code> is the read cache, run as a service. It serves one or more
+databases to the readers in a region. It checks each database for new writes
+every 500 ms and tells waiting readers at once, and it keeps the data readers
+ask for on its local disk, so the bucket is read once for all of them instead
+of once for each. Readers use it through <a href="/docs/cache/#api">the cache HTTP API</a>.</p>
 <pre><code>isledb cache --config /etc/isledb/isledb.yaml
 </code></pre>
 <p>or, without a file:</p>
@@ -766,8 +783,8 @@ A flag overrides the environment, the environment overrides the file, and the
 file overrides the default. <code>--db</code> on the command line, or
 <code>ISLEDB_CACHE_DATABASES</code>, replaces the file's list of databases rather than
 adding to it.</p>
-<p>One file can configure every isledb role: settings all roles share sit at the
-top, and each role reads its own section. The cache reads <code>cache:</code>.</p>
+<p>One file can configure every IsleDB service: settings they share sit at the
+top, and each service reads its own section. The cache reads <code>cache:</code>.</p>
 <pre><code class="language-yaml">bucket_url: s3://my-bucket?region=us-east-1
 log_level: info
 
@@ -802,176 +819,18 @@ cache:
 
   shutdown_drain: 5s
 </code></pre>
-<p>Unknown keys are an error, at the top and inside <code>cache:</code>, so a misspelled
-key stops the cache at start rather than being ignored. Sections of the
-other roles this binary has are left for them; a section named after no role
-is an error too. The file holds paths, never secrets: tokens and keys stay
-in their own files.</p>
 <p>A database at the root of the bucket is written <code>/</code>. An empty prefix is an
 error, so a blank value never names the root, and so is one with an empty,
 <code>.</code> or <code>..</code> segment (<code>prod//a</code>, <code>prod/../a</code>), whose keys would never match.</p>
 <p><code>isledb cache --config isledb.yaml --check</code> validates the configuration,
 prints it as resolved from every source, and exits.</p>
-<p><strong>Naming.</strong> A setting's environment variable is <code>ISLEDB_</code> followed by its
-key, upper case with dots as underscores: the shared settings as they are
-(<code>bucket_url</code> → <code>ISLEDB_BUCKET_URL</code>), the cache's after <code>CACHE_</code>
-(<code>cache.disk.bytes</code> → <code>ISLEDB_CACHE_DISK_BYTES</code>). An environment variable
-set to an empty value counts: <code>ISLEDB_CACHE_ADMIN_LISTEN=</code> turns the admin
-listener off.</p>
-<table>
-<thead>
-<tr>
-<th>File key</th>
-<th>Flag</th>
-<th>Environment</th>
-<th>Default</th>
-<th></th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>bucket_url</code></td>
-<td><code>--bucket-url</code></td>
-<td><code>ISLEDB_BUCKET_URL</code></td>
-<td>required</td>
-<td>Bucket holding the databases</td>
-</tr>
-<tr>
-<td><code>log_level</code></td>
-<td><code>--log-level</code></td>
-<td><code>ISLEDB_LOG_LEVEL</code></td>
-<td><code>info</code></td>
-<td><code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code></td>
-</tr>
-<tr>
-<td><code>cache.databases[].prefix</code></td>
-<td><code>--db</code> (repeat)</td>
-<td><code>ISLEDB_CACHE_DATABASES</code> (comma-separated)</td>
-<td>required</td>
-<td>Databases served, by prefix; <code>/</code> for the bucket root</td>
-</tr>
-<tr>
-<td><code>cache.databases[].current_poll</code></td>
-<td>–</td>
-<td>–</td>
-<td><code>cache.current.poll</code></td>
-<td>Per-database poll interval</td>
-</tr>
-<tr>
-<td><code>cache.listen</code></td>
-<td><code>--listen</code></td>
-<td><code>ISLEDB_CACHE_LISTEN</code></td>
-<td><code>:8090</code></td>
-<td>API address</td>
-</tr>
-<tr>
-<td><code>cache.admin_listen</code></td>
-<td><code>--admin-listen</code></td>
-<td><code>ISLEDB_CACHE_ADMIN_LISTEN</code></td>
-<td><code>127.0.0.1:8091</code></td>
-<td>Admin address; empty for none</td>
-</tr>
-<tr>
-<td><code>cache.disk.dir</code></td>
-<td><code>--disk-dir</code></td>
-<td><code>ISLEDB_CACHE_DISK_DIR</code></td>
-<td>required</td>
-<td>Chunk directory, on local disk</td>
-</tr>
-<tr>
-<td><code>cache.disk.bytes</code></td>
-<td><code>--disk-bytes</code></td>
-<td><code>ISLEDB_CACHE_DISK_BYTES</code></td>
-<td>required</td>
-<td>Disk budget</td>
-</tr>
-<tr>
-<td><code>cache.reads.max_bytes</code></td>
-<td><code>--max-read-bytes</code></td>
-<td><code>ISLEDB_CACHE_READS_MAX_BYTES</code></td>
-<td><code>256MiB</code></td>
-<td>Bytes read from storage at once; at least <code>4MiB</code></td>
-</tr>
-<tr>
-<td><code>cache.reads.max_wait</code></td>
-<td><code>--max-read-wait</code></td>
-<td><code>ISLEDB_CACHE_READS_MAX_WAIT</code></td>
-<td><code>5s</code></td>
-<td>Longest a storage read waits for budget. About half the readers' timeout to the cache.</td>
-</tr>
-<tr>
-<td><code>cache.current.poll</code></td>
-<td><code>--current-poll</code></td>
-<td><code>ISLEDB_CACHE_CURRENT_POLL</code></td>
-<td><code>500ms</code></td>
-<td>How often <code>CURRENT</code> is read</td>
-</tr>
-<tr>
-<td><code>cache.current.long_poll</code></td>
-<td><code>--long-poll</code></td>
-<td><code>ISLEDB_CACHE_CURRENT_LONG_POLL</code></td>
-<td><code>30s</code></td>
-<td>Longest a long poll is held, at most <code>30s</code></td>
-</tr>
-<tr>
-<td><code>cache.auth.token_file</code></td>
-<td><code>--auth-token-file</code></td>
-<td><code>ISLEDB_CACHE_AUTH_TOKEN_FILE</code></td>
-<td></td>
-<td>Bearer tokens, one per line</td>
-</tr>
-<tr>
-<td><code>cache.auth.insecure</code></td>
-<td><code>--insecure</code></td>
-<td><code>ISLEDB_CACHE_AUTH_INSECURE</code></td>
-<td><code>false</code></td>
-<td>No authentication, for development</td>
-</tr>
-<tr>
-<td><code>cache.tls.cert</code>, <code>cache.tls.key</code></td>
-<td><code>--tls-cert</code>, <code>--tls-key</code></td>
-<td><code>ISLEDB_CACHE_TLS_CERT</code>, <code>ISLEDB_CACHE_TLS_KEY</code></td>
-<td></td>
-<td>Serve TLS</td>
-</tr>
-<tr>
-<td><code>cache.tls.client_ca</code></td>
-<td><code>--tls-client-ca</code></td>
-<td><code>ISLEDB_CACHE_TLS_CLIENT_CA</code></td>
-<td></td>
-<td>Require client certificates signed by this CA</td>
-</tr>
-<tr>
-<td><code>cache.shutdown_drain</code></td>
-<td><code>--shutdown-drain</code></td>
-<td><code>ISLEDB_CACHE_SHUTDOWN_DRAIN</code></td>
-<td><code>5s</code></td>
-<td>Not-ready time before shutting down</td>
-</tr>
-<tr>
-<td>–</td>
-<td><code>--config</code></td>
-<td><code>ISLEDB_CONFIG</code></td>
-<td></td>
-<td>YAML file</td>
-</tr>
-</tbody>
-</table>
-<p>Sizes are bytes or binary units: <code>512KiB</code>, <code>256MiB</code>, <code>200GiB</code>, <code>2TiB</code>.
-Durations are Go durations: <code>250ms</code>, <code>30s</code>, <code>2m</code>.</p>
+<p>Every setting, with its flag, environment variable and default, is in the
+<a href="/docs/configuration/#read-cache">configuration reference</a>.</p>
 <h3 id="run-authentication">Authentication</h3>
-<p>The cache refuses to start without authentication unless <code>cache.auth.insecure</code> is set.</p>
-<ul>
-<li><strong>Tokens.</strong> <code>cache.auth.token_file</code> holds one token per line; blank lines and
-lines starting with <code>#</code> are skipped. Clients send
-<code>Authorization: Bearer &lt;token&gt;</code>. Send <code>SIGHUP</code> to reread the file; if the
-new file cannot be read or holds no tokens, the tokens in use stay.</li>
-<li><strong>Client certificates.</strong> With <code>cache.tls.client_ca</code>, clients must present a
-certificate it signed. With both tokens and client certificates set, both
-are required. An <code>isledb reader</code> presents one with <code>read_cache.cert</code> and
-<code>read_cache.key</code>, and trusts a cache certificate from a private CA with
-<code>read_cache.ca_file</code>.</li>
-</ul>
+<p>The cache refuses to start without authentication unless <code>cache.auth.insecure</code>
+is set. Readers send a token from the cache's <code>auth.token_file</code>, and with
+<code>tls.client_ca</code> also a client certificate; an <code>isledb reader</code> sets these with
+its <code>read_cache</code> settings. See <a href="/docs/security/">Secure IsleDB</a>.</p>
 <p>Each database is served only its own objects: those right under its prefix,
 not those of a database nested under it (<code>prod/a/b</code> under <code>prod/a</code>), and,
 for the root, not those of the databases under prefixes. A client can read
@@ -993,7 +852,7 @@ operators and scrapers reach.</p>
 </tr>
 <tr>
 <td><code>/readyz</code></td>
-<td>200 once every database's <code>CURRENT</code> has been read once; 503 before, and while shutting down. It stays 200 while storage is down: the cache keeps serving its copy, and readers judge its age.</td>
+<td>200 once it has checked every database for new writes once; 503 before, and while shutting down. It stays 200 while storage is down: the cache keeps serving what it has, and readers judge its age.</td>
 </tr>
 <tr>
 <td><code>/metrics</code></td>
@@ -1006,70 +865,9 @@ operators and scrapers reach.</p>
 </tbody>
 </table>
 <h3 id="run-metrics">Metrics</h3>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th></th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>isledb_cache_chunks_total{source}</code></td>
-<td>Chunks served: <code>disk</code>, <code>storage</code>, <code>shared</code>, <code>bridged</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_object_responses_total{status}</code></td>
-<td>Object responses by <code>Isledb-Cache</code>: <code>hit</code>, <code>shared</code>, <code>miss</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_storage_reads_total</code>, <code>isledb_cache_storage_read_bytes_total</code></td>
-<td>Storage range reads and bytes</td>
-</tr>
-<tr>
-<td><code>isledb_cache_storage_reads_queued_total</code></td>
-<td>Storage reads that waited for <code>cache.reads.max_bytes</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_storage_bytes_reading</code></td>
-<td>Bytes being read now</td>
-</tr>
-<tr>
-<td><code>isledb_cache_size_lookups_total</code></td>
-<td>Sizes asked of storage, for requests without <code>Isledb-Object-Size</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_current_position{db}</code>, <code>isledb_cache_current_age_seconds{db}</code></td>
-<td>The relayed <code>CURRENT</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_current_poll_errors_total{db}</code></td>
-<td>Failed reads of <code>CURRENT</code></td>
-</tr>
-<tr>
-<td><code>isledb_cache_long_polls_held</code></td>
-<td>Long polls waiting now</td>
-</tr>
-<tr>
-<td><code>isledb_cache_disk_bytes</code>, <code>isledb_cache_disk_max_bytes</code>, <code>isledb_cache_disk_entries</code>, <code>isledb_cache_disk_evictions_total</code>, <code>isledb_cache_disk_failures_total</code></td>
-<td>The chunk store</td>
-</tr>
-<tr>
-<td><code>isledb_cache_http_requests_total{route,code}</code>, <code>isledb_cache_http_request_seconds{route}</code></td>
-<td>Requests; <code>route</code> is <code>current</code>, <code>current_long_poll</code>, <code>object</code> or <code>other</code></td>
-</tr>
-</tbody>
-</table>
-<p>What to watch:</p>
-<ul>
-<li><strong><code>current_age_seconds</code> rising</strong> means storage is not answering; readers
-stop accepting the copy once it is older than their age limit.</li>
-<li><strong><code>storage_reads_queued_total</code> rising</strong> means reads wait for budget: raise
-<code>cache.reads.max_bytes</code>, or add replicas, before waits reach <code>cache.reads.max_wait</code>
-and turn into 502s.</li>
-<li><strong><code>disk_evictions_total</code> rising fast</strong> with a low hit share means the disk
-is too small for the working set.</li>
-</ul>
+<p>The cache's metrics, and what to watch, are in the
+<a href="/docs/metrics/#read-cache">metrics reference</a>: above all, storage not answering,
+reads waiting for their turn, and a disk too small for what readers read.</p>
 <h3 id="run-shutdown">Shutdown</h3>
 <p>On <code>SIGTERM</code> or <code>SIGINT</code> the cache:</p>
 <ol>
@@ -1092,8 +890,8 @@ storage itself. <code>cache.reads.max_wait</code>, 5 seconds by default, is abou
 that, so a read that waited for its turn still has time to fetch and
 answer. Raise it only for clients that wait longer, to about half their
 timeout.</li>
-<li><strong>Several replicas.</strong> Round-robin works: each replica relays <code>CURRENT</code> on
-its own, and readers treat a copy behind their view as nothing new. Each
+<li><strong>Several replicas.</strong> Round-robin works: each replica checks for new writes
+on its own, and readers treat a copy behind their view as nothing new. Each
 replica then caches every hot chunk. Hashing object requests by path at
 the load balancer (Envoy ring hash, NGINX <code>hash $uri consistent</code>) puts
 each chunk on one replica, so their disks add up instead of repeating
@@ -1120,9 +918,11 @@ spec:
       # Longer than cache.shutdown_drain (5s) plus the 30s given to
       # requests in flight.
       terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 65532   # the image's user: lets it write the chunk volume
       containers:
         - name: cache
-          image: isledb:latest
+          image: ghcr.io/ankur-anand/isledb:0.20.0
           args: [&quot;cache&quot;, &quot;--config&quot;, &quot;/etc/isledb/isledb.yaml&quot;]
           env:
             - name: ISLEDB_CACHE_ADMIN_LISTEN
@@ -1180,7 +980,7 @@ spec:
 <li><strong>Why a StatefulSet.</strong> Each replica keeps its own chunk volume across
 restarts, so a restarted pod serves hits from disk at once.</li>
 <li><strong>Probes.</strong> Readiness uses <code>/readyz</code>, so a pod takes traffic only once it
-has read <code>CURRENT</code> for every database; liveness uses <code>/healthz</code>, which
+has checked every database for new writes; liveness uses <code>/healthz</code>, which
 does not depend on storage, so a storage outage never restarts the pods.
 Kubelet probes come from the node, which most network plugins let
 through regardless of policy; if yours does not, allow the node's
@@ -1204,7 +1004,7 @@ reads from storage every 500 ms.</li>
 <li><strong>Immutable objects</strong> (SSTs, change batches, manifest pages and snapshots),
 by byte range, from 128 KiB chunks kept on the cache's disk.</li>
 </ul>
-<p>Running it: <a href="/docs/cache/#run">isledb-cache.md</a>.</p>
+<p>Running it: <a href="/docs/cache/#run">Read cache</a>.</p>
 <p>Version: <code>v1</code>. Every path starts with <code>/v1/</code>.</p>
 <h3 id="api-endpoints">Endpoints</h3>
 <table>

@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/" aria-current="page">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -746,7 +762,7 @@
 <p><code>isledb reader</code> is a service that serves reads of one IsleDB database over
 HTTP. Run as many replicas as you need behind a load balancer: they share
 nothing, so each one adds capacity. The HTTP API is described in
-<a href="/docs/http-api/#reader">reader-api.md</a>.</p>
+<a href="/docs/http-api/#reader">the reader HTTP API</a>.</p>
 <h2 id="start-a-reader">Start a reader</h2>
 <p>With a configuration file:</p>
 <pre><code>isledb reader --config /etc/isledb/isledb.yaml
@@ -772,7 +788,7 @@ replica, more when the database changes.</p>
 through it instead: they usually load new data within a second of each
 write, and storage sees reads from the cache rather than from every replica.</p>
 <p>If the database has a change feed, every replica also serves it at
-<code>/v1/changes</code>; see <a href="/docs/http-api/#reader-follow-the-change-feed">reader-api.md</a>. The
+<code>/v1/changes</code>; see <a href="/docs/change-feed/">Follow changes</a>. The
 feed's newest position comes from the same loads as the data, and new
 changes show at the same time as new data. Consumers that have caught up are
 answered from memory: polling costs about one read per new position per
@@ -840,113 +856,9 @@ reader:
 <p>It checks the settings and prints the configuration they resolve to. It
 doesn't open the token, CA or certificate files: a missing one stops the
 reader when it starts.</p>
-<h3 id="options">Options</h3>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Flag</th>
-<th>Environment</th>
-<th>Default</th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>reader.prefix</code></td>
-<td><code>--prefix</code></td>
-<td><code>ISLEDB_READER_PREFIX</code></td>
-<td></td>
-<td>The database to read; <code>/</code> for the bucket root. Required.</td>
-</tr>
-<tr>
-<td><code>reader.cache_dir</code></td>
-<td><code>--cache-dir</code></td>
-<td><code>ISLEDB_READER_CACHE_DIR</code></td>
-<td></td>
-<td>This replica's disk cache. Required; give each replica its own.</td>
-</tr>
-<tr>
-<td><code>reader.caches.disk_bytes</code></td>
-<td><code>--disk-cache-bytes</code></td>
-<td><code>ISLEDB_READER_CACHES_DISK_BYTES</code></td>
-<td><code>8GiB</code></td>
-<td>Disk cache budget. Must be positive.</td>
-</tr>
-<tr>
-<td><code>reader.caches.block_bytes</code></td>
-<td><code>--block-cache-bytes</code></td>
-<td><code>ISLEDB_READER_CACHES_BLOCK_BYTES</code></td>
-<td><code>256MiB</code></td>
-<td>In-memory cache of data blocks. Must be positive.</td>
-</tr>
-<tr>
-<td><code>reader.caches.bloom_bytes</code></td>
-<td><code>--bloom-cache-bytes</code></td>
-<td><code>ISLEDB_READER_CACHES_BLOOM_BYTES</code></td>
-<td><code>64MiB</code></td>
-<td>In-memory cache of Bloom filters. Must be positive.</td>
-</tr>
-<tr>
-<td><code>reader.views.refresh_after</code></td>
-<td><code>--refresh-after</code></td>
-<td><code>ISLEDB_READER_VIEWS_REFRESH_AFTER</code></td>
-<td><code>1s</code></td>
-<td>How often new data is loaded. At least <code>1s</code>.</td>
-</tr>
-<tr>
-<td><code>reader.read_cache.url</code></td>
-<td><code>--read-cache-url</code></td>
-<td><code>ISLEDB_READER_READ_CACHE_URL</code></td>
-<td></td>
-<td>An <code>isledb cache</code> to read through.</td>
-</tr>
-<tr>
-<td><code>reader.read_cache.token_file</code></td>
-<td><code>--read-cache-token-file</code></td>
-<td><code>ISLEDB_READER_READ_CACHE_TOKEN_FILE</code></td>
-<td></td>
-<td>The token to send the cache: one token, on a line of its own; blank lines and lines starting with <code>#</code> are skipped. Read when the reader starts: after changing it, restart the reader.</td>
-</tr>
-<tr>
-<td><code>reader.read_cache.ca_file</code></td>
-<td><code>--read-cache-ca-file</code></td>
-<td><code>ISLEDB_READER_READ_CACHE_CA_FILE</code></td>
-<td></td>
-<td>CA certificates that sign the cache's certificate, for a cache with a private CA. Empty trusts the system's CAs. Needs an <code>https://</code> URL.</td>
-</tr>
-<tr>
-<td><code>reader.read_cache.cert</code>, <code>reader.read_cache.key</code></td>
-<td><code>--read-cache-cert</code>, <code>--read-cache-key</code></td>
-<td><code>ISLEDB_READER_READ_CACHE_CERT</code>, <code>ISLEDB_READER_READ_CACHE_KEY</code></td>
-<td></td>
-<td>A client certificate for a cache that requires one (its <code>tls.client_ca</code>). Set both.</td>
-</tr>
-<tr>
-<td><code>reader.reads.max_concurrent</code></td>
-<td><code>--max-concurrent-reads</code></td>
-<td><code>ISLEDB_READER_READS_MAX_CONCURRENT</code></td>
-<td><code>256</code></td>
-<td>Reads served at once; past it, reads get <code>503</code>.</td>
-</tr>
-<tr>
-<td><code>reader.listen</code></td>
-<td><code>--listen</code></td>
-<td><code>ISLEDB_READER_LISTEN</code></td>
-<td><code>:8080</code></td>
-<td>API address.</td>
-</tr>
-<tr>
-<td><code>reader.admin_listen</code></td>
-<td><code>--admin-listen</code></td>
-<td><code>ISLEDB_READER_ADMIN_LISTEN</code></td>
-<td><code>127.0.0.1:8081</code></td>
-<td>Health checks and metrics.</td>
-</tr>
-</tbody>
-</table>
-<p>Authentication, TLS and <code>shutdown_drain</code> work as for the writer: see
-<a href="/docs/writer/#authentication">isledb-writer.md</a>.</p>
+<p>Every setting, with its flag, environment variable and default, is in the
+<a href="/docs/configuration/#reader">configuration reference</a>. Authentication and TLS
+work as for every service: see <a href="/docs/security/">Secure IsleDB</a>.</p>
 <p>The caches can't be turned off: each size must be positive.</p>
 <p><strong>After setting <code>read_cache.url</code>, check that it works.</strong> A reader that can't
 use the cache, because of a wrong URL, a wrong token, or a cache using TLS
@@ -988,60 +900,12 @@ about 1 MiB plus one value, at once. With large values, lower
 </tbody>
 </table>
 <h2 id="metrics">Metrics</h2>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th>Shows</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>isledb_reader_view_position</code></td>
-<td>The revision reads are answered from. Compare it across replicas, or with the writer's commits, to see how far behind a replica is.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_view_loaded_timestamp_seconds</code></td>
-<td>When the reader last loaded the database's data; <code>time()</code> minus it is how old the data being served is.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_stale_reads_total</code></td>
-<td>Reads answered while refreshes were failing.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_refresh_total</code>, <code>isledb_reader_refresh_errors_total</code></td>
-<td>Loads of new data, and loads that failed.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_get_total</code>, <code>isledb_reader_get_hits_total</code>, <code>isledb_reader_get_misses_total</code></td>
-<td>Reads, by found or not.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_http_reads_in_progress</code></td>
-<td>Reads being served now.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_http_requests_total{route,code}</code>, <code>isledb_reader_http_request_seconds{route}</code></td>
-<td>Requests by endpoint and status code.</td>
-</tr>
-<tr>
-<td><code>isledb_reader_read_cache_*</code></td>
-<td>Reads through the cache, and those that fell back to storage.</td>
-</tr>
-</tbody>
-</table>
-<p>What to alert on:</p>
-<ul>
-<li><strong>Falling behind:</strong> the reader's data is older than you accept. Alert on
-its age, for example `time() - isledb_reader_view_loaded_timestamp_seconds
-<blockquote>
-<p>30<code>, which grows whenever refreshes stop succeeding. Look at </code>isledb_reader_refresh_errors_total<code>for why: usually a storage permission problem or an outage.</code>isledb_reader_stale_reads_total<code>counts reads answered meanwhile. The reader keeps serving what it has, and stays ready, until that data is</code>max_pinned_view_age` old; taking every replica out of
-service at once would turn old reads into no reads.</p>
-</blockquote>
-</li>
-<li><strong>Overloaded:</strong> many <code>503 backpressure</code>. Add replicas, or raise
-<code>reads.max_concurrent</code> if memory allows.</li>
-</ul>
+<p>The reader's metrics, and what to alert on, are in the
+<a href="/docs/metrics/#reader">metrics reference</a>. Above all, alert when the data a
+reader serves gets older than you accept: <code>time() - isledb_reader_view_loaded_timestamp_seconds</code> grows whenever loading new data
+fails. The reader keeps serving what it has, and stays ready, until that data
+is <code>max_pinned_view_age</code> old; taking every replica out of service at once
+would turn old reads into no reads.</p>
 <h2 id="shutting-down">Shutting down</h2>
 <p>On <code>SIGTERM</code> or <code>SIGINT</code>, the reader reports itself not ready, waits
 <code>shutdown_drain</code>, finishes reads in progress, and exits. It holds nothing

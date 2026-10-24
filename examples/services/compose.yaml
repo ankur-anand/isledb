@@ -8,7 +8,7 @@
 # The services run without authentication, for trying IsleDB locally only.
 
 x-isledb: &isledb
-  image: ghcr.io/ankur-anand/isledb:0.19.0
+  image: ghcr.io/ankur-anand/isledb:0.20.0
   environment:
     ISLEDB_BUCKET_URL: s3://isledb?endpoint=http://silo:9000&region=us-east-1&use_path_style=true
     AWS_ACCESS_KEY_ID: minioadmin

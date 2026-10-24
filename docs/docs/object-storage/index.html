@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/" aria-current="page">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -747,7 +763,7 @@
 This guide says which object stores work, how to create a bucket for IsleDB,
 and which bucket features to leave off.</p>
 <p>For what IsleDB stores and where, see
-<a href="/docs/storage-layout/">object-store-schema.md</a>.</p>
+<a href="/docs/storage-layout/">the storage layout</a>.</p>
 <h2 id="what-isledb-needs-from-a-store">What IsleDB needs from a store</h2>
 <ul>
 <li><strong>Conditional writes.</strong> IsleDB writes &quot;only if this object is unchanged&quot; and
@@ -917,7 +933,7 @@ Readers need only <code>roles/storage.objectViewer</code>.</p>
 <p><strong>One save per second.</strong> Cloud Storage allows about one write per second to
 an object, so the writer saves at most once per second there.
 <code>flush.interval</code> defaults to 1s on <code>gs://</code> buckets and can't be set lower;
-see <a href="/docs/writer/#choose-the-flush-interval">isledb-writer.md</a>.</p>
+see <a href="/docs/writer/#choose-the-flush-interval">Choose the flush interval</a>.</p>
 <p><strong>Request limits.</strong> A new bucket handles about 1,000 writes and 5,000 reads
 per second at first, and scales up over minutes as traffic grows.</p>
 <h2 id="azure-blob-storage">Azure Blob Storage</h2>

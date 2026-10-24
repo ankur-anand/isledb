@@ -4,7 +4,7 @@ The writer service stores keys and values in one IsleDB database. You can
 write a key, delete a key, write several keys at once, and check whether a
 write was saved.
 
-To run the service, see [isledb-writer.md](isledb-writer.md).
+To run the service, see [Writer service](isledb-writer.md).
 
 Every path starts with `/v1/`. Every response body is JSON.
 

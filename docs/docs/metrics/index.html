@@ -1,0 +1,1211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>IsleDB Metrics Reference: Prometheus Metrics and Alerts</title>
+    <meta name="description" content="Every Prometheus metric IsleDB&#39;s writer, reader, maintenance, and read cache services expose, and what to alert on." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="https://isledb.com/docs/metrics/" />
+    <meta property="og:title" content="Metrics reference · IsleDB" />
+    <meta property="og:description" content="Every Prometheus metric IsleDB&#39;s writer, reader, maintenance, and read cache services expose, and what to alert on." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://isledb.com/docs/metrics/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Metrics reference · IsleDB" />
+    <meta name="twitter:description" content="Every Prometheus metric IsleDB&#39;s writer, reader, maintenance, and read cache services expose, and what to alert on." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "TechArticle",
+            "headline": "Metrics reference",
+            "description": "Every Prometheus metric IsleDB\u0027s writer, reader, maintenance, and read cache services expose, and what to alert on.",
+            "url": "https:\/\/isledb.com\/docs\/metrics\/",
+            "about": { "@id": "https://isledb.com/#software" },
+            "isPartOf": { "@id": "https://isledb.com/#website" }
+          },
+          {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+              { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+              { "@type": "ListItem", "position": 2, "name": "Metrics reference", "item": "https:\/\/isledb.com\/docs\/metrics\/" }
+            ]
+          }
+        ]
+      }
+    </script>
+    
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+       
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+       
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main toc";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+       
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+         
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+       
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          <h2>Start</h2>
+          <ul>
+            <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
+          </ul>
+          <h2>Build</h2>
+          <ul>
+            <li><a href="/docs/http-api/">HTTP API</a></li>
+            <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
+          </ul>
+          <h2>Operate</h2>
+          <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
+            <li><a href="/docs/object-storage/">Object storage</a></li>
+            <li><a href="/docs/writer/">Writer service</a></li>
+            <li><a href="/docs/reader/">Reader service</a></li>
+            <li><a href="/docs/maintenance/">Maintenance service</a></li>
+            <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
+          </ul>
+          <h2>Reference</h2>
+          <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/" aria-current="page">Metrics</a></li>
+            <li><a href="/docs/storage-layout/">Storage layout</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main id="main" class="reference">
+        <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / Metrics reference</p>
+        <h1>Metrics reference</h1>
+<p>Every IsleDB service serves Prometheus metrics at <code>/metrics</code> on its admin
+address, without authentication. This page lists them all, by service, with
+what to alert on. Each service also exports the standard Go process metrics.</p>
+<p>Counters end in <code>_total</code>. Durations are in seconds, and times are Unix
+timestamps in seconds. Every service with an API reports its requests in the
+same two metrics:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_&lt;service&gt;_http_requests_total{route,code}</code></td>
+<td>Requests, by endpoint and status code.</td>
+</tr>
+<tr>
+<td><code>isledb_&lt;service&gt;_http_request_seconds{route}</code></td>
+<td>How long requests took to answer, by endpoint.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="writer">Writer</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_writer_status{status}</code></td>
+<td><code>1</code> for the writer's current state: <code>open</code>, <code>stopped</code>, <code>closed</code> or <code>fenced</code> (another writer took over).</td>
+</tr>
+<tr>
+<td><code>isledb_writer_epoch</code></td>
+<td>This writer's takeover count: each writer that takes over the database has a higher one.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_puts_total</code>, <code>isledb_writer_deletes_total</code></td>
+<td>Writes and deletes accepted.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_backpressure_total</code></td>
+<td>Writes refused because too much data was waiting to be saved.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_accepted_sequence</code></td>
+<td>The sequence number of the newest write accepted, saved or not.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_committed_sequence</code></td>
+<td>The sequence number of the newest write saved to storage.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_pending_bytes</code>, <code>isledb_writer_pending_memtables</code></td>
+<td>Data accepted but not yet saved.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_oldest_uncommitted_timestamp_seconds</code></td>
+<td>When the oldest write still waiting to be saved arrived; <code>0</code> when nothing is waiting.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_commits_total</code>, <code>isledb_writer_commit_errors_total</code></td>
+<td>Saves to storage, and saves that failed and are being retried.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_commit_seconds</code></td>
+<td>How long a save takes.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_commit_bytes_total</code></td>
+<td>Bytes saved to storage.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_http_inflight_body_bytes</code></td>
+<td>Size of the requests being read and applied right now.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merges_total</code>, <code>isledb_writer_l0_merge_errors_total</code></td>
+<td>The writer combines its recent saves into larger files: combined files uploaded, and attempts that failed and are retried.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merge_bytes_total</code></td>
+<td>Bytes of combined files uploaded.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merge_held_bytes</code></td>
+<td>Recent saves held in memory to combine.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merge_skipped_bytes_total</code></td>
+<td>Saves not held for combining because the memory for it was full.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merges_published_total</code>, <code>isledb_writer_l0_merges_refused_total</code></td>
+<td>Combined files that replaced the saves they came from, and those refused because maintenance had already changed those saves.</td>
+</tr>
+<tr>
+<td><code>isledb_writer_l0_merges_dropped_total</code></td>
+<td>Combining work given up because maintenance took the files first.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Alert on:</strong></p>
+<ul>
+<li><strong>Saves failing:</strong> <code>commit_errors_total</code> rising while
+<code>time() - oldest_uncommitted_timestamp_seconds</code> grows. Usually a storage
+permission problem or an outage. The writer keeps retrying and loses
+nothing it accepted, but clients start getting <code>504</code>.</li>
+<li><strong>Overloaded:</strong> <code>backpressure_total</code> rising, or many <code>503</code>s. Writes arrive
+faster than they can be saved: raise <code>memtable.max_pending</code>, or check how
+long saves take (<code>commit_seconds</code>).</li>
+<li><strong>Replaced:</strong> <code>status{status=&quot;fenced&quot;}</code> is <code>1</code>. Another writer took over;
+see <a href="/docs/writer/#run-one-writer-per-database">Run one writer per database</a>.</li>
+</ul>
+<h2 id="reader">Reader</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_reader_view_position</code></td>
+<td>The revision reads are answered from. Compare it across replicas, or with the writer's commits, to see how far behind a replica is.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_view_loaded_timestamp_seconds</code></td>
+<td>When the reader last loaded new data; <code>time()</code> minus it is how old the data being served is.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_view_outdated_since_timestamp_seconds</code></td>
+<td>For a reader that publishes new data only when told to: since when it has held back newer data; <code>0</code> otherwise.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_view_safety_publishes_total</code></td>
+<td>Times such a reader published newer data itself, after holding it back too long.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_refresh_total</code>, <code>isledb_reader_refresh_errors_total</code></td>
+<td>Loads of new data, and loads that failed.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_refresh_latency_seconds</code></td>
+<td>How long a load of new data takes.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_stale_reads_total</code></td>
+<td>Reads answered while loading new data was failing.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_get_total</code>, <code>isledb_reader_get_hits_total</code>, <code>isledb_reader_get_misses_total</code>, <code>isledb_reader_get_errors_total</code></td>
+<td>Key reads: all, found, not found, and failed.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_get_latency_seconds</code></td>
+<td>How long a key read takes.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_scan_total</code>, <code>isledb_reader_scan_errors_total</code>, <code>isledb_reader_scan_results_total</code>, <code>isledb_reader_scan_latency_seconds</code></td>
+<td>Scans: count, failures, keys returned, and duration.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_scan_limit_total</code>, <code>isledb_reader_scan_limit_errors_total</code>, <code>isledb_reader_scan_limit_results_total</code>, <code>isledb_reader_scan_limit_latency_seconds</code></td>
+<td>Scans with a limit, such as one page of <code>GET /v1/kv</code>: the same four.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_http_reads_in_progress</code></td>
+<td>Reads being served now.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_sst_range_read_total</code>, <code>isledb_reader_sst_range_read_errors_total</code></td>
+<td>Reads of data files from storage, and those that failed.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_sst_range_read_bytes_total</code>, <code>isledb_reader_sst_range_read_latency_seconds</code></td>
+<td>Bytes those reads fetched, and how long they took.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_bloom_filter_skips_total</code></td>
+<td>Key reads that checked a file without its filter, which lets a read skip files that can't hold the key, because the filter was still loading.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_bloom_filter_errors_total</code></td>
+<td>Filters that failed to load; reads go on without them.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_dead_ssts_pending</code></td>
+<td>Replaced data files not yet removed from the disk cache.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_read_cache_reads_total</code></td>
+<td>Reads the read cache answered.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_read_cache_fallbacks_total{reason}</code></td>
+<td>Reads meant for the read cache that went to storage instead, and why.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_read_cache_doorbells_total{result}</code></td>
+<td>Waits on the read cache for new writes, by result: <code>rang</code> (new data), <code>quiet</code> or <code>error</code>.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_read_cache_current_total{outcome}</code></td>
+<td>Loads of new data asked of the read cache, by outcome: <code>relayed</code>, <code>too_old</code>, <code>behind</code> or <code>failed</code>.</td>
+</tr>
+<tr>
+<td><code>isledb_reader_read_cache_current_age_seconds</code></td>
+<td>How old the read cache's copy of the newest version was, when last asked.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Alert on:</strong></p>
+<ul>
+<li><strong>Falling behind:</strong> the data served is older than you accept, for example
+<code>time() - isledb_reader_view_loaded_timestamp_seconds &gt; 30</code>. It grows
+whenever loading new data fails; <code>refresh_errors_total</code> says why, usually a
+storage permission problem or an outage. The reader keeps serving what it
+has, and stays ready, until that data reaches the database's maximum view
+age (one hour by default).</li>
+<li><strong>Read cache not used:</strong> <code>read_cache_fallbacks_total</code> rising with every
+read. The cache's URL, token or certificate is wrong; reads still work, from
+storage.</li>
+<li><strong>Overloaded:</strong> many <code>503</code>s with <code>backpressure</code>. Add replicas, or raise
+<code>reads.max_concurrent</code> if memory allows.</li>
+</ul>
+<h2 id="maintenance">Maintenance</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_maintenance_running</code></td>
+<td><code>1</code> while maintenance works on the database; <code>0</code> after another maintenance process took it over.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_cycles_total</code>, <code>isledb_maintenance_cycle_errors_total</code></td>
+<td>Rounds of work, and rounds that failed and are retried.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_last_cycle_timestamp_seconds</code></td>
+<td>When the last round completed.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_waiting_for_writer</code></td>
+<td><code>1</code> while finished work waits for the writer to publish it. On a busy database this is <code>1</code> nearly all the time, because each round hands the writer new work; don't alert on it.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_waiting_for_writer_since_timestamp_seconds</code></td>
+<td>When the work the writer has yet to publish was handed to it; <code>0</code> when nothing waits. It moves forward each time the writer publishes.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_jobs_total</code></td>
+<td>Compactions, counted when they run, including any the writer then refuses.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_l0_merges_total</code>, <code>isledb_maintenance_compaction_moves_total</code></td>
+<td>Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_read_bytes_total</code>, <code>isledb_maintenance_compaction_rewritten_bytes_total</code></td>
+<td>Bytes compaction read from and wrote to storage: most of maintenance's storage cost.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_moved_bytes_total</code></td>
+<td>Bytes moved without being rewritten.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_oversized_jobs_total</code></td>
+<td>Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_commands_rejected_total</code></td>
+<td>Finished work the writer refused to publish. The writer logs why.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_rejected_bytes_total</code></td>
+<td>Bytes compaction wrote for work the writer refused. The files are deleted later.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_checkpoints_total</code></td>
+<td>Checkpoints of the database's metadata prepared for the writer to publish.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_deleted_objects_total{kind}</code>, <code>isledb_maintenance_delete_failures_total{kind}</code></td>
+<td>Objects deleted from storage, and deletes that failed and are retried, by kind: <code>sst</code>, <code>change_batch</code>, <code>snapshot</code>, <code>page</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Alert on:</strong></p>
+<ul>
+<li><strong>Stuck:</strong> <code>time() - isledb_maintenance_last_cycle_timestamp_seconds</code> above
+a few minutes, or <code>cycle_errors_total</code> rising. Usually a storage permission
+problem, or no space in <code>scratch_dir</code>; the log says which.</li>
+<li><strong>No writer:</strong> <code>time() - waiting_for_writer_since_timestamp_seconds</code> above a
+few minutes, while it isn't <code>0</code>. The work is ready, but no writer is
+publishing it, so files pile up.</li>
+<li><strong>Refused work:</strong> <code>commands_rejected_total</code> rising steadily. An occasional
+refusal is normal: the writer refuses work on files that changed meanwhile,
+and maintenance redoes it. A steady rise means work is thrown away; the
+writer's log says why.</li>
+<li><strong>Replaced:</strong> <code>running</code> at <code>0</code>. Another maintenance process took over; see
+<a href="/docs/maintenance/#run-one-maintenance-per-database">Run one maintenance per database</a>.</li>
+</ul>
+<h2 id="read-cache">Read cache</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>isledb_cache_chunks_total{source}</code></td>
+<td>Pieces of data served, by where they came from: <code>disk</code>, <code>storage</code> (read for this request), <code>shared</code> (read for another request at the same time) or <code>bridged</code> (on disk, read again to fill a gap).</td>
+</tr>
+<tr>
+<td><code>isledb_cache_object_responses_total{status}</code></td>
+<td>Responses, by the <code>Isledb-Cache</code> header: <code>hit</code>, <code>shared</code> or <code>miss</code>.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_reads_total</code>, <code>isledb_cache_storage_read_bytes_total</code></td>
+<td>Reads sent to storage, and the bytes they returned.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_reads_queued_total</code></td>
+<td>Storage reads that waited for their turn (<code>reads.max_bytes</code>).</td>
+</tr>
+<tr>
+<td><code>isledb_cache_storage_bytes_reading</code></td>
+<td>Bytes being read from storage now.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_size_lookups_total</code></td>
+<td>Object sizes asked of storage, for requests that didn't give one.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_current_position{db}</code></td>
+<td>The newest revision the cache has seen, by database.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_current_age_seconds{db}</code></td>
+<td>How long since the cache last checked a database for new writes.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_current_poll_errors_total{db}</code></td>
+<td>Checks for new writes that failed.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_long_polls_held</code></td>
+<td>Readers waiting for new writes now.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_disk_bytes</code>, <code>isledb_cache_disk_max_bytes</code>, <code>isledb_cache_disk_entries</code></td>
+<td>Data on disk, the disk budget, and the number of pieces held.</td>
+</tr>
+<tr>
+<td><code>isledb_cache_disk_evictions_total</code>, <code>isledb_cache_disk_failures_total</code></td>
+<td>Pieces removed to make room, and pieces that couldn't be written to disk.</td>
+</tr>
+</tbody>
+</table>
+<p><code>route</code> on the cache's request metrics is <code>current</code>, <code>current_long_poll</code>,
+<code>object</code> or <code>other</code>.</p>
+<p><strong>Alert on:</strong></p>
+<ul>
+<li><strong>Storage not answering:</strong> <code>current_age_seconds</code> rising. Readers stop
+trusting the cache's copy once it is older than their limit, and read
+storage themselves.</li>
+<li><strong>Reads waiting:</strong> <code>storage_reads_queued_total</code> rising. Raise
+<code>reads.max_bytes</code>, or add replicas, before waits reach <code>reads.max_wait</code> and
+turn into <code>502</code>s.</li>
+<li><strong>Disk too small:</strong> <code>disk_evictions_total</code> rising fast while few responses
+are <code>hit</code>s. The working set doesn't fit on disk.</li>
+</ul>
+
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        <details open>
+        <summary><strong>On this page</strong></summary>
+        <ol>
+          <li class="l2"><a href="#writer">Writer</a></li>
+          <li class="l2"><a href="#reader">Reader</a></li>
+          <li class="l2"><a href="#maintenance">Maintenance</a></li>
+          <li class="l2"><a href="#read-cache">Read cache</a></li>
+        </ol>
+        </details>
+      </aside>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>

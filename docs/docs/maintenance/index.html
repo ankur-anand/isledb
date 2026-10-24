@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/" aria-current="page">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -802,57 +818,9 @@ maintenance:
 <p>To check a configuration without starting maintenance:</p>
 <pre><code>isledb maintenance --config isledb.yaml --check
 </code></pre>
-<h3 id="options">Options</h3>
-<table>
-<thead>
-<tr>
-<th>File</th>
-<th>Flag</th>
-<th>Environment</th>
-<th>Default</th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>maintenance.prefix</code></td>
-<td><code>--prefix</code></td>
-<td><code>ISLEDB_MAINTENANCE_PREFIX</code></td>
-<td></td>
-<td>The database to maintain; <code>/</code> for the bucket root. Required.</td>
-</tr>
-<tr>
-<td><code>maintenance.scratch_dir</code></td>
-<td><code>--scratch-dir</code></td>
-<td><code>ISLEDB_MAINTENANCE_SCRATCH_DIR</code></td>
-<td>the user's cache directory</td>
-<td>Where compaction keeps the files it is merging.</td>
-</tr>
-<tr>
-<td><code>maintenance.change_feed.retain_for</code></td>
-<td><code>--change-feed-retain-for</code></td>
-<td><code>ISLEDB_MAINTENANCE_CHANGE_FEED_RETAIN_FOR</code></td>
-<td><code>0s</code></td>
-<td>How long the database's change-feed history is kept; <code>0s</code> keeps it all.</td>
-</tr>
-<tr>
-<td><code>maintenance.admin_listen</code></td>
-<td><code>--admin-listen</code></td>
-<td><code>ISLEDB_MAINTENANCE_ADMIN_LISTEN</code></td>
-<td><code>127.0.0.1:8061</code></td>
-<td>Health checks and metrics.</td>
-</tr>
-<tr>
-<td><code>maintenance.shutdown_drain</code></td>
-<td><code>--shutdown-drain</code></td>
-<td><code>ISLEDB_MAINTENANCE_SHUTDOWN_DRAIN</code></td>
-<td><code>0s</code></td>
-<td>How long to report not ready before stopping.</td>
-</tr>
-</tbody>
-</table>
-<p>Maintenance has no API, so <code>listen</code>, <code>auth</code> and <code>tls</code> don't apply: setting
-them is an error.</p>
+<p>Every setting, with its flag, environment variable and default, is in the
+<a href="/docs/configuration/#maintenance">configuration reference</a>. Maintenance has no
+API, so <code>listen</code>, <code>auth</code> and <code>tls</code> don't apply: setting them is an error.</p>
 <h2 id="scratch-space">Scratch space</h2>
 <p>Compaction writes the files it is merging to <code>scratch_dir</code> instead of holding
 them in memory. Give it a local disk with room for the files of the compaction
@@ -864,9 +832,8 @@ behind. It never deletes anything else in the directory.</p>
 <p>By default the change feed keeps every change forever. With
 <code>change_feed.retain_for</code> set, maintenance deletes changes older than that.
 A consumer whose saved position is older than what is kept can't resume from
-it without a gap: it either accepts the gap and continues from the oldest
-change kept, or rebuilds its state from a snapshot of the database. Set it
-longer than the longest time a consumer may be stopped.</p>
+it without a gap. Set it longer than the longest time a consumer may be
+stopped; see <a href="/docs/change-feed/#retention">Follow changes</a>.</p>
 <h2 id="health-checks">Health checks</h2>
 <p>Served on <code>admin_listen</code>, without authentication.</p>
 <table>
@@ -896,83 +863,10 @@ longer than the longest time a consumer may be stopped.</p>
 </tbody>
 </table>
 <h2 id="metrics">Metrics</h2>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th>Shows</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>isledb_maintenance_running</code></td>
-<td><code>1</code> while maintenance works on the database; <code>0</code> after another maintenance process took it over.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_cycles_total</code>, <code>isledb_maintenance_cycle_errors_total</code></td>
-<td>Rounds of work, and rounds that failed and are retried.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_last_cycle_timestamp_seconds</code></td>
-<td>When the last round completed.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_waiting_for_writer</code></td>
-<td><code>1</code> while finished work waits for the writer to publish it.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_jobs_total</code></td>
-<td>Compactions, counted when they run, including any the writer then rejects.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_l0_merges_total</code>, <code>isledb_maintenance_compaction_moves_total</code></td>
-<td>Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_read_bytes_total</code>, <code>isledb_maintenance_compaction_rewritten_bytes_total</code></td>
-<td>Bytes compaction read from and wrote to storage: most of maintenance's storage cost.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_moved_bytes_total</code></td>
-<td>Bytes moved without being rewritten.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_oversized_jobs_total</code></td>
-<td>Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_commands_rejected_total</code></td>
-<td>Finished work the writer refused to publish. The writer logs why.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_compaction_rejected_bytes_total</code></td>
-<td>Bytes compaction wrote for work the writer refused. The files are deleted later.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_checkpoints_total</code></td>
-<td>Checkpoints of the database's metadata prepared for the writer to publish.</td>
-</tr>
-<tr>
-<td><code>isledb_maintenance_deleted_objects_total{kind}</code>, <code>isledb_maintenance_delete_failures_total{kind}</code></td>
-<td>Objects deleted from storage, and deletes that failed and are retried, by kind: <code>sst</code>, <code>change_batch</code>, <code>snapshot</code>, <code>page</code>.</td>
-</tr>
-</tbody>
-</table>
-<p>What to alert on:</p>
-<ul>
-<li><strong>Stuck:</strong> <code>time() - isledb_maintenance_last_cycle_timestamp_seconds</code> above
-a few minutes, or <code>cycle_errors_total</code> rising. Usually a storage permission
-problem, or no space in <code>scratch_dir</code>; the log says which.</li>
-<li><strong>No writer:</strong> <code>waiting_for_writer</code> at <code>1</code> for minutes. Maintenance's work
-is ready but no writer is publishing it, so files pile up.</li>
-<li><strong>Refused work:</strong> <code>commands_rejected_total</code> rising steadily. An occasional
-refusal is normal: the writer refuses work on files that changed while it
-was being done, and maintenance redoes it. A steady rise means work is being
-thrown away; the writer's log says why.</li>
-<li><strong>Replaced:</strong> <code>isledb_maintenance_running</code> at <code>0</code>: another maintenance
-process took over, and this one does no more work. See
-<a href="#run-one-maintenance-per-database">Run one maintenance per database</a>.</li>
-</ul>
+<p>Maintenance's metrics, and what to alert on, are in the
+<a href="/docs/metrics/#maintenance">metrics reference</a>. Watch at least for maintenance
+getting stuck, finished work waiting for a writer, work the writer keeps
+refusing, and maintenance being replaced.</p>
 <h2 id="shutting-down">Shutting down</h2>
 <p>When maintenance receives <code>SIGTERM</code> or <code>SIGINT</code>, it stops the round in
 progress, removes its scratch files and exits, within about 30 seconds. A

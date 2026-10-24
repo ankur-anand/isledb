@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/" aria-current="page">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -745,7 +761,7 @@
         <h1>Writer service</h1>
 <p><code>isledb writer</code> is a service that writes to one IsleDB database. Your
 applications send it writes over HTTP; it saves them to object storage. The
-HTTP API is described in <a href="/docs/http-api/#writer">writer-api.md</a>.</p>
+HTTP API is described in <a href="/docs/http-api/#writer">the writer HTTP API</a>.</p>
 <h2 id="start-the-writer">Start the writer</h2>
 <p>With a configuration file:</p>
 <pre><code>isledb writer --config /etc/isledb/isledb.yaml
@@ -854,184 +870,16 @@ writer:
 <pre><code>isledb writer --config isledb.yaml --check
 </code></pre>
 <p>It prints every setting with its final value, or the problems it found.</p>
-<h3 id="options">Options</h3>
-<table>
-<thead>
-<tr>
-<th>File key</th>
-<th>Flag</th>
-<th>Environment variable</th>
-<th>Default</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>bucket_url</code></td>
-<td><code>--bucket-url</code></td>
-<td><code>ISLEDB_BUCKET_URL</code></td>
-<td>required</td>
-<td>The bucket that holds the database.</td>
-</tr>
-<tr>
-<td><code>writer.prefix</code></td>
-<td><code>--prefix</code></td>
-<td><code>ISLEDB_WRITER_PREFIX</code></td>
-<td>required</td>
-<td>The database's path in the bucket. Use <code>/</code> for a database at the root of the bucket.</td>
-</tr>
-<tr>
-<td><code>log_level</code></td>
-<td><code>--log-level</code></td>
-<td><code>ISLEDB_LOG_LEVEL</code></td>
-<td><code>info</code></td>
-<td><code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>.</td>
-</tr>
-<tr>
-<td><code>writer.owner_id</code></td>
-<td><code>--owner-id</code></td>
-<td><code>ISLEDB_WRITER_OWNER_ID</code></td>
-<td>host name</td>
-<td>A name for this writer, shown in logs and storage. In Kubernetes, use the pod name.</td>
-</tr>
-<tr>
-<td><code>writer.flush.interval</code></td>
-<td><code>--flush-interval</code></td>
-<td><code>ISLEDB_WRITER_FLUSH_INTERVAL</code></td>
-<td><code>250ms</code>; <code>1s</code> on <code>gs://</code></td>
-<td>How often writes are saved. At least <code>1s</code> on Google Cloud Storage. See <a href="#choose-the-flush-interval">Choose the flush interval</a>.</td>
-</tr>
-<tr>
-<td><code>writer.writes.commit_wait</code></td>
-<td><code>--commit-wait</code></td>
-<td><code>ISLEDB_WRITER_WRITES_COMMIT_WAIT</code></td>
-<td><code>10s</code></td>
-<td>How long a write waits to be saved before the client gets <code>504</code>. Must be longer than <code>flush.interval</code>, and at most <code>20s</code>.</td>
-</tr>
-<tr>
-<td><code>writer.values.max_key_bytes</code></td>
-<td><code>--max-key-bytes</code></td>
-<td><code>ISLEDB_WRITER_VALUES_MAX_KEY_BYTES</code></td>
-<td><code>65527</code></td>
-<td>Largest key accepted, in bytes. At most <code>65527</code>.</td>
-</tr>
-<tr>
-<td><code>writer.values.max_value_bytes</code></td>
-<td><code>--max-value-bytes</code></td>
-<td><code>ISLEDB_WRITER_VALUES_MAX_VALUE_BYTES</code></td>
-<td><code>16MiB</code></td>
-<td>Largest value accepted.</td>
-</tr>
-<tr>
-<td><code>writer.writes.max_request_bytes</code></td>
-<td><code>--max-request-bytes</code></td>
-<td><code>ISLEDB_WRITER_WRITES_MAX_REQUEST_BYTES</code></td>
-<td><code>32MiB</code></td>
-<td>Largest batch request. At least <code>1MiB</code>.</td>
-</tr>
-<tr>
-<td><code>writer.memtable.target_bytes</code></td>
-<td><code>--memtable-bytes</code></td>
-<td><code>ISLEDB_WRITER_MEMTABLE_TARGET_BYTES</code></td>
-<td><code>16MiB</code></td>
-<td>How much data the writer buffers before saving it in a separate group. Also the largest batch.</td>
-</tr>
-<tr>
-<td><code>writer.memtable.max_pending</code></td>
-<td><code>--max-pending-memtables</code></td>
-<td><code>ISLEDB_WRITER_MEMTABLE_MAX_PENDING</code></td>
-<td><code>4</code></td>
-<td>How many full groups can wait to be saved before new writes get <code>503</code>.</td>
-</tr>
-<tr>
-<td><code>writer.writes.max_inflight_bytes</code></td>
-<td><code>--max-inflight-bytes</code></td>
-<td><code>ISLEDB_WRITER_WRITES_MAX_INFLIGHT_BYTES</code></td>
-<td><code>256MiB</code></td>
-<td>Memory for requests being read and applied at once. A <code>PUT</code> counts its body; a batch counts 4 times its body, for its decoded copy and the batch built from it. Past it, new writes get <code>503</code> until earlier ones finish. At least 4 × <code>max_request_bytes</code>, and <code>max_value_bytes</code>.</td>
-</tr>
-<tr>
-<td><code>writer.writes.body_read_timeout</code></td>
-<td><code>--body-read-timeout</code></td>
-<td><code>ISLEDB_WRITER_WRITES_BODY_READ_TIMEOUT</code></td>
-<td><code>1m</code></td>
-<td>How long a client has to send its request body. Past it, the client gets <code>408</code>.</td>
-</tr>
-<tr>
-<td><code>writer.change_feed.payload</code></td>
-<td><code>--change-feed</code></td>
-<td><code>ISLEDB_WRITER_CHANGE_FEED_PAYLOAD</code></td>
-<td>empty</td>
-<td>Turns on the database's change feed: <code>keys</code> or <code>values</code>. See below.</td>
-</tr>
-<tr>
-<td><code>writer.policy.max_pinned_view_age</code></td>
-<td><code>--max-pinned-view-age</code></td>
-<td><code>ISLEDB_WRITER_POLICY_MAX_PINNED_VIEW_AGE</code></td>
-<td><code>1h</code></td>
-<td>Must match the database's setting. See below.</td>
-</tr>
-<tr>
-<td><code>writer.listen</code></td>
-<td><code>--listen</code></td>
-<td><code>ISLEDB_WRITER_LISTEN</code></td>
-<td><code>:8070</code></td>
-<td>Address for the API.</td>
-</tr>
-<tr>
-<td><code>writer.admin_listen</code></td>
-<td><code>--admin-listen</code></td>
-<td><code>ISLEDB_WRITER_ADMIN_LISTEN</code></td>
-<td><code>127.0.0.1:8071</code></td>
-<td>Address for health checks and metrics. Empty turns it off.</td>
-</tr>
-<tr>
-<td><code>writer.auth.token_file</code></td>
-<td><code>--auth-token-file</code></td>
-<td><code>ISLEDB_WRITER_AUTH_TOKEN_FILE</code></td>
-<td></td>
-<td>File of accepted tokens, one per line.</td>
-</tr>
-<tr>
-<td><code>writer.auth.insecure</code></td>
-<td><code>--insecure</code></td>
-<td><code>ISLEDB_WRITER_AUTH_INSECURE</code></td>
-<td><code>false</code></td>
-<td>Accept requests without a token. For development only.</td>
-</tr>
-<tr>
-<td><code>writer.tls.cert</code>, <code>writer.tls.key</code></td>
-<td><code>--tls-cert</code>, <code>--tls-key</code></td>
-<td><code>ISLEDB_WRITER_TLS_CERT</code>, <code>ISLEDB_WRITER_TLS_KEY</code></td>
-<td></td>
-<td>Serve HTTPS with this certificate.</td>
-</tr>
-<tr>
-<td><code>writer.tls.client_ca</code></td>
-<td><code>--tls-client-ca</code></td>
-<td><code>ISLEDB_WRITER_TLS_CLIENT_CA</code></td>
-<td></td>
-<td>Require clients to present a certificate signed by this CA.</td>
-</tr>
-<tr>
-<td><code>writer.shutdown_drain</code></td>
-<td><code>--shutdown-drain</code></td>
-<td><code>ISLEDB_WRITER_SHUTDOWN_DRAIN</code></td>
-<td><code>5s</code></td>
-<td>How long the writer reports itself not ready before it shuts down, so load balancers stop sending traffic.</td>
-</tr>
-</tbody>
-</table>
-<p>Sizes accept <code>KiB</code>, <code>MiB</code> and <code>GiB</code>, as in <code>512KiB</code> or <code>16MiB</code>. Durations
-look like <code>250ms</code>, <code>30s</code> or <code>2m</code>.</p>
-<p><strong>Change feed.</strong> Leave <code>change_feed.payload</code> empty unless you want to turn
-on the change feed. With it empty, the writer keeps whatever the database
-already has. Setting <code>keys</code> or <code>values</code> turns the feed on permanently. If the
-database already has a feed with a different setting, the writer won't start.</p>
-<p><strong>Pinned view age.</strong> If your database was created by an application that set
-<code>MaxPinnedViewAge</code>, set <code>policy.max_pinned_view_age</code> to the same value.
-Otherwise the writer won't start. Leave it empty for databases created with
-the default.</p>
+<p>Every setting, with its flag, environment variable and default, is in the
+<a href="/docs/configuration/#writer">configuration reference</a>. Two need care:</p>
+<ul>
+<li><strong><code>change_feed.payload</code></strong> turns on the database's change feed, <code>keys</code> or
+<code>values</code>, permanently. Leave it empty to keep what the database has. See
+<a href="/docs/change-feed/">Follow changes</a>.</li>
+<li><strong><code>policy.max_pinned_view_age</code></strong> must match the database's setting. Leave
+it unset unless the database was created by an application that set a
+different <code>MaxPinnedViewAge</code>; otherwise the writer won't start.</li>
+</ul>
 <h2 id="memory">Memory</h2>
 <p>Plan for about 910 MiB of memory with the default settings. Most of it is
 data waiting to be saved, and requests being read and applied, which
@@ -1043,18 +891,10 @@ about 64 MiB at a time, which takes up to about 190 MiB. If you raise
 limit too.</p>
 <h2 id="authentication">Authentication</h2>
 <p>The writer won't start without authentication unless you set
-<code>writer.auth.insecure</code>.</p>
-<ul>
-<li><strong>Tokens:</strong> put accepted tokens in the file named by
-<code>writer.auth.token_file</code>, one per line. Lines starting with <code>#</code> are ignored.
-Clients send <code>Authorization: Bearer &lt;token&gt;</code>. To reload the file without
-restarting, send the writer <code>SIGHUP</code>. A <code>SIGHUP</code> never stops a service,
-with or without a token file.</li>
-<li><strong>Client certificates:</strong> with <code>writer.tls.client_ca</code>, clients must also
-present a certificate signed by that CA.</li>
-</ul>
-<p>Any client with a valid token can write and delete every key in the
-database.</p>
+<code>writer.auth.insecure</code>. Clients send a token from <code>writer.auth.token_file</code>,
+and with <code>writer.tls.client_ca</code> also a client certificate. Any client with a
+valid token can write and delete every key in the database, so give writer
+tokens only to applications that write. See <a href="/docs/security/">Secure IsleDB</a>.</p>
 <h2 id="health-checks">Health checks</h2>
 <p>These are served on <code>admin_listen</code>, without authentication. Keep that address
 reachable only by your operators and monitoring.</p>
@@ -1085,64 +925,10 @@ reachable only by your operators and monitoring.</p>
 </tbody>
 </table>
 <h2 id="metrics">Metrics</h2>
-<table>
-<thead>
-<tr>
-<th>Metric</th>
-<th>Shows</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>isledb_writer_status{status}</code></td>
-<td><code>1</code> for the writer's current state: <code>open</code>, <code>stopped</code>, <code>closed</code> or <code>fenced</code> (another writer took over).</td>
-</tr>
-<tr>
-<td><code>isledb_writer_commits_total</code>, <code>isledb_writer_commit_errors_total</code></td>
-<td>Saves to storage, and saves that failed and are being retried.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_commit_seconds</code></td>
-<td>How long a save takes.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_oldest_uncommitted_timestamp_seconds</code></td>
-<td>When the oldest write still waiting to be saved arrived; <code>0</code> when nothing is waiting.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_pending_bytes</code>, <code>isledb_writer_pending_memtables</code></td>
-<td>Data waiting to be saved.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_puts_total</code>, <code>isledb_writer_deletes_total</code></td>
-<td>Writes and deletes accepted.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_backpressure_total</code></td>
-<td>Writes refused because too much data was waiting to be saved.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_http_inflight_body_bytes</code></td>
-<td>Size of the requests being read right now.</td>
-</tr>
-<tr>
-<td><code>isledb_writer_http_requests_total{route,code}</code>, <code>isledb_writer_http_request_seconds{route}</code></td>
-<td>Requests by endpoint and status code.</td>
-</tr>
-</tbody>
-</table>
-<p>What to alert on:</p>
-<ul>
-<li><strong>Saves failing:</strong> <code>commit_errors_total</code> rising, with the age of the oldest
-waiting write growing. Usually a storage permission problem or an outage.
-The writer keeps retrying and loses nothing it accepted, but clients start
-getting <code>504</code>.</li>
-<li><strong>Writer overloaded:</strong> <code>backpressure_total</code> rising, or many <code>503</code>s. Writes
-arrive faster than they can be saved. Increase <code>memtable.max_pending</code>, or
-check how long saves take.</li>
-<li><strong>Writer replaced:</strong> <code>status{status=&quot;fenced&quot;}</code> is <code>1</code>. See
-<a href="#run-one-writer-per-database">Run one writer per database</a>.</li>
-</ul>
+<p>The writer's metrics, and what to alert on, are in the
+<a href="/docs/metrics/#writer">metrics reference</a>. Watch at least for saves failing,
+the writer refusing writes because it is overloaded, and the writer being
+replaced.</p>
 <h2 id="shutting-down">Shutting down</h2>
 <p>When the writer receives <code>SIGTERM</code> or <code>SIGINT</code>, it:</p>
 <ol>
@@ -1181,7 +967,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
         - name: writer
-          image: isledb:latest
+          image: ghcr.io/ankur-anand/isledb:0.20.0
           args: [&quot;writer&quot;, &quot;--config&quot;, &quot;/etc/isledb/isledb.yaml&quot;]
           env:
             - name: ISLEDB_WRITER_ADMIN_LISTEN

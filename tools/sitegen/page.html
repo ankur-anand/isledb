@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+      /* Names in tables stay whole; a wide table scrolls in its own box. */
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;

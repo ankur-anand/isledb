@@ -72,6 +72,15 @@ var pages = []page{
 		tocDepth:    3,
 	},
 	{
+		path: "/docs/concepts/", group: "Start", nav: "How IsleDB works",
+		summary:     "The writer, readers, maintenance, the read cache, revisions, and the change feed.",
+		title:       "How IsleDB Works: A Key-Value Database in Your Object Storage Bucket",
+		heading:     "How IsleDB works",
+		description: "How IsleDB keeps a key-value database in an object storage bucket: one writer, any number of readers, maintenance, the read cache, revisions, and the change feed.",
+		parts:       []part{{file: "docs/concepts.md"}},
+		tocDepth:    2,
+	},
+	{
 		path: "/docs/http-api/", group: "Build", nav: "HTTP API",
 		summary:     "Write and delete keys on the writer; read, scan, and follow the change feed on readers.",
 		title:       "IsleDB HTTP API Reference: Writes, Reads, Scans, and the Change Feed",
@@ -92,6 +101,24 @@ var pages = []page{
 		description: "The IsleDB Go API: open a database on S3, GCS, or Azure Blob, write and read keys, follow the change feed, and run maintenance.",
 		lede:        "Embed IsleDB in a Go program: open a database on your bucket, write and read keys, follow the change feed, and run maintenance.",
 		parts:       []part{{file: "api.md"}},
+		tocDepth:    2,
+	},
+	{
+		path: "/docs/change-feed/", group: "Build", nav: "Follow changes",
+		summary:     "Turn on the change feed, read it, keep your place, and build a copy that stays current.",
+		title:       "Follow Changes with the IsleDB Change Feed: Cursors, Copies, Retention",
+		heading:     "Follow changes",
+		description: "Use IsleDB's change feed to keep a cache, search index, or another system in sync: turn it on, read it over HTTP or in Go, save cursors, bootstrap a copy, and set retention.",
+		parts:       []part{{file: "docs/change-feed.md"}},
+		tocDepth:    2,
+	},
+	{
+		path: "/docs/deploy/", group: "Operate", nav: "Deploy",
+		summary:     "What to run for a database, how many of each, and a production checklist.",
+		title:       "Deploy IsleDB: Writer, Readers, Maintenance, and Read Cache",
+		heading:     "Deploy IsleDB",
+		description: "What to run for an IsleDB database, how many of each service, how to configure them together, and a checklist for production.",
+		parts:       []part{{file: "docs/deploy.md"}},
 		tocDepth:    2,
 	},
 	{
@@ -141,6 +168,33 @@ var pages = []page{
 			{file: "docs/read-cache-api.md", title: "Cache HTTP API", prefix: "api-"},
 		},
 		tocDepth: 3,
+	},
+	{
+		path: "/docs/security/", group: "Operate", nav: "Security",
+		summary:     "Tokens, TLS, admin addresses, and storage credentials for every service.",
+		title:       "Secure IsleDB: Tokens, TLS, and Storage Credentials",
+		heading:     "Secure IsleDB",
+		description: "Secure IsleDB's services: token authentication, TLS and client certificates, admin addresses, and least-privilege storage credentials.",
+		parts:       []part{{file: "docs/security.md"}},
+		tocDepth:    2,
+	},
+	{
+		path: "/docs/configuration/", group: "Reference", nav: "Configuration",
+		summary:     "Every setting of every service, with its flag, environment variable, and default.",
+		title:       "IsleDB Configuration Reference: Every Setting of Every Service",
+		heading:     "Configuration reference",
+		description: "Every setting of IsleDB's writer, reader, maintenance, and read cache services, with its YAML key, flag, environment variable, and default.",
+		parts:       []part{{file: "docs/configuration.md"}},
+		tocDepth:    2,
+	},
+	{
+		path: "/docs/metrics/", group: "Reference", nav: "Metrics",
+		summary:     "Every Prometheus metric of every service, and what to alert on.",
+		title:       "IsleDB Metrics Reference: Prometheus Metrics and Alerts",
+		heading:     "Metrics reference",
+		description: "Every Prometheus metric IsleDB's writer, reader, maintenance, and read cache services expose, and what to alert on.",
+		parts:       []part{{file: "docs/metrics.md"}},
+		tocDepth:    2,
 	},
 	{
 		path: "/docs/storage-layout/", group: "Reference", nav: "Storage layout",
@@ -263,7 +317,8 @@ func nav(current string) []navGroup {
 func render(p page) ([]byte, error) {
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.GFM),
-		goldmark.WithRendererOptions(html.WithXHTML()),
+		// The docs are ours, and their tables use <br> to stack names in a cell.
+		goldmark.WithRendererOptions(html.WithXHTML(), html.WithUnsafe()),
 	)
 	var body bytes.Buffer
 	var toc []tocEntry

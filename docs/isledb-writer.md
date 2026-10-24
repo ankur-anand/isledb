@@ -2,7 +2,7 @@
 
 `isledb writer` is a service that writes to one IsleDB database. Your
 applications send it writes over HTTP; it saves them to object storage. The
-HTTP API is described in [writer-api.md](writer-api.md).
+HTTP API is described in [the writer HTTP API](writer-api.md).
 
 ## Start the writer
 
@@ -113,45 +113,15 @@ isledb writer --config isledb.yaml --check
 
 It prints every setting with its final value, or the problems it found.
 
-### Options
+Every setting, with its flag, environment variable and default, is in the
+[configuration reference](configuration.md#writer). Two need care:
 
-| File key | Flag | Environment variable | Default | Description |
-|---|---|---|---|---|
-| `bucket_url` | `--bucket-url` | `ISLEDB_BUCKET_URL` | required | The bucket that holds the database. |
-| `writer.prefix` | `--prefix` | `ISLEDB_WRITER_PREFIX` | required | The database's path in the bucket. Use `/` for a database at the root of the bucket. |
-| `log_level` | `--log-level` | `ISLEDB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
-| `writer.owner_id` | `--owner-id` | `ISLEDB_WRITER_OWNER_ID` | host name | A name for this writer, shown in logs and storage. In Kubernetes, use the pod name. |
-| `writer.flush.interval` | `--flush-interval` | `ISLEDB_WRITER_FLUSH_INTERVAL` | `250ms`; `1s` on `gs://` | How often writes are saved. At least `1s` on Google Cloud Storage. See [Choose the flush interval](#choose-the-flush-interval). |
-| `writer.writes.commit_wait` | `--commit-wait` | `ISLEDB_WRITER_WRITES_COMMIT_WAIT` | `10s` | How long a write waits to be saved before the client gets `504`. Must be longer than `flush.interval`, and at most `20s`. |
-| `writer.values.max_key_bytes` | `--max-key-bytes` | `ISLEDB_WRITER_VALUES_MAX_KEY_BYTES` | `65527` | Largest key accepted, in bytes. At most `65527`. |
-| `writer.values.max_value_bytes` | `--max-value-bytes` | `ISLEDB_WRITER_VALUES_MAX_VALUE_BYTES` | `16MiB` | Largest value accepted. |
-| `writer.writes.max_request_bytes` | `--max-request-bytes` | `ISLEDB_WRITER_WRITES_MAX_REQUEST_BYTES` | `32MiB` | Largest batch request. At least `1MiB`. |
-| `writer.memtable.target_bytes` | `--memtable-bytes` | `ISLEDB_WRITER_MEMTABLE_TARGET_BYTES` | `16MiB` | How much data the writer buffers before saving it in a separate group. Also the largest batch. |
-| `writer.memtable.max_pending` | `--max-pending-memtables` | `ISLEDB_WRITER_MEMTABLE_MAX_PENDING` | `4` | How many full groups can wait to be saved before new writes get `503`. |
-| `writer.writes.max_inflight_bytes` | `--max-inflight-bytes` | `ISLEDB_WRITER_WRITES_MAX_INFLIGHT_BYTES` | `256MiB` | Memory for requests being read and applied at once. A `PUT` counts its body; a batch counts 4 times its body, for its decoded copy and the batch built from it. Past it, new writes get `503` until earlier ones finish. At least 4 × `max_request_bytes`, and `max_value_bytes`. |
-| `writer.writes.body_read_timeout` | `--body-read-timeout` | `ISLEDB_WRITER_WRITES_BODY_READ_TIMEOUT` | `1m` | How long a client has to send its request body. Past it, the client gets `408`. |
-| `writer.change_feed.payload` | `--change-feed` | `ISLEDB_WRITER_CHANGE_FEED_PAYLOAD` | empty | Turns on the database's change feed: `keys` or `values`. See below. |
-| `writer.policy.max_pinned_view_age` | `--max-pinned-view-age` | `ISLEDB_WRITER_POLICY_MAX_PINNED_VIEW_AGE` | `1h` | Must match the database's setting. See below. |
-| `writer.listen` | `--listen` | `ISLEDB_WRITER_LISTEN` | `:8070` | Address for the API. |
-| `writer.admin_listen` | `--admin-listen` | `ISLEDB_WRITER_ADMIN_LISTEN` | `127.0.0.1:8071` | Address for health checks and metrics. Empty turns it off. |
-| `writer.auth.token_file` | `--auth-token-file` | `ISLEDB_WRITER_AUTH_TOKEN_FILE` | | File of accepted tokens, one per line. |
-| `writer.auth.insecure` | `--insecure` | `ISLEDB_WRITER_AUTH_INSECURE` | `false` | Accept requests without a token. For development only. |
-| `writer.tls.cert`, `writer.tls.key` | `--tls-cert`, `--tls-key` | `ISLEDB_WRITER_TLS_CERT`, `ISLEDB_WRITER_TLS_KEY` | | Serve HTTPS with this certificate. |
-| `writer.tls.client_ca` | `--tls-client-ca` | `ISLEDB_WRITER_TLS_CLIENT_CA` | | Require clients to present a certificate signed by this CA. |
-| `writer.shutdown_drain` | `--shutdown-drain` | `ISLEDB_WRITER_SHUTDOWN_DRAIN` | `5s` | How long the writer reports itself not ready before it shuts down, so load balancers stop sending traffic. |
-
-Sizes accept `KiB`, `MiB` and `GiB`, as in `512KiB` or `16MiB`. Durations
-look like `250ms`, `30s` or `2m`.
-
-**Change feed.** Leave `change_feed.payload` empty unless you want to turn
-on the change feed. With it empty, the writer keeps whatever the database
-already has. Setting `keys` or `values` turns the feed on permanently. If the
-database already has a feed with a different setting, the writer won't start.
-
-**Pinned view age.** If your database was created by an application that set
-`MaxPinnedViewAge`, set `policy.max_pinned_view_age` to the same value.
-Otherwise the writer won't start. Leave it empty for databases created with
-the default.
+- **`change_feed.payload`** turns on the database's change feed, `keys` or
+  `values`, permanently. Leave it empty to keep what the database has. See
+  [Follow changes](change-feed.md).
+- **`policy.max_pinned_view_age`** must match the database's setting. Leave
+  it unset unless the database was created by an application that set a
+  different `MaxPinnedViewAge`; otherwise the writer won't start.
 
 ## Memory
 
@@ -167,18 +137,10 @@ limit too.
 ## Authentication
 
 The writer won't start without authentication unless you set
-`writer.auth.insecure`.
-
-- **Tokens:** put accepted tokens in the file named by
-  `writer.auth.token_file`, one per line. Lines starting with `#` are ignored.
-  Clients send `Authorization: Bearer <token>`. To reload the file without
-  restarting, send the writer `SIGHUP`. A `SIGHUP` never stops a service,
-  with or without a token file.
-- **Client certificates:** with `writer.tls.client_ca`, clients must also
-  present a certificate signed by that CA.
-
-Any client with a valid token can write and delete every key in the
-database.
+`writer.auth.insecure`. Clients send a token from `writer.auth.token_file`,
+and with `writer.tls.client_ca` also a client certificate. Any client with a
+valid token can write and delete every key in the database, so give writer
+tokens only to applications that write. See [Secure IsleDB](security.md).
 
 ## Health checks
 
@@ -194,29 +156,10 @@ reachable only by your operators and monitoring.
 
 ## Metrics
 
-| Metric | Shows |
-|---|---|
-| `isledb_writer_status{status}` | `1` for the writer's current state: `open`, `stopped`, `closed` or `fenced` (another writer took over). |
-| `isledb_writer_commits_total`, `isledb_writer_commit_errors_total` | Saves to storage, and saves that failed and are being retried. |
-| `isledb_writer_commit_seconds` | How long a save takes. |
-| `isledb_writer_oldest_uncommitted_timestamp_seconds` | When the oldest write still waiting to be saved arrived; `0` when nothing is waiting. |
-| `isledb_writer_pending_bytes`, `isledb_writer_pending_memtables` | Data waiting to be saved. |
-| `isledb_writer_puts_total`, `isledb_writer_deletes_total` | Writes and deletes accepted. |
-| `isledb_writer_backpressure_total` | Writes refused because too much data was waiting to be saved. |
-| `isledb_writer_http_inflight_body_bytes` | Size of the requests being read right now. |
-| `isledb_writer_http_requests_total{route,code}`, `isledb_writer_http_request_seconds{route}` | Requests by endpoint and status code. |
-
-What to alert on:
-
-- **Saves failing:** `commit_errors_total` rising, with the age of the oldest
-  waiting write growing. Usually a storage permission problem or an outage.
-  The writer keeps retrying and loses nothing it accepted, but clients start
-  getting `504`.
-- **Writer overloaded:** `backpressure_total` rising, or many `503`s. Writes
-  arrive faster than they can be saved. Increase `memtable.max_pending`, or
-  check how long saves take.
-- **Writer replaced:** `status{status="fenced"}` is `1`. See
-  [Run one writer per database](#run-one-writer-per-database).
+The writer's metrics, and what to alert on, are in the
+[metrics reference](metrics.md#writer). Watch at least for saves failing,
+the writer refusing writes because it is overloaded, and the writer being
+replaced.
 
 ## Shutting down
 
@@ -260,7 +203,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
         - name: writer
-          image: isledb:latest
+          image: ghcr.io/ankur-anand/isledb:0.20.0
           args: ["writer", "--config", "/etc/isledb/isledb.yaml"]
           env:
             - name: ISLEDB_WRITER_ADMIN_LISTEN

@@ -4,8 +4,8 @@ The reader service reads keys, and scans ranges of keys, from one IsleDB
 database. Run as many readers
 as you like: each serves reads on its own, so add replicas to serve more.
 
-To run the service, see [isledb-reader.md](isledb-reader.md). Writes go to
-the writer service, described in [writer-api.md](writer-api.md).
+To run the service, see [Reader service](isledb-reader.md). Writes go to
+the writer service, described in [the writer HTTP API](writer-api.md).
 
 Every path starts with `/v1/`.
 

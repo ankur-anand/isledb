@@ -10,10 +10,19 @@
     <loc>https://isledb.com/getting-started/</loc>
   </url>
   <url>
+    <loc>https://isledb.com/docs/concepts/</loc>
+  </url>
+  <url>
     <loc>https://isledb.com/docs/http-api/</loc>
   </url>
   <url>
     <loc>https://isledb.com/docs/go-api/</loc>
+  </url>
+  <url>
+    <loc>https://isledb.com/docs/change-feed/</loc>
+  </url>
+  <url>
+    <loc>https://isledb.com/docs/deploy/</loc>
   </url>
   <url>
     <loc>https://isledb.com/docs/object-storage/</loc>
@@ -29,6 +38,15 @@
   </url>
   <url>
     <loc>https://isledb.com/docs/cache/</loc>
+  </url>
+  <url>
+    <loc>https://isledb.com/docs/security/</loc>
+  </url>
+  <url>
+    <loc>https://isledb.com/docs/configuration/</loc>
+  </url>
+  <url>
+    <loc>https://isledb.com/docs/metrics/</loc>
   </url>
   <url>
     <loc>https://isledb.com/docs/storage-layout/</loc>

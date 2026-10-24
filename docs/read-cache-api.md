@@ -8,7 +8,7 @@ It serves two things:
 - **Immutable objects** (SSTs, change batches, manifest pages and snapshots),
   by byte range, from 128 KiB chunks kept on the cache's disk.
 
-Running it: [isledb-cache.md](isledb-cache.md).
+Running it: [Read cache](isledb-cache.md).
 
 Version: `v1`. Every path starts with `/v1/`.
 

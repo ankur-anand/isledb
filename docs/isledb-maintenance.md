@@ -83,18 +83,9 @@ To check a configuration without starting maintenance:
 isledb maintenance --config isledb.yaml --check
 ```
 
-### Options
-
-| File | Flag | Environment | Default | Meaning |
-|---|---|---|---|---|
-| `maintenance.prefix` | `--prefix` | `ISLEDB_MAINTENANCE_PREFIX` | | The database to maintain; `/` for the bucket root. Required. |
-| `maintenance.scratch_dir` | `--scratch-dir` | `ISLEDB_MAINTENANCE_SCRATCH_DIR` | the user's cache directory | Where compaction keeps the files it is merging. |
-| `maintenance.change_feed.retain_for` | `--change-feed-retain-for` | `ISLEDB_MAINTENANCE_CHANGE_FEED_RETAIN_FOR` | `0s` | How long the database's change-feed history is kept; `0s` keeps it all. |
-| `maintenance.admin_listen` | `--admin-listen` | `ISLEDB_MAINTENANCE_ADMIN_LISTEN` | `127.0.0.1:8061` | Health checks and metrics. |
-| `maintenance.shutdown_drain` | `--shutdown-drain` | `ISLEDB_MAINTENANCE_SHUTDOWN_DRAIN` | `0s` | How long to report not ready before stopping. |
-
-Maintenance has no API, so `listen`, `auth` and `tls` don't apply: setting
-them is an error.
+Every setting, with its flag, environment variable and default, is in the
+[configuration reference](configuration.md#maintenance). Maintenance has no
+API, so `listen`, `auth` and `tls` don't apply: setting them is an error.
 
 ## Scratch space
 
@@ -110,9 +101,8 @@ behind. It never deletes anything else in the directory.
 By default the change feed keeps every change forever. With
 `change_feed.retain_for` set, maintenance deletes changes older than that.
 A consumer whose saved position is older than what is kept can't resume from
-it without a gap: it either accepts the gap and continues from the oldest
-change kept, or rebuilds its state from a snapshot of the database. Set it
-longer than the longest time a consumer may be stopped.
+it without a gap. Set it longer than the longest time a consumer may be
+stopped; see [Follow changes](change-feed.md#retention).
 
 ## Health checks
 
@@ -127,38 +117,10 @@ Served on `admin_listen`, without authentication.
 
 ## Metrics
 
-| Metric | Shows |
-|---|---|
-| `isledb_maintenance_running` | `1` while maintenance works on the database; `0` after another maintenance process took it over. |
-| `isledb_maintenance_cycles_total`, `isledb_maintenance_cycle_errors_total` | Rounds of work, and rounds that failed and are retried. |
-| `isledb_maintenance_last_cycle_timestamp_seconds` | When the last round completed. |
-| `isledb_maintenance_waiting_for_writer` | `1` while finished work waits for the writer to publish it. On a busy database this is `1` nearly all the time, because each round hands the writer new work; don't alert on it. |
-| `isledb_maintenance_waiting_for_writer_since_timestamp_seconds` | When the work the writer has yet to publish was handed to it; `0` when nothing waits. It moves forward each time the writer publishes. |
-| `isledb_maintenance_compaction_jobs_total` | Compactions, counted when they run, including any the writer then rejects. |
-| `isledb_maintenance_compaction_l0_merges_total`, `isledb_maintenance_compaction_moves_total` | Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them. |
-| `isledb_maintenance_compaction_read_bytes_total`, `isledb_maintenance_compaction_rewritten_bytes_total` | Bytes compaction read from and wrote to storage: most of maintenance's storage cost. |
-| `isledb_maintenance_compaction_moved_bytes_total` | Bytes moved without being rewritten. |
-| `isledb_maintenance_compaction_oversized_jobs_total` | Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file. |
-| `isledb_maintenance_commands_rejected_total` | Finished work the writer refused to publish. The writer logs why. |
-| `isledb_maintenance_compaction_rejected_bytes_total` | Bytes compaction wrote for work the writer refused. The files are deleted later. |
-| `isledb_maintenance_checkpoints_total` | Checkpoints of the database's metadata prepared for the writer to publish. |
-| `isledb_maintenance_deleted_objects_total{kind}`, `isledb_maintenance_delete_failures_total{kind}` | Objects deleted from storage, and deletes that failed and are retried, by kind: `sst`, `change_batch`, `snapshot`, `page`. |
-
-What to alert on:
-
-- **Stuck:** `time() - isledb_maintenance_last_cycle_timestamp_seconds` above
-  a few minutes, or `cycle_errors_total` rising. Usually a storage permission
-  problem, or no space in `scratch_dir`; the log says which.
-- **No writer:** `time() - waiting_for_writer_since_timestamp_seconds` above a
-  few minutes, while it isn't `0`. Maintenance's work is ready but no writer
-  is publishing it, so files pile up.
-- **Refused work:** `commands_rejected_total` rising steadily. An occasional
-  refusal is normal: the writer refuses work on files that changed while it
-  was being done, and maintenance redoes it. A steady rise means work is being
-  thrown away; the writer's log says why.
-- **Replaced:** `isledb_maintenance_running` at `0`: another maintenance
-  process took over, and this one does no more work. See
-  [Run one maintenance per database](#run-one-maintenance-per-database).
+Maintenance's metrics, and what to alert on, are in the
+[metrics reference](metrics.md#maintenance). Watch at least for maintenance
+getting stuck, finished work waiting for a writer, work the writer keeps
+refusing, and maintenance being replaced.
 
 ## Shutting down
 

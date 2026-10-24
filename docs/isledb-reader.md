@@ -3,7 +3,7 @@
 `isledb reader` is a service that serves reads of one IsleDB database over
 HTTP. Run as many replicas as you need behind a load balancer: they share
 nothing, so each one adds capacity. The HTTP API is described in
-[reader-api.md](reader-api.md).
+[the reader HTTP API](reader-api.md).
 
 ## Start a reader
 
@@ -42,7 +42,7 @@ through it instead: they usually load new data within a second of each
 write, and storage sees reads from the cache rather than from every replica.
 
 If the database has a change feed, every replica also serves it at
-`/v1/changes`; see [reader-api.md](reader-api.md#follow-the-change-feed). The
+`/v1/changes`; see [Follow changes](change-feed.md). The
 feed's newest position comes from the same loads as the data, and new
 changes show at the same time as new data. Consumers that have caught up are
 answered from memory: polling costs about one read per new position per
@@ -123,26 +123,9 @@ It checks the settings and prints the configuration they resolve to. It
 doesn't open the token, CA or certificate files: a missing one stops the
 reader when it starts.
 
-### Options
-
-| Setting | Flag | Environment | Default | Meaning |
-|---|---|---|---|---|
-| `reader.prefix` | `--prefix` | `ISLEDB_READER_PREFIX` | | The database to read; `/` for the bucket root. Required. |
-| `reader.cache_dir` | `--cache-dir` | `ISLEDB_READER_CACHE_DIR` | | This replica's disk cache. Required; give each replica its own. |
-| `reader.caches.disk_bytes` | `--disk-cache-bytes` | `ISLEDB_READER_CACHES_DISK_BYTES` | `8GiB` | Disk cache budget. Must be positive. |
-| `reader.caches.block_bytes` | `--block-cache-bytes` | `ISLEDB_READER_CACHES_BLOCK_BYTES` | `256MiB` | In-memory cache of data blocks. Must be positive. |
-| `reader.caches.bloom_bytes` | `--bloom-cache-bytes` | `ISLEDB_READER_CACHES_BLOOM_BYTES` | `64MiB` | In-memory cache of Bloom filters. Must be positive. |
-| `reader.views.refresh_after` | `--refresh-after` | `ISLEDB_READER_VIEWS_REFRESH_AFTER` | `1s` | How often new data is loaded. At least `1s`. |
-| `reader.read_cache.url` | `--read-cache-url` | `ISLEDB_READER_READ_CACHE_URL` | | An `isledb cache` to read through. |
-| `reader.read_cache.token_file` | `--read-cache-token-file` | `ISLEDB_READER_READ_CACHE_TOKEN_FILE` | | The token to send the cache: one token, on a line of its own; blank lines and lines starting with `#` are skipped. Read when the reader starts: after changing it, restart the reader. |
-| `reader.read_cache.ca_file` | `--read-cache-ca-file` | `ISLEDB_READER_READ_CACHE_CA_FILE` | | CA certificates that sign the cache's certificate, for a cache with a private CA. Empty trusts the system's CAs. Needs an `https://` URL. |
-| `reader.read_cache.cert`, `reader.read_cache.key` | `--read-cache-cert`, `--read-cache-key` | `ISLEDB_READER_READ_CACHE_CERT`, `ISLEDB_READER_READ_CACHE_KEY` | | A client certificate for a cache that requires one (its `tls.client_ca`). Set both. |
-| `reader.reads.max_concurrent` | `--max-concurrent-reads` | `ISLEDB_READER_READS_MAX_CONCURRENT` | `256` | Reads served at once; past it, reads get `503`. |
-| `reader.listen` | `--listen` | `ISLEDB_READER_LISTEN` | `:8080` | API address. |
-| `reader.admin_listen` | `--admin-listen` | `ISLEDB_READER_ADMIN_LISTEN` | `127.0.0.1:8081` | Health checks and metrics. |
-
-Authentication, TLS and `shutdown_drain` work as for the writer: see
-[isledb-writer.md](isledb-writer.md#authentication).
+Every setting, with its flag, environment variable and default, is in the
+[configuration reference](configuration.md#reader). Authentication and TLS
+work as for every service: see [Secure IsleDB](security.md).
 
 The caches can't be turned off: each size must be positive.
 
@@ -173,29 +156,13 @@ Served on `admin_listen`, without authentication.
 
 ## Metrics
 
-| Metric | Shows |
-|---|---|
-| `isledb_reader_view_position` | The revision reads are answered from. Compare it across replicas, or with the writer's commits, to see how far behind a replica is. |
-| `isledb_reader_view_loaded_timestamp_seconds` | When the reader last loaded the database's data; `time()` minus it is how old the data being served is. |
-| `isledb_reader_stale_reads_total` | Reads answered while refreshes were failing. |
-| `isledb_reader_refresh_total`, `isledb_reader_refresh_errors_total` | Loads of new data, and loads that failed. |
-| `isledb_reader_get_total`, `isledb_reader_get_hits_total`, `isledb_reader_get_misses_total` | Reads, by found or not. |
-| `isledb_reader_http_reads_in_progress` | Reads being served now. |
-| `isledb_reader_http_requests_total{route,code}`, `isledb_reader_http_request_seconds{route}` | Requests by endpoint and status code. |
-| `isledb_reader_read_cache_*` | Reads through the cache, and those that fell back to storage. |
-
-What to alert on:
-
-- **Falling behind:** the reader's data is older than you accept. Alert on
-  its age, for example `time() - isledb_reader_view_loaded_timestamp_seconds
-  > 30`, which grows whenever refreshes stop succeeding. Look at
-  `isledb_reader_refresh_errors_total` for why: usually a storage permission
-  problem or an outage. `isledb_reader_stale_reads_total` counts reads
-  answered meanwhile. The reader keeps serving what it has, and stays ready,
-  until that data is `max_pinned_view_age` old; taking every replica out of
-  service at once would turn old reads into no reads.
-- **Overloaded:** many `503 backpressure`. Add replicas, or raise
-  `reads.max_concurrent` if memory allows.
+The reader's metrics, and what to alert on, are in the
+[metrics reference](metrics.md#reader). Above all, alert when the data a
+reader serves gets older than you accept: `time() -
+isledb_reader_view_loaded_timestamp_seconds` grows whenever loading new data
+fails. The reader keeps serving what it has, and stays ready, until that data
+is `max_pinned_view_age` old; taking every replica out of service at once
+would turn old reads into no reads.
 
 ## Shutting down
 

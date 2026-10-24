@@ -525,6 +525,16 @@
         overflow-x: auto;
       }
 
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
       .reference blockquote {
         margin: 0 0 20px;
         padding: 14px 18px;
@@ -719,22 +729,28 @@
           <h2>Start</h2>
           <ul>
             <li><a href="/getting-started/" aria-current="page">Get started</a></li>
+            <li><a href="/docs/concepts/">How IsleDB works</a></li>
           </ul>
           <h2>Build</h2>
           <ul>
             <li><a href="/docs/http-api/">HTTP API</a></li>
             <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
           </ul>
           <h2>Operate</h2>
           <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
             <li><a href="/docs/object-storage/">Object storage</a></li>
             <li><a href="/docs/writer/">Writer service</a></li>
             <li><a href="/docs/reader/">Reader service</a></li>
             <li><a href="/docs/maintenance/">Maintenance service</a></li>
             <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
           </ul>
           <h2>Reference</h2>
           <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
             <li><a href="/docs/storage-layout/">Storage layout</a></li>
           </ul>
         </details>
@@ -852,7 +868,7 @@ isledb maintenance \
             <tr><td>Amazon S3</td><td><code>s3://my-bucket?region=us-east-1</code></td></tr>
             <tr><td>Google Cloud Storage</td><td><code>gs://my-bucket</code></td></tr>
             <tr><td>Azure Blob Storage</td><td><code>azblob://my-container</code></td></tr>
-            <tr><td>MinIO and other S3-compatible stores</td><td><code>s3://my-bucket?endpoint=https://…&amp;region=us-east-1&amp;use_path_style=true</code></td></tr>
+            <tr><td>MinIO and other S3-compatible stores</td><td>See <a href="/docs/object-storage/#s3-compatible-stores">S3-compatible stores</a></td></tr>
           </tbody>
         </table>
         <p>
@@ -932,6 +948,14 @@ go get github.com/ankur-anand/isledb</code></pre>
         <h2 id="next">Next steps</h2>
         <ul class="next">
           <li>
+            <a href="/docs/concepts/">How IsleDB works</a>
+            <span>The writer, readers, maintenance, revisions, and the change feed.</span>
+          </li>
+          <li>
+            <a href="/docs/deploy/">Deploy IsleDB</a>
+            <span>What to run, how many of each, and a production checklist.</span>
+          </li>
+          <li>
             <a href="/docs/http-api/#writer">Writer HTTP API</a>
             <span>Batches, deletes, TTLs, and waiting for a write.</span>
           </li>
@@ -940,11 +964,7 @@ go get github.com/ankur-anand/isledb</code></pre>
             <span>Reads, scans, freshness, and the change feed.</span>
           </li>
           <li>
-            <a href="https://github.com/ankur-anand/isledb/blob/main/docs/isledb-writer.md">Running the services</a>
-            <span>Configuration, authentication, and metrics for each service.</span>
-          </li>
-          <li>
-            <a href="https://github.com/ankur-anand/isledb/blob/main/docs/isledb-cache.md">Shared read cache</a>
+            <a href="/docs/cache/">Shared read cache</a>
             <span>Serve many readers in a region from one copy of each read.</span>
           </li>
           <li>
