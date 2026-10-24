@@ -132,7 +132,8 @@ Served on `admin_listen`, without authentication.
 | `isledb_maintenance_running` | `1` while maintenance works on the database; `0` after another maintenance process took it over. |
 | `isledb_maintenance_cycles_total`, `isledb_maintenance_cycle_errors_total` | Rounds of work, and rounds that failed and are retried. |
 | `isledb_maintenance_last_cycle_timestamp_seconds` | When the last round completed. |
-| `isledb_maintenance_waiting_for_writer` | `1` while finished work waits for the writer to publish it. |
+| `isledb_maintenance_waiting_for_writer` | `1` while finished work waits for the writer to publish it. On a busy database this is `1` nearly all the time, because each round hands the writer new work; don't alert on it. |
+| `isledb_maintenance_waiting_for_writer_since_timestamp_seconds` | When the work the writer has yet to publish was handed to it; `0` when nothing waits. It moves forward each time the writer publishes. |
 | `isledb_maintenance_compaction_jobs_total` | Compactions, counted when they run, including any the writer then rejects. |
 | `isledb_maintenance_compaction_l0_merges_total`, `isledb_maintenance_compaction_moves_total` | Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them. |
 | `isledb_maintenance_compaction_read_bytes_total`, `isledb_maintenance_compaction_rewritten_bytes_total` | Bytes compaction read from and wrote to storage: most of maintenance's storage cost. |
@@ -148,8 +149,9 @@ What to alert on:
 - **Stuck:** `time() - isledb_maintenance_last_cycle_timestamp_seconds` above
   a few minutes, or `cycle_errors_total` rising. Usually a storage permission
   problem, or no space in `scratch_dir`; the log says which.
-- **No writer:** `waiting_for_writer` at `1` for minutes. Maintenance's work
-  is ready but no writer is publishing it, so files pile up.
+- **No writer:** `time() - waiting_for_writer_since_timestamp_seconds` above a
+  few minutes, while it isn't `0`. Maintenance's work is ready but no writer
+  is publishing it, so files pile up.
 - **Refused work:** `commands_rejected_total` rising steadily. An occasional
   refusal is normal: the writer refuses work on files that changed while it
   was being done, and maintenance redoes it. A steady rise means work is being

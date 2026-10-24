@@ -784,3 +784,74 @@ func TestMaintenanceCountsRejectedCommand(t *testing.T) {
 		t.Fatalf("jobs=%d, want 0: reading a rejection runs no job", cycle.SSTCompaction.Jobs)
 	}
 }
+
+func TestMaintenanceWaitingSinceTracksTheUnansweredCommand(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-waiting-since")
+	defer store.Close()
+
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-waiting-since"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		if _, err := db.manifestStore.AppendAddSSTableWithFence(ctx, manifest.SSTMeta{
+			ID:     fmt.Sprintf("waiting-sst-%02d", i),
+			Level:  0,
+			MinKey: []byte(fmt.Sprintf("key-%02d", i)),
+			MaxKey: []byte(fmt.Sprintf("key-%02d", i)),
+			Size:   1,
+		}); err != nil {
+			t.Fatalf("AppendAddSSTableWithFence(%d): %v", i, err)
+		}
+	}
+	opts := DefaultMaintenanceOptions()
+	opts.SSTCompaction.L0TriggerSSTs = 64
+	opts.ManifestCheckpoint.TargetReplayPages = 1
+	opts.ManifestCheckpoint.TargetReplayBytes = ^uint64(0)
+	maintenance, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+	defer maintenance.Close(ctx)
+
+	staged, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce(stage): %v", err)
+	}
+	if staged.State != MaintenanceWaitingForWriter || staged.WaitingSince.IsZero() {
+		t.Fatalf("after staging: state=%v since=%v, want waiting with a time", staged.State, staged.WaitingSince)
+	}
+
+	// The writer hasn't answered: the next cycle waits on the same command.
+	unanswered, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce(unanswered): %v", err)
+	}
+	if !unanswered.WaitingSince.Equal(staged.WaitingSince) {
+		t.Fatalf("unanswered since=%v, want %v", unanswered.WaitingSince, staged.WaitingSince)
+	}
+
+	// Once the writer answers, the time moves on, or clears when nothing waits.
+	if _, err := db.manifestStore.ApplyPendingMaintenance(ctx); err != nil {
+		t.Fatalf("ApplyPendingMaintenance: %v", err)
+	}
+	answered, err := maintenance.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce(answered): %v", err)
+	}
+	switch answered.State {
+	case MaintenanceIdle:
+		if !answered.WaitingSince.IsZero() {
+			t.Fatalf("idle since=%v, want zero", answered.WaitingSince)
+		}
+	case MaintenanceWaitingForWriter:
+		if !answered.WaitingSince.After(staged.WaitingSince) {
+			t.Fatalf("next command since=%v, want after %v", answered.WaitingSince, staged.WaitingSince)
+		}
+	}
+}

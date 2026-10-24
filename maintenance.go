@@ -400,7 +400,13 @@ type MaintenanceScheduleStats struct {
 // MaintenanceStats describes work performed by one bounded RunOnce cycle.
 // Command-producing work is not visible until the writer applies it.
 type MaintenanceStats struct {
-	State               MaintenanceState
+	State MaintenanceState
+	// WaitingSince is when the command the writer has yet to answer was
+	// staged; zero when State is MaintenanceIdle. A busy database stages a
+	// new command almost every cycle, so State alone stays
+	// MaintenanceWaitingForWriter even while the writer keeps up; only an
+	// old WaitingSince means the writer isn't answering.
+	WaitingSince        time.Time
 	Scheduling          MaintenanceScheduleStats
 	SSTCompaction       SSTCompactionStats
 	SSTCleanup          SSTCleanupStats
@@ -1262,7 +1268,8 @@ func (m *Maintenance) stageCommand(ctx context.Context, command manifest.Mainten
 	if command.ID == "" {
 		command.ID = ksuid.New().String()
 	}
-	if _, err := m.manifestLog.StageMaintenance(ctx, command, m.fenceToken); err != nil {
+	head, err := m.manifestLog.StageMaintenance(ctx, command, m.fenceToken)
+	if err != nil {
 		return err
 	}
 	m.notifyWriter()
@@ -1270,6 +1277,7 @@ func (m *Maintenance) stageCommand(ctx context.Context, command manifest.Mainten
 	m.commandStaged = true
 	if m.currentStats != nil {
 		m.currentStats.State = MaintenanceWaitingForWriter
+		m.currentStats.WaitingSince = head.Pending.CreatedAt
 	}
 	m.statsMu.Unlock()
 	return nil
@@ -1310,6 +1318,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	m.statsMu.Lock()
 	if m.currentStats != nil {
 		m.currentStats.State = MaintenanceWaitingForWriter
+		m.currentStats.WaitingSince = head.Pending.CreatedAt
 	}
 	m.statsMu.Unlock()
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
@@ -1377,6 +1386,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	m.statsMu.Lock()
 	if m.currentStats != nil {
 		m.currentStats.State = MaintenanceIdle
+		m.currentStats.WaitingSince = time.Time{}
 	}
 	m.statsMu.Unlock()
 	return false, nil
