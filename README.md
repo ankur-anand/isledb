@@ -286,11 +286,11 @@ One binary, `isledb`, runs each service. Get it from the
 for Linux (amd64, arm64) and macOS (arm64), or run the container image:
 
 ```bash
-docker run ghcr.io/ankur-anand/isledb:0.19.0 help
+docker run ghcr.io/ankur-anand/isledb:0.20.0 help
 ```
 
-The image is tagged with each release's exact version, such as `0.19.0`, and
-with its minor version, such as `0.19`; there is no `latest` tag. With Go
+The image is tagged with each release's exact version, such as `0.20.0`, and
+with its minor version, such as `0.20`; there is no `latest` tag. With Go
 installed, you can also build it:
 
 ```bash

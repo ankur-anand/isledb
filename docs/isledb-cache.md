@@ -1,9 +1,10 @@
 # Running `isledb cache`
 
-`isledb cache` is the regional read cache as a service. It relays `CURRENT`
-for each database it serves, reading it from storage every 500 ms, and serves
-immutable objects from 128 KiB chunks on local disk. The HTTP API is in
-[read-cache-api.md](read-cache-api.md).
+`isledb cache` is the read cache, run as a service. It serves one or more
+databases to the readers in a region. It checks each database for new writes
+every 500 ms and tells waiting readers at once, and it keeps the data readers
+ask for on its local disk, so the bucket is read once for all of them instead
+of once for each. Readers use it through [the cache HTTP API](read-cache-api.md).
 
 ```
 isledb cache --config /etc/isledb/isledb.yaml
@@ -31,8 +32,8 @@ file overrides the default. `--db` on the command line, or
 `ISLEDB_CACHE_DATABASES`, replaces the file's list of databases rather than
 adding to it.
 
-One file can configure every isledb role: settings all roles share sit at the
-top, and each role reads its own section. The cache reads `cache:`.
+One file can configure every IsleDB service: settings they share sit at the
+top, and each service reads its own section. The cache reads `cache:`.
 
 ```yaml
 bucket_url: s3://my-bucket?region=us-east-1
@@ -70,12 +71,6 @@ cache:
   shutdown_drain: 5s
 ```
 
-Unknown keys are an error, at the top and inside `cache:`, so a misspelled
-key stops the cache at start rather than being ignored. Sections of the
-other roles this binary has are left for them; a section named after no role
-is an error too. The file holds paths, never secrets: tokens and keys stay
-in their own files.
-
 A database at the root of the bucket is written `/`. An empty prefix is an
 error, so a blank value never names the root, and so is one with an empty,
 `.` or `..` segment (`prod//a`, `prod/../a`), whose keys would never match.
@@ -83,50 +78,15 @@ error, so a blank value never names the root, and so is one with an empty,
 `isledb cache --config isledb.yaml --check` validates the configuration,
 prints it as resolved from every source, and exits.
 
-**Naming.** A setting's environment variable is `ISLEDB_` followed by its
-key, upper case with dots as underscores: the shared settings as they are
-(`bucket_url` → `ISLEDB_BUCKET_URL`), the cache's after `CACHE_`
-(`cache.disk.bytes` → `ISLEDB_CACHE_DISK_BYTES`). An environment variable
-set to an empty value counts: `ISLEDB_CACHE_ADMIN_LISTEN=` turns the admin
-listener off.
-
-| File key | Flag | Environment | Default | |
-|---|---|---|---|---|
-| `bucket_url` | `--bucket-url` | `ISLEDB_BUCKET_URL` | required | Bucket holding the databases |
-| `log_level` | `--log-level` | `ISLEDB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `cache.databases[].prefix` | `--db` (repeat) | `ISLEDB_CACHE_DATABASES` (comma-separated) | required | Databases served, by prefix; `/` for the bucket root |
-| `cache.databases[].current_poll` | – | – | `cache.current.poll` | Per-database poll interval |
-| `cache.listen` | `--listen` | `ISLEDB_CACHE_LISTEN` | `:8090` | API address |
-| `cache.admin_listen` | `--admin-listen` | `ISLEDB_CACHE_ADMIN_LISTEN` | `127.0.0.1:8091` | Admin address; empty for none |
-| `cache.disk.dir` | `--disk-dir` | `ISLEDB_CACHE_DISK_DIR` | required | Chunk directory, on local disk |
-| `cache.disk.bytes` | `--disk-bytes` | `ISLEDB_CACHE_DISK_BYTES` | required | Disk budget |
-| `cache.reads.max_bytes` | `--max-read-bytes` | `ISLEDB_CACHE_READS_MAX_BYTES` | `256MiB` | Bytes read from storage at once; at least `4MiB` |
-| `cache.reads.max_wait` | `--max-read-wait` | `ISLEDB_CACHE_READS_MAX_WAIT` | `5s` | Longest a storage read waits for budget. About half the readers' timeout to the cache. |
-| `cache.current.poll` | `--current-poll` | `ISLEDB_CACHE_CURRENT_POLL` | `500ms` | How often `CURRENT` is read |
-| `cache.current.long_poll` | `--long-poll` | `ISLEDB_CACHE_CURRENT_LONG_POLL` | `30s` | Longest a long poll is held, at most `30s` |
-| `cache.auth.token_file` | `--auth-token-file` | `ISLEDB_CACHE_AUTH_TOKEN_FILE` | | Bearer tokens, one per line |
-| `cache.auth.insecure` | `--insecure` | `ISLEDB_CACHE_AUTH_INSECURE` | `false` | No authentication, for development |
-| `cache.tls.cert`, `cache.tls.key` | `--tls-cert`, `--tls-key` | `ISLEDB_CACHE_TLS_CERT`, `ISLEDB_CACHE_TLS_KEY` | | Serve TLS |
-| `cache.tls.client_ca` | `--tls-client-ca` | `ISLEDB_CACHE_TLS_CLIENT_CA` | | Require client certificates signed by this CA |
-| `cache.shutdown_drain` | `--shutdown-drain` | `ISLEDB_CACHE_SHUTDOWN_DRAIN` | `5s` | Not-ready time before shutting down |
-| – | `--config` | `ISLEDB_CONFIG` | | YAML file |
-
-Sizes are bytes or binary units: `512KiB`, `256MiB`, `200GiB`, `2TiB`.
-Durations are Go durations: `250ms`, `30s`, `2m`.
+Every setting, with its flag, environment variable and default, is in the
+[configuration reference](configuration.md#read-cache).
 
 ## Authentication
 
-The cache refuses to start without authentication unless `cache.auth.insecure` is set.
-
-- **Tokens.** `cache.auth.token_file` holds one token per line; blank lines and
-  lines starting with `#` are skipped. Clients send
-  `Authorization: Bearer <token>`. Send `SIGHUP` to reread the file; if the
-  new file cannot be read or holds no tokens, the tokens in use stay.
-- **Client certificates.** With `cache.tls.client_ca`, clients must present a
-  certificate it signed. With both tokens and client certificates set, both
-  are required. An `isledb reader` presents one with `read_cache.cert` and
-  `read_cache.key`, and trusts a cache certificate from a private CA with
-  `read_cache.ca_file`.
+The cache refuses to start without authentication unless `cache.auth.insecure`
+is set. Readers send a token from the cache's `auth.token_file`, and with
+`tls.client_ca` also a client certificate; an `isledb reader` sets these with
+its `read_cache` settings. See [Secure IsleDB](security.md).
 
 Each database is served only its own objects: those right under its prefix,
 not those of a database nested under it (`prod/a/b` under `prod/a`), and,
@@ -141,35 +101,15 @@ operators and scrapers reach.
 | Path | |
 |---|---|
 | `/healthz` | 200 while the process runs |
-| `/readyz` | 200 once every database's `CURRENT` has been read once; 503 before, and while shutting down. It stays 200 while storage is down: the cache keeps serving its copy, and readers judge its age. |
+| `/readyz` | 200 once it has checked every database for new writes once; 503 before, and while shutting down. It stays 200 while storage is down: the cache keeps serving what it has, and readers judge its age. |
 | `/metrics` | Prometheus |
 | `/debug/pprof/` | Go profiles |
 
 ## Metrics
 
-| Metric | |
-|---|---|
-| `isledb_cache_chunks_total{source}` | Chunks served: `disk`, `storage`, `shared`, `bridged` |
-| `isledb_cache_object_responses_total{status}` | Object responses by `Isledb-Cache`: `hit`, `shared`, `miss` |
-| `isledb_cache_storage_reads_total`, `isledb_cache_storage_read_bytes_total` | Storage range reads and bytes |
-| `isledb_cache_storage_reads_queued_total` | Storage reads that waited for `cache.reads.max_bytes` |
-| `isledb_cache_storage_bytes_reading` | Bytes being read now |
-| `isledb_cache_size_lookups_total` | Sizes asked of storage, for requests without `Isledb-Object-Size` |
-| `isledb_cache_current_position{db}`, `isledb_cache_current_age_seconds{db}` | The relayed `CURRENT` |
-| `isledb_cache_current_poll_errors_total{db}` | Failed reads of `CURRENT` |
-| `isledb_cache_long_polls_held` | Long polls waiting now |
-| `isledb_cache_disk_bytes`, `isledb_cache_disk_max_bytes`, `isledb_cache_disk_entries`, `isledb_cache_disk_evictions_total`, `isledb_cache_disk_failures_total` | The chunk store |
-| `isledb_cache_http_requests_total{route,code}`, `isledb_cache_http_request_seconds{route}` | Requests; `route` is `current`, `current_long_poll`, `object` or `other` |
-
-What to watch:
-
-- **`current_age_seconds` rising** means storage is not answering; readers
-  stop accepting the copy once it is older than their age limit.
-- **`storage_reads_queued_total` rising** means reads wait for budget: raise
-  `cache.reads.max_bytes`, or add replicas, before waits reach `cache.reads.max_wait`
-  and turn into 502s.
-- **`disk_evictions_total` rising fast** with a low hit share means the disk
-  is too small for the working set.
+The cache's metrics, and what to watch, are in the
+[metrics reference](metrics.md#read-cache): above all, storage not answering,
+reads waiting for their turn, and a disk too small for what readers read.
 
 ## Shutdown
 
@@ -196,8 +136,8 @@ Chunks on disk are kept. After a restart, requests carrying
   that, so a read that waited for its turn still has time to fetch and
   answer. Raise it only for clients that wait longer, to about half their
   timeout.
-- **Several replicas.** Round-robin works: each replica relays `CURRENT` on
-  its own, and readers treat a copy behind their view as nothing new. Each
+- **Several replicas.** Round-robin works: each replica checks for new writes
+  on its own, and readers treat a copy behind their view as nothing new. Each
   replica then caches every hot chunk. Hashing object requests by path at
   the load balancer (Envoy ring hash, NGINX `hash $uri consistent`) puts
   each chunk on one replica, so their disks add up instead of repeating
@@ -227,9 +167,11 @@ spec:
       # Longer than cache.shutdown_drain (5s) plus the 30s given to
       # requests in flight.
       terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 65532   # the image's user: lets it write the chunk volume
       containers:
         - name: cache
-          image: isledb:latest
+          image: ghcr.io/ankur-anand/isledb:0.20.0
           args: ["cache", "--config", "/etc/isledb/isledb.yaml"]
           env:
             - name: ISLEDB_CACHE_ADMIN_LISTEN
@@ -287,7 +229,7 @@ spec:
 - **Why a StatefulSet.** Each replica keeps its own chunk volume across
   restarts, so a restarted pod serves hits from disk at once.
 - **Probes.** Readiness uses `/readyz`, so a pod takes traffic only once it
-  has read `CURRENT` for every database; liveness uses `/healthz`, which
+  has checked every database for new writes; liveness uses `/healthz`, which
   does not depend on storage, so a storage outage never restarts the pods.
   Kubelet probes come from the node, which most network plugins let
   through regardless of policy; if yours does not, allow the node's

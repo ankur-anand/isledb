@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>IsleDB Documentation: Key-Value Database on Object Storage</title>
+    <meta name="description" content="Guides and references for IsleDB: get started, use the HTTP and Go APIs, run the services, and set up object storage." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="{{.URL}}" />
+    <meta property="og:title" content="IsleDB documentation" />
+    <meta property="og:description" content="Guides and references for IsleDB: get started, use the HTTP and Go APIs, run the services, and set up object storage." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="{{.URL}}" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="IsleDB documentation" />
+    <meta name="twitter:description" content="Guides and references for IsleDB: get started, use the HTTP and Go APIs, run the services, and set up object storage." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "BreadcrumbList",
+        "itemListElement": [
+          { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+          { "@type": "ListItem", "position": 2, "name": "Docs", "item": "https://isledb.com/docs/" }
+        ]
+      }
+    </script>
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+      /* Navigation, as on the home page */
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+      /* The guide */
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main main";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+      /* The docs sidebar */
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+        /* Long lines wrap on screen; copying still gives one line. */
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+      /* Reference pages: long, so the contents scroll on their own. */
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+      /* Reference code keeps its lines: long ones scroll inside the box. */
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .overview-page h2 {
+        margin-top: 44px;
+        font-size: 24px;
+      }
+
+      .overview-list {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .overview-list li {
+        padding: 12px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .overview-list a {
+        font-weight: 700;
+      }
+
+      .overview-list span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 16px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+      /* Footer, as on the home page */
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          {{- range .Nav}}
+          <h2>{{.Name}}</h2>
+          <ul>
+            {{- range .Pages}}
+            <li><a href="{{.Path}}"{{if .Current}} aria-current="page"{{end}}>{{.Name}}</a></li>
+            {{- end}}
+          </ul>
+          {{- end}}
+        </details>
+      </nav>
+
+      <main id="main" class="reference overview-page">
+        <p class="crumbs"><a href="/">IsleDB</a> / Docs</p>
+        <h1>Documentation</h1>
+        <p class="lede">
+          IsleDB keeps a key-value database in your object storage bucket. Start with a few minutes
+          on your machine, then use the APIs or run the services.
+        </p>
+        {{- range .Nav}}
+        <h2>{{.Name}}</h2>
+        <ul class="overview-list">
+          {{- range .Pages}}
+          <li><a href="{{.Path}}">{{.Name}}</a><span>{{.Summary}}</span></li>
+          {{- end}}
+        </ul>
+        {{- end}}
+      </main>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      // Lists that come before the page on narrower screens start closed.
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,959 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>How IsleDB Works: A Key-Value Database in Your Object Storage Bucket</title>
+    <meta name="description" content="How IsleDB keeps a key-value database in an object storage bucket: one writer, any number of readers, maintenance, the read cache, revisions, and the change feed." />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="https://isledb.com/docs/concepts/" />
+    <meta property="og:title" content="How IsleDB works · IsleDB" />
+    <meta property="og:description" content="How IsleDB keeps a key-value database in an object storage bucket: one writer, any number of readers, maintenance, the read cache, revisions, and the change feed." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://isledb.com/docs/concepts/" />
+    <meta property="og:site_name" content="IsleDB" />
+    <meta property="og:image" content="https://isledb.com/social-v2.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="IsleDB, a key-value database for object storage" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="How IsleDB works · IsleDB" />
+    <meta name="twitter:description" content="How IsleDB keeps a key-value database in an object storage bucket: one writer, any number of readers, maintenance, the read cache, revisions, and the change feed." />
+    <meta name="twitter:image" content="https://isledb.com/social-v2.png" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32" />
+    <link rel="icon" type="image/svg+xml" href="/favicon-v2.svg" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "TechArticle",
+            "headline": "How IsleDB works",
+            "description": "How IsleDB keeps a key-value database in an object storage bucket: one writer, any number of readers, maintenance, the read cache, revisions, and the change feed.",
+            "url": "https:\/\/isledb.com\/docs\/concepts\/",
+            "about": { "@id": "https://isledb.com/#software" },
+            "isPartOf": { "@id": "https://isledb.com/#website" }
+          },
+          {
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+              { "@type": "ListItem", "position": 1, "name": "IsleDB", "item": "https://isledb.com/" },
+              { "@type": "ListItem", "position": 2, "name": "How IsleDB works", "item": "https:\/\/isledb.com\/docs\/concepts\/" }
+            ]
+          }
+        ]
+      }
+    </script>
+    
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-FD2BNEFTY7"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-FD2BNEFTY7");
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700;800&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --ink: #102927;
+        --ink-soft: #405f5a;
+        --muted: #5d726e;
+        --paper: #ffffff;
+        --green-50: #eff9f3;
+        --green-600: #187552;
+        --green-700: #105b40;
+        --line: rgba(16, 41, 39, 0.12);
+        --line-strong: rgba(16, 41, 39, 0.2);
+        --max: 1160px;
+        --measure: 720px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.65;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--green-600);
+        text-underline-offset: 3px;
+      }
+
+      a:hover {
+        color: var(--green-700);
+      }
+
+      .shell {
+        width: min(var(--max), calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 1000;
+        padding: 9px 13px;
+        color: #fff;
+        background: var(--green-700);
+        border-radius: 8px;
+        transform: translateY(-150%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+       
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-inner {
+        min-height: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+      }
+
+      .brand img {
+        width: 30px;
+        height: 30px;
+      }
+
+      .brand-name {
+        color: var(--ink);
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .brand-db {
+        color: var(--green-600);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+
+      .nav-links a {
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+      }
+
+      .nav-cta {
+        padding: 9px 15px;
+        color: #fff !important;
+        background: var(--green-600);
+        border-radius: 8px;
+      }
+
+       
+      .guide {
+        display: grid;
+        grid-template-columns: 210px minmax(0, var(--measure)) 210px;
+        grid-template-areas: "docnav main toc";
+        gap: 48px;
+        padding: 48px 0 96px;
+      }
+
+      .docnav {
+        grid-area: docnav;
+      }
+
+      .guide > main {
+        grid-area: main;
+      }
+
+      .guide > .toc {
+        grid-area: toc;
+      }
+
+       
+      .docnav {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        font-size: 15px;
+      }
+
+      .docnav summary {
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .docnav summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .docnav summary strong {
+        display: none;
+      }
+
+      .docnav h2 {
+        margin: 22px 0 6px;
+        padding: 0;
+        border: 0;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: var(--muted);
+      }
+
+      .docnav .overview {
+        font-weight: 700;
+      }
+
+      .docnav ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .docnav li {
+        margin: 2px 0;
+      }
+
+      .docnav a {
+        display: block;
+        padding: 4px 10px;
+        margin-left: -10px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .docnav a:hover {
+        color: var(--ink);
+        background: var(--green-50);
+      }
+
+      .docnav a[aria-current="page"] {
+        color: var(--green-700);
+        background: var(--green-50);
+        font-weight: 700;
+      }
+
+      .guide > * {
+        min-width: 0;
+      }
+
+      .toc {
+        position: sticky;
+        top: 100px;
+        align-self: start;
+        font-size: 15px;
+      }
+
+      .toc strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .toc li {
+        margin: 6px 0;
+      }
+
+      .toc a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+
+      .toc .sub {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .crumbs {
+        margin: 0 0 14px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      .crumbs a {
+        color: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(36px, 5vw, 52px);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .lede {
+        margin: 0 0 12px;
+        font-size: 19px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 64px 0 12px;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+        font-size: clamp(26px, 3vw, 34px);
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+      }
+
+      h3 {
+        margin: 36px 0 8px;
+        font-size: 20px;
+        letter-spacing: -0.015em;
+      }
+
+      p {
+        margin: 0 0 16px;
+      }
+
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+
+      li {
+        margin: 4px 0;
+      }
+
+      code {
+        font-family: "DM Mono", ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+
+      p code,
+      li code,
+      td code {
+        padding: 1px 5px;
+        background: var(--green-50);
+        border-radius: 5px;
+      }
+
+      pre {
+        margin: 0 0 20px;
+        padding: 18px 20px;
+        overflow-x: auto;
+        color: #dfe9e6;
+        background: var(--ink);
+        border-radius: 12px;
+        font: 400 14px/1.65 "DM Mono", ui-monospace, monospace;
+         
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      pre code {
+        font-size: inherit;
+      }
+
+      .out {
+        color: #8aa29d;
+      }
+
+      .c {
+        color: #8aa29d;
+      }
+
+      .k {
+        color: #f0a58f;
+      }
+
+      .s {
+        color: #f3d58a;
+      }
+
+      .f {
+        color: #7fd6ac;
+      }
+
+      table {
+        width: 100%;
+        margin: 0 0 20px;
+        border-collapse: collapse;
+        font-size: 16px;
+      }
+
+      th,
+      td {
+        padding: 10px 14px 10px 0;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 14px;
+        color: var(--muted);
+        border-bottom-color: var(--line-strong);
+      }
+
+      .note {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .note p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference .toc,
+      .toc {
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+      }
+
+      .toc .l3 {
+        padding-left: 14px;
+        font-size: 14px;
+      }
+
+      .toc .l1 {
+        margin-top: 14px;
+        font-weight: 700;
+      }
+
+      .toc .l1 a {
+        color: var(--ink);
+      }
+
+      .toc summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .toc summary::-webkit-details-marker {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .toc summary strong {
+          margin: 0;
+        }
+
+        .toc summary strong::after {
+          content: " ▾";
+        }
+
+        .toc details[open] summary {
+          margin-bottom: 10px;
+        }
+      }
+
+      h2.part {
+        margin-top: 72px;
+        font-size: clamp(30px, 3.4vw, 40px);
+      }
+
+      .reference h3 {
+        margin-top: 44px;
+      }
+
+      .reference h4 {
+        margin: 28px 0 8px;
+        font-size: 17px;
+      }
+
+      .reference table {
+        display: block;
+        overflow-x: auto;
+      }
+
+       
+      .reference td code,
+      .reference th code {
+        white-space: nowrap;
+      }
+
+      .reference td:last-child {
+        min-width: 14em;
+      }
+
+      .reference blockquote {
+        margin: 0 0 20px;
+        padding: 14px 18px;
+        background: var(--green-50);
+        border-left: 3px solid var(--green-600);
+        border-radius: 0 10px 10px 0;
+        font-size: 16px;
+      }
+
+      .reference blockquote p:last-child {
+        margin-bottom: 0;
+      }
+
+       
+      .reference pre {
+        white-space: pre;
+        overflow-wrap: normal;
+      }
+
+      .reference :target {
+        scroll-margin-top: 90px;
+      }
+
+      .next {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px 32px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .next a {
+        font-weight: 700;
+      }
+
+      .next span {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 15px;
+      }
+
+       
+      footer {
+        padding: 44px 0 28px;
+        color: #526b67;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer-main {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 1fr;
+        gap: 42px;
+        padding-bottom: 38px;
+      }
+
+      .footer-brand p {
+        max-width: 360px;
+        margin-top: 16px;
+        font-size: 15px;
+      }
+
+      .footer-column strong {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .footer-column a {
+        display: block;
+        width: fit-content;
+        margin: 7px 0;
+        color: #526b67;
+        text-decoration: none;
+        font-size: 15px;
+      }
+
+      .footer-column a:hover,
+      .footer-bottom a:hover {
+        color: var(--green-700);
+        text-decoration: underline;
+      }
+
+      .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        font-family: "DM Mono", monospace;
+        font-size: 13px;
+        text-transform: uppercase;
+      }
+
+      .footer-bottom a {
+        color: var(--green-700);
+        text-decoration: none;
+      }
+
+      @media (max-width: 1200px) {
+        .guide {
+          grid-template-columns: 210px minmax(0, 1fr);
+          grid-template-areas: "docnav toc" "docnav main";
+          row-gap: 24px;
+        }
+
+        .guide > .toc {
+          position: static;
+          max-height: none;
+        }
+
+        .guide > .toc details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .guide > .toc summary strong::after {
+          content: " ▾";
+        }
+      }
+
+      @media (max-width: 900px) {
+        .guide {
+          grid-template-areas: "docnav" "toc" "main";
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding-top: 32px;
+        }
+
+        .toc,
+        .docnav {
+          position: static;
+          max-height: none;
+        }
+
+        .docnav details {
+          padding: 12px 16px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+        }
+
+        .docnav summary strong {
+          display: inline;
+          font-size: 13px;
+          color: var(--muted);
+        }
+
+        .docnav summary strong::after {
+          content: " ▾";
+        }
+
+        .nav-links .hide-sm {
+          display: none;
+        }
+
+        .next,
+        .footer-main {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-bottom {
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <nav aria-label="Primary navigation">
+      <div class="shell nav-inner">
+        <a class="brand" href="/" aria-label="IsleDB home">
+          <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+          <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+        </a>
+        <div class="nav-links">
+          <a class="hide-sm" href="/docs/">Docs</a>
+          <a class="hide-sm" href="/getting-started/">Get started</a>
+          <a class="nav-cta" href="https://github.com/ankur-anand/isledb">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="shell guide">
+      <nav class="docnav" aria-label="Documentation">
+        <details open>
+          <summary><strong>Docs</strong></summary>
+          <a class="overview" href="/docs/">Overview</a>
+          <h2>Start</h2>
+          <ul>
+            <li><a href="/getting-started/">Get started</a></li>
+            <li><a href="/docs/concepts/" aria-current="page">How IsleDB works</a></li>
+          </ul>
+          <h2>Build</h2>
+          <ul>
+            <li><a href="/docs/http-api/">HTTP API</a></li>
+            <li><a href="/docs/go-api/">Go API</a></li>
+            <li><a href="/docs/change-feed/">Follow changes</a></li>
+          </ul>
+          <h2>Operate</h2>
+          <ul>
+            <li><a href="/docs/deploy/">Deploy</a></li>
+            <li><a href="/docs/object-storage/">Object storage</a></li>
+            <li><a href="/docs/writer/">Writer service</a></li>
+            <li><a href="/docs/reader/">Reader service</a></li>
+            <li><a href="/docs/maintenance/">Maintenance service</a></li>
+            <li><a href="/docs/cache/">Read cache</a></li>
+            <li><a href="/docs/security/">Security</a></li>
+          </ul>
+          <h2>Reference</h2>
+          <ul>
+            <li><a href="/docs/configuration/">Configuration</a></li>
+            <li><a href="/docs/metrics/">Metrics</a></li>
+            <li><a href="/docs/storage-layout/">Storage layout</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main id="main" class="reference">
+        <p class="crumbs"><a href="/">IsleDB</a> / <a href="/docs/">Docs</a> / How IsleDB works</p>
+        <h1>How IsleDB works</h1>
+<p>IsleDB is a key-value database that keeps all of its data in an object
+storage bucket, such as Amazon S3, Google Cloud Storage or Azure Blob
+Storage. This page explains the parts and how they fit together. The same
+model holds whether you run IsleDB as HTTP services or embed it in a Go
+program; the table at the end shows the names each uses.</p>
+<h2 id="one-database-one-prefix">One database, one prefix</h2>
+<p>A database is everything under one prefix of a bucket, such as
+<code>s3://my-bucket/prod/accounts/</code>. The bucket is the only place its data lives:
+there is no storage cluster to run, and no disk on any machine that must be
+backed up. One bucket can hold many databases, each under its own prefix.</p>
+<p>What IsleDB stores there is described in
+<a href="/docs/storage-layout/">the storage layout</a>. Applications never read those
+objects directly; they go through a writer and readers.</p>
+<h2 id="the-writer">The writer</h2>
+<p>One writer writes to a database. It takes puts and deletes, buffers them,
+and saves them to the bucket together, once every flush interval (250 ms by
+default). A write is durable once it is saved:</p>
+<ul>
+<li><strong>Over HTTP,</strong> the writer answers a write once it is saved, unless the
+request asks not to wait.</li>
+<li><strong>In Go,</strong> <code>Put</code> buffers the write; <code>Flush</code>, or waiting for its commit,
+confirms it is saved.</li>
+</ul>
+<p>Writes made together in one batch are saved together: readers see all of
+them or none.</p>
+<p><strong>Only one writer at a time.</strong> If a second writer opens the same database, it
+takes over, and the first one stops taking writes. This keeps two writers
+from overwriting each other, even when an old and a new one overlap during a
+deployment. Run exactly one.</p>
+<h2 id="readers">Readers</h2>
+<p>Readers serve reads: single keys, scans of a key range, and the change feed.
+Run as many as you need. They share nothing with each other or with the
+writer, so each one adds capacity, and any of them can answer any request.</p>
+<p>A reader answers from the newest version of the database it has loaded, and
+it loads the newest version about once a second. It keeps what it reads in
+caches on its own disk and in memory, so repeated reads don't go back to the
+bucket.</p>
+<h2 id="revisions-and-freshness">Revisions and freshness</h2>
+<p>Every save gives the database a new <strong>revision</strong>, a number that only grows.</p>
+<ul>
+<li>The writer tells you the revision of each write.</li>
+<li>Every read tells you the revision it was answered from (the
+<code>Isledb-Revision</code> header over HTTP).</li>
+<li>A read at a revision at or past a write's includes that write.</li>
+</ul>
+<p>So a read can be up to about a second behind the writer: it may not yet
+include a write made in the last second. When you need to read your own
+write, compare revisions and read again if the reader is behind.</p>
+<p>If a reader loses access to the bucket, it keeps answering from what it has,
+for up to the database's maximum view age (one hour by default), and only
+then refuses reads. During a storage outage, reads can therefore be up to
+that old.</p>
+<h2 id="maintenance">Maintenance</h2>
+<p>As the writer saves, the database gathers many small files. Maintenance
+merges them into fewer, larger ones (compaction), so reads stay fast, and
+deletes what is no longer needed, so storage doesn't grow without end. It
+also deletes change-feed history older than you choose to keep.</p>
+<p>Maintenance runs in its own process, on whatever compute suits you, so this
+work never competes with the processes serving traffic. It prepares its work,
+and the writer publishes it with its next save. Run one per database, in
+production always.</p>
+<h2 id="the-read-cache">The read cache</h2>
+<p>The read cache is optional. It sits between the readers in one region and
+the bucket: readers read through it, and it keeps one copy of what they read
+on its local disk. Many readers then cost the bucket one read instead of one
+each, and they usually learn about a new write within a second of it.</p>
+<p>If the cache can't answer, readers read the bucket directly, so the cache
+never stops reads.</p>
+<h2 id="the-change-feed">The change feed</h2>
+<p>The change feed is optional. When it is on, the database keeps every
+committed put and delete, in order, alongside the data. Consumers read it a
+page at a time and save their place, a <strong>cursor</strong>, to resume from later. It
+keeps a cache, a search index or another system in sync with the database.</p>
+<p>The feed keeps either keys only, or keys and values. See
+<a href="/docs/change-feed/">Follow changes</a>.</p>
+<h2 id="services-and-the-go-library">Services and the Go library</h2>
+<table>
+<thead>
+<tr>
+<th>Part</th>
+<th>As a service</th>
+<th>In Go</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Database</td>
+<td>A bucket URL and a prefix in each service's configuration</td>
+<td><code>isledb.Open</code></td>
+</tr>
+<tr>
+<td>Writer</td>
+<td><code>isledb writer</code>, writes over HTTP</td>
+<td><code>DB.OpenWriter</code></td>
+</tr>
+<tr>
+<td>Reader</td>
+<td><code>isledb reader</code>, reads over HTTP</td>
+<td><code>DB.OpenReader</code></td>
+</tr>
+<tr>
+<td>Maintenance</td>
+<td><code>isledb maintenance</code></td>
+<td><code>DB.OpenMaintenance</code></td>
+</tr>
+<tr>
+<td>Read cache</td>
+<td><code>isledb cache</code></td>
+<td>A reader's <code>ReadCache</code> options</td>
+</tr>
+<tr>
+<td>Change feed</td>
+<td><code>GET /v1/changes</code> on readers</td>
+<td><code>DB.OpenChangeReader</code></td>
+</tr>
+</tbody>
+</table>
+<p>The two mix freely: a Go program can read a database that the writer service
+writes, and the maintenance service can maintain a database a Go program
+writes.</p>
+<h2 id="what-isledb-is-not">What IsleDB is not</h2>
+<ul>
+<li><strong>Not built for low-latency writes.</strong> A write takes about the flush
+interval to be saved, and about a second more to reach readers.</li>
+<li><strong>Not transactional across reads and writes.</strong> A batch of writes is atomic,
+but there are no transactions that read, decide and write.</li>
+<li><strong>Not a query engine.</strong> Reads are by key or by key range: no SQL, joins or
+secondary indexes.</li>
+</ul>
+
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        <details open>
+        <summary><strong>On this page</strong></summary>
+        <ol>
+          <li class="l2"><a href="#one-database-one-prefix">One database, one prefix</a></li>
+          <li class="l2"><a href="#the-writer">The writer</a></li>
+          <li class="l2"><a href="#readers">Readers</a></li>
+          <li class="l2"><a href="#revisions-and-freshness">Revisions and freshness</a></li>
+          <li class="l2"><a href="#maintenance">Maintenance</a></li>
+          <li class="l2"><a href="#the-read-cache">The read cache</a></li>
+          <li class="l2"><a href="#the-change-feed">The change feed</a></li>
+          <li class="l2"><a href="#services-and-the-go-library">Services and the Go library</a></li>
+          <li class="l2"><a href="#what-isledb-is-not">What IsleDB is not</a></li>
+        </ol>
+        </details>
+      </aside>
+    </div>
+
+    <footer>
+      <div class="shell">
+        <div class="footer-main">
+          <div class="footer-brand">
+            <a class="brand" href="/" aria-label="IsleDB home">
+              <img src="/favicon-v2.svg" width="30" height="30" alt="" />
+              <span class="brand-name">Isle<span class="brand-db">DB</span></span>
+            </a>
+            <p>A key-value database for object storage: run it as HTTP services, or embed it in Go.</p>
+          </div>
+          <div class="footer-column">
+            <strong>Resources</strong>
+            <a href="/docs/">Docs</a>
+            <a href="/getting-started/">Getting started</a>
+            <a href="/docs/http-api/">HTTP API</a>
+            <a href="/docs/go-api/">Go API</a>
+          </div>
+          <div class="footer-column">
+            <strong>Project</strong>
+            <a href="https://github.com/ankur-anand/isledb">GitHub</a>
+            <a href="https://pkg.go.dev/github.com/ankur-anand/isledb">Go package</a>
+            <a href="https://github.com/ankur-anand/isledb/tree/main/examples">Examples</a>
+            <a href="https://github.com/ankur-anand/isledb/blob/main/LICENSE">Apache 2.0</a>
+          </div>
+        </div>
+        <div class="footer-bottom">
+          <span>© <span id="footer-year">2026</span> IsleDB. Apache License.</span>
+          <span>Built by <a href="https://x.com/in_aanand">@in_aanand</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      
+      if (window.matchMedia("(max-width: 1200px)").matches) {
+        document.querySelector(".toc details")?.removeAttribute("open");
+      }
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        document.querySelector(".docnav details")?.removeAttribute("open");
+      }
+
+      const year = document.getElementById("footer-year");
+      if (year) {
+        year.textContent = String(new Date().getFullYear());
+      }
+    </script>
+  </body>
+</html>
