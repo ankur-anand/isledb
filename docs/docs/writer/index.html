@@ -886,9 +886,10 @@ data waiting to be saved, and requests being read and applied, which
 <code>writes.max_inflight_bytes</code> bounds: a batch is counted at 4 times its body,
 for the copies made while decoding and applying it. The writer also keeps
 its recent saves in memory until it has combined them into one larger file,
-about 64 MiB at a time, which takes up to about 190 MiB. If you raise
-<code>writes.max_inflight_bytes</code> or <code>memtable.target_bytes</code>, raise the memory
-limit too.</p>
+about 64 MiB at a time, which takes up to about 190 MiB;
+<code>l0_merge.target_bytes</code> sets that size. If you raise
+<code>writes.max_inflight_bytes</code>, <code>memtable.target_bytes</code> or
+<code>l0_merge.target_bytes</code>, raise the memory limit too.</p>
 <h2 id="authentication">Authentication</h2>
 <p>The writer won't start without authentication unless you set
 <code>writer.auth.insecure</code>. Clients send a token from <code>writer.auth.token_file</code>,

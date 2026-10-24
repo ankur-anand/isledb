@@ -910,6 +910,16 @@ unless <code>auth.insecure</code> is set. See <a href="/docs/security/">Secure I
 <td>How many full groups can wait to be saved before new writes get <code>503</code>.</td>
 </tr>
 <tr>
+<td><code>writer.l0_merge.target_bytes</code><br><code>--l0-merge-bytes</code><br><code>ISLEDB_WRITER_L0_MERGE_TARGET_BYTES</code></td>
+<td><code>64MiB</code></td>
+<td>The writer keeps the files it recently saved in memory and combines them into one larger file once they hold this much. Holds up to twice this much in memory. Smaller makes fewer recent files for a scan to read; larger means less rewriting. See <a href="/docs/writer/#memory">Memory</a>.</td>
+</tr>
+<tr>
+<td><code>writer.l0_merge.max_age</code><br><code>--l0-merge-max-age</code><br><code>ISLEDB_WRITER_L0_MERGE_MAX_AGE</code></td>
+<td><code>5m</code></td>
+<td>How long a saved file is kept in memory before what is kept is combined, whatever its size.</td>
+</tr>
+<tr>
 <td><code>writer.writes.max_inflight_bytes</code><br><code>--max-inflight-bytes</code><br><code>ISLEDB_WRITER_WRITES_MAX_INFLIGHT_BYTES</code></td>
 <td><code>256MiB</code></td>
 <td>Memory for requests being read and applied at once. A <code>PUT</code> counts its body; a batch counts 4 times its body. Past it, new writes get <code>503</code> until earlier ones finish. At least 4 × <code>max_request_bytes</code>, and <code>max_value_bytes</code>.</td>
@@ -1042,6 +1052,36 @@ unless <code>auth.insecure</code> is set. See <a href="/docs/security/">Secure I
 <td><code>maintenance.change_feed.retain_for</code><br><code>--change-feed-retain-for</code><br><code>ISLEDB_MAINTENANCE_CHANGE_FEED_RETAIN_FOR</code></td>
 <td><code>0s</code></td>
 <td>How long change-feed history is kept; <code>0s</code> keeps it all.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.base_level_bytes</code><br><code>--base-level-bytes</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_BASE_LEVEL_BYTES</code></td>
+<td><code>512MiB</code></td>
+<td>Target size of the first level below newly saved files. Each level after it is <code>level_growth</code> times larger. See <a href="/docs/maintenance/#tune-compaction">Tune compaction</a>.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.level_growth</code><br><code>--level-growth</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_LEVEL_GROWTH</code></td>
+<td><code>8</code></td>
+<td>How much larger each level is than the one above it. At least <code>2</code>.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.target_sst_bytes</code><br><code>--target-sst-bytes</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_TARGET_SST_BYTES</code></td>
+<td><code>64MiB</code></td>
+<td>Size of the files compaction writes.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.l0_to_base_ratio</code><br><code>--l0-to-base-ratio</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_L0_TO_BASE_RATIO</code></td>
+<td><code>1</code></td>
+<td>How much newly saved data collects, as a share of the first level, before it is merged into that level. Higher rewrites less, but leaves more files for a scan to read. Must be positive.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.l0_max_depth</code><br><code>--l0-max-depth</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_L0_MAX_DEPTH</code></td>
+<td><code>16</code></td>
+<td>Newly saved files a single key may be in before they are merged into the first level, whatever their size. Bounds the files a read checks.</td>
+</tr>
+<tr>
+<td><code>maintenance.compaction.l0_max_age</code><br><code>--l0-max-age</code><br><code>ISLEDB_MAINTENANCE_COMPACTION_L0_MAX_AGE</code></td>
+<td><code>30m</code></td>
+<td>Age of the oldest newly saved data that makes it merge into the first level, whatever its size, so a database that stops being written settles.</td>
 </tr>
 <tr>
 <td><code>maintenance.admin_listen</code><br><code>--admin-listen</code><br><code>ISLEDB_MAINTENANCE_ADMIN_LISTEN</code></td>

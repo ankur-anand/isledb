@@ -48,6 +48,29 @@ func TestConfigDefaultsAndOptions(t *testing.T) {
 	}
 }
 
+func TestCompactionSettings(t *testing.T) {
+	cfg, err := load([]string{"-bucket-url", "file:///b", "-prefix", "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.options().SSTCompaction, isledb.DefaultMaintenanceOptions().SSTCompaction; got != want {
+		t.Fatalf("defaults %+v, want the library's %+v", got, want)
+	}
+	cfg, err = load([]string{"-bucket-url", "file:///b", "-prefix", "a", "-l0-to-base-ratio", "4", "-l0-max-depth", "64",
+		"-base-level-bytes", "4GiB", "-level-growth", "10", "-target-sst-bytes", "32MiB", "-l0-max-age", "10m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	sc := cfg.options().SSTCompaction
+	if sc.L0ToBaseRatio != 4 || sc.L0MaxDepth != 64 || sc.BaseLevelBytes != 4<<30 || sc.LevelGrowthFactor != 10 ||
+		sc.TargetSSTBytes != 32<<20 || sc.L0MaxAge != 10*time.Minute {
+		t.Fatalf("overrides: %+v", sc)
+	}
+}
+
 func TestConfigRefusesMistakes(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -60,6 +83,12 @@ func TestConfigRefusesMistakes(t *testing.T) {
 		{"auth", []string{"-prefix", "a", "-auth-token-file", "/t"}, "serves no API"},
 		{"tls", []string{"-prefix", "a", "-tls-cert", "/c", "-tls-key", "/k"}, "serves no API"},
 		{"negative retention", []string{"-prefix", "a", "-change-feed-retain-for", "-1h"}, "change_feed.retain_for"},
+		{"growth of one", []string{"-prefix", "a", "-level-growth", "1"}, "compaction.level_growth"},
+		{"no ratio", []string{"-prefix", "a", "-l0-to-base-ratio", "0"}, "compaction.l0_to_base_ratio"},
+		{"ratio not a number", []string{"-prefix", "a", "-l0-to-base-ratio", "NaN"}, "compaction.l0_to_base_ratio"},
+		{"no depth", []string{"-prefix", "a", "-l0-max-depth", "0"}, "compaction.l0_max_depth"},
+		{"no age", []string{"-prefix", "a", "-l0-max-age", "0s"}, "compaction.l0_max_age"},
+		{"no base level", []string{"-prefix", "a", "-base-level-bytes", "0"}, "compaction.base_level_bytes"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg, err := load(append([]string{"-bucket-url", "file:///b"}, c.args...))

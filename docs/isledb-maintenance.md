@@ -75,6 +75,14 @@ maintenance:
 
   change_feed:
     retain_for: 0s               # 0s keeps all history; e.g. 168h
+
+  compaction:                    # see Tune compaction below
+    base_level_bytes: 512MiB
+    level_growth: 8
+    target_sst_bytes: 64MiB
+    l0_to_base_ratio: 1
+    l0_max_depth: 16
+    l0_max_age: 30m
 ```
 
 To check a configuration without starting maintenance:
@@ -95,6 +103,36 @@ in progress, and in a container mount a volume there: the default cache
 directory may be small or read-only. Maintenance removes its
 own files when it stops, and on its next start it removes any a crash left
 behind. It never deletes anything else in the directory.
+
+## Tune compaction
+
+Compaction rewrites saved data into fewer, larger files, so reads check fewer
+files. The defaults suit most databases. Change them when compaction writes
+much more to storage than your application does, which
+`isledb_maintenance_compaction_rewritten_bytes_total` shows: divide its rate
+by the rate of data you write.
+
+To rewrite less, let new data collect for longer before it is merged, and
+make the first level larger:
+
+```yaml
+maintenance:
+  compaction:
+    l0_to_base_ratio: 4
+    l0_max_depth: 64
+    base_level_bytes: 4GiB
+```
+
+What this costs:
+
+- **Scans read more files** while new data collects, so they are slower
+  while writes are heavy. Reads of single keys are barely affected.
+- **Each merge is larger.** Merges happen less often but take longer, and
+  `scratch_dir` needs room for the larger merges.
+
+Change one setting at a time and compare the rewrite rate and your read
+latency before and after. A change applies to the database from the next
+round of work after maintenance restarts.
 
 ## Change-feed history
 

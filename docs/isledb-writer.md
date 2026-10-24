@@ -130,9 +130,10 @@ data waiting to be saved, and requests being read and applied, which
 `writes.max_inflight_bytes` bounds: a batch is counted at 4 times its body,
 for the copies made while decoding and applying it. The writer also keeps
 its recent saves in memory until it has combined them into one larger file,
-about 64 MiB at a time, which takes up to about 190 MiB. If you raise
-`writes.max_inflight_bytes` or `memtable.target_bytes`, raise the memory
-limit too.
+about 64 MiB at a time, which takes up to about 190 MiB;
+`l0_merge.target_bytes` sets that size. If you raise
+`writes.max_inflight_bytes`, `memtable.target_bytes` or
+`l0_merge.target_bytes`, raise the memory limit too.
 
 ## Authentication
 
