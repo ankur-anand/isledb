@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -876,6 +877,50 @@ func TestWriteIfMatchFallbackOneWinner(t *testing.T) {
 			t.Fatalf("round %d: object holds %q (%v), want the winner's %q", round, got, err, data)
 		}
 		etag = nextETag
+	}
+}
+
+// TestWriteIfMatchFileSurvivesAKilledWrite: the file store writes an
+// object's MD5 beside it, then moves the bytes into place. A writer killed
+// between the two leaves the old bytes with the new MD5; a conditional write
+// built on a read of those bytes must still succeed.
+func TestWriteIfMatchFileSurvivesAKilledWrite(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := openFile(ctx, dir, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	key := store.ManifestPath()
+	if _, err := store.WriteIfNotExist(ctx, key, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Write(ctx, key, []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	// Undo the move, keeping v2's MD5: the killed write.
+	if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(key)), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	data, attr, err := store.Read(ctx, key)
+	if err != nil || string(data) != "v1" {
+		t.Fatalf("read %q, %v; want v1", data, err)
+	}
+	next, err := store.WriteIfMatch(ctx, key, []byte("v3"), attr.ETag)
+	if err != nil {
+		t.Fatalf("conditional write after the killed write: %v", err)
+	}
+	// The ETag a write returns is the one a read of its bytes gives.
+	if _, err := store.WriteIfMatch(ctx, key, []byte("v4"), next.ETag); err != nil {
+		t.Fatalf("conditional write on the returned ETag: %v", err)
+	}
+	if _, err := store.WriteIfMatch(ctx, key, []byte("v5"), attr.ETag); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("conditional write on a stale ETag: %v, want ErrPreconditionFailed", err)
+	}
+	if data, _, _ := store.Read(ctx, key); string(data) != "v4" {
+		t.Fatalf("object holds %q, want v4", data)
 	}
 }
 

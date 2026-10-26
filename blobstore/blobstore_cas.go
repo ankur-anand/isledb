@@ -71,16 +71,9 @@ func (s *Store) writeIfNotExistWithETag(ctx context.Context, key string, data []
 		if _, err := s.writeIfNotExist(ctx, key, data); err != nil {
 			return Attributes{}, err
 		}
-		attr, err := s.bucket.Attributes(ctx, key)
-		if err != nil {
-			return Attributes{}, err
-		}
-		gen := generationFromAttrs(attr)
-		return Attributes{
-			Size:       attr.Size,
-			ETag:       s.stableETag(attr),
-			Generation: gen,
-		}, nil
+		// From the bytes written, not a second request, which could see a
+		// later write's object.
+		return Attributes{Size: int64(len(data)), ETag: contentETag(data)}, nil
 	}
 
 }

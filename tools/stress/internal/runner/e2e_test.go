@@ -28,6 +28,11 @@ func TestRunAgainstTheWorkingTree(t *testing.T) {
 		t.Skip("not the isledb repository")
 	}
 	dir := t.TempDir()
+	t.Cleanup(func() {
+		if t.Failed() {
+			logRoleLogs(t, filepath.Join(dir, "results"))
+		}
+	})
 	bucket := filepath.Join(dir, "bucket")
 	if err := os.MkdirAll(bucket, 0o755); err != nil {
 		t.Fatal(err)
@@ -86,6 +91,20 @@ sample_every: 500ms
 		if _, err := os.Stat(filepath.Join(sum.Run.Dir, f)); err != nil {
 			t.Errorf("run directory lacks %s", f)
 		}
+	}
+}
+
+// logRoleLogs logs the end of every role's log under results, which the
+// temporary directory takes with it.
+func logRoleLogs(t *testing.T, results string) {
+	logs, _ := filepath.Glob(filepath.Join(results, "*", "logs", "*.log"))
+	for _, path := range logs {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		t.Logf("%s, last %d lines:\n%s", filepath.Base(path), min(len(lines), 40), strings.Join(lines[max(0, len(lines)-40):], "\n"))
 	}
 }
 
