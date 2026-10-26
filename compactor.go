@@ -29,6 +29,10 @@ import (
 // tuning knob.
 const maxCompactionSSTsPerJob = manifest.MaxRetiredObjectsPerEntry
 
+// maxFillWhileL0Waits is how many times its target a level below L1 may hold
+// before it is compacted even while L0 waits for L1 to drain.
+const maxFillWhileL0Waits = 2
+
 // maxCompactionOutputOvershoot is how far past its target a compaction output
 // can run on its last entry: the largest value a writer accepts by default.
 const maxCompactionOutputOvershoot = defaultMaxValueBytes
@@ -412,6 +416,8 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
+	// l0Waits is set when L0 is due but must wait for L1 to drain first.
+	l0Waits := false
 	now := time.Now()
 	drainable := c.drainableL0(m, now)
 	if c.l0NeedsPlanning(drainable) {
@@ -450,12 +456,11 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 					workUnits: 1,
 					critical:  critical,
 				}
-				if plan.sourceLevel != 0 {
-					// This lower-level plan is a prerequisite selected specifically to
-					// unblock L0. Run it before unrelated level work; otherwise the
-					// lower-level round robin can delay the drain while L0 keeps growing.
-					return []compactionCandidate{candidate}, nil
-				}
+				// A lower-level plan here is a prerequisite selected
+				// specifically to unblock L0. Run it before unrelated level
+				// work; otherwise the lower-level round robin can delay the
+				// drain while L0 keeps growing.
+				l0Waits = plan.sourceLevel != 0
 				candidates = append(candidates, candidate)
 			}
 		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
@@ -474,6 +479,15 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 			continue
 		}
 		if _, exists := plannedLevels[level.Number]; exists {
+			continue
+		}
+		// While L0 waits, other levels wait too, but not without end: L0
+		// can stay behind for as long as ingest outpaces compaction, and a
+		// level held back meanwhile would grow without bound, making every
+		// job into it rewrite more of it. From maxFillWhileL0Waits times its
+		// target, a level takes turns beside L1's drain.
+		target := c.levelTargetBytes(level.Number)
+		if l0Waits && level.TotalSize()-target < (maxFillWhileL0Waits-1)*target {
 			continue
 		}
 		limit := min(maxCompactionSSTsPerJob, len(level.SSTs))

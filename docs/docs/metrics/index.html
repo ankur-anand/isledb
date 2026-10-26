@@ -1045,6 +1045,14 @@ storage.</li>
 <td>How long compactions take, by kind: <code>l0_drain</code> (new files into the first level), <code>l0_merge</code> (new files with each other), <code>level</code> (one level into the next) and <code>move</code> (files moved without being rewritten).</td>
 </tr>
 <tr>
+<td><code>isledb_maintenance_compaction_jobs_by_level_total{level}</code></td>
+<td>Compactions, by the level they read from: <code>0</code> for the newest files, <code>1</code> for the first level, and so on. A level whose <code>level_bytes</code> stays above its target while its count stands still is not getting turns.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_blocked_total{level}</code></td>
+<td>Times a level due for compaction could not be given a job, by level. Maintenance tries again on its next round.</td>
+</tr>
+<tr>
 <td><code>isledb_maintenance_compaction_critical</code></td>
 <td><code>1</code> when the last compaction was urgent, because the newest files had piled up too deep.</td>
 </tr>
@@ -1054,7 +1062,7 @@ storage.</li>
 </tr>
 <tr>
 <td><code>isledb_maintenance_l0_depth</code></td>
-<td>The most of those files one key is in, so the most a read of one key may check. <code>compaction.l0_max_depth</code> limits it.</td>
+<td>The most of those files one key is in, so the most a read of one key may check. At <code>compaction.l0_max_depth</code>, they are merged into the first level; past it, compaction is behind.</td>
 </tr>
 <tr>
 <td><code>isledb_maintenance_level_files{level}</code>, <code>isledb_maintenance_level_bytes{level}</code></td>

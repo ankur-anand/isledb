@@ -17,6 +17,7 @@ type metrics struct {
 	oversizedJobs, rejectedCommands       prometheus.Counter
 	rejectedBytes                         prometheus.Counter
 	deleted, deleteFailures               *prometheus.CounterVec
+	levelJobs, blocked                    *prometheus.CounterVec
 
 	l0Files, l0Bytes, l0Depth, critical prometheus.Gauge
 	shapeTime                           prometheus.Gauge
@@ -34,6 +35,9 @@ func newMetrics() *metrics {
 	}
 	byKind := func(name, help string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: "isledb_maintenance_" + name, Help: help}, []string{"kind"})
+	}
+	countByLevel := func(name, help string) *prometheus.CounterVec {
+		return prometheus.NewCounterVec(prometheus.CounterOpts{Name: "isledb_maintenance_" + name, Help: help}, []string{"level"})
 	}
 	byLevel := func(name, help string) *prometheus.GaugeVec {
 		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "isledb_maintenance_" + name, Help: help}, []string{"level"})
@@ -69,13 +73,15 @@ func newMetrics() *metrics {
 		rejectedBytes:    counter("compaction_rejected_bytes_total", "Bytes compaction wrote for jobs the writer then rejected."),
 		deleted:          byKind("deleted_objects_total", "Objects deleted from storage, by kind: sst, change_batch, snapshot or page."),
 		deleteFailures:   byKind("delete_failures_total", "Deletes that failed, by kind; they are retried."),
+		levelJobs:        countByLevel("compaction_jobs_by_level_total", "Compaction jobs, by the level they read from: 0 for L0."),
+		blocked:          countByLevel("compaction_blocked_total", "Times a level due for compaction could not be given a job, by level; the next cycle tries again."),
 	}
 }
 
 func (m *metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{m.cycles, m.cycleErrors, m.running, m.lastCycle, m.waitingForWriter, m.waitingSince, m.jobs, m.l0Merges,
 		m.movedJobs, m.readBytes, m.rewrittenBytes, m.movedBytes, m.checkpoint, m.oversizedJobs, m.rejectedCommands,
-		m.rejectedBytes, m.deleted, m.deleteFailures,
+		m.rejectedBytes, m.deleted, m.deleteFailures, m.levelJobs, m.blocked,
 		m.l0Files, m.l0Bytes, m.l0Depth, m.critical, m.shapeTime, m.levelFiles, m.levelBytes, m.levelTarget, m.jobSeconds}
 }
 
@@ -105,7 +111,11 @@ func (m *metrics) cycle(s isledb.MaintenanceStats) {
 	if s.ManifestCheckpoint.Staged {
 		m.checkpoint.Inc()
 	}
+	for _, b := range s.Scheduling.Blocked {
+		m.blocked.WithLabelValues(strconv.FormatUint(uint64(b.SourceLevel), 10)).Inc()
+	}
 	if c.Jobs > 0 && s.Scheduling.Selected == isledb.MaintenanceTaskSSTCompaction {
+		m.levelJobs.WithLabelValues(strconv.FormatUint(uint64(s.Scheduling.CompactionSourceLevel), 10)).Add(float64(c.Jobs))
 		m.jobSeconds.WithLabelValues(jobKind(s)).Observe(s.Duration.Seconds())
 		m.critical.Set(boolValue(s.Scheduling.CompactionCritical))
 	}
