@@ -246,8 +246,7 @@ func (s *Store) Read(ctx context.Context, key string) (data []byte, attrs Attrib
 		// bytes just read. Asking for it in a second request could pair these
 		// bytes with a newer object's token, and a conditional write built on
 		// them would then overwrite that newer object.
-		sum := md5.Sum(data)
-		attrs.ETag = hex.EncodeToString(sum[:])
+		attrs.ETag = contentETag(data)
 	}
 
 	return data, attrs, nil
@@ -491,21 +490,34 @@ var fallbackCASMu sync.Mutex
 // writeIfMatchFallback writes data if key's ETag is ifMatch, for backends
 // without a native conditional write. Without fallbackCASMu, two writers
 // could both pass the check and both write, each believing it won.
+//
+// It hashes the object's bytes, as Read does, rather than trusting the MD5
+// the file store keeps beside them: that store writes the MD5 before it
+// moves the bytes into place, so a process killed between the two leaves an
+// MD5 no read can match, and every conditional write would fail.
 func (s *Store) writeIfMatchFallback(ctx context.Context, key string, data []byte, ifMatch string) (Attributes, error) {
 	fallbackCASMu.Lock()
 	defer fallbackCASMu.Unlock()
-	currentAttr, err := s.bucket.Attributes(ctx, key)
-	objectExists := err == nil
-	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
+	current, err := s.bucket.ReadAll(ctx, key)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return Attributes{}, ErrPreconditionFailed
+		}
 		return Attributes{}, err
 	}
-	if !objectExists {
+	if contentETag(current) != ifMatch {
 		return Attributes{}, ErrPreconditionFailed
 	}
-	if s.stableETag(currentAttr) != ifMatch {
-		return Attributes{}, ErrPreconditionFailed
+	if _, err := s.WriteReader(ctx, key, bytes.NewReader(data), nil); err != nil {
+		return Attributes{}, err
 	}
-	return s.Write(ctx, key, data)
+	return Attributes{Size: int64(len(data)), ETag: contentETag(data)}, nil
+}
+
+// contentETag is the ETag of data on the in-memory and file stores: its MD5.
+func contentETag(data []byte) string {
+	sum := md5.Sum(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func generationFromAttrs(attr *blob.Attributes) int64 {
