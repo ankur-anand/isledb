@@ -1,0 +1,2 @@
+# Alerts are Prometheus rules (deploy/prometheus/alerts.yml), not Grafana ones.
+apiVersion: 1

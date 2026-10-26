@@ -1,0 +1,38 @@
+# The small-file profile at 12 MiB/s, at the version's default compaction
+# settings. Pick the size on the command line:
+#
+#   stress run -spec specs/default.yaml -target 20GiB -isledb v0.20.0
+#
+# Checkpoints follow the ladder (1, 5, 10, 20, 50, 100, 250, 500 GiB, 1 TiB)
+# up to the target. Start SILO with deploy/up.sh.
+name: default
+workload:
+  shape: random
+  values: mixed
+  target: 20GiB
+  batch_keys: 16
+  rate: 12MiB
+  workers: 128
+readers:
+  - {name: uniform, rate: 200, workers: 16, scan_ratio: 0.05, scan_limit: 100}
+storage:
+  bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
+  endpoint: http://127.0.0.1:19000
+  latency: {min: 15ms, max: 40ms}
+  # For long runs, hold writes while the disk under SILO is too full:
+  # disk: {path: /data, max_used_pct: 85}
+isledb:
+  readers: 1
+  config:
+    writer:
+      memtable: {target_bytes: 3MiB}
+      flush: {interval: 250ms}
+      # Replaced files wait this long before they are deleted. IsleDB's
+      # default is 1h; 10m frees disk six times sooner, so space
+      # amplification reads lower than production's would.
+      policy: {max_pinned_view_age: 10m}
+phases:
+  - load: {}
+  - settle: {quiet: 5m, max: 3h}
+  - verify: {parts: 32}
+sample_every: 30s
