@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1398,5 +1399,34 @@ func TestCompactorCommitsRetirementRecords(t *testing.T) {
 		if object.Key != store.SSTPath(sst.ID) {
 			t.Fatalf("invalid retirement record for %s: %+v", sst.ID, object)
 		}
+	}
+}
+
+func TestLSMShapeCountsEveryLevel(t *testing.T) {
+	opts := defaultCompactorOptions()
+	opts.Trigger.BaseLevelBytes = 1 << 20
+	opts.Trigger.LevelSizeMultiplier = 4
+	c := &compactor{opts: normalizeCompactorOptions(opts)}
+	m := &manifestState{}
+	m.AddL0SST(manifest.SSTMeta{ID: "a", MinKey: []byte("a"), MaxKey: []byte("m"), Size: 5})
+	m.AddL0SST(manifest.SSTMeta{ID: "b", MinKey: []byte("k"), MaxKey: []byte("z"), Size: 7})
+	m.Levels = []manifest.Level{
+		{Number: 3, SSTs: []manifest.SSTMeta{{ID: "c", Level: 3, Size: 1000}}},
+		{Number: 1, SSTs: []manifest.SSTMeta{{ID: "d", Level: 1, Size: 100}, {ID: "e", Level: 1, Size: 200}}},
+	}
+	got := c.lsmShape(m)
+	want := LSMShape{
+		L0:      LevelShape{Files: 2, Bytes: 12},
+		L0Depth: 2,
+		Levels: []LevelShape{
+			{Level: 1, Files: 2, Bytes: 300, TargetBytes: 1 << 20},
+			{Level: 3, Files: 1, Bytes: 1000, TargetBytes: 16 << 20},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("shape %+v, want %+v", got, want)
+	}
+	if empty := c.lsmShape(&manifestState{}); empty.L0.Files != 0 || empty.L0Depth != 0 || len(empty.Levels) != 0 {
+		t.Fatalf("an empty database: %+v", empty)
 	}
 }

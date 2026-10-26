@@ -419,6 +419,29 @@ type MaintenanceStats struct {
 	Duration         time.Duration
 }
 
+// LSMShape is the database's files by level, from Maintenance.Shape: how
+// much new data waits in L0 to be merged, and how full each level below is.
+type LSMShape struct {
+	// L0 is the newly saved files, which may overlap each other. Its
+	// TargetBytes is zero.
+	L0 LevelShape
+	// L0Depth is the most L0 files covering any one key: the L0 files a
+	// read of that key may check, and what L0MaxDepth bounds.
+	L0Depth int
+	// Levels are L1 and below, in order.
+	Levels []LevelShape
+}
+
+// LevelShape is one level's files.
+type LevelShape struct {
+	Level uint32
+	Files int
+	Bytes int64
+	// TargetBytes is the size compaction keeps the level near: BaseLevelBytes
+	// for L1, LevelGrowthFactor times more for each level below.
+	TargetBytes int64
+}
+
 // DefaultMaintenanceOptions returns safe defaults. Compaction, checkpoints,
 // and SST sweeping are enabled; change-feed retention remains disabled.
 func DefaultMaintenanceOptions() MaintenanceOptions {
@@ -475,14 +498,18 @@ func DefaultChangeFeedRetentionOptions() ChangeFeedRetentionOptions {
 // It is safe to call Close concurrently with Run or RunOnce.
 type Maintenance struct {
 	manifestLog *manifest.Store
-	opts        maintenanceOptions
-	compactor   *compactor
-	changeFeed  *changeFeedCleaner
-	sstGC       *sstCleaner
-	snapshotGC  *snapshotCleaner
-	pageGC      *manifestPageCleaner
-	deleter     *limitedObjectDeleter
-	fenceToken  *manifest.FenceToken
+	// shapeLog reads the manifest for Shape, apart from manifestLog, so
+	// Shape never waits on or disturbs a cycle.
+	shapeLog   *manifest.Store
+	shapeMu    sync.Mutex
+	opts       maintenanceOptions
+	compactor  *compactor
+	changeFeed *changeFeedCleaner
+	sstGC      *sstCleaner
+	snapshotGC *snapshotCleaner
+	pageGC     *manifestPageCleaner
+	deleter    *limitedObjectDeleter
+	fenceToken *manifest.FenceToken
 	// l0SSTsSeen is how many SSTs L0 held after the Run loop's last cycle.
 	l0SSTsSeen int
 
@@ -548,6 +575,7 @@ func newMaintenance(
 	deleter := newLimitedObjectDeleter(store, normalized.reclamation.MaxConcurrentDeletes)
 	m := &Maintenance{
 		manifestLog: manifestLog,
+		shapeLog:    manifest.NewStore(store),
 		opts:        normalized,
 		sstGC: newSSTCleaner(store, sstCleanerOptions{
 			DeleteBatchSize: normalized.reclamation.SST.MaxObjectsPerPass,
@@ -1236,6 +1264,26 @@ func (m *Maintenance) checkpointIfNeeded(ctx context.Context) error {
 	}
 	m.statsMu.Unlock()
 	return nil
+}
+
+// Shape returns the database's files by level now. It reads the manifest on
+// a store of its own, only the entries added since its last call after the
+// first, so it is cheap to call every few seconds, and it can run while a
+// cycle compacts: a long job does not hold it up.
+func (m *Maintenance) Shape(ctx context.Context) (LSMShape, error) {
+	if err := checkContext(ctx); err != nil {
+		return LSMShape{}, err
+	}
+	if m.closed.Load() {
+		return LSMShape{}, ErrMaintenanceClosed
+	}
+	m.shapeMu.Lock()
+	defer m.shapeMu.Unlock()
+	state, err := m.shapeLog.Replay(ctx)
+	if err != nil {
+		return LSMShape{}, fmt.Errorf("replay manifest: %w", err)
+	}
+	return m.compactor.lsmShape(state), nil
 }
 
 func (m *Maintenance) recordScheduling(decision maintenanceDecision) {

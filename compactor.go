@@ -243,6 +243,22 @@ func (c *compactor) runSelected(
 	return &chosen, nil
 }
 
+// lsmShape returns m's files by level, with the targets this compactor
+// keeps each level near.
+func (c *compactor) lsmShape(m *manifestState) LSMShape {
+	s := LSMShape{L0: LevelShape{Files: len(m.L0SSTs)}, L0Depth: l0Depth(m.L0SSTs)}
+	for _, sst := range m.L0SSTs {
+		s.L0.Bytes += sst.Size
+	}
+	for i := range m.Levels {
+		l := &m.Levels[i]
+		s.Levels = append(s.Levels, LevelShape{Level: l.Number, Files: len(l.SSTs), Bytes: l.TotalSize(),
+			TargetBytes: c.levelTargetBytes(l.Number)})
+	}
+	sort.Slice(s.Levels, func(i, j int) bool { return s.Levels[i].Level < s.Levels[j].Level })
+	return s
+}
+
 func (c *compactor) beginRun(ctx context.Context) error {
 	if c.closed.Load() {
 		return errCompactorClosed

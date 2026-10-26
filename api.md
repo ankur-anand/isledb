@@ -1347,6 +1347,7 @@ deletes never block compaction.
 ```go
 func (m *Maintenance) Run(ctx context.Context) error
 func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error)
+func (m *Maintenance) Shape(ctx context.Context) (LSMShape, error)
 func (m *Maintenance) Close(ctx context.Context) error
 ```
 
@@ -1373,6 +1374,13 @@ func runMaintenance(ctx context.Context, db *isledb.DB) error {
     return errors.Join(runErr, closeErr)
 }
 ```
+
+`Shape` reports the database's files by level now: how much newly saved
+data waits in L0 and how deep it is, and each level's size against its
+target. It reads only what changed since its last call, and it doesn't wait
+for a compaction in progress, so it can be called every few seconds to watch
+whether compaction keeps up. The types are in
+[the appendix](#appendix-maintenance-statistics).
 
 For a scheduled job, call `RunOnce` instead:
 
@@ -1880,13 +1888,29 @@ and `WriterStatus` implement `String`.
 ```go
 type MaintenanceStats struct {
     State               MaintenanceState
+    WaitingSince        time.Time
     Scheduling          MaintenanceScheduleStats
     SSTCompaction       SSTCompactionStats
     SSTCleanup          SSTCleanupStats
     ChangeFeedRetention ChangeFeedCleanupStats
     ManifestCheckpoint  ManifestCheckpointStats
     ManifestCleanup     ManifestCleanupStats
+    RejectedCommands    int
     Duration            time.Duration
+}
+
+// LSMShape is what Maintenance.Shape returns.
+type LSMShape struct {
+    L0      LevelShape   // newly saved files; TargetBytes is 0
+    L0Depth int          // the most L0 files covering one key
+    Levels  []LevelShape // L1 and below, in order
+}
+
+type LevelShape struct {
+    Level       uint32
+    Files       int
+    Bytes       int64
+    TargetBytes int64 // BaseLevelBytes for L1, LevelGrowthFactor times more per level below
 }
 
 type ReclamationCycleStats struct {

@@ -51,7 +51,8 @@ type Memtable struct {
 // larger ones, from the copies it keeps in memory.
 type L0Merge struct {
 	// TargetBytes is how much it keeps before combining, and about the size
-	// of the combined file. It keeps up to twice this much.
+	// of the combined file. It keeps up to twice this much, and holds the
+	// combined file while it uploads: about three times in all.
 	TargetBytes service.ByteSize `yaml:"target_bytes"`
 	// MaxAge is how long a commit's file is kept before what is kept is
 	// combined whatever its size.

@@ -2218,6 +2218,7 @@ manifest pages are deleted in independent lanes at their own pace, so slow
 deletes never block compaction.</p>
 <pre><code class="language-go">func (m *Maintenance) Run(ctx context.Context) error
 func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error)
+func (m *Maintenance) Shape(ctx context.Context) (LSMShape, error)
 func (m *Maintenance) Close(ctx context.Context) error
 </code></pre>
 <p><code>Run</code> continues until its context ends, <code>Close</code> is called, or another
@@ -2241,6 +2242,12 @@ context is usually already cancelled:</p>
     return errors.Join(runErr, closeErr)
 }
 </code></pre>
+<p><code>Shape</code> reports the database's files by level now: how much newly saved
+data waits in L0 and how deep it is, and each level's size against its
+target. It reads only what changed since its last call, and it doesn't wait
+for a compaction in progress, so it can be called every few seconds to watch
+whether compaction keeps up. The types are in
+<a href="#appendix-maintenance-statistics">the appendix</a>.</p>
 <p>For a scheduled job, call <code>RunOnce</code> instead:</p>
 <pre><code class="language-go">stats, err := maintenance.RunOnce(ctx)
 </code></pre>
@@ -2938,13 +2945,29 @@ const (
 and <code>WriterStatus</code> implement <code>String</code>.</p>
 <pre><code class="language-go">type MaintenanceStats struct {
     State               MaintenanceState
+    WaitingSince        time.Time
     Scheduling          MaintenanceScheduleStats
     SSTCompaction       SSTCompactionStats
     SSTCleanup          SSTCleanupStats
     ChangeFeedRetention ChangeFeedCleanupStats
     ManifestCheckpoint  ManifestCheckpointStats
     ManifestCleanup     ManifestCleanupStats
+    RejectedCommands    int
     Duration            time.Duration
+}
+
+// LSMShape is what Maintenance.Shape returns.
+type LSMShape struct {
+    L0      LevelShape   // newly saved files; TargetBytes is 0
+    L0Depth int          // the most L0 files covering one key
+    Levels  []LevelShape // L1 and below, in order
+}
+
+type LevelShape struct {
+    Level       uint32
+    Files       int
+    Bytes       int64
+    TargetBytes int64 // BaseLevelBytes for L1, LevelGrowthFactor times more per level below
 }
 
 type ReclamationCycleStats struct {

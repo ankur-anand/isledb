@@ -912,7 +912,7 @@ unless <code>auth.insecure</code> is set. See <a href="/docs/security/">Secure I
 <tr>
 <td><code>writer.l0_merge.target_bytes</code><br><code>--l0-merge-bytes</code><br><code>ISLEDB_WRITER_L0_MERGE_TARGET_BYTES</code></td>
 <td><code>64MiB</code></td>
-<td>The writer keeps the files it recently saved in memory and combines them into one larger file once they hold this much. Holds up to twice this much in memory. Smaller makes fewer recent files for a scan to read; larger means less rewriting. See <a href="/docs/writer/#memory">Memory</a>.</td>
+<td>The writer keeps the files it recently saved in memory and combines them into one larger file once they hold this much. Uses up to about three times this much memory: twice this in saved files, and the combined file while it uploads. Smaller makes fewer recent files for a scan to read; larger means less rewriting. See <a href="/docs/writer/#memory">Memory</a>.</td>
 </tr>
 <tr>
 <td><code>writer.l0_merge.max_age</code><br><code>--l0-merge-max-age</code><br><code>ISLEDB_WRITER_L0_MERGE_MAX_AGE</code></td>

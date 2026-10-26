@@ -103,6 +103,13 @@ same two metrics:
 | `isledb_maintenance_compaction_read_bytes_total`, `isledb_maintenance_compaction_rewritten_bytes_total` | Bytes compaction read from and wrote to storage: most of maintenance's storage cost. |
 | `isledb_maintenance_compaction_moved_bytes_total` | Bytes moved without being rewritten. |
 | `isledb_maintenance_compaction_oversized_jobs_total` | Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file. |
+| `isledb_maintenance_compaction_seconds{kind}` | How long compactions take, by kind: `l0_drain` (new files into the first level), `l0_merge` (new files with each other), `level` (one level into the next) and `move` (files moved without being rewritten). |
+| `isledb_maintenance_compaction_critical` | `1` when the last compaction was urgent, because the newest files had piled up too deep. |
+| `isledb_maintenance_l0_files`, `isledb_maintenance_l0_bytes` | Newly saved data not yet merged into the first level. This and the level metrics below are read from the database every 10 seconds, also while a long compaction runs. |
+| `isledb_maintenance_l0_depth` | The most of those files one key is in, so the most a read of one key may check. `compaction.l0_max_depth` limits it. |
+| `isledb_maintenance_level_files{level}`, `isledb_maintenance_level_bytes{level}` | Files and bytes in each level below the newest files. |
+| `isledb_maintenance_level_target_bytes{level}` | The size compaction keeps each level near. A level far above it makes every merge into it more expensive. |
+| `isledb_maintenance_shape_timestamp_seconds` | When the L0 and level metrics were last read. If it falls behind, storage is failing; the metrics keep their last values. |
 | `isledb_maintenance_commands_rejected_total` | Finished work the writer refused to publish. The writer logs why. |
 | `isledb_maintenance_compaction_rejected_bytes_total` | Bytes compaction wrote for work the writer refused. The files are deleted later. |
 | `isledb_maintenance_checkpoints_total` | Checkpoints of the database's metadata prepared for the writer to publish. |
@@ -120,6 +127,10 @@ same two metrics:
   refusal is normal: the writer refuses work on files that changed meanwhile,
   and maintenance redoes it. A steady rise means work is thrown away; the
   writer's log says why.
+- **Falling behind:** `l0_files` rising for many minutes while writes go on,
+  or a level's `level_bytes` staying above twice its `level_target_bytes`.
+  Compaction can't keep up with the writes: reads slow down and storage
+  grows. See [Tune compaction](isledb-maintenance.md#tune-compaction).
 - **Replaced:** `running` at `0`. Another maintenance process took over; see
   [Run one maintenance per database](isledb-maintenance.md#run-one-maintenance-per-database).
 
