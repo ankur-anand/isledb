@@ -130,12 +130,49 @@ ts("Writer merges", [(f'rate(isledb_writer_l0_merge_bytes_total{{{R}}}[2m])', "m
                      (f'isledb_writer_l0_merge_held_bytes{{{R}}}', "held in memory")], "Bps",
    right={"held in memory": "bytes"})
 newline()
+ts("Writer backpressure", [(f'rate(isledb_writer_backpressure_total{{{R}}}[1m])', "refused")], "short", minv=0,
+   desc="Writes per second the writer refused because too much data was waiting to be saved.")
+ts("Oldest write waiting to be saved",
+   [(f'(time() - isledb_writer_oldest_uncommitted_timestamp_seconds{{{R}}}) * (isledb_writer_oldest_uncommitted_timestamp_seconds{{{R}}} > bool 0)', "oldest")], "s",
+   desc="How long the oldest accepted write has waited to be saved; 0 when nothing waits. Rising: saves are stalling.")
+ts("Writer merge outcomes", [(f'rate(isledb_writer_l0_merges_published_total{{{R}}}[2m])', "published"),
+                             (f'rate(isledb_writer_l0_merges_refused_total{{{R}}}[2m])', "refused"),
+                             (f'rate(isledb_writer_l0_merges_dropped_total{{{R}}}[2m])', "dropped"),
+                             (f'rate(isledb_writer_l0_merge_errors_total{{{R}}}[2m])', "errors"),
+                             (f'rate(isledb_writer_l0_merge_skipped_bytes_total{{{R}}}[2m])', "skipped bytes")], "short", minv=0,
+   right={"skipped bytes": "Bps"},
+   desc="Combined files per second: published in place of the saves they came from, refused by maintenance, dropped "
+        "because maintenance took the files first, or failed. Skipped bytes: saves not held to combine, the memory being full.")
+newline()
 
 row("Reads")
 ts("Read latency, as the client sees it",
    [(q(0.5, "stress_read_seconds_bucket", "op"), "{{op}} p50"), (q(0.99, "stress_read_seconds_bucket", "op"), "{{op}} p99")], "s")
 ts("Reads per second", [(f'sum by (op, result) (rate(stress_reads_total{{{R}}}[1m]))', "{{op}} {{result}}")], "short")
 ts("Age of the data readers serve", [(f'time() - isledb_reader_view_loaded_timestamp_seconds{{{R}}}', "{{role}}")], "s")
+newline()
+ts("Reader refresh failures", [(f'rate(isledb_reader_refresh_errors_total{{{R}}}[1m])', "{{role}} refresh errors"),
+                               (f'rate(isledb_reader_stale_reads_total{{{R}}}[1m])', "{{role}} stale reads")], "short", minv=0,
+   desc="Failed loads of new data per second, and reads answered from old data while loading failed.")
+ts("Reader refresh time", [(q(0.5, "isledb_reader_refresh_latency_seconds_bucket", "role"), "{{role}} p50"),
+                           (q(0.99, "isledb_reader_refresh_latency_seconds_bucket", "role"), "{{role}} p99")], "s",
+   desc="How long loading new data takes; slow loads are the usual reason the data served is old.")
+ts("Reader errors", [(f'sum(rate(isledb_reader_get_errors_total{{{R}}}[1m]))', "get errors"),
+                     (f'sum(rate(isledb_reader_scan_errors_total{{{R}}}[1m]))', "scan errors"),
+                     (f'sum(rate(isledb_reader_sst_range_read_errors_total{{{R}}}[1m]))', "storage read errors"),
+                     (f'sum(rate(isledb_reader_bloom_filter_errors_total{{{R}}}[1m]))', "filter errors"),
+                     (f'sum(rate(isledb_reader_bloom_filter_skips_total{{{R}}}[1m]))', "filter skips")], "short", minv=0,
+   desc="Per second, all readers. Filter skips: key reads that checked a file without its filter, because it failed to load.")
+newline()
+ts("Reader storage reads", [(f'sum(rate(isledb_reader_sst_range_read_total{{{R}}}[1m]))', "reads"),
+                            (f'sum(rate(isledb_reader_sst_range_read_bytes_total{{{R}}}[1m]))', "bytes")], "short", minv=0,
+   right={"bytes": "Bps"},
+   desc="Reads of data files from storage per second, all readers, and the bytes they fetched.")
+ts("Storage bytes per client read",
+   [(f'sum(rate(isledb_reader_sst_range_read_bytes_total{{{R}}}[2m])) / sum(rate(stress_reads_total{{{R}}}[2m]))', "per read")], "bytes", minv=0,
+   desc="Bytes the readers fetched from storage for each get or scan the harness made. Grows as reads check more files.")
+ts("Reader storage read time", [(q(0.5, "isledb_reader_sst_range_read_latency_seconds_bucket"), "p50"),
+                                (q(0.99, "isledb_reader_sst_range_read_latency_seconds_bucket"), "p99")], "s")
 newline()
 
 row("Correctness")
@@ -148,7 +185,8 @@ row("Compaction")
 ts("Compaction bytes per second", [(f'rate(isledb_maintenance_compaction_rewritten_bytes_total{{{R}}}[2m])', "written"),
                                     (f'rate(isledb_maintenance_compaction_read_bytes_total{{{R}}}[2m])', "read"),
                                     (f'rate(isledb_maintenance_compaction_moved_bytes_total{{{R}}}[2m])', "moved")], "Bps")
-ts("Compaction jobs per minute", [(f'increase(isledb_maintenance_compaction_jobs_total{{{R}}}[1m])', "jobs"),
+ts("Compaction jobs per minute", [(f'increase(isledb_maintenance_compaction_jobs_total{{{R}}}[1m])', "all"),
+                                   (f'sum by (kind) (increase(isledb_maintenance_compaction_seconds_count{{{R}}}[1m]))', "{{kind}}"),
                                    (f'increase(isledb_maintenance_compaction_oversized_jobs_total{{{R}}}[1m])', "oversized"),
                                    (f'increase(isledb_maintenance_commands_rejected_total{{{R}}}[1m])', "refused by the writer")], "short")
 ts("Finished work waiting for the writer",
@@ -169,6 +207,13 @@ ts("Level fill (bytes / target)", [(f'isledb_maintenance_level_bytes{{{R}}} / is
 ts("Compaction time, by kind", [(q(0.5, "isledb_maintenance_compaction_seconds_bucket", "kind"), "{{kind}} p50"),
                                  (q(0.99, "isledb_maintenance_compaction_seconds_bucket", "kind"), "{{kind}} p99")], "s",
    desc="Jobs hold the single compaction slot for this long.")
+newline()
+ts("Level files", [(f'isledb_maintenance_level_files{{{R}}}', "L{{level}}")], "short", minv=0,
+   desc="Files in each level below L0. A job takes at most 128 files, so many small files make each job cover less.")
+ts("Deleted per second, by kind", [(f'sum by (kind) (rate(isledb_maintenance_deleted_objects_total{{{R}}}[2m]))', "{{kind}}")], "short", minv=0,
+   desc="Objects maintenance removed from storage. If deletes fall behind, the bucket grows: see space amplification.")
+ts("Maintenance cycle errors per minute", [(f'increase(isledb_maintenance_cycle_errors_total{{{R}}}[1m])', "errors")], "short", minv=0,
+   desc="Rounds of maintenance work that failed and are retried.")
 newline()
 
 row("Storage")
