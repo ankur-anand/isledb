@@ -223,8 +223,10 @@ func TestPlanCompactionCandidatesOffersFullLevelsWhileL0Waits(t *testing.T) {
 	if len(candidates) != 2 || candidates[0].plan.sourceLevel != 1 || candidates[1].plan.sourceLevel != 2 {
 		t.Fatalf("candidates %+v, want the L1 drain and L2", candidates)
 	}
-	if !candidates[0].critical || candidates[1].critical {
-		t.Errorf("critical: L1 drain %v, L2 %v; want only the drain L0 waits on", candidates[0].critical, candidates[1].critical)
+	// Both are urgent, as the drain alone was: a due checkpoint takes no
+	// more of their turns than it took of the drain's.
+	if !candidates[0].critical || !candidates[1].critical {
+		t.Errorf("critical: L1 drain %v, L2 %v; want both, for the L0 that waits", candidates[0].critical, candidates[1].critical)
 	}
 
 	// The round robin alternates the two.

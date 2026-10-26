@@ -416,8 +416,9 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
-	// l0Waits is set when L0 is due but must wait for L1 to drain first.
-	l0Waits := false
+	// l0Waits is set when L0 is due but must wait for L1 to drain first;
+	// l0Critical when it is also critical.
+	l0Waits, l0Critical := false, false
 	now := time.Now()
 	drainable := c.drainableL0(m, now)
 	if c.l0NeedsPlanning(drainable) {
@@ -461,6 +462,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				// work; otherwise the lower-level round robin can delay the
 				// drain while L0 keeps growing.
 				l0Waits = plan.sourceLevel != 0
+				l0Critical = l0Waits && critical
 				candidates = append(candidates, candidate)
 			}
 		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
@@ -475,7 +477,8 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	for i := range m.Levels {
 		level := &m.Levels[i]
-		if level.TotalSize() <= c.levelTargetBytes(level.Number) {
+		target := c.levelTargetBytes(level.Number)
+		if level.TotalSize() <= target {
 			continue
 		}
 		if _, exists := plannedLevels[level.Number]; exists {
@@ -485,9 +488,11 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		// can stay behind for as long as ingest outpaces compaction, and a
 		// level held back meanwhile would grow without bound, making every
 		// job into it rewrite more of it. From maxFillWhileL0Waits times its
-		// target, a level takes turns beside L1's drain.
-		target := c.levelTargetBytes(level.Number)
-		if l0Waits && level.TotalSize()-target < (maxFillWhileL0Waits-1)*target {
+		// target, a level takes turns beside L1's drain, as urgent as the
+		// drain, so a due checkpoint does not take those turns either. The
+		// size is divided rather than the target multiplied: a deep level's
+		// target can be near the int64 limit.
+		if l0Waits && level.TotalSize()/maxFillWhileL0Waits < target {
 			continue
 		}
 		limit := min(maxCompactionSSTsPerJob, len(level.SSTs))
@@ -505,6 +510,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		candidates = append(candidates, compactionCandidate{
 			plan:      plan,
 			workUnits: 1,
+			critical:  l0Critical,
 		})
 		plannedLevels[plan.sourceLevel] = struct{}{}
 	}

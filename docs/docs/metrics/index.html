@@ -1050,7 +1050,7 @@ storage.</li>
 </tr>
 <tr>
 <td><code>isledb_maintenance_compaction_blocked_total{level}</code></td>
-<td>Times a level due for compaction could not be given a job, by level. Maintenance tries again on its next round.</td>
+<td>Times no job could be planned for a level due for compaction, by level. Maintenance tries again on its next round. A level waiting its turn is not counted.</td>
 </tr>
 <tr>
 <td><code>isledb_maintenance_compaction_critical</code></td>

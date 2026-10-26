@@ -74,7 +74,7 @@ func newMetrics() *metrics {
 		deleted:          byKind("deleted_objects_total", "Objects deleted from storage, by kind: sst, change_batch, snapshot or page."),
 		deleteFailures:   byKind("delete_failures_total", "Deletes that failed, by kind; they are retried."),
 		levelJobs:        countByLevel("compaction_jobs_by_level_total", "Compaction jobs, by the level they read from: 0 for L0."),
-		blocked:          countByLevel("compaction_blocked_total", "Times a level due for compaction could not be given a job, by level; the next cycle tries again."),
+		blocked:          countByLevel("compaction_blocked_total", "Times no job could be planned for a level due for compaction, by level; the next cycle tries again. Levels waiting their turn are not counted."),
 	}
 }
 
