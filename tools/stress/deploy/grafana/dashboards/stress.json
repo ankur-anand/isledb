@@ -1295,22 +1295,9 @@
    }
   },
   {
-   "type": "row",
-   "title": "Reads",
-   "id": 25,
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 30
-   },
-   "panels": []
-  },
-  {
    "type": "timeseries",
-   "title": "Read latency, as the client sees it",
-   "id": 26,
+   "title": "Writer backpressure",
+   "id": 25,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1319,7 +1306,222 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 31
+    "y": 30
+   },
+   "description": "Writes per second the writer refused because too much data was waiting to be saved.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_backpressure_total{run=\"$run\"}[1m])",
+     "legendFormat": "refused",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Oldest write waiting to be saved",
+   "id": 26,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 30
+   },
+   "description": "How long the oldest accepted write has waited to be saved; 0 when nothing waits. Rising: saves are stalling.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "(time() - isledb_writer_oldest_uncommitted_timestamp_seconds{run=\"$run\"}) * (isledb_writer_oldest_uncommitted_timestamp_seconds{run=\"$run\"} > bool 0)",
+     "legendFormat": "oldest",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Writer merge outcomes",
+   "id": 27,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 30
+   },
+   "description": "Combined files per second: published in place of the saves they came from, refused by maintenance, dropped because maintenance took the files first, or failed. Skipped bytes: saves not held to combine, the memory being full.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_l0_merges_published_total{run=\"$run\"}[2m])",
+     "legendFormat": "published",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_l0_merges_refused_total{run=\"$run\"}[2m])",
+     "legendFormat": "refused",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_l0_merges_dropped_total{run=\"$run\"}[2m])",
+     "legendFormat": "dropped",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_l0_merge_errors_total{run=\"$run\"}[2m])",
+     "legendFormat": "errors",
+     "refId": "D"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_writer_l0_merge_skipped_bytes_total{run=\"$run\"}[2m])",
+     "legendFormat": "skipped bytes",
+     "refId": "E"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "skipped bytes"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "Bps"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Reads",
+   "id": 28,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 38
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Read latency, as the client sees it",
+   "id": 29,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 39
    },
    "description": "",
    "targets": [
@@ -1368,7 +1570,7 @@
   {
    "type": "timeseries",
    "title": "Reads per second",
-   "id": 27,
+   "id": 30,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1377,7 +1579,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 31
+    "y": 39
    },
    "description": "",
    "targets": [
@@ -1417,7 +1619,7 @@
   {
    "type": "timeseries",
    "title": "Age of the data readers serve",
-   "id": 28,
+   "id": 31,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1426,7 +1628,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 31
+    "y": 39
    },
    "description": "",
    "targets": [
@@ -1464,22 +1666,9 @@
    }
   },
   {
-   "type": "row",
-   "title": "Correctness",
-   "id": 29,
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 39
-   },
-   "panels": []
-  },
-  {
    "type": "timeseries",
-   "title": "Reads checked per second",
-   "id": 30,
+   "title": "Reader refresh failures",
+   "id": 32,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1488,7 +1677,407 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 40
+    "y": 47
+   },
+   "description": "Failed loads of new data per second, and reads answered from old data while loading failed.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_reader_refresh_errors_total{run=\"$run\"}[1m])",
+     "legendFormat": "{{role}} refresh errors",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "rate(isledb_reader_stale_reads_total{run=\"$run\"}[1m])",
+     "legendFormat": "{{role}} stale reads",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reader refresh time",
+   "id": 33,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 47
+   },
+   "description": "How long loading new data takes; slow loads are the usual reason the data served is old.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le, role) (rate(isledb_reader_refresh_latency_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "{{role}} p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, role) (rate(isledb_reader_refresh_latency_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "{{role}} p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reader errors",
+   "id": 34,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 47
+   },
+   "description": "Per second, all readers. Filter skips: key reads that checked a file without its filter, because it failed to load.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_get_errors_total{run=\"$run\"}[1m]))",
+     "legendFormat": "get errors",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_scan_errors_total{run=\"$run\"}[1m]))",
+     "legendFormat": "scan errors",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_sst_range_read_errors_total{run=\"$run\"}[1m]))",
+     "legendFormat": "storage read errors",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_bloom_filter_errors_total{run=\"$run\"}[1m]))",
+     "legendFormat": "filter errors",
+     "refId": "D"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_bloom_filter_skips_total{run=\"$run\"}[1m]))",
+     "legendFormat": "filter skips",
+     "refId": "E"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reader storage reads",
+   "id": 35,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 55
+   },
+   "description": "Reads of data files from storage per second, all readers, and the bytes they fetched.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_sst_range_read_total{run=\"$run\"}[1m]))",
+     "legendFormat": "reads",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_sst_range_read_bytes_total{run=\"$run\"}[1m]))",
+     "legendFormat": "bytes",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "bytes"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "Bps"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Storage bytes per client read",
+   "id": 36,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 55
+   },
+   "description": "Bytes the readers fetched from storage for each get or scan the harness made. Grows as reads check more files.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(rate(isledb_reader_sst_range_read_bytes_total{run=\"$run\"}[2m])) / sum(rate(stress_reads_total{run=\"$run\"}[2m]))",
+     "legendFormat": "per read",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reader storage read time",
+   "id": 37,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 55
+   },
+   "description": "",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(isledb_reader_sst_range_read_latency_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(isledb_reader_sst_range_read_latency_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Correctness",
+   "id": 38,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 63
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Reads checked per second",
+   "id": 39,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 64
    },
    "description": "",
    "targets": [
@@ -1528,7 +2117,7 @@
   {
    "type": "timeseries",
    "title": "Checks waiting for their revision to settle",
-   "id": 31,
+   "id": 40,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1537,7 +2126,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 40
+    "y": 64
    },
    "description": "",
    "targets": [
@@ -1577,7 +2166,7 @@
   {
    "type": "timeseries",
    "title": "Wrong answers by kind",
-   "id": 32,
+   "id": 41,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1586,7 +2175,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 40
+    "y": 64
    },
    "description": "",
    "targets": [
@@ -1627,20 +2216,20 @@
   {
    "type": "row",
    "title": "Compaction",
-   "id": 33,
+   "id": 42,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 48
+    "y": 72
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Compaction bytes per second",
-   "id": 34,
+   "id": 43,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1649,7 +2238,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 49
+    "y": 73
    },
    "description": "",
    "targets": [
@@ -1707,7 +2296,7 @@
   {
    "type": "timeseries",
    "title": "Compaction jobs per minute",
-   "id": 35,
+   "id": 44,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1716,7 +2305,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 49
+    "y": 73
    },
    "description": "",
    "targets": [
@@ -1726,8 +2315,17 @@
       "uid": "prometheus"
      },
      "expr": "increase(isledb_maintenance_compaction_jobs_total{run=\"$run\"}[1m])",
-     "legendFormat": "jobs",
+     "legendFormat": "all",
      "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (kind) (increase(isledb_maintenance_compaction_seconds_count{run=\"$run\"}[1m]))",
+     "legendFormat": "{{kind}}",
+     "refId": "B"
     },
     {
      "datasource": {
@@ -1736,7 +2334,7 @@
      },
      "expr": "increase(isledb_maintenance_compaction_oversized_jobs_total{run=\"$run\"}[1m])",
      "legendFormat": "oversized",
-     "refId": "B"
+     "refId": "C"
     },
     {
      "datasource": {
@@ -1745,7 +2343,7 @@
      },
      "expr": "increase(isledb_maintenance_commands_rejected_total{run=\"$run\"}[1m])",
      "legendFormat": "refused by the writer",
-     "refId": "C"
+     "refId": "D"
     }
    ],
    "fieldConfig": {
@@ -1774,7 +2372,7 @@
   {
    "type": "timeseries",
    "title": "Finished work waiting for the writer",
-   "id": 36,
+   "id": 45,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1783,7 +2381,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 49
+    "y": 73
    },
    "description": "How long the oldest finished compaction has waited for the writer to publish it; 0 when nothing waits.",
    "targets": [
@@ -1823,7 +2421,7 @@
   {
    "type": "timeseries",
    "title": "L0 files and depth",
-   "id": 37,
+   "id": 46,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1832,7 +2430,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 57
+    "y": 81
    },
    "description": "New files not yet merged into L1, and the most of them one key is in. Growing without stopping: compaction can't keep up. Empty for versions that don't export it.",
    "targets": [
@@ -1881,7 +2479,7 @@
   {
    "type": "timeseries",
    "title": "L0 bytes",
-   "id": 38,
+   "id": 47,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1890,7 +2488,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 57
+    "y": 81
    },
    "description": "",
    "targets": [
@@ -1930,7 +2528,7 @@
   {
    "type": "timeseries",
    "title": "Compaction urgent",
-   "id": 39,
+   "id": 48,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1939,7 +2537,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 57
+    "y": 81
    },
    "description": "1 while the compaction running is urgent because L0 is too deep.",
    "targets": [
@@ -1980,7 +2578,7 @@
   {
    "type": "timeseries",
    "title": "Level bytes against target",
-   "id": 40,
+   "id": 49,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1989,7 +2587,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 65
+    "y": 89
    },
    "description": "",
    "targets": [
@@ -2038,7 +2636,7 @@
   {
    "type": "timeseries",
    "title": "Level fill (bytes / target)",
-   "id": 41,
+   "id": 50,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2047,7 +2645,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 65
+    "y": 89
    },
    "description": "Above 100% the level waits to be merged down; far above, every merge into it costs more.",
    "targets": [
@@ -2087,7 +2685,7 @@
   {
    "type": "timeseries",
    "title": "Compaction time, by kind",
-   "id": 42,
+   "id": 51,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2096,7 +2694,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 65
+    "y": 89
    },
    "description": "Jobs hold the single compaction slot for this long.",
    "targets": [
@@ -2143,22 +2741,9 @@
    }
   },
   {
-   "type": "row",
-   "title": "Storage",
-   "id": 43,
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 73
-   },
-   "panels": []
-  },
-  {
    "type": "timeseries",
-   "title": "Uploaded per second, by proxy and kind",
-   "id": 44,
+   "title": "Level files",
+   "id": 52,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2167,7 +2752,170 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 74
+    "y": 97
+   },
+   "description": "Files in each level below L0. A job takes at most 128 files, so many small files make each job cover less.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "isledb_maintenance_level_files{run=\"$run\"}",
+     "legendFormat": "L{{level}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Deleted per second, by kind",
+   "id": 53,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 97
+   },
+   "description": "Objects maintenance removed from storage. If deletes fall behind, the bucket grows: see space amplification.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (kind) (rate(isledb_maintenance_deleted_objects_total{run=\"$run\"}[2m]))",
+     "legendFormat": "{{kind}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Maintenance cycle errors per minute",
+   "id": 54,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 97
+   },
+   "description": "Rounds of maintenance work that failed and are retried.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(isledb_maintenance_cycle_errors_total{run=\"$run\"}[1m])",
+     "legendFormat": "errors",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Storage",
+   "id": 55,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 105
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Uploaded per second, by proxy and kind",
+   "id": 56,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 106
    },
    "description": "",
    "targets": [
@@ -2207,7 +2955,7 @@
   {
    "type": "timeseries",
    "title": "Requests per second, by proxy and method",
-   "id": 45,
+   "id": 57,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2216,7 +2964,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 74
+    "y": 106
    },
    "description": "",
    "targets": [
@@ -2256,7 +3004,7 @@
   {
    "type": "timeseries",
    "title": "Storage errors per second",
-   "id": 46,
+   "id": 58,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2265,7 +3013,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 74
+    "y": 106
    },
    "description": "",
    "targets": [
@@ -2323,7 +3071,7 @@
   {
    "type": "timeseries",
    "title": "Write amplification",
-   "id": 47,
+   "id": 59,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2332,7 +3080,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 82
+    "y": 114
    },
    "description": "",
    "targets": [
@@ -2372,7 +3120,7 @@
   {
    "type": "timeseries",
    "title": "Space amplification",
-   "id": 48,
+   "id": 60,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2381,7 +3129,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 82
+    "y": 114
    },
    "description": "",
    "targets": [
@@ -2421,7 +3169,7 @@
   {
    "type": "timeseries",
    "title": "Bucket bytes, by kind",
-   "id": 49,
+   "id": 61,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2430,7 +3178,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 82
+    "y": 114
    },
    "description": "",
    "targets": [
@@ -2470,20 +3218,20 @@
   {
    "type": "row",
    "title": "SILO",
-   "id": 50,
+   "id": 62,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 90
+    "y": 122
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "SILO CPU (cores)",
-   "id": 51,
+   "id": 63,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2492,7 +3240,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 91
+    "y": 123
    },
    "description": "Compare with SILO_CPUS: near it, SILO is the bottleneck.",
    "targets": [
@@ -2532,7 +3280,7 @@
   {
    "type": "timeseries",
    "title": "SILO requests per second, by call",
-   "id": 52,
+   "id": 64,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2541,7 +3289,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 91
+    "y": 123
    },
    "description": "",
    "targets": [
@@ -2581,7 +3329,7 @@
   {
    "type": "timeseries",
    "title": "SILO requests in flight and waiting",
-   "id": 53,
+   "id": 65,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2590,7 +3338,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 91
+    "y": 123
    },
    "description": "",
    "targets": [
@@ -2639,7 +3387,7 @@
   {
    "type": "timeseries",
    "title": "SILO traffic",
-   "id": 54,
+   "id": 66,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2648,7 +3396,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 99
+    "y": 131
    },
    "description": "",
    "targets": [
@@ -2697,7 +3445,7 @@
   {
    "type": "timeseries",
    "title": "SILO drive",
-   "id": 55,
+   "id": 67,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2706,7 +3454,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 99
+    "y": 131
    },
    "description": "",
    "targets": [
@@ -2797,7 +3545,7 @@
   {
    "type": "timeseries",
    "title": "SILO drive space",
-   "id": 56,
+   "id": 68,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2806,7 +3554,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 99
+    "y": 131
    },
    "description": "",
    "targets": [
@@ -2855,20 +3603,20 @@
   {
    "type": "row",
    "title": "Processes and host",
-   "id": 57,
+   "id": 69,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 107
+    "y": 139
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "CPU by process (cores)",
-   "id": 58,
+   "id": 70,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2877,7 +3625,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 108
+    "y": 140
    },
    "description": "",
    "targets": [
@@ -2926,7 +3674,7 @@
   {
    "type": "timeseries",
    "title": "Memory by process",
-   "id": 59,
+   "id": 71,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2935,7 +3683,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 108
+    "y": 140
    },
    "description": "",
    "targets": [
@@ -2984,7 +3732,7 @@
   {
    "type": "timeseries",
    "title": "Goroutines by process",
-   "id": 60,
+   "id": 72,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2993,7 +3741,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 108
+    "y": 140
    },
    "description": "",
    "targets": [
@@ -3033,7 +3781,7 @@
   {
    "type": "timeseries",
    "title": "Host CPU",
-   "id": 61,
+   "id": 73,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3042,7 +3790,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 116
+    "y": 148
    },
    "description": "The whole host, as SILO sees it.",
    "targets": [
@@ -3100,7 +3848,7 @@
   {
    "type": "timeseries",
    "title": "Host memory",
-   "id": 62,
+   "id": 74,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3109,7 +3857,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 116
+    "y": 148
    },
    "description": "",
    "targets": [
@@ -3167,7 +3915,7 @@
   {
    "type": "timeseries",
    "title": "Disk under the run",
-   "id": 63,
+   "id": 75,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3176,7 +3924,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 116
+    "y": 148
    },
    "description": "",
    "targets": [
