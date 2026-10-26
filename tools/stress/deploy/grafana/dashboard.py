@@ -187,6 +187,7 @@ ts("Compaction bytes per second", [(f'rate(isledb_maintenance_compaction_rewritt
                                     (f'rate(isledb_maintenance_compaction_moved_bytes_total{{{R}}}[2m])', "moved")], "Bps")
 ts("Compaction jobs per minute", [(f'increase(isledb_maintenance_compaction_jobs_total{{{R}}}[1m])', "all"),
                                    (f'sum by (kind) (increase(isledb_maintenance_compaction_seconds_count{{{R}}}[1m]))', "{{kind}}"),
+                                   (f'sum by (level) (increase(isledb_maintenance_compaction_jobs_by_level_total{{{R}}}[1m]))', "from L{{level}}"),
                                    (f'increase(isledb_maintenance_compaction_oversized_jobs_total{{{R}}}[1m])', "oversized"),
                                    (f'increase(isledb_maintenance_commands_rejected_total{{{R}}}[1m])', "refused by the writer")], "short")
 ts("Finished work waiting for the writer",
@@ -212,8 +213,11 @@ ts("Level files", [(f'isledb_maintenance_level_files{{{R}}}', "L{{level}}")], "s
    desc="Files in each level below L0. A job takes at most 128 files, so many small files make each job cover less.")
 ts("Deleted per second, by kind", [(f'sum by (kind) (rate(isledb_maintenance_deleted_objects_total{{{R}}}[2m]))', "{{kind}}")], "short", minv=0,
    desc="Objects maintenance removed from storage. If deletes fall behind, the bucket grows: see space amplification.")
-ts("Maintenance cycle errors per minute", [(f'increase(isledb_maintenance_cycle_errors_total{{{R}}}[1m])', "errors")], "short", minv=0,
-   desc="Rounds of maintenance work that failed and are retried.")
+ts("Maintenance errors per minute", [(f'increase(isledb_maintenance_cycle_errors_total{{{R}}}[1m])', "cycle errors"),
+                                     (f'sum by (level) (increase(isledb_maintenance_compaction_blocked_total{{{R}}}[1m]))', "blocked L{{level}}")],
+   "short", minv=0,
+   desc="Rounds of maintenance work that failed and are retried, and levels due for compaction that no job could be "
+        "planned for. Levels waiting their turn are not counted. Blocked is empty for versions that don't export it.")
 newline()
 
 row("Storage")
