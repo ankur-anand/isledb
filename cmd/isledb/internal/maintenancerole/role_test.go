@@ -204,6 +204,8 @@ func TestMaintenanceCompactsWhatTheWriterSaves(t *testing.T) {
 		save(i)
 	}
 
+	shapeEvery = 100 * time.Millisecond
+	defer func() { shapeEvery = 10 * time.Second }()
 	admin, stop := serve(t, bucket)
 	defer stop()
 	if code, _ := get(t, admin+"/readyz"); code != http.StatusOK {
@@ -226,6 +228,17 @@ func TestMaintenanceCompactsWhatTheWriterSaves(t *testing.T) {
 	if metric(body, "isledb_maintenance_last_cycle_timestamp_seconds") < float64(time.Now().Add(-time.Minute).Unix()) {
 		t.Fatalf("last cycle too old:\n%s", body)
 	}
+	// The L0 and level metrics follow the manifest on their own, so they
+	// show the compacted level without waiting for a cycle.
+	level1 := regexp.MustCompile(`(?m)^isledb_maintenance_level_bytes\{level="1"\} (\S+)$`)
+	within(t, 30*time.Second, "level 1 in the shape metrics", func() bool {
+		save(i)
+		i++
+		_, body = get(t, admin+"/metrics")
+		m := level1.FindStringSubmatch(body)
+		return m != nil && m[1] != "0" && metric(body, "isledb_maintenance_l0_files") >= 0 &&
+			metric(body, "isledb_maintenance_shape_timestamp_seconds") > float64(time.Now().Add(-5*time.Second).Unix())
+	})
 }
 
 // TestMaintenanceTakenOverStaysUpNotReady: another process claims the

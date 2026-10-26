@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -853,5 +854,54 @@ func TestMaintenanceWaitingSinceTracksTheUnansweredCommand(t *testing.T) {
 		if !answered.WaitingSince.After(staged.WaitingSince) {
 			t.Fatalf("next command since=%v, want after %v", answered.WaitingSince, staged.WaitingSince)
 		}
+	}
+}
+
+func TestMaintenanceShapeFollowsTheManifest(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-shape")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-shape"); err != nil {
+		t.Fatalf("ClaimWriter: %v", err)
+	}
+	add := func(sst manifest.SSTMeta) {
+		t.Helper()
+		if _, err := db.manifestStore.AppendAddSSTableWithFence(ctx, sst); err != nil {
+			t.Fatalf("add %s: %v", sst.ID, err)
+		}
+	}
+	// Three L0 files over one another at c..d: depth 3.
+	add(manifest.SSTMeta{ID: "l0-a", Level: 0, MinKey: []byte("a"), MaxKey: []byte("z"), Size: 10})
+	add(manifest.SSTMeta{ID: "l0-b", Level: 0, MinKey: []byte("b"), MaxKey: []byte("y"), Size: 20})
+	add(manifest.SSTMeta{ID: "l0-c", Level: 0, MinKey: []byte("c"), MaxKey: []byte("d"), Size: 30})
+	maintenance, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatalf("OpenMaintenance: %v", err)
+	}
+
+	// A writer adds L0 files only; the levels below are covered by
+	// TestLSMShapeCountsEveryLevel.
+	shape, err := maintenance.Shape(ctx)
+	if err != nil {
+		t.Fatalf("Shape: %v", err)
+	}
+	if want := (LSMShape{L0: LevelShape{Files: 3, Bytes: 60}, L0Depth: 3}); !reflect.DeepEqual(shape, want) {
+		t.Fatalf("shape %+v, want %+v", shape, want)
+	}
+	// A file committed since is seen without a maintenance cycle.
+	add(manifest.SSTMeta{ID: "l0-d", Level: 0, MinKey: []byte("c"), MaxKey: []byte("c"), Size: 5})
+	if shape, err = maintenance.Shape(ctx); err != nil || shape.L0.Files != 4 || shape.L0Depth != 4 {
+		t.Fatalf("after another commit: %+v, %v", shape, err)
+	}
+	if err := maintenance.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := maintenance.Shape(ctx); !errors.Is(err, ErrMaintenanceClosed) {
+		t.Fatalf("Shape after Close: %v, want ErrMaintenanceClosed", err)
 	}
 }

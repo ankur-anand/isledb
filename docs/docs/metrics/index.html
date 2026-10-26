@@ -1041,6 +1041,34 @@ storage.</li>
 <td>Compactions larger than usual, run because the level they write into could not be made smaller first. Each writes one unusually large file.</td>
 </tr>
 <tr>
+<td><code>isledb_maintenance_compaction_seconds{kind}</code></td>
+<td>How long compactions take, by kind: <code>l0_drain</code> (new files into the first level), <code>l0_merge</code> (new files with each other), <code>level</code> (one level into the next) and <code>move</code> (files moved without being rewritten).</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_compaction_critical</code></td>
+<td><code>1</code> when the last compaction was urgent, because the newest files had piled up too deep.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_l0_files</code>, <code>isledb_maintenance_l0_bytes</code></td>
+<td>Newly saved data not yet merged into the first level. This and the level metrics below are read from the database every 10 seconds, also while a long compaction runs.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_l0_depth</code></td>
+<td>The most of those files one key is in, so the most a read of one key may check. <code>compaction.l0_max_depth</code> limits it.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_level_files{level}</code>, <code>isledb_maintenance_level_bytes{level}</code></td>
+<td>Files and bytes in each level below the newest files.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_level_target_bytes{level}</code></td>
+<td>The size compaction keeps each level near. A level far above it makes every merge into it more expensive.</td>
+</tr>
+<tr>
+<td><code>isledb_maintenance_shape_timestamp_seconds</code></td>
+<td>When the L0 and level metrics were last read. If it falls behind, storage is failing; the metrics keep their last values.</td>
+</tr>
+<tr>
 <td><code>isledb_maintenance_commands_rejected_total</code></td>
 <td>Finished work the writer refused to publish. The writer logs why.</td>
 </tr>
@@ -1070,6 +1098,10 @@ publishing it, so files pile up.</li>
 refusal is normal: the writer refuses work on files that changed meanwhile,
 and maintenance redoes it. A steady rise means work is thrown away; the
 writer's log says why.</li>
+<li><strong>Falling behind:</strong> <code>l0_files</code> rising for many minutes while writes go on,
+or a level's <code>level_bytes</code> staying above twice its <code>level_target_bytes</code>.
+Compaction can't keep up with the writes: reads slow down and storage
+grows. See <a href="/docs/maintenance/#tune-compaction">Tune compaction</a>.</li>
 <li><strong>Replaced:</strong> <code>running</code> at <code>0</code>. Another maintenance process took over; see
 <a href="/docs/maintenance/#run-one-maintenance-per-database">Run one maintenance per database</a>.</li>
 </ul>
