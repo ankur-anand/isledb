@@ -1,0 +1,75 @@
+# Storage and monitoring for stress runs, on a Linux host. up.sh starts it.
+#
+#   STRESS_DATA=/data/isledb-stress SILO_CPUS=6 ./up.sh
+#
+# Nothing here is reachable from another host: SILO publishes its ports on
+# 127.0.0.1 only, and Prometheus and Grafana use the host's network, to reach
+# the runner and the isledb roles on 127.0.0.1, and listen on 127.0.0.1 only.
+# From another machine, use an SSH tunnel:
+#
+#   ssh -N -L 3300:127.0.0.1:3300 -L 9090:127.0.0.1:9090 <host>
+name: isledb-stress
+
+services:
+  # SILO, a maintained fork of the MinIO server. Its metrics are public so
+  # Prometheus needs no token; like the S3 API, only 127.0.0.1 can reach
+  # them. prometheus.yml scrapes 127.0.0.1:19000: change it there too if
+  # SILO_PORT changes.
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    ports:
+      - "127.0.0.1:${SILO_PORT:-19000}:9000"
+      - "127.0.0.1:${SILO_CONSOLE_PORT:-19001}:9001"
+    # A bind mount on the disk under test: a named volume would live under
+    # /var/lib/docker, often on a small root disk.
+    volumes:
+      - ${STRESS_DATA:?set STRESS_DATA}/silo:/data
+    cpus: ${SILO_CPUS:-3}
+    restart: unless-stopped
+
+  # Scrapes every running stress run, from the target files runs write to
+  # STRESS_RESULTS/.prometheus, and SILO; evaluates alerts.yml.
+  prometheus:
+    image: docker.io/prom/prometheus:v3.4.0
+    profiles: [monitoring]
+    network_mode: host
+    user: "${STRESS_UID:-0}:${STRESS_GID:-0}"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:${PROMETHEUS_PORT:-9090}
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - ${STRESS_DATA:?set STRESS_DATA}/prometheus:/prometheus
+      - ${STRESS_RESULTS:?set STRESS_RESULTS}/.prometheus:/targets:ro
+    restart: unless-stopped
+
+  # Anonymous, read-only access: it listens on 127.0.0.1 only. It reports
+  # nothing to grafana.com and checks for no updates.
+  grafana:
+    image: docker.io/grafana/grafana:11.6.0
+    profiles: [monitoring]
+    network_mode: host
+    user: "${STRESS_UID:-0}:${STRESS_GID:-0}"
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: ${GRAFANA_PORT:-3300}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/stress.json
+      PROMETHEUS_URL: http://127.0.0.1:${PROMETHEUS_PORT:-9090}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - ${STRESS_DATA:?set STRESS_DATA}/grafana:/var/lib/grafana
+    restart: unless-stopped

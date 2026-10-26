@@ -1,0 +1,28 @@
+# Prometheus for stress runs. Every run writes its scrape targets, the
+# runner and each isledb role, to STRESS_RESULTS/.prometheus/<run>.json while
+# it runs, labelled with run, role and version; this finds them there.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: stress
+    file_sd_configs:
+      - files: [/targets/*.json]
+        refresh_interval: 10s
+
+  # SILO on its default port; change both if SILO_PORT changes.
+  - job_name: silo
+    metrics_path: /minio/v2/metrics/node
+    static_configs:
+      - targets: [127.0.0.1:19000]
+        labels: {role: silo}
+  - job_name: silo-resource
+    metrics_path: /minio/v2/metrics/resource
+    scrape_interval: 30s
+    static_configs:
+      - targets: [127.0.0.1:19000]
+        labels: {role: silo}

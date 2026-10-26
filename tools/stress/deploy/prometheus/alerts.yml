@@ -1,0 +1,99 @@
+# Alerts for stress runs. There is no Alertmanager: firing alerts show in
+# Prometheus (/alerts) and on the dashboard.
+groups:
+  - name: correctness
+    rules:
+      - alert: StressVerificationFailed
+        expr: sum by (run) (stress_verify_failures_total) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.run }}: a read returned a wrong answer; the run has failed. See failures.jsonl."
+
+  - name: progress
+    rules:
+      - alert: StressNoProgress
+        expr: rate(stress_written_bytes_total[10m]) == 0 and on (run) stress_phase{phase=~"load|update.*"} == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: nothing written for 10 minutes while the phase writes."
+      - alert: StressWritesRefused
+        expr: rate(stress_writes_total{outcome="refused"}[5m]) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: the writer refuses more than one write a second (503)."
+      - alert: StressWritesUnresolved
+        expr: increase(stress_writes_total{outcome="unresolved"}[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: writes whose outcome could not be learned were sent again."
+      - alert: StressTargetDown
+        expr: up{job="stress"} == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: {{ $labels.role }} does not answer /metrics."
+
+  - name: disk
+    rules:
+      - alert: StressDiskHeld
+        expr: stress_disk_held == 1
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: writes are held, {{ $labels.path }} is too full."
+      - alert: StressDiskNearlyFull
+        expr: stress_disk_used_ratio > 0.92
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.run }}: {{ $labels.path }} is over 92% full, past the guard's limit."
+
+  - name: maintenance
+    rules:
+      - alert: MaintenanceStuck
+        expr: time() - isledb_maintenance_last_cycle_timestamp_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: maintenance has finished no round of work for 5 minutes."
+      - alert: MaintenanceWorkNotPublished
+        expr: (time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds) > 300 and isledb_maintenance_waiting_for_writer_since_timestamp_seconds > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: finished compaction has waited over 5 minutes for the writer to publish it."
+
+      - alert: CompactionFallingBehind
+        expr: deriv(isledb_maintenance_l0_files[15m]) > 0 and isledb_maintenance_l0_files > 500
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: L0 has over 500 files and has grown for 15 minutes: compaction can't keep up."
+      - alert: ShapeMetricsStale
+        expr: time() - isledb_maintenance_shape_timestamp_seconds > 120
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: the L0 and level metrics haven't been read for over 2 minutes; maintenance's log says why."
+      - alert: LevelOverTarget
+        expr: isledb_maintenance_level_bytes / isledb_maintenance_level_target_bytes > 2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: L{{ $labels.level }} has been over twice its target for 15 minutes."
+
+  - name: silo
+    rules:
+      - alert: SiloDown
+        expr: up{job=~"silo.*"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "SILO does not answer its metrics."
+      - alert: SiloRequestsQueued
+        expr: minio_s3_requests_waiting_total > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "SILO has had requests waiting for 5 minutes: it is the bottleneck. Raise SILO_CPUS."
