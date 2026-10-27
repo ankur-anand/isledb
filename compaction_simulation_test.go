@@ -157,23 +157,26 @@ func (s *compactionSim) fill() map[uint32]float64 {
 	return f
 }
 
-// TestCompactionBoundsEveryLevelUnderRandomIngest writes 200 GiB of random
+// TestCompactionBoundsEveryLevelUnderRandomIngest writes 700 GiB of random
 // keys, in L0 files spanning the whole key space, while compaction reads and
-// writes 17 or 25 bytes for each byte written.
+// writes 17 or 50 bytes for each byte written.
 //
-// At 25, compaction keeps up: L0 stays shallow and every level near its
+// At 50, compaction keeps up: L0 stays shallow and every level near its
 // target. At 17, what one maintenance process managed against 24 MiB/s of
 // ingest on S3-compatible storage, it cannot: L0 is due on every cycle and
 // waits on L1, and deepens however the jobs are ordered. No level may then
 // be held back for L1's sake past twice its target: L2 once grew to four
-// times its target, and every job into it rewrote ever more of it.
+// times its target, and every job into it rewrote ever more of it. Nor may
+// jobs keep to one end of a level: started at its lowest key, they rewrote
+// 23 to 51 bytes of the level below for each byte they moved, and at either
+// rate L2 grew past four times its target.
 func TestCompactionBoundsEveryLevelUnderRandomIngest(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		ingest     float64
 		maxL0Depth int // 0: no bound, compaction cannot keep up
 	}{
-		{"keeps up", 1.0 / 25, 200},
+		{"keeps up", 1.0 / 50, 200},
 		{"falls behind", 1.0 / 17, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -183,7 +186,7 @@ func TestCompactionBoundsEveryLevelUnderRandomIngest(t *testing.T) {
 			}
 			worst := map[uint32]float64{}
 			var deepest int
-			for jobs := 0; s.written < 200<<30; jobs++ {
+			for jobs := 0; s.written < 700<<30; jobs++ {
 				if jobs > 100_000 {
 					t.Fatal("no end to the jobs")
 				}

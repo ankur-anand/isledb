@@ -444,7 +444,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				// small job still runs, so L0 always makes progress. An L2
 				// created here is ordinary growth of an over-full L1, not a
 				// forced level, so it is not marked as one.
-				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, plan.destinationSSTs); drainErr == nil {
+				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, cheapestStart(m.Level(2), plan.destinationSSTs)); drainErr == nil {
 					plan = drain
 				}
 			}
@@ -495,8 +495,9 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		if l0Waits && level.TotalSize()/maxFillWhileL0Waits < target {
 			continue
 		}
-		limit := min(maxCompactionSSTsPerJob, len(level.SSTs))
-		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, level.SSTs[:limit])
+		sources := cheapestStart(m.Level(level.Number+1), level.SSTs)
+		limit := min(maxCompactionSSTsPerJob, len(sources))
+		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, sources[:limit])
 		if err != nil {
 			if firstPlanningErr == nil {
 				firstPlanningErr = err
@@ -824,6 +825,24 @@ func (c *compactor) l0DrainTooSmall(plan *levelCompactionPlan, inputs []sstMetad
 		return false
 	}
 	return float64(sstBytes(plan.sourceSSTs)) < c.opts.Trigger.L0ToBaseRatio*float64(sstBytes(plan.destinationSSTs))
+}
+
+// cheapestStart returns ssts, files of one level in key order, from the file
+// that rewrites the least of next, the level below, per byte of its own; ties
+// go to the lower key. A job takes files in key order from where it starts.
+// Started always at the lowest key, every job would rewrite the part of next
+// that the jobs before it had grown, moving less of the level each time,
+// while the files at higher keys were never reached and the level kept
+// growing. A file that overlaps nothing in next is a move, the cheapest of all.
+func cheapestStart(next *manifest.Level, ssts []sstMetadata) []sstMetadata {
+	best, bestCost := 0, math.Inf(1)
+	for i, sst := range ssts {
+		cost := float64(sstBytes(next.OverlappingSSTs(sst.MinKey, sst.MaxKey))) / float64(max(sst.Size, 1))
+		if cost < bestCost {
+			best, bestCost = i, cost
+		}
+	}
+	return ssts[best:]
 }
 
 // maxRewriteInputBytes bounds the input of a rewrite. Each output but the last
