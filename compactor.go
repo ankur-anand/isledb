@@ -29,6 +29,10 @@ import (
 // tuning knob.
 const maxCompactionSSTsPerJob = manifest.MaxRetiredObjectsPerEntry
 
+// maxFillWhileL0Waits is how many times its target a level below L1 may hold
+// before it is compacted even while L0 waits for L1 to drain.
+const maxFillWhileL0Waits = 2
+
 // maxCompactionOutputOvershoot is how far past its target a compaction output
 // can run on its last entry: the largest value a writer accepts by default.
 const maxCompactionOutputOvershoot = defaultMaxValueBytes
@@ -412,6 +416,9 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	candidates := make([]compactionCandidate, 0, len(m.Levels)+1)
 	var firstPlanningErr error
+	// l0Waits is set when L0 is due but must wait for L1 to drain first;
+	// l0Critical when it is also critical.
+	l0Waits, l0Critical := false, false
 	now := time.Now()
 	drainable := c.drainableL0(m, now)
 	if c.l0NeedsPlanning(drainable) {
@@ -437,7 +444,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				// small job still runs, so L0 always makes progress. An L2
 				// created here is ordinary growth of an over-full L1, not a
 				// forced level, so it is not marked as one.
-				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, plan.destinationSSTs); drainErr == nil {
+				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, c.cheapestRun(m.Level(2), plan.destinationSSTs)); drainErr == nil {
 					plan = drain
 				}
 			}
@@ -450,12 +457,12 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 					workUnits: 1,
 					critical:  critical,
 				}
-				if plan.sourceLevel != 0 {
-					// This lower-level plan is a prerequisite selected specifically to
-					// unblock L0. Run it before unrelated level work; otherwise the
-					// lower-level round robin can delay the drain while L0 keeps growing.
-					return []compactionCandidate{candidate}, nil
-				}
+				// A lower-level plan here is a prerequisite selected
+				// specifically to unblock L0. Run it before unrelated level
+				// work; otherwise the lower-level round robin can delay the
+				// drain while L0 keeps growing.
+				l0Waits = plan.sourceLevel != 0
+				l0Critical = l0Waits && critical
 				candidates = append(candidates, candidate)
 			}
 		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
@@ -470,14 +477,27 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	}
 	for i := range m.Levels {
 		level := &m.Levels[i]
-		if level.TotalSize() <= c.levelTargetBytes(level.Number) {
+		target := c.levelTargetBytes(level.Number)
+		if level.TotalSize() <= target {
 			continue
 		}
 		if _, exists := plannedLevels[level.Number]; exists {
 			continue
 		}
-		limit := min(maxCompactionSSTsPerJob, len(level.SSTs))
-		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, level.SSTs[:limit])
+		// While L0 waits, other levels wait too, but not without end: L0
+		// can stay behind for as long as ingest outpaces compaction, and a
+		// level held back meanwhile would grow without bound, making every
+		// job into it rewrite more of it. From maxFillWhileL0Waits times its
+		// target, a level takes turns beside L1's drain, as urgent as the
+		// drain, so a due checkpoint does not take those turns either. The
+		// size is divided rather than the target multiplied: a deep level's
+		// target can be near the int64 limit.
+		if l0Waits && level.TotalSize()/maxFillWhileL0Waits < target {
+			continue
+		}
+		sources := c.cheapestRun(m.Level(level.Number+1), level.SSTs)
+		limit := min(maxCompactionSSTsPerJob, len(sources))
+		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, sources[:limit])
 		if err != nil {
 			if firstPlanningErr == nil {
 				firstPlanningErr = err
@@ -491,6 +511,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		candidates = append(candidates, compactionCandidate{
 			plan:      plan,
 			workUnits: 1,
+			critical:  l0Critical,
 		})
 		plannedLevels[plan.sourceLevel] = struct{}{}
 	}
@@ -804,6 +825,67 @@ func (c *compactor) l0DrainTooSmall(plan *levelCompactionPlan, inputs []sstMetad
 		return false
 	}
 	return float64(sstBytes(plan.sourceSSTs)) < c.opts.Trigger.L0ToBaseRatio*float64(sstBytes(plan.destinationSSTs))
+}
+
+// cheapestRun returns the run of ssts, files of one level in key order, that
+// fits one job and rewrites the least of next, the level below, per byte it
+// moves there; ties go to the lower key. A run that overlaps nothing in next
+// is a move, the cheapest of all. Taking files from the lowest key instead,
+// every job rewrote the part of next the jobs before it had grown, moving
+// less of the level each time, while files at higher keys were never reached
+// and the level kept growing. The whole run is weighed, not where it starts:
+// a cheap file near the end of the level leaves room for few files after it,
+// and those after a cheap file can be dear.
+func (c *compactor) cheapestRun(next *manifest.Level, ssts []sstMetadata) []sstMetadata {
+	n := len(ssts)
+	if n == 0 {
+		return ssts
+	}
+	var below []sstMetadata
+	if next != nil {
+		below = next.SSTs
+	}
+	// ssts[i] overlaps below[lo[i]:hi[i]]; both only grow with i.
+	lo, hi := make([]int, n), make([]int, n)
+	for i := range ssts {
+		lo[i] = sort.Search(len(below), func(k int) bool { return bytes.Compare(below[k].MaxKey, ssts[i].MinKey) >= 0 })
+		hi[i] = sort.Search(len(below), func(k int) bool { return bytes.Compare(below[k].MinKey, ssts[i].MaxKey) > 0 })
+	}
+	srcSum, belowSum := make([]int64, n+1), make([]int64, len(below)+1)
+	for i, sst := range ssts {
+		srcSum[i+1] = srcSum[i] + sst.Size
+	}
+	for k, sst := range below {
+		belowSum[k+1] = belowSum[k] + sst.Size
+	}
+	maxBytes := c.maxRewriteInputBytes()
+	// cost is what ssts[i:j] rewrites below, and whether the run fits a job.
+	cost := func(i, j int) (int64, bool) {
+		a, b := lo[i], max(lo[i], hi[j-1])
+		dest := belowSum[b] - belowSum[a]
+		fits := j-i+b-a <= maxCompactionSSTsPerJob &&
+			(dest == 0 || srcSum[j]-srcSum[i]+dest <= maxBytes)
+		return dest, fits
+	}
+	best, bestEnd, bestCost := 0, 1, math.Inf(1)
+	for i, j := 0, 1; i < n; i++ {
+		j = max(j, i+1)
+		for j < n {
+			if _, fits := cost(i, j+1); !fits {
+				break
+			}
+			j++
+		}
+		// A file too large for a job with what it overlaps runs alone, and
+		// is offered only if nothing else fits; the drain below it is then
+		// planned from it.
+		if dest, fits := cost(i, j); fits {
+			if r := float64(dest) / float64(max(srcSum[j]-srcSum[i], 1)); r < bestCost {
+				best, bestEnd, bestCost = i, j, r
+			}
+		}
+	}
+	return ssts[best:bestEnd]
 }
 
 // maxRewriteInputBytes bounds the input of a rewrite. Each output but the last

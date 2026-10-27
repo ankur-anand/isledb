@@ -2332,9 +2332,18 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
+     "expr": "sum by (level) (increase(isledb_maintenance_compaction_jobs_by_level_total{run=\"$run\"}[1m]))",
+     "legendFormat": "from L{{level}}",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
      "expr": "increase(isledb_maintenance_compaction_oversized_jobs_total{run=\"$run\"}[1m])",
      "legendFormat": "oversized",
-     "refId": "C"
+     "refId": "D"
     },
     {
      "datasource": {
@@ -2343,7 +2352,7 @@
      },
      "expr": "increase(isledb_maintenance_commands_rejected_total{run=\"$run\"}[1m])",
      "legendFormat": "refused by the writer",
-     "refId": "D"
+     "refId": "E"
     }
    ],
    "fieldConfig": {
@@ -2842,7 +2851,7 @@
   },
   {
    "type": "timeseries",
-   "title": "Maintenance cycle errors per minute",
+   "title": "Maintenance errors per minute",
    "id": 54,
    "datasource": {
     "type": "prometheus",
@@ -2854,7 +2863,7 @@
     "x": 16,
     "y": 97
    },
-   "description": "Rounds of maintenance work that failed and are retried.",
+   "description": "Rounds of maintenance work that failed and are retried, and levels due for compaction that no job could be planned for. Levels waiting their turn are not counted. Blocked is empty for versions that don't export it.",
    "targets": [
     {
      "datasource": {
@@ -2862,8 +2871,17 @@
       "uid": "prometheus"
      },
      "expr": "increase(isledb_maintenance_cycle_errors_total{run=\"$run\"}[1m])",
-     "legendFormat": "errors",
+     "legendFormat": "cycle errors",
      "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (level) (increase(isledb_maintenance_compaction_blocked_total{run=\"$run\"}[1m]))",
+     "legendFormat": "blocked L{{level}}",
+     "refId": "B"
     }
    ],
    "fieldConfig": {

@@ -286,19 +286,45 @@ func TestLevelPlannerRecursivelyDrainsDeepestBlockingLevel(t *testing.T) {
 	}
 	m.AddLevelSSTs(2, l2)
 
-	candidates, err := c.planCompactionCandidates(m)
+	// The planner drains L1's other files first, which overlap nothing in
+	// L2 and move there; this is the drain of the first.
+	plan, err := c.buildLevelPlanWithDrain(m, 0, 1, m.L0SSTs)
 	if err != nil {
 		t.Fatalf("plan recursive drain: %v", err)
 	}
-	if len(candidates) == 0 {
-		t.Fatal("no compaction candidate")
-	}
-	plan := candidates[0].plan
 	if plan.sourceLevel != 2 || plan.destinationLevel != 3 || !plan.metadataOnly {
 		t.Fatalf("plan=%+v, want deepest L2-to-L3 drain", plan)
 	}
 	if !plan.forcedLevelCreation {
 		t.Fatal("recursive prerequisite drain into absent L3 was not marked as forced level creation")
+	}
+}
+
+func TestLevelJobStartsWhereItRewritesLeastBelow(t *testing.T) {
+	m := &manifestState{}
+	l2 := []sstMetadata{plannerSST(2, 0, 9), plannerSST(2, 10, 19), plannerSST(2, 20, 29), plannerSST(2, 30, 39)}
+	start := func() string {
+		t.Helper()
+		return plannerOnlyCompactor().cheapestRun(m.Level(3), l2)[0].ID
+	}
+	if got := start(); got != l2[0].ID {
+		t.Fatalf("with no level below, started at %s, want the lowest key", got)
+	}
+	// Dense under the lowest keys, as jobs that always started there leave
+	// it; one file under the second, two under each of the others.
+	m.AddLevelSSTs(3, []sstMetadata{
+		plannerSST(3, 0, 1), plannerSST(3, 2, 3), plannerSST(3, 4, 5), plannerSST(3, 6, 9),
+		plannerSST(3, 10, 19),
+		plannerSST(3, 20, 24), plannerSST(3, 25, 29),
+		plannerSST(3, 30, 34), plannerSST(3, 35, 39),
+	})
+	if got := start(); got != l2[1].ID {
+		t.Fatalf("started at %s, want %s, which rewrites the least below", got, l2[1].ID)
+	}
+	// A file that overlaps nothing below moves, which costs nothing.
+	l2 = append(l2, plannerSST(2, 50, 59))
+	if got := start(); got != l2[4].ID {
+		t.Fatalf("started at %s, want %s, which overlaps nothing below", got, l2[4].ID)
 	}
 }
 

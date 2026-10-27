@@ -58,6 +58,28 @@ func TestCompactionCyclesAreTimedAndMarked(t *testing.T) {
 	}
 }
 
+func TestCompactionJobsAndBlocksByLevel(t *testing.T) {
+	m := newMetrics()
+	fromL2 := isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskSSTCompaction, CompactionSourceLevel: 2,
+		Blocked: []isledb.CompactionBlocked{{SourceLevel: 3}}}
+	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1}})
+	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1}})
+	// A checkpoint ran instead: no job, but L3 was still blocked.
+	m.cycle(isledb.MaintenanceStats{Scheduling: isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskManifestCheckpoint,
+		Blocked: []isledb.CompactionBlocked{{SourceLevel: 3}}}})
+	for name, c := range map[string]struct{ got, want float64 }{
+		"jobs from L2": {testutil.ToFloat64(m.levelJobs.WithLabelValues("2")), 2},
+		"L3 blocked":   {testutil.ToFloat64(m.blocked.WithLabelValues("3")), 3},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", name, c.got, c.want)
+		}
+	}
+	if n := testutil.CollectAndCount(m.levelJobs); n != 1 {
+		t.Errorf("jobs counted for %d levels, want only L2", n)
+	}
+}
+
 func TestJobKind(t *testing.T) {
 	compaction := isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskSSTCompaction}
 	level := compaction

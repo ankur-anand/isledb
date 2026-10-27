@@ -123,9 +123,12 @@ func TestPlanCompactionCandidatesIncludesEveryOverBudgetLevel(t *testing.T) {
 	}
 }
 
-func TestCriticalL0PrerequisiteDrainRetainsPriority(t *testing.T) {
+// l0WaitingOnL1 is a critical L0 that must wait for L1 to drain, over levels
+// whose targets are 24 MiB for L1, 48 MiB for L2 and 96 MiB for L3.
+func l0WaitingOnL1(t *testing.T) (*compactor, *manifestState) {
+	t.Helper()
 	c := plannerOnlyCompactor()
-	c.opts.Trigger.BaseLevelBytes = 1
+	c.opts.Trigger.BaseLevelBytes = 24 << 20
 	c.opts.Trigger.LevelSizeMultiplier = 2
 	m := &manifestState{}
 
@@ -148,19 +151,27 @@ func TestCriticalL0PrerequisiteDrainRetainsPriority(t *testing.T) {
 		l1 = append(l1, sst)
 	}
 	m.AddLevelSSTs(1, l1)
+	return c, m
+}
+
+// addLevelFile adds one file of size bytes to level, outside L1's keys.
+func addLevelFile(m *manifestState, level uint32, size int64) {
+	sst := plannerSST(level, 0, 0)
+	sst.ID = fmt.Sprintf("unrelated-l%d", level)
+	sst.MinKey = []byte(fmt.Sprintf("x%03d", level))
+	sst.MaxKey = sst.MinKey
+	sst.Size = size
+	m.AddLevelSSTs(level, []sstMetadata{sst})
+}
+
+func TestCriticalL0PrerequisiteDrainRetainsPriority(t *testing.T) {
+	c, m := l0WaitingOnL1(t)
 
 	// Unrelated over-target levels make the lost priority observable: the lower-
 	// level round robin has other valid work to choose instead of the L1 drain.
-	l2 := plannerSST(2, 0, 0)
-	l2.ID = "unrelated-l2"
-	l2.MinKey = []byte("x000")
-	l2.MaxKey = []byte("x000")
-	m.AddLevelSSTs(2, []sstMetadata{l2})
-	l3 := plannerSST(3, 0, 0)
-	l3.ID = "unrelated-l3"
-	l3.MinKey = []byte("y000")
-	l3.MaxKey = []byte("y000")
-	m.AddLevelSSTs(3, []sstMetadata{l3})
+	// Each holds under twice its target, so it waits for L0.
+	addLevelFile(m, 2, 64<<20)
+	addLevelFile(m, 3, 120<<20)
 
 	candidates, err := c.planCompactionCandidates(m)
 	if err != nil {
@@ -194,6 +205,40 @@ func TestCriticalL0PrerequisiteDrainRetainsPriority(t *testing.T) {
 	decision := selectMaintenancePrimary(drain, checkpointPressure{eligible: true}, state)
 	if decision.task != MaintenanceTaskSSTCompaction {
 		t.Errorf("primary task=%v, want critical prerequisite compaction", decision.task)
+	}
+}
+
+// A level at twice its target takes turns beside the drain L0 waits on: L0
+// can wait for as long as ingest outpaces compaction, and the level would
+// otherwise grow all that time.
+func TestPlanCompactionCandidatesOffersFullLevelsWhileL0Waits(t *testing.T) {
+	c, m := l0WaitingOnL1(t)
+	addLevelFile(m, 2, 96<<20)  // twice L2's target
+	addLevelFile(m, 3, 120<<20) // under twice L3's: it waits
+
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		t.Fatalf("planCompactionCandidates: %v", err)
+	}
+	if len(candidates) != 2 || candidates[0].plan.sourceLevel != 1 || candidates[1].plan.sourceLevel != 2 {
+		t.Fatalf("candidates %+v, want the L1 drain and L2", candidates)
+	}
+	// Both are urgent, as the drain alone was: a due checkpoint takes no
+	// more of their turns than it took of the drain's.
+	if !candidates[0].critical || !candidates[1].critical {
+		t.Errorf("critical: L1 drain %v, L2 %v; want both, for the L0 that waits", candidates[0].critical, candidates[1].critical)
+	}
+
+	// The round robin alternates the two.
+	state := manifest.MaintenanceSchedulerState{}
+	var order []uint32
+	for range 4 {
+		selected := selectCompactionCandidate(candidates, state)
+		order = append(order, selected.plan.sourceLevel)
+		applyCompactionCandidateForTest(&state, selected)
+	}
+	if fmt.Sprint(order) != "[1 2 1 2]" {
+		t.Fatalf("selected levels %v, want L1 and L2 in turn", order)
 	}
 }
 
