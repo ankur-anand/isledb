@@ -444,7 +444,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 				// small job still runs, so L0 always makes progress. An L2
 				// created here is ordinary growth of an over-full L1, not a
 				// forced level, so it is not marked as one.
-				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, cheapestStart(m.Level(2), plan.destinationSSTs)); drainErr == nil {
+				if drain, drainErr := c.buildLevelPlanWithDrain(m, 1, 2, c.cheapestRun(m.Level(2), plan.destinationSSTs)); drainErr == nil {
 					plan = drain
 				}
 			}
@@ -495,7 +495,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		if l0Waits && level.TotalSize()/maxFillWhileL0Waits < target {
 			continue
 		}
-		sources := cheapestStart(m.Level(level.Number+1), level.SSTs)
+		sources := c.cheapestRun(m.Level(level.Number+1), level.SSTs)
 		limit := min(maxCompactionSSTsPerJob, len(sources))
 		plan, err := c.buildLevelPlanWithDrain(m, level.Number, level.Number+1, sources[:limit])
 		if err != nil {
@@ -827,22 +827,65 @@ func (c *compactor) l0DrainTooSmall(plan *levelCompactionPlan, inputs []sstMetad
 	return float64(sstBytes(plan.sourceSSTs)) < c.opts.Trigger.L0ToBaseRatio*float64(sstBytes(plan.destinationSSTs))
 }
 
-// cheapestStart returns ssts, files of one level in key order, from the file
-// that rewrites the least of next, the level below, per byte of its own; ties
-// go to the lower key. A job takes files in key order from where it starts.
-// Started always at the lowest key, every job would rewrite the part of next
-// that the jobs before it had grown, moving less of the level each time,
-// while the files at higher keys were never reached and the level kept
-// growing. A file that overlaps nothing in next is a move, the cheapest of all.
-func cheapestStart(next *manifest.Level, ssts []sstMetadata) []sstMetadata {
-	best, bestCost := 0, math.Inf(1)
+// cheapestRun returns the run of ssts, files of one level in key order, that
+// fits one job and rewrites the least of next, the level below, per byte it
+// moves there; ties go to the lower key. A run that overlaps nothing in next
+// is a move, the cheapest of all. Taking files from the lowest key instead,
+// every job rewrote the part of next the jobs before it had grown, moving
+// less of the level each time, while files at higher keys were never reached
+// and the level kept growing. The whole run is weighed, not where it starts:
+// a cheap file near the end of the level leaves room for few files after it,
+// and those after a cheap file can be dear.
+func (c *compactor) cheapestRun(next *manifest.Level, ssts []sstMetadata) []sstMetadata {
+	n := len(ssts)
+	if n == 0 {
+		return ssts
+	}
+	var below []sstMetadata
+	if next != nil {
+		below = next.SSTs
+	}
+	// ssts[i] overlaps below[lo[i]:hi[i]]; both only grow with i.
+	lo, hi := make([]int, n), make([]int, n)
+	for i := range ssts {
+		lo[i] = sort.Search(len(below), func(k int) bool { return bytes.Compare(below[k].MaxKey, ssts[i].MinKey) >= 0 })
+		hi[i] = sort.Search(len(below), func(k int) bool { return bytes.Compare(below[k].MinKey, ssts[i].MaxKey) > 0 })
+	}
+	srcSum, belowSum := make([]int64, n+1), make([]int64, len(below)+1)
 	for i, sst := range ssts {
-		cost := float64(sstBytes(next.OverlappingSSTs(sst.MinKey, sst.MaxKey))) / float64(max(sst.Size, 1))
-		if cost < bestCost {
-			best, bestCost = i, cost
+		srcSum[i+1] = srcSum[i] + sst.Size
+	}
+	for k, sst := range below {
+		belowSum[k+1] = belowSum[k] + sst.Size
+	}
+	maxBytes := c.maxRewriteInputBytes()
+	// cost is what ssts[i:j] rewrites below, and whether the run fits a job.
+	cost := func(i, j int) (int64, bool) {
+		a, b := lo[i], max(lo[i], hi[j-1])
+		dest := belowSum[b] - belowSum[a]
+		fits := j-i+b-a <= maxCompactionSSTsPerJob &&
+			(dest == 0 || srcSum[j]-srcSum[i]+dest <= maxBytes)
+		return dest, fits
+	}
+	best, bestEnd, bestCost := 0, 1, math.Inf(1)
+	for i, j := 0, 1; i < n; i++ {
+		j = max(j, i+1)
+		for j < n {
+			if _, fits := cost(i, j+1); !fits {
+				break
+			}
+			j++
+		}
+		// A file too large for a job with what it overlaps runs alone, and
+		// is offered only if nothing else fits; the drain below it is then
+		// planned from it.
+		if dest, fits := cost(i, j); fits {
+			if r := float64(dest) / float64(max(srcSum[j]-srcSum[i], 1)); r < bestCost {
+				best, bestEnd, bestCost = i, j, r
+			}
 		}
 	}
-	return ssts[best:]
+	return ssts[best:bestEnd]
 }
 
 // maxRewriteInputBytes bounds the input of a rewrite. Each output but the last

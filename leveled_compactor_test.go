@@ -305,7 +305,7 @@ func TestLevelJobStartsWhereItRewritesLeastBelow(t *testing.T) {
 	l2 := []sstMetadata{plannerSST(2, 0, 9), plannerSST(2, 10, 19), plannerSST(2, 20, 29), plannerSST(2, 30, 39)}
 	start := func() string {
 		t.Helper()
-		return cheapestStart(m.Level(3), l2)[0].ID
+		return plannerOnlyCompactor().cheapestRun(m.Level(3), l2)[0].ID
 	}
 	if got := start(); got != l2[0].ID {
 		t.Fatalf("with no level below, started at %s, want the lowest key", got)
