@@ -20,6 +20,9 @@ type Shape interface {
 	// order, until yield returns false. A nil lo is the start of the
 	// keyspace and a nil hi its end.
 	Walk(lo, hi []byte, yield func(idx uint64) bool)
+	// Place returns where idx's key falls in the keyspace, from 0 for the
+	// first key to below 1 for the last, so a share of it is a key range.
+	Place(idx uint64) float64
 }
 
 // MaxKeys bounds a workload's keys: 2^40, far beyond any run.
@@ -76,6 +79,10 @@ func (s *randomShape) Index(key []byte) (uint64, bool) {
 	return idx, idx < s.n && binary.BigEndian.Uint64(key) == s.high(s.f.encrypt(idx))
 }
 
+func (s *randomShape) Place(idx uint64) float64 {
+	return float64(s.f.encrypt(idx)) / float64(uint64(1)<<s.bits)
+}
+
 func (s *randomShape) Walk(lo, hi []byte, yield func(uint64) bool) {
 	var key []byte
 	for p := prefix8(lo) >> (64 - s.bits); p < 1<<s.bits; p++ {
@@ -115,6 +122,8 @@ func (s *sequentialShape) Index(key []byte) (uint64, bool) {
 	idx := binary.BigEndian.Uint64(key)
 	return idx, idx < s.n && binary.BigEndian.Uint64(key[8:]) == mix64(idx^s.seed)
 }
+
+func (s *sequentialShape) Place(idx uint64) float64 { return float64(idx) / float64(s.n) }
 
 func (s *sequentialShape) Walk(lo, hi []byte, yield func(uint64) bool) {
 	var key []byte

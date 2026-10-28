@@ -29,7 +29,7 @@ func (db *fakeDB) state(idx, rev uint64) workload.State {
 	for _, batches := range db.commits[:rev] {
 		for _, no := range batches {
 			b := db.s.Batch(no)
-			if db.s.BatchOf(b.Round, idx) == no {
+			if db.s.Writes(b.Round, idx) && db.s.BatchOf(b.Round, idx) == no {
 				st = db.s.After(b.Round, idx)
 			}
 		}
@@ -55,12 +55,17 @@ func (db *fakeDB) scan(lo []byte, rev uint64, limit int) []Item {
 
 func setup(t *testing.T, n, chunk, deletes uint64) (*fakeDB, *ledger.Ledger, *Verifier, *bytes.Buffer) {
 	t.Helper()
+	return setupWith(t, n, chunk, deletes, workload.Options{})
+}
+
+func setupWith(t *testing.T, n, chunk, deletes uint64, o workload.Options) (*fakeDB, *ledger.Ledger, *Verifier, *bytes.Buffer) {
+	t.Helper()
 	d, _ := workload.ParseSizeDist("fixed:40")
-	s, err := workload.NewSchedule(n, chunk, 3, deletes, d)
+	s, err := workload.NewScheduleWith(n, chunk, 3, deletes, d, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	shape, err := workload.NewShape("random", n, 3)
+	shape, err := workload.NewShape("random", s.MaxKeys(), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,5 +265,75 @@ func TestReadsPastTheLastWriteSettle(t *testing.T) {
 	requireClean(t, v, log)
 	if s := v.Stats(); s.Checked != 2 || s.Queued != 0 {
 		t.Fatalf("stats %+v: want both reads checked at once", s)
+	}
+}
+
+// checkAll reads every key the schedule may ever have, and scans
+// everything in pages, at each revision up to the newest.
+func checkAll(t *testing.T, db *fakeDB, v *Verifier, step uint64) {
+	t.Helper()
+	top := uint64(len(db.commits))
+	for rev := uint64(0); rev <= top; rev += step {
+		for idx := range db.s.MaxKeys() {
+			st := db.state(idx, rev)
+			var value []byte
+			if st.Present {
+				value = db.value(idx, st)
+			}
+			v.Get(idx, rev, value, st.Present)
+		}
+		var lo []byte
+		for {
+			items := db.scan(lo, rev, 23)
+			more := len(items) == 23
+			v.Page(lo, nil, rev, items, more)
+			if !more {
+				break
+			}
+			lo = append(bytes.Clone(items[len(items)-1].Key), 0)
+		}
+	}
+}
+
+// Rounds that write part of the keys, a hot range among them, delete some
+// and insert new ones: right answers pass at every revision, and a key keeps
+// what the last round to write it left.
+func TestPartialRoundsAreCheckedExactly(t *testing.T) {
+	hot := func(idx uint64) bool { return idx < 30 }
+	db, l, v, log := setupWith(t, 300, 4, 250, workload.Options{UpdatePermille: 100, HotPermille: 700, Hot: hot, HotShare: 100,
+		InsertsPerRound: 40, Rounds: 4})
+	for no := range db.s.FirstBatch(5) {
+		if db.s.Written(db.s.Batch(no)) > 0 {
+			db.send(t, l, no)
+		}
+	}
+	checkAll(t, db, v, 3)
+	requireClean(t, v, log)
+
+	// A wrong answer for a key the last round left alone is caught: it must
+	// still hold what an earlier round wrote.
+	top := uint64(len(db.commits))
+	kept, found := uint64(0), false
+	for idx := range db.s.N {
+		if r, ok := db.s.Last(4, idx); ok && r < 4 && r > 0 && !db.s.Deletes(r, idx) {
+			kept, found = idx, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no key whose last write was a middle round")
+	}
+	st := db.state(kept, top)
+	stale := workload.State{Present: true, Version: st.Version - 1}
+	v.Get(kept, top, db.value(kept, stale), true)
+	if s := v.Stats(); s.Failures[Stale] != 1 {
+		t.Fatalf("a stale read of key %d (%v, holds %v) was not caught: %s", kept, stale, st, s.Summary())
+	}
+	// A key round 4 inserts is absent before its batch committed.
+	idx := db.s.Keys(3)
+	rev := l.Get(db.s.BatchOf(4, idx)).Revision - 1
+	v.Get(idx, rev, db.value(idx, workload.State{Present: true, Version: 4}), true)
+	if s := v.Stats(); s.Failures[Future] != 1 {
+		t.Fatalf("key %d read before round 4 inserted it was not caught: %s", idx, s.Summary())
 	}
 }

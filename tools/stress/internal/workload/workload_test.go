@@ -205,3 +205,172 @@ func TestKeysForBytes(t *testing.T) {
 		t.Fatalf("%d keys for 1161 bytes, want 11", got)
 	}
 }
+
+// The schedule as it was before rounds could write part of the keys, so the
+// default can be checked to be unchanged: old ledgers stay valid.
+type fullSchedule struct{ n, chunk, seed, del uint64 }
+
+func (f fullSchedule) per() uint64 { return (f.n + f.chunk - 1) / f.chunk }
+func (f fullSchedule) index(round uint32, pos uint64) uint64 {
+	if round == 0 {
+		return pos
+	}
+	return NewPerm(f.n, f.seed^uint64(round)).At(pos)
+}
+func (f fullSchedule) deletes(round uint32, idx uint64) bool {
+	return round > 0 && f.del > 0 && mix64(idx^uint64(round)*0x9e3779b97f4a7c15^f.seed)%1000 < f.del
+}
+
+func TestDefaultScheduleIsUnchanged(t *testing.T) {
+	d, _ := ParseSizeDist("mixed")
+	f := fullSchedule{n: 1003, chunk: 16, seed: 9, del: 150}
+	s, err := NewSchedule(f.n, f.chunk, f.seed, f.del, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BatchesPerRound() != f.per() {
+		t.Fatalf("%d batches a round, want %d", s.BatchesPerRound(), f.per())
+	}
+	for no := range 4 * f.per() {
+		round, j := uint32(no/f.per()), no%f.per()
+		b := s.Batch(no)
+		if b.Round != round || b.Start != j*f.chunk || b.Count != min(f.chunk, f.n-j*f.chunk) {
+			t.Fatalf("batch %d = %+v", no, b)
+		}
+		for pos := b.Start; pos < b.Start+b.Count; pos++ {
+			idx := s.Index(round, pos)
+			if idx != f.index(round, pos) || !s.Writes(round, idx) || s.Deletes(round, idx) != f.deletes(round, idx) ||
+				s.BatchOf(round, idx) != no {
+				t.Fatalf("round %d position %d: index %d, deletes %v, batch %d", round, pos, idx, s.Deletes(round, idx), s.BatchOf(round, idx))
+			}
+		}
+	}
+}
+
+func TestPartialRoundsWriteTheirShareOnce(t *testing.T) {
+	d, _ := ParseSizeDist("fixed:32")
+	const n, rounds = 4000, 6
+	hot := func(idx uint64) bool { return idx%10 == 0 } // a tenth of the keys
+	s, err := NewScheduleWith(n, 8, 3, 200, d, Options{UpdatePermille: 50, HotPermille: 600, Hot: hot, HotShare: 100,
+		InsertsPerRound: 300, Rounds: rounds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.MaxKeys() != n+rounds*300 {
+		t.Fatalf("%d keys at most, want %d", s.MaxKeys(), n+rounds*300)
+	}
+	var hotWrites, coldWrites, hotKeys, coldKeys, deleted, keys int
+	for round := uint32(0); round <= rounds; round++ {
+		first, next := s.FirstBatch(round), s.FirstBatch(round+1)
+		seen := map[uint64]bool{}
+		for no := first; no < next; no++ {
+			b := s.Batch(no)
+			if b.No != no || b.Round != round {
+				t.Fatalf("batch %d = %+v, want round %d", no, b, round)
+			}
+			var written uint64
+			for pos := b.Start; pos < b.Start+b.Count; pos++ {
+				idx := s.Index(round, pos)
+				if !s.Writes(round, idx) {
+					continue
+				}
+				written++
+				if seen[idx] {
+					t.Fatalf("round %d writes %d twice", round, idx)
+				}
+				seen[idx] = true
+				if got := s.BatchOf(round, idx); got != no {
+					t.Fatalf("BatchOf(%d, %d) = %d, want %d", round, idx, got, no)
+				}
+				if s.Deletes(round, idx) {
+					deleted++
+					if idx >= s.Keys(round-1) {
+						t.Fatalf("round %d deletes %d, a key it inserts", round, idx)
+					}
+				}
+			}
+			if written != s.Written(b) {
+				t.Fatalf("batch %d writes %d keys, Written says %d", no, written, s.Written(b))
+			}
+		}
+		keys += len(seen)
+		// Every key Writes names is in some batch of the round, and no other.
+		for idx := range s.MaxKeys() {
+			if s.Writes(round, idx) != seen[idx] {
+				t.Fatalf("round %d: Writes(%d) = %v, but a batch writes it: %v", round, idx, s.Writes(round, idx), seen[idx])
+			}
+		}
+		if round == 0 {
+			continue
+		}
+		// The keys the round inserts, and only those, are new.
+		for idx := s.Keys(round - 1); idx < s.Keys(round); idx++ {
+			if !seen[idx] {
+				t.Fatalf("round %d does not insert %d", round, idx)
+			}
+		}
+		for idx := range s.Keys(round - 1) {
+			if hot(idx) {
+				hotKeys++
+				if seen[idx] {
+					hotWrites++
+				}
+			} else {
+				coldKeys++
+				if seen[idx] {
+					coldWrites++
+				}
+			}
+		}
+	}
+	if share := float64(hotWrites) / float64(hotKeys); share < 0.55 || share > 0.65 {
+		t.Fatalf("hot keys written %.3f of the time, want about 0.6", share)
+	}
+	if share := float64(coldWrites) / float64(coldKeys); share < 0.04 || share > 0.06 {
+		t.Fatalf("other keys written %.3f of the time, want about 0.05", share)
+	}
+	if share := float64(deleted) / float64(hotWrites+coldWrites); share < 0.17 || share > 0.23 {
+		t.Fatalf("%.3f of updates deleted, want about 0.2", share)
+	}
+	// Batches of updates write about 8 keys each, as inserts do.
+	if mean := float64(keys) / float64(s.FirstBatch(rounds+1)); mean < 6 || mean > 9 {
+		t.Fatalf("%.1f keys a batch, want about 8", mean)
+	}
+}
+
+func TestLastFindsTheRoundThatLastWroteAKey(t *testing.T) {
+	d, _ := ParseSizeDist("fixed:8")
+	s, err := NewScheduleWith(500, 4, 1, 0, d, Options{UpdatePermille: 100, InsertsPerRound: 50, Rounds: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx := range s.MaxKeys() {
+		for round := uint32(0); round <= 8; round++ {
+			got, ok := s.Last(round, idx)
+			want, found := uint32(0), false
+			for r := uint32(0); r <= round; r++ {
+				if s.Writes(r, idx) {
+					want, found = r, true
+				}
+			}
+			if ok != found || got != want {
+				t.Fatalf("Last(%d, %d) = %d %v, want %d %v", round, idx, got, ok, want, found)
+			}
+		}
+	}
+}
+
+func TestShapesPlaceKeysInKeyOrder(t *testing.T) {
+	for _, name := range []string{"random", "sequential"} {
+		shape, _ := NewShape(name, 3000, 4)
+		prev := -1.0
+		shape.Walk(nil, nil, func(idx uint64) bool {
+			p := shape.Place(idx)
+			if p < 0 || p >= 1 || p <= prev {
+				t.Fatalf("%s: key %d placed at %v after %v", name, idx, p, prev)
+			}
+			prev = p
+			return true
+		})
+	}
+}

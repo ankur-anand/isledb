@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ankur-anand/isledb/tools/stress/internal/workload"
 )
 
 func loadSpec(t *testing.T, body string) error {
@@ -34,6 +36,11 @@ func TestSpecMistakesFailWhenLoaded(t *testing.T) {
 		{"fault kind", baseSpec + "phases: [{load: {faults: [{proxy: writer, set: {kinds: [blob]}}]}}]", `kind "blob"`},
 		{"fault rates", baseSpec + "phases: [{load: {faults: [{proxy: writer, set: {error_rate: 0.7, drop_rate: 0.7}}]}}]", "add up to at most 1"},
 		{"fault proxy", baseSpec + "phases: [{load: {faults: [{proxy: cache, set: {}}]}}]", `proxy "cache"`},
+		{"update share", strings.Replace(baseSpec, "{keys: 10}", "{keys: 10, update_permille: 1200}", 1) + "phases: [{verify: {}}]", "at most 1000"},
+		{"hot range", strings.Replace(baseSpec, "{keys: 10}", "{keys: 10, update_permille: 50, hot: {from_permille: 300, to_permille: 200, update_permille: 500}}", 1) + "phases: [{verify: {}}]", "workload.hot: want"},
+		{"hot without partial rounds", strings.Replace(baseSpec, "{keys: 10}", "{keys: 10, hot: {to_permille: 100, update_permille: 500}}", 1) + "phases: [{verify: {}}]", "needs update_permille below 1000"},
+		{"scan range", baseSpec + "readers: [{name: r, scan_min: 50, scan_limit: 10}]\nphases: [{verify: {}}]", "scan_min must be"},
+		{"read dist", baseSpec + "readers: [{name: r, dist: hot}]\nphases: [{verify: {}}]", `dist "hot"`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			err := loadSpec(t, c.body)
@@ -85,5 +92,48 @@ func TestSizeOverridesAndTheLadder(t *testing.T) {
 	bad := strings.Replace(baseSpec, "latency:", "disk: {path: /, max_used_pct: 100}, latency:", 1)
 	if err := loadSpec(t, bad+"phases: [{verify: {}}]\n"); err == nil || !strings.Contains(err.Error(), "max_used_pct") {
 		t.Fatalf("a disk limit of 100%%: %v", err)
+	}
+}
+
+// An update round writes its share of the keys that exist, hot range
+// included, and inserts; inserts grow what later rounds update.
+func TestPlannedBytesFollowPartialRounds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spec.yaml")
+	body := strings.Replace(baseSpec, "{keys: 10}", "{target: 10GiB, update_permille: 50, insert_permille: 100, hot: {to_permille: 100, update_permille: 500}}", 1)
+	if err := os.WriteFile(path, []byte(body+"phases: [{load: {}}, {update: {rounds: 3}}]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 95 thousandths a round of 1000, 1100 and 1200 thousandths of the
+	// keys, each round inserting 100 more: 10 GiB times 1 + 0.195 + 0.204 + 0.214.
+	factor := 1 + 0.195 + 0.204 + 0.214
+	want := Size(float64(10<<30) * factor)
+	if got := s.Planned(); got < want-want/1000 || got > want+want/1000 {
+		t.Fatalf("planned %s, want about %s", got.Label(), want.Label())
+	}
+	if s.UpdateRounds() != 3 || s.UpdateShare() != 95 {
+		t.Fatalf("%d rounds at %d‰, want 3 at 95‰", s.UpdateRounds(), s.UpdateShare())
+	}
+}
+
+// Every spec in specs/ loads.
+func TestShippedSpecsLoad(t *testing.T) {
+	paths, err := filepath.Glob("../../specs/*.yaml")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no specs: %v", err)
+	}
+	for _, path := range paths {
+		s, err := LoadSpec(path)
+		if err != nil {
+			t.Errorf("%s: %v", filepath.Base(path), err)
+			continue
+		}
+		dist, _ := workload.ParseSizeDist(s.Workload.Values)
+		if _, _, err := newSchedule(s, workload.KeysForBytes(dist, 16, 1<<30), dist); err != nil {
+			t.Errorf("%s: schedule: %v", filepath.Base(path), err)
+		}
 	}
 }

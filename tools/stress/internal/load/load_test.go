@@ -162,3 +162,30 @@ func TestLiveBytesFollowEachKeysNewestState(t *testing.T) {
 		t.Fatalf("live bytes after three rounds %d, want %d", got, want)
 	}
 }
+
+func TestLiveBytesFollowPartialRounds(t *testing.T) {
+	d, _ := workload.ParseSizeDist("mixed")
+	s, err := workload.NewScheduleWith(400, 5, 2, 300, d, workload.Options{UpdatePermille: 150, InsertsPerRound: 60, Rounds: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shape, _ := workload.NewShape("random", s.MaxKeys(), 2)
+	ld, err := New(Config{Schedule: s, Shape: shape, Ledger: ledger.New(), Writer: client.New("http://unused", "")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for no := range s.FirstBatch(5) {
+		ld.C.Live.Add(ld.liveDelta(s.Batch(no)))
+	}
+	var want int64
+	for idx := range s.MaxKeys() {
+		if r, ok := s.Last(4, idx); ok {
+			if st := s.After(r, idx); st.Present {
+				want += int64(16 + d.Size(idx, r))
+			}
+		}
+	}
+	if got := ld.C.Live.Load(); got != want {
+		t.Fatalf("live bytes after four partial rounds %d, want %d", got, want)
+	}
+}

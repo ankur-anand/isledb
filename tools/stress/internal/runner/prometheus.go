@@ -230,8 +230,17 @@ func (st *runState) exposition(ctx context.Context) []byte {
 		p.counter("stress_reads_total", help, float64(r.C.Retries.Load()), "group", name, "op", "any", "result", "retry")
 		p.counter("stress_reads_total", help, float64(r.C.Errors.Load()), "group", name, "op", "any", "result", "error")
 		p.counter("stress_scan_items_total", "Keys scans returned.", float64(r.C.ScanItems.Load()), "group", name)
-		p.histogram("stress_read_seconds", "Read latency as the client sees it.", r.C.Get.Snapshot(), "group", name, "op", "get")
-		p.histogram("stress_read_seconds", "Read latency as the client sees it.", r.C.Scan.Snapshot(), "group", name, "op", "scan")
+		p.histogram("stress_read_seconds", "Read service time: from sending a read to its answer.", r.C.Get.Snapshot(), "group", name, "op", "get")
+		p.histogram("stress_read_seconds", "Read service time: from sending a read to its answer.", r.C.Scan.Snapshot(), "group", name, "op", "scan")
+		p.histogram("stress_read_response_seconds", "Read response time: from when a read was due to its answer, the wait for a free worker included.",
+			r.C.GetResponse.Snapshot(), "group", name, "op", "get")
+		p.histogram("stress_read_response_seconds", "Read response time: from when a read was due to its answer, the wait for a free worker included.",
+			r.C.ScanResponse.Snapshot(), "group", name, "op", "scan")
+		p.counter("stress_reads_offered_total", "Reads the group's rate made due.", float64(r.C.Offered.Load()), "group", name)
+		p.counter("stress_reads_dropped_total", "Reads never sent: due longer ago than max_lag when a worker was free.", float64(r.C.Dropped.Load()), "group", name)
+		p.counter("stress_reads_late_total", "Reads started more than 10ms after they were due.", float64(r.C.Late.Load()), "group", name)
+		p.gauge("stress_read_workers_busy", "Reader workers reading now.", float64(r.C.Busy.Load()), "group", name)
+		p.gauge("stress_read_workers", "Reader workers in the group.", float64(st.groupWorkers(name)), "group", name)
 	}
 
 	v := s.Verify

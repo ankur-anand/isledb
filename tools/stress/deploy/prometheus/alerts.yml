@@ -23,6 +23,12 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "{{ $labels.run }}: the writer refuses more than one write a second (503)."
+      - alert: StressReadsDropped
+        expr: sum by (run, group) (rate(stress_reads_dropped_total[5m])) > 0.01 * sum by (run, group) (rate(stress_reads_offered_total[5m]))
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: reader group {{ $labels.group }} drops over 1% of the reads its rate offers: its workers can't keep up."
       - alert: StressWritesUnresolved
         expr: increase(stress_writes_total{outcome="unresolved"}[10m]) > 0
         labels: {severity: warning}

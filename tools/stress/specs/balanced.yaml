@@ -1,0 +1,58 @@
+# A balanced production-like mix. default and l0-batched only insert; this
+# then updates, deletes and inserts. Each update round writes 5% of the keys,
+# and 30% of those in a hot tenth of the keyspace; deletes a tenth of what
+# it writes, which later rounds write back; and inserts 2% more keys, so
+# the database grows as it churns. Readers mix point reads, scans of 1 to
+# 100 keys and reads of the newest keys.
+#
+# It builds the dataset, settles and verifies it, runs the mix, then settles
+# and verifies again, so a result is never read off work compaction still
+# owes. Pick the size on the command line; qualify at 100 GiB before 1 TiB:
+#
+#   stress run -spec specs/balanced.yaml -target 100GiB -isledb origin/main -fetch
+#   stress run -spec specs/balanced.yaml -target 1TiB   -isledb origin/main -fetch
+#
+# Reads are paced open loop: each is due at its time, and one a worker can't
+# start within max_lag is dropped and counted, so the dashboard shows reads
+# offered against achieved.
+name: balanced
+workload:
+  shape: random
+  values: mixed
+  target: 20GiB
+  batch_keys: 16
+  update_permille: 50
+  delete_permille: 100
+  insert_permille: 20
+  hot: {from_permille: 0, to_permille: 100, update_permille: 300}
+  rate: 12MiB
+  workers: 256
+readers:
+  - {name: uniform, rate: 300, workers: 32, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
+  - {name: latest, rate: 100, workers: 16, dist: latest, latest_window: 1000000}
+storage:
+  bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
+  endpoint: http://127.0.0.1:19000
+  latency: {min: 15ms, max: 40ms}
+  # Hold writes while the disk SILO stores on is more than 85% full.
+  disk: {path: /data, max_used_pct: 85}
+isledb:
+  readers: 1
+  config:
+    writer:
+      memtable: {target_bytes: 3MiB}
+      flush: {interval: 250ms}
+      # Replaced files wait this long before they are deleted. IsleDB's
+      # default is 1h; 10m frees disk six times sooner, so space
+      # amplification reads lower than production's would.
+      policy: {max_pinned_view_age: 10m}
+    maintenance:
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}
+phases:
+  - load: {}
+  - settle: {quiet: 5m, max: 3h}
+  - verify: {parts: 32}
+  - update: {rounds: 10}
+  - settle: {quiet: 5m, max: 3h}
+  - verify: {parts: 32}
+sample_every: 30s

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ankur-anand/isledb/tools/stress/internal/workload"
 )
 
 // TestRunAgainstTheWorkingTree builds isledb from this repository and runs
@@ -91,6 +93,97 @@ sample_every: 500ms
 		if _, err := os.Stat(filepath.Join(sum.Run.Dir, f)); err != nil {
 			t.Errorf("run directory lacks %s", f)
 		}
+	}
+}
+
+// TestPartialRoundsAgainstTheWorkingTree runs update rounds that write part
+// of the keys, a hot range more often, delete some and insert new ones, and
+// checks the run wrote and kept exactly the keys its schedule says. Killing
+// the writer is TestRunAgainstTheWorkingTree's: a lost write holds the next
+// round a minute.
+func TestPartialRoundsAgainstTheWorkingTree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs isledb")
+	}
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		t.Skip("not in a git checkout")
+	}
+	repo := strings.TrimSpace(string(out))
+	if _, err := os.Stat(filepath.Join(repo, "cmd", "isledb")); err != nil {
+		t.Skip("not the isledb repository")
+	}
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		if t.Failed() {
+			logRoleLogs(t, filepath.Join(dir, "results"))
+		}
+	})
+	bucket := filepath.Join(dir, "bucket")
+	if err := os.MkdirAll(bucket, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(specPath, []byte(`
+name: e2e-partial
+workload:
+  keys: 3000
+  values: "fixed:128"
+  batch_keys: 8
+  delete_permille: 200
+  update_permille: 150
+  insert_permille: 100
+  hot: {to_permille: 200, update_permille: 600}
+  workers: 4
+  rate: 2MiB
+readers: [{name: r, rate: 300, workers: 4, scan_ratio: 0.2, scan_min: 1, scan_limit: 60, dist: latest, latest_window: 500}]
+storage: {bucket_url: "file://`+bucket+`"}
+isledb: {readers: 1, config: {writer: {flush: {interval: 100ms}}}}
+phases:
+  - load: {}
+  - update: {rounds: 4, rate: 512KiB}
+  - verify: {parts: 4, limit: 200}
+sample_every: 500ms
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := LoadSpec(specPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sum, err := Run(ctx, Options{Spec: spec, Isledb: ".", Repo: repo, Out: filepath.Join(dir, "results"),
+		Log: slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := sum.Final
+	if final.Verify.Checked == 0 || final.Verify.Failed() != 0 || final.Verify.Pending != 0 {
+		t.Fatalf("verify: %s", final.Verify.Summary())
+	}
+	dist, _ := workload.ParseSizeDist(spec.Workload.Values)
+	s, _, err := newSchedule(spec, spec.Workload.Keys, dist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys, live int64
+	for no := range s.FirstBatch(5) {
+		keys += int64(s.Written(s.Batch(no)))
+	}
+	for idx := range s.MaxKeys() {
+		if r, ok := s.Last(4, idx); ok && s.After(r, idx).Present {
+			live++
+		}
+	}
+	if final.Load.Keys != keys {
+		t.Fatalf("%d keys written, the schedule writes %d", final.Load.Keys, keys)
+	}
+	if got := sum.Phases[2].Scanned; got != live {
+		t.Fatalf("the verify scanned %d keys, the schedule leaves %d", got, live)
+	}
+	if r := final.Readers["r"]; r.Offered == 0 || r.Gets == 0 || r.Scans == 0 || r.GetResponse.Count == 0 {
+		t.Fatalf("readers %+v", r)
 	}
 }
 

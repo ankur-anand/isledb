@@ -1511,7 +1511,7 @@
   },
   {
    "type": "timeseries",
-   "title": "Read latency, as the client sees it",
+   "title": "Read response time",
    "id": 29,
    "datasource": {
     "type": "prometheus",
@@ -1523,7 +1523,74 @@
     "x": 0,
     "y": 39
    },
-   "description": "",
+   "description": "From when each read was due to its answer, the wait for a free worker included: what a client arriving at the group's rate sees. Above service time when the workers can't keep up. Empty for runs before open-loop pacing.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le, op) (rate(stress_read_response_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "{{op}} p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, op) (rate(stress_read_response_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "{{op}} p99",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le, op) (rate(stress_read_response_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "{{op}} p99.9",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Read service time",
+   "id": 30,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 39
+   },
+   "description": "From sending a read to its answer.",
    "targets": [
     {
      "datasource": {
@@ -1570,7 +1637,7 @@
   {
    "type": "timeseries",
    "title": "Reads per second",
-   "id": 30,
+   "id": 31,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1578,7 +1645,7 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 8,
+    "x": 16,
     "y": 39
    },
    "description": "",
@@ -1618,8 +1685,126 @@
   },
   {
    "type": "timeseries",
-   "title": "Age of the data readers serve",
-   "id": 31,
+   "title": "Reads offered and achieved",
+   "id": 32,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 47
+   },
+   "description": "Reads a second the group's rate made due, and reads answered, retries and errors included. Achieved below offered: the readers can't keep up.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (group) (rate(stress_reads_offered_total{run=\"$run\"}[1m]))",
+     "legendFormat": "{{group}} offered",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (group) (rate(stress_reads_total{run=\"$run\"}[1m]))",
+     "legendFormat": "{{group}} achieved",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reads dropped and late",
+   "id": 33,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 47
+   },
+   "description": "Per second. Dropped: due longer ago than max_lag when a worker was free, never sent. Late: started more than 10ms after it was due.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (group) (rate(stress_reads_dropped_total{run=\"$run\"}[1m]))",
+     "legendFormat": "{{group}} dropped",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (group) (rate(stress_reads_late_total{run=\"$run\"}[1m]))",
+     "legendFormat": "{{group}} late",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Reader workers busy",
+   "id": 34,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1628,7 +1813,57 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 39
+    "y": 47
+   },
+   "description": "The share of each group's workers reading when sampled. At 100% the group is saturated: reads wait, then drop.",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (group) (stress_read_workers_busy{run=\"$run\"}) / sum by (group) (stress_read_workers{run=\"$run\"})",
+     "legendFormat": "{{group}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Age of the data readers serve",
+   "id": 35,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 55
    },
    "description": "",
    "targets": [
@@ -1668,7 +1903,7 @@
   {
    "type": "timeseries",
    "title": "Reader refresh failures",
-   "id": 32,
+   "id": 36,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1676,8 +1911,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 0,
-    "y": 47
+    "x": 8,
+    "y": 55
    },
    "description": "Failed loads of new data per second, and reads answered from old data while loading failed.",
    "targets": [
@@ -1727,7 +1962,7 @@
   {
    "type": "timeseries",
    "title": "Reader refresh time",
-   "id": 33,
+   "id": 37,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1735,8 +1970,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 8,
-    "y": 47
+    "x": 16,
+    "y": 55
    },
    "description": "How long loading new data takes; slow loads are the usual reason the data served is old.",
    "targets": [
@@ -1785,7 +2020,7 @@
   {
    "type": "timeseries",
    "title": "Reader errors",
-   "id": 34,
+   "id": 38,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1793,8 +2028,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 16,
-    "y": 47
+    "x": 0,
+    "y": 63
    },
    "description": "Per second, all readers. Filter skips: key reads that checked a file without its filter, because it failed to load.",
    "targets": [
@@ -1871,7 +2106,7 @@
   {
    "type": "timeseries",
    "title": "Reader storage reads",
-   "id": 35,
+   "id": 39,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1879,8 +2114,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 0,
-    "y": 55
+    "x": 8,
+    "y": 63
    },
    "description": "Reads of data files from storage per second, all readers, and the bytes they fetched.",
    "targets": [
@@ -1947,7 +2182,7 @@
   {
    "type": "timeseries",
    "title": "Storage bytes per client read",
-   "id": 36,
+   "id": 40,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1955,8 +2190,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 8,
-    "y": 55
+    "x": 16,
+    "y": 63
    },
    "description": "Bytes the readers fetched from storage for each get or scan the harness made. Grows as reads check more files.",
    "targets": [
@@ -1997,7 +2232,7 @@
   {
    "type": "timeseries",
    "title": "Reader storage read time",
-   "id": 37,
+   "id": 41,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2005,8 +2240,8 @@
    "gridPos": {
     "h": 8,
     "w": 8,
-    "x": 16,
-    "y": 55
+    "x": 0,
+    "y": 71
    },
    "description": "",
    "targets": [
@@ -2055,20 +2290,20 @@
   {
    "type": "row",
    "title": "Correctness",
-   "id": 38,
+   "id": 42,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 63
+    "y": 79
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Reads checked per second",
-   "id": 39,
+   "id": 43,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2077,7 +2312,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 64
+    "y": 80
    },
    "description": "",
    "targets": [
@@ -2117,7 +2352,7 @@
   {
    "type": "timeseries",
    "title": "Checks waiting for their revision to settle",
-   "id": 40,
+   "id": 44,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2126,7 +2361,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 64
+    "y": 80
    },
    "description": "",
    "targets": [
@@ -2166,7 +2401,7 @@
   {
    "type": "timeseries",
    "title": "Wrong answers by kind",
-   "id": 41,
+   "id": 45,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2175,7 +2410,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 64
+    "y": 80
    },
    "description": "",
    "targets": [
@@ -2216,20 +2451,20 @@
   {
    "type": "row",
    "title": "Compaction",
-   "id": 42,
+   "id": 46,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 72
+    "y": 88
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Compaction bytes per second",
-   "id": 43,
+   "id": 47,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2238,7 +2473,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 73
+    "y": 89
    },
    "description": "",
    "targets": [
@@ -2296,7 +2531,7 @@
   {
    "type": "timeseries",
    "title": "Compaction jobs per minute",
-   "id": 44,
+   "id": 48,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2305,7 +2540,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 73
+    "y": 89
    },
    "description": "",
    "targets": [
@@ -2381,7 +2616,7 @@
   {
    "type": "timeseries",
    "title": "Finished work waiting for the writer",
-   "id": 45,
+   "id": 49,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2390,7 +2625,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 73
+    "y": 89
    },
    "description": "Published: from when maintenance handed over finished work to when the writer published it, as the writer measured it. Publishing: the writer's own time to publish it. Unanswered now: how long the work maintenance is waiting on has waited, as maintenance last saw it; it clears when maintenance's next round starts, so it rising past a few minutes means no writer is answering. Empty for versions that don't export them.",
    "targets": [
@@ -2457,7 +2692,7 @@
   {
    "type": "timeseries",
    "title": "L0 files and depth",
-   "id": 46,
+   "id": 50,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2466,7 +2701,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 81
+    "y": 97
    },
    "description": "New files not yet merged into L1, and the most of them one key is in. Growing without stopping: compaction can't keep up. Empty for versions that don't export it.",
    "targets": [
@@ -2515,7 +2750,7 @@
   {
    "type": "timeseries",
    "title": "L0 bytes",
-   "id": 47,
+   "id": 51,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2524,7 +2759,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 81
+    "y": 97
    },
    "description": "",
    "targets": [
@@ -2564,7 +2799,7 @@
   {
    "type": "timeseries",
    "title": "Compaction urgent",
-   "id": 48,
+   "id": 52,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2573,7 +2808,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 81
+    "y": 97
    },
    "description": "1 while the compaction running is urgent because L0 is too deep.",
    "targets": [
@@ -2614,7 +2849,7 @@
   {
    "type": "timeseries",
    "title": "Level bytes against target",
-   "id": 49,
+   "id": 53,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2623,7 +2858,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 89
+    "y": 105
    },
    "description": "",
    "targets": [
@@ -2672,7 +2907,7 @@
   {
    "type": "timeseries",
    "title": "Level fill (bytes / target)",
-   "id": 50,
+   "id": 54,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2681,7 +2916,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 89
+    "y": 105
    },
    "description": "Above 100% the level waits to be merged down; far above, every merge into it costs more.",
    "targets": [
@@ -2721,7 +2956,7 @@
   {
    "type": "timeseries",
    "title": "Compaction time, by kind",
-   "id": 51,
+   "id": 55,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2730,7 +2965,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 89
+    "y": 105
    },
    "description": "Jobs hold the single compaction slot for this long.",
    "targets": [
@@ -2779,7 +3014,7 @@
   {
    "type": "timeseries",
    "title": "Level files",
-   "id": 52,
+   "id": 56,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2788,7 +3023,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 97
+    "y": 113
    },
    "description": "Files in each level below L0. A job takes at most 128 files, so many small files make each job cover less.",
    "targets": [
@@ -2829,7 +3064,7 @@
   {
    "type": "timeseries",
    "title": "Deleted per second, by kind",
-   "id": 53,
+   "id": 57,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2838,7 +3073,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 97
+    "y": 113
    },
    "description": "Objects maintenance removed from storage. If deletes fall behind, the bucket grows: see space amplification.",
    "targets": [
@@ -2879,7 +3114,7 @@
   {
    "type": "timeseries",
    "title": "Maintenance errors per minute",
-   "id": 54,
+   "id": 58,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2888,7 +3123,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 97
+    "y": 113
    },
    "description": "Rounds of maintenance work that failed and are retried, and levels due for compaction that no job could be planned for. Levels waiting their turn are not counted. Blocked is empty for versions that don't export it.",
    "targets": [
@@ -2938,20 +3173,20 @@
   {
    "type": "row",
    "title": "Storage",
-   "id": 55,
+   "id": 59,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 105
+    "y": 121
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Uploaded per second, by proxy and kind",
-   "id": 56,
+   "id": 60,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -2960,7 +3195,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 106
+    "y": 122
    },
    "description": "",
    "targets": [
@@ -3000,7 +3235,7 @@
   {
    "type": "timeseries",
    "title": "Requests per second, by proxy and method",
-   "id": 57,
+   "id": 61,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3009,7 +3244,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 106
+    "y": 122
    },
    "description": "",
    "targets": [
@@ -3049,7 +3284,7 @@
   {
    "type": "timeseries",
    "title": "Storage errors per second",
-   "id": 58,
+   "id": 62,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3058,7 +3293,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 106
+    "y": 122
    },
    "description": "",
    "targets": [
@@ -3116,7 +3351,7 @@
   {
    "type": "timeseries",
    "title": "Write amplification",
-   "id": 59,
+   "id": 63,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3125,7 +3360,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 114
+    "y": 130
    },
    "description": "",
    "targets": [
@@ -3165,7 +3400,7 @@
   {
    "type": "timeseries",
    "title": "Space amplification",
-   "id": 60,
+   "id": 64,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3174,7 +3409,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 114
+    "y": 130
    },
    "description": "",
    "targets": [
@@ -3214,7 +3449,7 @@
   {
    "type": "timeseries",
    "title": "Bucket bytes, by kind",
-   "id": 61,
+   "id": 65,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3223,7 +3458,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 114
+    "y": 130
    },
    "description": "",
    "targets": [
@@ -3263,20 +3498,20 @@
   {
    "type": "row",
    "title": "SILO",
-   "id": 62,
+   "id": 66,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 122
+    "y": 138
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "SILO CPU (cores)",
-   "id": 63,
+   "id": 67,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3285,7 +3520,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 123
+    "y": 139
    },
    "description": "Compare with SILO_CPUS: near it, SILO is the bottleneck.",
    "targets": [
@@ -3325,7 +3560,7 @@
   {
    "type": "timeseries",
    "title": "SILO requests per second, by call",
-   "id": 64,
+   "id": 68,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3334,7 +3569,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 123
+    "y": 139
    },
    "description": "",
    "targets": [
@@ -3374,7 +3609,7 @@
   {
    "type": "timeseries",
    "title": "SILO requests in flight and waiting",
-   "id": 65,
+   "id": 69,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3383,7 +3618,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 123
+    "y": 139
    },
    "description": "",
    "targets": [
@@ -3432,7 +3667,7 @@
   {
    "type": "timeseries",
    "title": "SILO traffic",
-   "id": 66,
+   "id": 70,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3441,7 +3676,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 131
+    "y": 147
    },
    "description": "",
    "targets": [
@@ -3490,7 +3725,7 @@
   {
    "type": "timeseries",
    "title": "SILO drive",
-   "id": 67,
+   "id": 71,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3499,7 +3734,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 131
+    "y": 147
    },
    "description": "",
    "targets": [
@@ -3590,7 +3825,7 @@
   {
    "type": "timeseries",
    "title": "SILO drive space",
-   "id": 68,
+   "id": 72,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3599,7 +3834,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 131
+    "y": 147
    },
    "description": "",
    "targets": [
@@ -3648,20 +3883,20 @@
   {
    "type": "row",
    "title": "Processes and host",
-   "id": 69,
+   "id": 73,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 139
+    "y": 155
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "CPU by process (cores)",
-   "id": 70,
+   "id": 74,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3670,7 +3905,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 140
+    "y": 156
    },
    "description": "",
    "targets": [
@@ -3719,7 +3954,7 @@
   {
    "type": "timeseries",
    "title": "Memory by process",
-   "id": 71,
+   "id": 75,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3728,7 +3963,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 140
+    "y": 156
    },
    "description": "",
    "targets": [
@@ -3777,7 +4012,7 @@
   {
    "type": "timeseries",
    "title": "Goroutines by process",
-   "id": 72,
+   "id": 76,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3786,7 +4021,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 140
+    "y": 156
    },
    "description": "",
    "targets": [
@@ -3826,7 +4061,7 @@
   {
    "type": "timeseries",
    "title": "Host CPU",
-   "id": 73,
+   "id": 77,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3835,7 +4070,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 148
+    "y": 164
    },
    "description": "The whole host, as SILO sees it.",
    "targets": [
@@ -3893,7 +4128,7 @@
   {
    "type": "timeseries",
    "title": "Host memory",
-   "id": 74,
+   "id": 78,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3902,7 +4137,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 148
+    "y": 164
    },
    "description": "",
    "targets": [
@@ -3960,7 +4195,7 @@
   {
    "type": "timeseries",
    "title": "Disk under the run",
-   "id": 75,
+   "id": 79,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -3969,7 +4204,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 148
+    "y": 164
    },
    "description": "",
    "targets": [

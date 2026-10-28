@@ -208,6 +208,9 @@ func (l *Loader) Run(ctx context.Context) error {
 		if l.cfg.Ledger.Get(no).Revision != 0 {
 			continue // committed by an earlier run
 		}
+		if s.Written(s.Batch(no)) == 0 {
+			continue // its positions hold no key its round writes
+		}
 		if !dispatch(no) {
 			break
 		}
@@ -228,6 +231,9 @@ func (l *Loader) body(no uint64) ([]byte, workload.Batch, int64, error) {
 	var bytes int64
 	for pos := b.Start; pos < b.Start+b.Count; pos++ {
 		idx := s.Index(b.Round, pos)
+		if !s.Writes(b.Round, idx) {
+			continue
+		}
 		key := l.cfg.Shape.AppendKey(nil, idx)
 		bytes += int64(len(key))
 		if s.Deletes(b.Round, idx) {
@@ -327,15 +333,15 @@ func (l *Loader) committed(att *ledger.Attempt, b workload.Batch, bytes int64, r
 		return err
 	}
 	l.C.Batches.Add(1)
-	l.C.Keys.Add(int64(b.Count))
+	l.C.Keys.Add(int64(l.cfg.Schedule.Written(b)))
 	l.C.Bytes.Add(bytes)
 	l.C.Live.Add(l.liveDelta(b))
 	l.C.addRoundBytes(b.Round, bytes)
 	return nil
 }
 
-// liveDelta is how batch b changes the bytes the database holds: each key's
-// new state replaces what the round before left it.
+// liveDelta is how batch b changes the bytes the database holds: each key it
+// writes replaces what the last round to write it left.
 func (l *Loader) liveDelta(b workload.Batch) int64 {
 	s := l.cfg.Schedule
 	held := func(round uint32, idx uint64) int64 {
@@ -347,9 +353,14 @@ func (l *Loader) liveDelta(b workload.Batch) int64 {
 	var d int64
 	for pos := b.Start; pos < b.Start+b.Count; pos++ {
 		idx := s.Index(b.Round, pos)
+		if !s.Writes(b.Round, idx) {
+			continue
+		}
 		d += held(b.Round, idx)
 		if b.Round > 0 {
-			d -= held(b.Round-1, idx)
+			if prev, ok := s.Last(b.Round-1, idx); ok {
+				d -= held(prev, idx)
+			}
 		}
 	}
 	return d

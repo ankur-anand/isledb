@@ -146,24 +146,39 @@ ts("Writer merge outcomes", [(f'rate(isledb_writer_l0_merges_published_total{{{R
 newline()
 
 row("Reads")
-ts("Read latency, as the client sees it",
-   [(q(0.5, "stress_read_seconds_bucket", "op"), "{{op}} p50"), (q(0.99, "stress_read_seconds_bucket", "op"), "{{op}} p99")], "s")
+ts("Read response time", [(q(0.5, "stress_read_response_seconds_bucket", "op"), "{{op}} p50"),
+                          (q(0.99, "stress_read_response_seconds_bucket", "op"), "{{op}} p99"),
+                          (q(0.999, "stress_read_response_seconds_bucket", "op"), "{{op}} p99.9")], "s",
+   desc="From when each read was due to its answer, the wait for a free worker included: what a client arriving at the "
+        "group's rate sees. Above service time when the workers can't keep up. Empty for runs before open-loop pacing.")
+ts("Read service time", [(q(0.5, "stress_read_seconds_bucket", "op"), "{{op}} p50"), (q(0.99, "stress_read_seconds_bucket", "op"), "{{op}} p99")], "s",
+   desc="From sending a read to its answer.")
 ts("Reads per second", [(f'sum by (op, result) (rate(stress_reads_total{{{R}}}[1m]))', "{{op}} {{result}}")], "short")
-ts("Age of the data readers serve", [(f'time() - isledb_reader_view_loaded_timestamp_seconds{{{R}}}', "{{role}}")], "s")
 newline()
+ts("Reads offered and achieved", [(f'sum by (group) (rate(stress_reads_offered_total{{{R}}}[1m]))', "{{group}} offered"),
+                                  (f'sum by (group) (rate(stress_reads_total{{{R}}}[1m]))', "{{group}} achieved")], "short", minv=0,
+   desc="Reads a second the group's rate made due, and reads answered, retries and errors included. Achieved below offered: the readers can't keep up.")
+ts("Reads dropped and late", [(f'sum by (group) (rate(stress_reads_dropped_total{{{R}}}[1m]))', "{{group}} dropped"),
+                              (f'sum by (group) (rate(stress_reads_late_total{{{R}}}[1m]))', "{{group}} late")], "short", minv=0,
+   desc="Per second. Dropped: due longer ago than max_lag when a worker was free, never sent. Late: started more than 10ms after it was due.")
+ts("Reader workers busy", [(f'sum by (group) (stress_read_workers_busy{{{R}}}) / sum by (group) (stress_read_workers{{{R}}})', "{{group}}")],
+   "percentunit", minv=0,
+   desc="The share of each group's workers reading when sampled. At 100% the group is saturated: reads wait, then drop.")
+newline()
+ts("Age of the data readers serve", [(f'time() - isledb_reader_view_loaded_timestamp_seconds{{{R}}}', "{{role}}")], "s")
 ts("Reader refresh failures", [(f'rate(isledb_reader_refresh_errors_total{{{R}}}[1m])', "{{role}} refresh errors"),
                                (f'rate(isledb_reader_stale_reads_total{{{R}}}[1m])', "{{role}} stale reads")], "short", minv=0,
    desc="Failed loads of new data per second, and reads answered from old data while loading failed.")
 ts("Reader refresh time", [(q(0.5, "isledb_reader_refresh_latency_seconds_bucket", "role"), "{{role}} p50"),
                            (q(0.99, "isledb_reader_refresh_latency_seconds_bucket", "role"), "{{role}} p99")], "s",
    desc="How long loading new data takes; slow loads are the usual reason the data served is old.")
+newline()
 ts("Reader errors", [(f'sum(rate(isledb_reader_get_errors_total{{{R}}}[1m]))', "get errors"),
                      (f'sum(rate(isledb_reader_scan_errors_total{{{R}}}[1m]))', "scan errors"),
                      (f'sum(rate(isledb_reader_sst_range_read_errors_total{{{R}}}[1m]))', "storage read errors"),
                      (f'sum(rate(isledb_reader_bloom_filter_errors_total{{{R}}}[1m]))', "filter errors"),
                      (f'sum(rate(isledb_reader_bloom_filter_skips_total{{{R}}}[1m]))', "filter skips")], "short", minv=0,
    desc="Per second, all readers. Filter skips: key reads that checked a file without its filter, because it failed to load.")
-newline()
 ts("Reader storage reads", [(f'sum(rate(isledb_reader_sst_range_read_total{{{R}}}[1m]))', "reads"),
                             (f'sum(rate(isledb_reader_sst_range_read_bytes_total{{{R}}}[1m]))', "bytes")], "short", minv=0,
    right={"bytes": "Bps"},
@@ -171,6 +186,7 @@ ts("Reader storage reads", [(f'sum(rate(isledb_reader_sst_range_read_total{{{R}}
 ts("Storage bytes per client read",
    [(f'sum(rate(isledb_reader_sst_range_read_bytes_total{{{R}}}[2m])) / sum(rate(stress_reads_total{{{R}}}[2m]))', "per read")], "bytes", minv=0,
    desc="Bytes the readers fetched from storage for each get or scan the harness made. Grows as reads check more files.")
+newline()
 ts("Reader storage read time", [(q(0.5, "isledb_reader_sst_range_read_latency_seconds_bucket"), "p50"),
                                 (q(0.99, "isledb_reader_sst_range_read_latency_seconds_bucket"), "p99")], "s")
 newline()
