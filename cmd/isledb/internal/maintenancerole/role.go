@@ -74,6 +74,7 @@ func (c *Config) Start(ctx context.Context, common service.Common, log *slog.Log
 	if err != nil {
 		return nil, err
 	}
+	m.maintenance.Store(maintenance)
 	log.Info("maintenance open", "prefix", c.Prefix, "change_feed_retain_for", time.Duration(c.ChangeFeed.RetainFor))
 
 	// Run returns only when maintenance closes, or when another process

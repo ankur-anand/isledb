@@ -38,11 +38,19 @@ func newWriterMetrics() (*isledb.WriterMetrics, []prometheus.Collector) {
 		L0MergePublished:    counter("l0_merges_published_total", "Merged L0 files that replaced their inputs in L0."),
 		L0MergeRefused:      counter("l0_merges_refused_total", "Merges refused because their inputs were no longer a run in L0."),
 		L0MergeDropped:      counter("l0_merges_dropped_total", "Held runs and unpublished merges given up because maintenance took their files."),
+		MaintenancePublishDelay: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "isledb_writer_maintenance_publish_delay_seconds", Help: "Time from when maintenance staged a command to when the writer published it, applied or rejected.",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600},
+		}),
+		MaintenanceApplyLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "isledb_writer_maintenance_apply_seconds", Help: "Time an attempt to publish a maintenance command took, by outcome: applied, rejected or failed.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 12),
+		}, []string{"outcome"}),
 	}
 	return m, []prometheus.Collector{m.FlushTotal, m.FlushErrors, m.FlushLatency, m.FlushBytes, m.PutTotal,
 		m.BackPressureTotal, m.DeleteTotal, m.CommittedSequence, m.OldestUncommitted,
 		m.L0MergeTotal, m.L0MergeErrors, m.L0MergeBytes, m.L0MergeSkippedBytes, m.L0MergeHeldBytes,
-		m.L0MergePublished, m.L0MergeRefused, m.L0MergeDropped}
+		m.L0MergePublished, m.L0MergeRefused, m.L0MergeDropped, m.MaintenancePublishDelay, m.MaintenanceApplyLatency}
 }
 
 // collector reports the writer's state as it is at each scrape.

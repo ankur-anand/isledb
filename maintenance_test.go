@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -827,6 +829,9 @@ func TestMaintenanceWaitingSinceTracksTheUnansweredCommand(t *testing.T) {
 	if staged.State != MaintenanceWaitingForWriter || staged.WaitingSince.IsZero() {
 		t.Fatalf("after staging: state=%v since=%v, want waiting with a time", staged.State, staged.WaitingSince)
 	}
+	if got := maintenance.WaitingSince(); !got.Equal(staged.WaitingSince) {
+		t.Fatalf("WaitingSince()=%v after staging, want %v", got, staged.WaitingSince)
+	}
 
 	// The writer hasn't answered: the next cycle waits on the same command.
 	unanswered, err := maintenance.RunOnce(ctx)
@@ -841,9 +846,16 @@ func TestMaintenanceWaitingSinceTracksTheUnansweredCommand(t *testing.T) {
 	if _, err := db.manifestStore.ApplyPendingMaintenance(ctx); err != nil {
 		t.Fatalf("ApplyPendingMaintenance: %v", err)
 	}
+	// Maintenance sees the answer only when its next cycle starts.
+	if got := maintenance.WaitingSince(); !got.Equal(staged.WaitingSince) {
+		t.Fatalf("WaitingSince()=%v before the next cycle, want %v", got, staged.WaitingSince)
+	}
 	answered, err := maintenance.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("RunOnce(answered): %v", err)
+	}
+	if got := maintenance.WaitingSince(); !got.Equal(answered.WaitingSince) {
+		t.Fatalf("WaitingSince()=%v after the cycle, want %v", got, answered.WaitingSince)
 	}
 	switch answered.State {
 	case MaintenanceIdle:
@@ -854,6 +866,120 @@ func TestMaintenanceWaitingSinceTracksTheUnansweredCommand(t *testing.T) {
 		if !answered.WaitingSince.After(staged.WaitingSince) {
 			t.Fatalf("next command since=%v, want after %v", answered.WaitingSince, staged.WaitingSince)
 		}
+	}
+}
+
+// A compaction can take many minutes, but its progress keeps moving while it
+// runs: each input it copies and each output it saves counts.
+func TestMaintenanceProgressMovesWithinACompaction(t *testing.T) {
+	ctx := context.Background()
+	var (
+		maintenance atomic.Pointer[Maintenance]
+		watching    atomic.Bool
+		mu          sync.Mutex
+		seen        []time.Time // progress as each output was saved
+	)
+	bucketURL := setupFakeS3BucketURLWithHandler(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if m := maintenance.Load(); m != nil && watching.Load() &&
+				r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/sstable/") {
+				mu.Lock()
+				seen = append(seen, m.LastProgress())
+				mu.Unlock()
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	store, err := blobstore.Open(ctx, bucketURL, "maintenance-progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-progress"); err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultMaintenanceOptions()
+	opts.SSTCompaction.L0TriggerSSTs = 4
+	opts.SSTCompaction.TargetSSTBytes = 256 << 10
+	m, err := db.OpenMaintenance(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(ctx)
+	maintenance.Store(m)
+
+	var seq uint64
+	for range 4 {
+		addRandomL0SST(t, ctx, db, &seq, 1<<20, 1024)
+	}
+	opened := m.LastProgress()
+	if opened.IsZero() {
+		t.Fatal("LastProgress() is zero once open, want when it opened")
+	}
+	start := time.Now()
+	watching.Store(true)
+	stats, err := m.RunOnce(ctx)
+	watching.Store(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SSTCompaction.Jobs != 1 || stats.SSTCompaction.RewrittenBytes == 0 {
+		t.Fatalf("compaction stats=%+v, want one rewrite", stats.SSTCompaction)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 4 {
+		t.Fatalf("%d outputs saved, want several", len(seen))
+	}
+	// Before its first output, the job had copied its inputs; each output
+	// saved after it moves the time on again.
+	if !seen[0].After(opened) || seen[0].Before(start) {
+		t.Fatalf("progress %v when the first output was saved, want after the round began at %v", seen[0], start)
+	}
+	if !seen[len(seen)-1].After(seen[0]) {
+		t.Fatalf("progress stood at %v through %d outputs", seen[0], len(seen))
+	}
+	if got := m.LastProgress(); got.Before(seen[len(seen)-1]) {
+		t.Fatalf("LastProgress()=%v after the round, want at least %v", got, seen[len(seen)-1])
+	}
+}
+
+// A move with checksums on reads its files to verify them and writes none;
+// each file verified is progress too.
+func TestMaintenanceProgressMovesWhileVerifyingAMove(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("maintenance-progress-verify")
+	defer store.Close()
+	db, err := openDB(ctx, store, dbOpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.manifestStore.ClaimWriter(ctx, "writer-progress-verify"); err != nil {
+		t.Fatal(err)
+	}
+	var seq uint64
+	addRandomL0SST(t, ctx, db, &seq, 64<<10, 256)
+	m, err := db.OpenMaintenance(ctx, DefaultMaintenanceOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(ctx)
+	state, err := db.manifestStore.Replay(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.compactor.progress.Store(0)
+	if _, err := m.compactor.verifyMoveSources(ctx, state.L0SSTs); err != nil {
+		t.Fatalf("verifyMoveSources: %v", err)
+	}
+	if m.LastProgress().IsZero() {
+		t.Fatal("no progress after verifying a move's files")
 	}
 }
 

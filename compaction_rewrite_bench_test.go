@@ -203,7 +203,7 @@ func reportRewritePhases(b *testing.B, requests []storageRequest, elapsed time.D
 
 // addRandomL0SST uploads an L0 SST of random keys spanning the whole key
 // range, as random writes produce, and adds it to the manifest.
-func addRandomL0SST(b *testing.B, ctx context.Context, db *DB, seq *uint64, size, valueBytes int) {
+func addRandomL0SST(b testing.TB, ctx context.Context, db *DB, seq *uint64, size, valueBytes int) {
 	count := size / (valueBytes + 32)
 	keys := make([][]byte, count)
 	for i := range keys {

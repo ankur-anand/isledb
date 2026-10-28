@@ -14,6 +14,7 @@ import (
 
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -1884,6 +1885,164 @@ func TestWriterRejectsInvalidMaintenanceWithoutBecomingTerminal(t *testing.T) {
 	if _, err := w.put(ctx, []byte("still-writable"), []byte("value")); err != nil {
 		t.Fatalf("put after rejected maintenance: %v", err)
 	}
+}
+
+func TestWriterTimesMaintenancePublication(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-timing")
+	defer store.Close()
+
+	manifestStore := newManifestStore(store, nil)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	opts.Metrics = DefaultWriterMetrics(nil)
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+	metrics := opts.Metrics
+
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	publish := func(command manifest.MaintenanceCommand) *manifest.MaintenanceHead {
+		t.Helper()
+		head, err := manifestStore.StageMaintenance(ctx, command, token)
+		if err != nil {
+			t.Fatalf("StageMaintenance: %v", err)
+		}
+		w.pollMaintenance(ctx) // what the background poller does, at once
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		return head
+	}
+	check := func(when string, delays, applied, rejected uint64) {
+		t.Helper()
+		if got := histogramSamples(t, metrics.MaintenancePublishDelay); got != delays {
+			t.Errorf("%s: %d publish delays, want %d", when, got, delays)
+		}
+		if got := histogramSamples(t, metrics.MaintenanceApplyLatency, "applied"); got != applied {
+			t.Errorf("%s: %d applied attempts, want %d", when, got, applied)
+		}
+		if got := histogramSamples(t, metrics.MaintenanceApplyLatency, "rejected"); got != rejected {
+			t.Errorf("%s: %d rejected attempts, want %d", when, got, rejected)
+		}
+	}
+
+	head := publish(manifest.MaintenanceCommand{
+		ID:              "change-feed-floor-1",
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	})
+	check("applied", 1, 1, 0)
+
+	// Until maintenance clears it, the poller fetches the command again;
+	// publishing it again changes nothing, and is not timed.
+	w.pollMaintenance(ctx)
+	if err := w.flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	check("fetched again", 1, 1, 0)
+
+	if _, err := manifestStore.ClearMaintenance(ctx, head.Pending.ID, head.Pending.Epoch, head.Pending.Generation, token); err != nil {
+		t.Fatalf("ClearMaintenance: %v", err)
+	}
+	publish(manifest.MaintenanceCommand{
+		ID:   "invalid-compaction",
+		Kind: manifest.MaintenanceCommandCompaction,
+		Compaction: &manifest.CompactionCommand{Payload: manifest.CompactionLogPayload{
+			SourceLevel:      0,
+			DestinationLevel: 1,
+		}},
+	})
+	check("rejected", 2, 1, 1)
+}
+
+// A publish whose answer was lost is retried and found done: it counts once,
+// as published, after the failed attempt.
+func TestWriterTimesMaintenancePublishedThroughALostResponse(t *testing.T) {
+	ctx := context.Background()
+	store := blobstore.NewMemory("writer-maintenance-lost-response")
+	defer store.Close()
+
+	storage := &applyThenFailOnceStorage{
+		Storage: manifest.NewBlobStoreBackend(store),
+		failErr: errors.New("lost CURRENT response"),
+	}
+	manifestStore := manifest.NewStoreWithStorage(storage)
+	opts := DefaultWriterOptions()
+	opts.Flush.Interval = 0
+	opts.Metrics = DefaultWriterMetrics(nil)
+	w, err := newWriter(ctx, store, manifestStore, opts)
+	if err != nil {
+		t.Fatalf("newWriter: %v", err)
+	}
+	defer w.close(ctx)
+	metrics := opts.Metrics
+
+	token, err := manifestStore.ClaimMaintenance(ctx, "maintenance-1")
+	if err != nil {
+		t.Fatalf("ClaimMaintenance: %v", err)
+	}
+	if _, err := manifestStore.StageMaintenance(ctx, manifest.MaintenanceCommand{
+		ID:              "change-feed-floor-1",
+		Kind:            manifest.MaintenanceCommandChangeFeedFloor,
+		ChangeFeedFloor: &manifest.AdvanceFloorCommand{Floor: 1},
+	}, token); err != nil {
+		t.Fatalf("StageMaintenance: %v", err)
+	}
+	// The next CURRENT write, the publish, lands but its answer is lost.
+	storage.failOnWrite = storage.writeCount.Load() + 1
+	for range 3 { // the lost answer, the retry that finds it done, a fetch of it again
+		w.pollMaintenance(ctx)
+		if err := w.flush(ctx); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	}
+	current, err := manifestStore.ReadCurrentData(ctx)
+	if err != nil {
+		t.Fatalf("ReadCurrentData: %v", err)
+	}
+	if current.MaintenanceReceipt == nil || current.MaintenanceReceipt.Status != manifest.MaintenanceStatusApplied {
+		t.Fatalf("maintenance_receipt=%+v, want applied", current.MaintenanceReceipt)
+	}
+	for _, c := range []struct {
+		name string
+		got  uint64
+	}{
+		{"failed attempts", histogramSamples(t, metrics.MaintenanceApplyLatency, "failed")},
+		{"applied attempts", histogramSamples(t, metrics.MaintenanceApplyLatency, "applied")},
+		{"publish delays", histogramSamples(t, metrics.MaintenancePublishDelay)},
+	} {
+		if c.got != 1 {
+			t.Errorf("%d %s, want 1", c.got, c.name)
+		}
+	}
+}
+
+// histogramSamples is how many observations c, a histogram or histogram
+// vector, holds; with a label value, only of the series that has it.
+func histogramSamples(t *testing.T, c prometheus.Collector, label ...string) uint64 {
+	t.Helper()
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(c)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var n uint64
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			if len(label) > 0 && (len(metric.GetLabel()) == 0 || metric.GetLabel()[0].GetValue() != label[0]) {
+				continue
+			}
+			n += metric.GetHistogram().GetSampleCount()
+		}
+	}
+	return n
 }
 
 func TestWriterBackgroundFlushPollsMaintenanceWhenIdle(t *testing.T) {
