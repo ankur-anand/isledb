@@ -191,8 +191,14 @@ ts("Compaction jobs per minute", [(f'increase(isledb_maintenance_compaction_jobs
                                    (f'increase(isledb_maintenance_compaction_oversized_jobs_total{{{R}}}[1m])', "oversized"),
                                    (f'increase(isledb_maintenance_commands_rejected_total{{{R}}}[1m])', "refused by the writer")], "short")
 ts("Finished work waiting for the writer",
-   [(f'(time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds{{{R}}}) * (isledb_maintenance_waiting_for_writer_since_timestamp_seconds{{{R}}} > bool 0)', "waiting")], "s",
-   desc="How long the oldest finished compaction has waited for the writer to publish it; 0 when nothing waits.")
+   [(q(0.5, "isledb_writer_maintenance_publish_delay_seconds_bucket"), "published, p50"),
+    (q(0.99, "isledb_writer_maintenance_publish_delay_seconds_bucket"), "published, p99"),
+    (q(0.99, "isledb_writer_maintenance_apply_seconds_bucket", "outcome"), "publishing {{outcome}}, p99"),
+    (f'(time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds{{{R}}}) * (isledb_maintenance_waiting_for_writer_since_timestamp_seconds{{{R}}} > bool 0)', "unanswered now")], "s",
+   desc="Published: from when maintenance handed over finished work to when the writer published it, as the writer measured it. "
+        "Publishing: the writer's own time to publish it. Unanswered now: how long the work maintenance is waiting on has waited, "
+        "as maintenance last saw it; it clears when maintenance's next round starts, so it rising past a few minutes means no writer is answering. "
+        "Empty for versions that don't export them.")
 newline()
 ts("L0 files and depth", [(f'isledb_maintenance_l0_files{{{R}}}', "files"), (f'isledb_maintenance_l0_depth{{{R}}}', "depth")], "short",
    desc="New files not yet merged into L1, and the most of them one key is in. Growing without stopping: compaction can't keep up. "

@@ -92,6 +92,9 @@ type writer struct {
 	// stagedMaintenance is a maintenance command the poller has read from
 	// maintenance/HEAD and the next pass applies; nil when there is none.
 	stagedMaintenance atomic.Pointer[manifest.MaintenanceCommand]
+	// maintenanceFailedID is the command whose last attempt to publish it
+	// failed, nil when the last attempt didn't.
+	maintenanceFailedID atomic.Pointer[string]
 	// applyWake asks the committer to apply a newly fetched command.
 	applyWake  chan struct{}
 	pollerDone chan struct{}
@@ -1139,7 +1142,9 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 	}
 	applyCtx, cancel := context.WithTimeout(ctx, maintenanceApplyTimeout)
 	defer cancel()
+	start := time.Now()
 	result, err := w.manifestLog.ApplyMaintenanceCommand(applyCtx, *command)
+	w.observeMaintenanceApply(ctx, command, time.Since(start), result, err)
 	switch {
 	case err == nil:
 		if result.Reason != "" {
@@ -1159,6 +1164,33 @@ func (w *writer) applyStagedMaintenance(ctx context.Context) error {
 		w.reportFailure(&w.maintenanceFailures, fmt.Errorf("apply maintenance command: %w", err))
 		return nil
 	}
+}
+
+// observeMaintenanceApply records an attempt to publish command that took d.
+// An attempt that finds the command published already counts only when this
+// writer's attempt before it failed: that one published it, but its answer was
+// lost. Otherwise the poller fetched a command published already, which
+// maintenance has yet to clear, or another writer published it.
+func (w *writer) observeMaintenanceApply(ctx context.Context, command *manifest.MaintenanceCommand,
+	d time.Duration, result manifest.MaintenanceApplyResult, err error) {
+	switch {
+	case err != nil && (isFenceError(err) || ctx.Err() != nil):
+		return
+	case err != nil:
+		w.maintenanceFailedID.Store(&command.ID)
+		w.metrics.ObserveMaintenanceApply(command.CreatedAt, d, "failed")
+		return
+	}
+	failed := w.maintenanceFailedID.Swap(nil)
+	retried := failed != nil && *failed == command.ID
+	if result.Status == "" || (!result.Changed && !retried) {
+		return
+	}
+	outcome := "applied"
+	if result.Status == manifest.MaintenanceStatusRejected {
+		outcome = "rejected"
+	}
+	w.metrics.ObserveMaintenanceApply(command.CreatedAt, d, outcome)
 }
 
 // maintenanceCommandSSTIDs is the SSTs a command removes from the manifest.

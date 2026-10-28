@@ -2,6 +2,7 @@ package maintenancerole
 
 import (
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ankur-anand/isledb"
@@ -10,8 +11,8 @@ import (
 
 type metrics struct {
 	cycles, cycleErrors                   prometheus.Counter
-	running, lastCycle, waitingForWriter  prometheus.Gauge
-	waitingSince                          prometheus.Gauge
+	running, lastCycle                    prometheus.Gauge
+	waitingSince, lastProgress            prometheus.GaugeFunc
 	jobs, l0Merges, movedJobs, checkpoint prometheus.Counter
 	readBytes, rewrittenBytes, movedBytes prometheus.Counter
 	oversizedJobs, rejectedCommands       prometheus.Counter
@@ -24,6 +25,9 @@ type metrics struct {
 	levelFiles, levelBytes, levelTarget *prometheus.GaugeVec
 	levelsSeen                          map[uint32]bool
 	jobSeconds                          *prometheus.HistogramVec
+
+	// maintenance answers waitingSince at each scrape, once it is open.
+	maintenance atomic.Pointer[isledb.Maintenance]
 }
 
 func newMetrics() *metrics {
@@ -42,7 +46,7 @@ func newMetrics() *metrics {
 	byLevel := func(name, help string) *prometheus.GaugeVec {
 		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "isledb_maintenance_" + name, Help: help}, []string{"level"})
 	}
-	return &metrics{
+	m := &metrics{
 		l0Files:     gauge("l0_files", "Files in L0, the newly saved data not yet merged into L1."),
 		l0Bytes:     gauge("l0_bytes", "Bytes in L0."),
 		l0Depth:     gauge("l0_depth", "The most L0 files covering one key: the L0 files a read of it may check. compaction.l0_max_depth bounds it."),
@@ -59,8 +63,6 @@ func newMetrics() *metrics {
 		cycleErrors:      counter("cycle_errors_total", "Maintenance cycles that failed; they are retried."),
 		running:          gauge("running", "1 while maintenance works on the database, 0 after another process took it over."),
 		lastCycle:        gauge("last_cycle_timestamp_seconds", "Unix time the last cycle completed."),
-		waitingForWriter: gauge("waiting_for_writer", "1 while a command waits for the writer to apply it."),
-		waitingSince:     gauge("waiting_for_writer_since_timestamp_seconds", "Unix time the command the writer has yet to answer was staged; 0 when none waits."),
 		jobs:             counter("compaction_jobs_total", "Compaction jobs, metadata-only moves and L0 merges included, counted when run; rejected ones included."),
 		l0Merges:         counter("compaction_l0_merges_total", "Compaction jobs that merged L0 files with each other."),
 		movedJobs:        counter("compaction_moves_total", "Compaction jobs that moved files to another level without rewriting them."),
@@ -76,10 +78,30 @@ func newMetrics() *metrics {
 		levelJobs:        countByLevel("compaction_jobs_by_level_total", "Compaction jobs, by the level they read from: 0 for L0."),
 		blocked:          countByLevel("compaction_blocked_total", "Times no job could be planned for a level due for compaction, by level; the next cycle tries again. Levels waiting their turn are not counted."),
 	}
+	// unix reads a time from maintenance at each scrape: 0 while it isn't
+	// open, or when the time is zero.
+	unix := func(name, help string, read func(*isledb.Maintenance) time.Time) prometheus.GaugeFunc {
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "isledb_maintenance_" + name, Help: help}, func() float64 {
+			maintenance := m.maintenance.Load()
+			if maintenance == nil {
+				return 0
+			}
+			t := read(maintenance)
+			if t.IsZero() {
+				return 0
+			}
+			return float64(t.UnixNano()) / 1e9
+		})
+	}
+	m.waitingSince = unix("waiting_for_writer_since_timestamp_seconds",
+		"Unix time the command the writer has yet to answer was staged; 0 when none waits.", (*isledb.Maintenance).WaitingSince)
+	m.lastProgress = unix("last_progress_timestamp_seconds",
+		"Unix time maintenance opened or last finished a round, or copied or saved a file within a compaction.", (*isledb.Maintenance).LastProgress)
+	return m
 }
 
 func (m *metrics) collectors() []prometheus.Collector {
-	return []prometheus.Collector{m.cycles, m.cycleErrors, m.running, m.lastCycle, m.waitingForWriter, m.waitingSince, m.jobs, m.l0Merges,
+	return []prometheus.Collector{m.cycles, m.cycleErrors, m.running, m.lastCycle, m.waitingSince, m.lastProgress, m.jobs, m.l0Merges,
 		m.movedJobs, m.readBytes, m.rewrittenBytes, m.movedBytes, m.checkpoint, m.oversizedJobs, m.rejectedCommands,
 		m.rejectedBytes, m.deleted, m.deleteFailures, m.levelJobs, m.blocked,
 		m.l0Files, m.l0Bytes, m.l0Depth, m.critical, m.shapeTime, m.levelFiles, m.levelBytes, m.levelTarget, m.jobSeconds}
@@ -88,16 +110,6 @@ func (m *metrics) collectors() []prometheus.Collector {
 func (m *metrics) cycle(s isledb.MaintenanceStats) {
 	m.cycles.Inc()
 	m.lastCycle.Set(float64(time.Now().UnixNano()) / 1e9)
-	waiting := 0.0
-	if s.State == isledb.MaintenanceWaitingForWriter {
-		waiting = 1
-	}
-	m.waitingForWriter.Set(waiting)
-	since := 0.0
-	if !s.WaitingSince.IsZero() {
-		since = float64(s.WaitingSince.UnixNano()) / 1e9
-	}
-	m.waitingSince.Set(since)
 	c := s.SSTCompaction
 	m.jobs.Add(float64(c.Jobs))
 	m.l0Merges.Add(float64(c.L0Merges))

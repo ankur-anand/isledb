@@ -79,8 +79,20 @@ type compactor struct {
 	scratch    *compactionScratchWorkspace
 	// oversizedLog rate-limits the warning for oversized jobs.
 	oversizedLog readerDiagnosticLimiter
+	// progress is the Unix nanoseconds a job last staged or verified an input
+	// or saved an output, 0 before any did.
+	progress atomic.Int64
 
 	closed atomic.Bool
+}
+
+// madeProgress records that a job staged or verified an input or saved an
+// output.
+func (c *compactor) madeProgress() {
+	if c == nil {
+		return
+	}
+	c.progress.Store(time.Now().UnixNano())
 }
 
 func newCompactor(ctx context.Context, store *blobstore.Store, manifestLog *manifest.Store, opts compactorOptions) (*compactor, error) {
@@ -1255,6 +1267,7 @@ func (c *compactor) verifyOneSST(ctx context.Context, sst sstMetadata) error {
 	if err := verifyCompactionSST(ctx, c.store, sst); err != nil {
 		return fmt.Errorf("verify move source %s: %w", sst.ID, err)
 	}
+	c.madeProgress()
 	return nil
 }
 
@@ -1345,6 +1358,7 @@ func (c *compactor) openOneSST(ctx context.Context, sst sstMetadata) openSSTResu
 	if err != nil {
 		return openSSTResult{err: err}
 	}
+	c.madeProgress()
 
 	reader, err := sstable.NewReader(ctx, readable, sstable.ReaderOptions{})
 	if err != nil {
@@ -1396,8 +1410,11 @@ func (c *compactor) writeCompactedSSTs(
 	upload := blobstore.UploadInOneRequest(c.opts.Output.TargetSSTBytes*5/4 + maxCompactionOutputOvershoot)
 	uploadFn := func(ctx context.Context, sstID string, r io.Reader) error {
 		sstPath := c.store.SSTPath(sstID)
-		_, err := c.store.WriteReader(ctx, sstPath, r, upload)
-		return err
+		if _, err := c.store.WriteReader(ctx, sstPath, r, upload); err != nil {
+			return err
+		}
+		c.madeProgress()
+		return nil
 	}
 
 	// The writer rejects a compaction with more outputs than one manifest

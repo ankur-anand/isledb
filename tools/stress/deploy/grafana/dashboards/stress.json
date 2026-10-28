@@ -2392,16 +2392,43 @@
     "x": 16,
     "y": 73
    },
-   "description": "How long the oldest finished compaction has waited for the writer to publish it; 0 when nothing waits.",
+   "description": "Published: from when maintenance handed over finished work to when the writer published it, as the writer measured it. Publishing: the writer's own time to publish it. Unanswered now: how long the work maintenance is waiting on has waited, as maintenance last saw it; it clears when maintenance's next round starts, so it rising past a few minutes means no writer is answering. Empty for versions that don't export them.",
    "targets": [
     {
      "datasource": {
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "(time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds{run=\"$run\"}) * (isledb_maintenance_waiting_for_writer_since_timestamp_seconds{run=\"$run\"} > bool 0)",
-     "legendFormat": "waiting",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(isledb_writer_maintenance_publish_delay_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "published, p50",
      "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(isledb_writer_maintenance_publish_delay_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "published, p99",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, outcome) (rate(isledb_writer_maintenance_apply_seconds_bucket{run=\"$run\"}[2m])))",
+     "legendFormat": "publishing {{outcome}}, p99",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "(time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds{run=\"$run\"}) * (isledb_maintenance_waiting_for_writer_since_timestamp_seconds{run=\"$run\"} > bool 0)",
+     "legendFormat": "unanswered now",
+     "refId": "D"
     }
    ],
    "fieldConfig": {

@@ -51,12 +51,24 @@ groups:
 
   - name: maintenance
     rules:
+      # A large compaction keeps one round going for many minutes, but copies
+      # or saves a file every few seconds. Versions without the progress
+      # metric fall back to rounds, with room for a long compaction.
       - alert: MaintenanceStuck
-        expr: time() - isledb_maintenance_last_cycle_timestamp_seconds > 300
+        expr: |
+          time() - isledb_maintenance_last_progress_timestamp_seconds > 300
+          or (time() - isledb_maintenance_last_cycle_timestamp_seconds > 1800
+              unless isledb_maintenance_last_progress_timestamp_seconds)
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.run }}: maintenance has made no progress for over 5 minutes."
+      - alert: MaintenanceFailing
+        expr: increase(isledb_maintenance_cycle_errors_total[15m]) > 0 and increase(isledb_maintenance_cycles_total[15m]) == 0
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.run }}: maintenance has finished no round of work for 5 minutes."
+          summary: "{{ $labels.run }}: every maintenance round for 15 minutes has failed; its log says why."
       - alert: MaintenanceWorkNotPublished
         expr: (time() - isledb_maintenance_waiting_for_writer_since_timestamp_seconds) > 300 and isledb_maintenance_waiting_for_writer_since_timestamp_seconds > 0
         for: 5m

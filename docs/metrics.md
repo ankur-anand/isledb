@@ -35,6 +35,8 @@ same two metrics:
 | `isledb_writer_l0_merge_skipped_bytes_total` | Saves not held for combining because the memory for it was full. |
 | `isledb_writer_l0_merges_published_total`, `isledb_writer_l0_merges_refused_total` | Combined files that replaced the saves they came from, and those refused because maintenance had already changed those saves. |
 | `isledb_writer_l0_merges_dropped_total` | Combining work given up because maintenance took the files first. |
+| `isledb_writer_maintenance_publish_delay_seconds` | How long finished maintenance work waited before the writer published it, from when maintenance handed it over. Usually about a second. |
+| `isledb_writer_maintenance_apply_seconds{outcome}` | How long the writer took to publish one piece of maintenance work, by outcome: `applied`, `rejected` (refused; maintenance redoes it) or `failed` (tried again). |
 
 **Alert on:**
 
@@ -95,9 +97,9 @@ same two metrics:
 |---|---|
 | `isledb_maintenance_running` | `1` while maintenance works on the database; `0` after another maintenance process took it over. |
 | `isledb_maintenance_cycles_total`, `isledb_maintenance_cycle_errors_total` | Rounds of work, and rounds that failed and are retried. |
-| `isledb_maintenance_last_cycle_timestamp_seconds` | When the last round completed. |
-| `isledb_maintenance_waiting_for_writer` | `1` while finished work waits for the writer to publish it. On a busy database this is `1` nearly all the time, because each round hands the writer new work; don't alert on it. |
-| `isledb_maintenance_waiting_for_writer_since_timestamp_seconds` | When the work the writer has yet to publish was handed to it; `0` when nothing waits. It moves forward each time the writer publishes. |
+| `isledb_maintenance_last_cycle_timestamp_seconds` | When the last round completed. A round lasts as long as its compaction, which can be many minutes for a large one. |
+| `isledb_maintenance_last_progress_timestamp_seconds` | When maintenance last made progress: it opened, finished a round, or, within a compaction, copied an input file or saved an output file. A compaction does one of those every few seconds, however large it is. |
+| `isledb_maintenance_waiting_for_writer_since_timestamp_seconds` | When the work the writer has yet to publish was handed to it; `0` when nothing waits. Maintenance sees the writer has published when its next round starts, and updates this then. |
 | `isledb_maintenance_compaction_jobs_total` | Compactions, counted when they run, including any the writer then refuses. |
 | `isledb_maintenance_compaction_l0_merges_total`, `isledb_maintenance_compaction_moves_total` | Of those, merges of newly saved files with each other, and moves of files to another level without rewriting them. |
 | `isledb_maintenance_compaction_read_bytes_total`, `isledb_maintenance_compaction_rewritten_bytes_total` | Bytes compaction read from and wrote to storage: most of maintenance's storage cost. |
@@ -119,12 +121,16 @@ same two metrics:
 
 **Alert on:**
 
-- **Stuck:** `time() - isledb_maintenance_last_cycle_timestamp_seconds` above
-  a few minutes, or `cycle_errors_total` rising. Usually a storage permission
-  problem, or no space in `scratch_dir`; the log says which.
+- **Stuck:** `time() - isledb_maintenance_last_progress_timestamp_seconds`
+  above a few minutes. Don't use `last_cycle_timestamp_seconds` for this: a
+  large compaction keeps one round going for many minutes while it works.
+- **Failing:** `cycle_errors_total` rising while `cycles_total` isn't, so
+  every round fails. Usually a storage permission problem, or no space in
+  `scratch_dir`; the log says which.
 - **No writer:** `time() - waiting_for_writer_since_timestamp_seconds` above a
   few minutes, while it isn't `0`. The work is ready, but no writer is
-  publishing it, so files pile up.
+  publishing it, so files pile up. While the writer runs,
+  `isledb_writer_maintenance_publish_delay_seconds` shows how long it takes.
 - **Refused work:** `commands_rejected_total` rising steadily. An occasional
   refusal is normal: the writer refuses work on files that changed meanwhile,
   and maintenance redoes it. A steady rise means work is thrown away; the

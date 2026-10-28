@@ -48,6 +48,16 @@ type WriterMetrics struct {
 	L0MergePublished prometheus.Counter
 	L0MergeRefused   prometheus.Counter
 	L0MergeDropped   prometheus.Counter
+
+	// MaintenancePublishDelay is the seconds from when maintenance staged a
+	// command to when the writer published it to the manifest, applied or
+	// rejected. The command is stamped by maintenance's clock and published
+	// by the writer's.
+	MaintenancePublishDelay prometheus.Histogram
+	// MaintenanceApplyLatency is the seconds each attempt to publish a
+	// command took, by outcome: applied, rejected or failed. A failed
+	// attempt is tried again.
+	MaintenanceApplyLatency *prometheus.HistogramVec
 }
 
 func (m *WriterMetrics) incCounter(counter prometheus.Counter) {
@@ -167,6 +177,22 @@ func (m *WriterMetrics) ObserveL0MergeDropped(count int) {
 		return
 	}
 	m.addCounter(m.L0MergeDropped, float64(count))
+}
+
+// ObserveMaintenanceApply records one attempt to publish a maintenance
+// command staged at staged, which took d, by outcome: applied, rejected or
+// failed. Only an attempt that published the command records how long it
+// waited since it was staged.
+func (m *WriterMetrics) ObserveMaintenanceApply(staged time.Time, d time.Duration, outcome string) {
+	if m == nil {
+		return
+	}
+	if m.MaintenanceApplyLatency != nil {
+		m.MaintenanceApplyLatency.WithLabelValues(outcome).Observe(d.Seconds())
+	}
+	if outcome != "failed" && !staged.IsZero() {
+		m.observeHistogram(m.MaintenancePublishDelay, max(time.Since(staged), 0).Seconds())
+	}
 }
 
 // ObserveL0MergeHeld records how many bytes the writer holds for merging.
@@ -316,8 +342,28 @@ func DefaultWriterMetrics(constLabels prometheus.Labels) *WriterMetrics {
 			Help:        "Held runs and unpublished merges given up because a maintenance command took their files.",
 			ConstLabels: constLabels,
 		}),
+		MaintenancePublishDelay: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "maintenance_publish_delay_seconds",
+			Help:        "Time from when maintenance staged a command to when the writer published it.",
+			Buckets:     maintenancePublishBuckets,
+			ConstLabels: constLabels,
+		}),
+		MaintenanceApplyLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace:   "isledb",
+			Subsystem:   "writer",
+			Name:        "maintenance_apply_seconds",
+			Help:        "Time an attempt to publish a maintenance command took, by outcome.",
+			Buckets:     prometheus.ExponentialBuckets(0.01, 2, 12),
+			ConstLabels: constLabels,
+		}, []string{"outcome"}),
 	}
 }
+
+// maintenancePublishBuckets reach from a fraction of the writer's one second
+// poll to ten minutes, past which the writer is not answering.
+var maintenancePublishBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600}
 
 type ReaderMetrics struct {
 	RefreshTotal   prometheus.Counter

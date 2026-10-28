@@ -528,6 +528,8 @@ type Maintenance struct {
 	currentStats  *MaintenanceStats
 	commandStaged bool
 	writerWake    chan<- struct{}
+	// waitingSince is WaitingSince in Unix nanoseconds, 0 when none waits.
+	waitingSince atomic.Int64
 
 	running atomic.Bool
 	closed  atomic.Bool
@@ -627,6 +629,8 @@ func newMaintenance(
 		m.changeFeed.stageCommand = m.stageCommand
 	}
 
+	// Opening counts, so a first round that never ends shows as stuck.
+	m.compactor.madeProgress()
 	return m, nil
 }
 
@@ -1323,10 +1327,7 @@ func (m *Maintenance) stageCommand(ctx context.Context, command manifest.Mainten
 	m.notifyWriter()
 	m.statsMu.Lock()
 	m.commandStaged = true
-	if m.currentStats != nil {
-		m.currentStats.State = MaintenanceWaitingForWriter
-		m.currentStats.WaitingSince = head.Pending.CreatedAt
-	}
+	m.setWaitingSince(head.Pending.CreatedAt)
 	m.statsMu.Unlock()
 	return nil
 }
@@ -1364,10 +1365,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		return false, err
 	}
 	m.statsMu.Lock()
-	if m.currentStats != nil {
-		m.currentStats.State = MaintenanceWaitingForWriter
-		m.currentStats.WaitingSince = head.Pending.CreatedAt
-	}
+	m.setWaitingSince(head.Pending.CreatedAt)
 	m.statsMu.Unlock()
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
 		return true, nil
@@ -1432,15 +1430,58 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		return false, err
 	}
 	m.statsMu.Lock()
-	if m.currentStats != nil {
-		m.currentStats.State = MaintenanceIdle
-		m.currentStats.WaitingSince = time.Time{}
-	}
+	m.setWaitingSince(time.Time{})
 	m.statsMu.Unlock()
 	return false, nil
 }
 
+// setWaitingSince records when the command the writer has yet to answer was
+// staged, zero for none, in the cycle's stats and for WaitingSince. The
+// caller holds statsMu.
+func (m *Maintenance) setWaitingSince(since time.Time) {
+	if m.currentStats != nil {
+		m.currentStats.State = MaintenanceIdle
+		if !since.IsZero() {
+			m.currentStats.State = MaintenanceWaitingForWriter
+		}
+		m.currentStats.WaitingSince = since
+	}
+	var nanos int64
+	if !since.IsZero() {
+		nanos = since.UnixNano()
+	}
+	m.waitingSince.Store(nanos)
+}
+
+// LastProgress reports when maintenance opened or last finished a round, or,
+// within a compaction, last copied one of its input files or saved one of its
+// output files. A round can take as long as its compaction, many minutes for
+// a large one, but a compaction copies or saves a file every few seconds, so
+// a time that keeps getting older means maintenance is stuck.
+func (m *Maintenance) LastProgress() time.Time {
+	if m.compactor == nil {
+		return time.Time{}
+	}
+	if nanos := m.compactor.progress.Load(); nanos != 0 {
+		return time.Unix(0, nanos).UTC()
+	}
+	return time.Time{}
+}
+
+// WaitingSince reports when the command the writer has yet to answer was
+// staged, or zero when none waits. Unlike MaintenanceStats.WaitingSince, which
+// is reported when a cycle ends, it changes as soon as maintenance stages a
+// command or sees the writer's answer, which it looks for when each cycle
+// starts. A time that keeps getting older means the writer isn't answering.
+func (m *Maintenance) WaitingSince() time.Time {
+	if nanos := m.waitingSince.Load(); nanos != 0 {
+		return time.Unix(0, nanos).UTC()
+	}
+	return time.Time{}
+}
+
 func (m *Maintenance) completeCycleStats(start time.Time) MaintenanceStats {
+	m.compactor.madeProgress()
 	m.statsMu.Lock()
 	defer m.statsMu.Unlock()
 	duration := time.Since(start)
