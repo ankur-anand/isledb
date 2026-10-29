@@ -17,7 +17,6 @@ import (
 
 	"github.com/ankur-anand/isledb/tools/stress/internal/client"
 	"github.com/ankur-anand/isledb/tools/stress/internal/ledger"
-	"github.com/ankur-anand/isledb/tools/stress/internal/load"
 	"github.com/ankur-anand/isledb/tools/stress/internal/stats"
 	"github.com/ankur-anand/isledb/tools/stress/internal/verify"
 	"github.com/ankur-anand/isledb/tools/stress/internal/workload"
@@ -32,11 +31,17 @@ type Config struct {
 	Verifier *verify.Verifier
 	// Readers are the isledb readers to spread reads over.
 	Readers []*client.Client
-	// Rate is operations a second; 0 is unlimited.
-	Rate      float64
-	Workers   int
-	ScanRatio float64
-	ScanLimit int
+	// Rate is operations a second; 0 is unlimited. With a rate, reads are
+	// due at their times whether or not the workers keep up: one a worker
+	// starts late counts its wait in its response time, and one due more
+	// than MaxLag ago is dropped and counted, never sent.
+	Rate    float64
+	MaxLag  time.Duration
+	Workers int
+	// ScanLimit is the most keys a scan asks for; with ScanMin, each asks
+	// for a number between the two.
+	ScanRatio          float64
+	ScanMin, ScanLimit int
 	// Dist picks the keys gets read: uniform, zipf (low indexes hot) or
 	// latest (the most recently inserted).
 	Dist         string
@@ -49,12 +54,26 @@ type Config struct {
 type Counters struct {
 	Gets, Scans, ScanItems atomic.Int64
 	Retries, Errors        atomic.Int64
-	Get, Scan              stats.Histogram
+	// Get and Scan are service times, from sending a read to its answer;
+	// GetResponse and ScanResponse response times, from when it was due.
+	Get, Scan                 stats.Histogram
+	GetResponse, ScanResponse stats.Histogram
+	// Offered is the reads the rate made due; Dropped those never sent
+	// because they were due more than MaxLag ago, and Late those sent more
+	// than lateAfter after they were due. Busy is the workers reading now.
+	Offered, Dropped, Late atomic.Int64
+	Busy                   atomic.Int64
 }
+
+// DefaultWorkers is a group's workers when its config gives none.
+const DefaultWorkers = 16
+
+// lateAfter is how long after it was due a read counts as started late.
+const lateAfter = 10 * time.Millisecond
 
 type Reader struct {
 	cfg  Config
-	pace *load.Pacer
+	due  *arrivals
 	C    Counters
 	next atomic.Uint64
 	// lastErr is logged at most once a second.
@@ -67,10 +86,16 @@ func New(cfg Config) (*Reader, error) {
 		return nil, errors.New("read: no readers")
 	}
 	if cfg.Workers <= 0 {
-		cfg.Workers = 16
+		cfg.Workers = DefaultWorkers
 	}
 	if cfg.ScanLimit <= 0 {
 		cfg.ScanLimit = 100
+	}
+	if cfg.ScanMin < 0 || cfg.ScanMin > cfg.ScanLimit {
+		return nil, fmt.Errorf("read: scan_min %d: want 0 to scan_limit %d", cfg.ScanMin, cfg.ScanLimit)
+	}
+	if cfg.MaxLag <= 0 {
+		cfg.MaxLag = 5 * time.Second
 	}
 	switch cfg.Dist {
 	case "":
@@ -88,7 +113,41 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Reader{cfg: cfg, pace: load.NewPacer(cfg.Rate)}, nil
+	r := &Reader{cfg: cfg}
+	if cfg.Rate > 0 {
+		r.due = &arrivals{interval: time.Duration(float64(time.Second) / cfg.Rate), maxLag: cfg.MaxLag}
+	}
+	return r, nil
+}
+
+// arrivals hands out the times reads are due, one each interval, whether or
+// not the workers keep up.
+type arrivals struct {
+	interval, maxLag time.Duration
+	mu               sync.Mutex
+	next             time.Time
+}
+
+// take waits for the next read's time and returns it, with how many reads
+// before it were dropped for being due more than maxLag ago.
+func (a *arrivals) take(ctx context.Context) (time.Time, int64, error) {
+	a.mu.Lock()
+	now := time.Now()
+	if a.next.IsZero() {
+		a.next = now
+	}
+	var dropped int64
+	if lag := now.Sub(a.next); lag > a.maxLag {
+		dropped = int64((lag - a.maxLag + a.interval - 1) / a.interval)
+		a.next = a.next.Add(time.Duration(dropped) * a.interval)
+	}
+	due := a.next
+	a.next = a.next.Add(a.interval)
+	a.mu.Unlock()
+	if d := time.Until(due); d > 0 && !sleep(ctx, d) {
+		return due, dropped, ctx.Err()
+	}
+	return due, dropped, ctx.Err()
 }
 
 func (r *Reader) reader() *client.Client {
@@ -96,18 +155,15 @@ func (r *Reader) reader() *client.Client {
 	return rs[r.next.Add(1)%uint64(len(rs))]
 }
 
-// written returns how many keys have been sent: all of them once the insert
-// round is over.
+// written returns how many keys have been sent: those of the rounds before
+// the newest batch sent, and the inserts of its round up to it.
 func (r *Reader) written() uint64 {
-	s := r.cfg.Schedule
 	sent := r.cfg.Ledger.MaxSent()
 	if sent < 0 {
 		return 0
 	}
-	if b := s.Batch(uint64(sent)); b.Round == 0 {
-		return b.Start + b.Count
-	}
-	return s.N
+	s := r.cfg.Schedule
+	return s.KeysBy(s.Batch(uint64(sent)))
 }
 
 func (r *Reader) logErr(msg string, args ...any) {
@@ -134,10 +190,23 @@ func (r *Reader) Run(ctx context.Context) {
 }
 
 func (r *Reader) work(ctx context.Context, worker uint64) {
-	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), worker))
-	var zipf *rand.Zipf
-	var zipfN uint64
-	for r.pace.Take(ctx, 1) == nil {
+	w := &picker{rng: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), worker))}
+	for {
+		due := time.Now()
+		if r.due != nil {
+			var dropped int64
+			var err error
+			if due, dropped, err = r.due.take(ctx); err != nil {
+				return
+			}
+			r.C.Offered.Add(1 + dropped)
+			r.C.Dropped.Add(dropped)
+			if time.Since(due) > lateAfter {
+				r.C.Late.Add(1)
+			}
+		} else if ctx.Err() != nil {
+			return
+		}
 		n := r.written()
 		if n == 0 {
 			if !sleep(ctx, 100*time.Millisecond) {
@@ -145,26 +214,45 @@ func (r *Reader) work(ctx context.Context, worker uint64) {
 			}
 			continue
 		}
-		if rng.Float64() < r.cfg.ScanRatio {
-			// From a written key, so the scan lands among keys in every
-			// shape: random bytes would start past every sequential key.
-			r.scan(ctx, r.cfg.Shape.AppendKey(nil, rng.Uint64N(n)))
-			continue
-		}
-		var idx uint64
-		switch r.cfg.Dist {
-		case "zipf":
-			if zipf == nil || zipfN != n {
-				zipf, zipfN = rand.NewZipf(rng, r.cfg.ZipfS, 1, n-1), n
-			}
-			idx = zipf.Uint64()
-		case "latest":
-			idx = r.cfg.Schedule.Index(0, n-1-rng.Uint64N(min(r.cfg.LatestWindow, n)))
-		default:
-			idx = rng.Uint64N(n)
-		}
-		r.get(ctx, idx)
+		r.C.Busy.Add(1)
+		r.read(ctx, w, n, due)
+		r.C.Busy.Add(-1)
 	}
+}
+
+// picker is one worker's choice of what to read.
+type picker struct {
+	rng   *rand.Rand
+	zipf  *rand.Zipf
+	zipfN uint64
+}
+
+// read does one get or scan of the first n keys, due at due.
+func (r *Reader) read(ctx context.Context, w *picker, n uint64, due time.Time) {
+	if w.rng.Float64() < r.cfg.ScanRatio {
+		limit := r.cfg.ScanLimit
+		if r.cfg.ScanMin > 0 {
+			limit = r.cfg.ScanMin + w.rng.IntN(r.cfg.ScanLimit-r.cfg.ScanMin+1)
+		}
+		// From a written key, so the scan lands among keys in every shape:
+		// random bytes would start past every sequential key.
+		r.scan(ctx, r.cfg.Shape.AppendKey(nil, w.rng.Uint64N(n)), limit, due)
+		return
+	}
+	var idx uint64
+	switch r.cfg.Dist {
+	case "zipf":
+		if w.zipf == nil || w.zipfN != n {
+			w.zipf, w.zipfN = rand.NewZipf(w.rng, r.cfg.ZipfS, 1, n-1), n
+		}
+		idx = w.zipf.Uint64()
+	case "latest":
+		// Keys are inserted in index order, so the newest have the highest.
+		idx = n - 1 - w.rng.Uint64N(min(r.cfg.LatestWindow, n))
+	default:
+		idx = w.rng.Uint64N(n)
+	}
+	r.get(ctx, idx, due)
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -178,7 +266,7 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (r *Reader) get(ctx context.Context, idx uint64) {
+func (r *Reader) get(ctx context.Context, idx uint64, due time.Time) {
 	key := r.cfg.Shape.AppendKey(nil, idx)
 	start := time.Now()
 	value, found, rev, err := r.reader().Get(ctx, key)
@@ -194,6 +282,7 @@ func (r *Reader) get(ctx context.Context, idx uint64) {
 		return
 	}
 	r.C.Get.Observe(time.Since(start))
+	r.C.GetResponse.Observe(time.Since(due))
 	r.C.Gets.Add(1)
 	r.cfg.Verifier.Get(idx, rev, value, found)
 }
@@ -206,10 +295,10 @@ func items(p client.Page) []verify.Item {
 	return out
 }
 
-// scan reads one page from lo.
-func (r *Reader) scan(ctx context.Context, lo []byte) {
+// scan reads one page of at most limit keys from lo.
+func (r *Reader) scan(ctx context.Context, lo []byte, limit int, due time.Time) {
 	start := time.Now()
-	p, err := r.reader().Scan(ctx, lo, nil, r.cfg.ScanLimit, "")
+	p, err := r.reader().Scan(ctx, lo, nil, limit, "")
 	switch {
 	case ctx.Err() != nil:
 		return
@@ -222,6 +311,7 @@ func (r *Reader) scan(ctx context.Context, lo []byte) {
 		return
 	}
 	r.C.Scan.Observe(time.Since(start))
+	r.C.ScanResponse.Observe(time.Since(due))
 	r.C.Scans.Add(1)
 	r.C.ScanItems.Add(int64(len(p.Items)))
 	r.cfg.Verifier.Page(lo, nil, p.Revision, items(p), p.Next != "")

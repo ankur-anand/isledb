@@ -55,23 +55,50 @@ type WorkloadSpec struct {
 	Keys      uint64 `yaml:"keys"`
 	Target    Size   `yaml:"target"`
 	BatchKeys uint64 `yaml:"batch_keys"`
-	// DeletePermille is the share of keys, in thousandths, each overwrite
-	// round deletes.
+	// DeletePermille is the share, in thousandths, of the keys each update
+	// round writes that it deletes instead.
 	DeletePermille uint64 `yaml:"delete_permille"`
-	Rate           Size   `yaml:"rate"` // bytes a second; 0 unlimited
+	// UpdatePermille is the share, in thousandths, of the keys that exist
+	// that each update round writes; 0 is all of them.
+	UpdatePermille uint64 `yaml:"update_permille"`
+	// InsertPermille is the new keys each update round inserts, in
+	// thousandths of the keys the insert round wrote.
+	InsertPermille uint64 `yaml:"insert_permille"`
+	// Hot, when set, is a key range update rounds write more often.
+	Hot  *HotSpec `yaml:"hot"`
+	Rate Size     `yaml:"rate"` // bytes a second; 0 unlimited
 	// Workers is the batches in flight at once. Each waits for its commit,
 	// so a rate needs about rate × commit latency ÷ batch bytes of them:
 	// 12MiB/s of 40KB batches at 300ms is about 100.
 	Workers int `yaml:"workers"`
 }
 
+// HotSpec is a key range, as thousandths of the keyspace from its start,
+// with its own share of keys each update round writes.
+type HotSpec struct {
+	FromPermille   uint64 `yaml:"from_permille"`
+	ToPermille     uint64 `yaml:"to_permille"`
+	UpdatePermille uint64 `yaml:"update_permille"`
+}
+
 type ReaderSpec struct {
-	Name      string  `yaml:"name"`
-	Rate      float64 `yaml:"rate"` // operations a second; 0 unlimited
-	Workers   int     `yaml:"workers"`
-	ScanRatio float64 `yaml:"scan_ratio"`
-	ScanLimit int     `yaml:"scan_limit"`
-	Dist      string  `yaml:"dist"`
+	Name string  `yaml:"name"`
+	Rate float64 `yaml:"rate"` // operations a second; 0 unlimited
+	// MaxLag is how late a read may start before it is dropped, counted
+	// and never sent: 5s when unset.
+	MaxLag    Duration `yaml:"max_lag"`
+	Workers   int      `yaml:"workers"`
+	ScanRatio float64  `yaml:"scan_ratio"`
+	// A scan asks for ScanLimit keys, or, with ScanMin, a number between
+	// the two.
+	ScanMin   int `yaml:"scan_min"`
+	ScanLimit int `yaml:"scan_limit"`
+	// Dist picks the keys gets read: uniform, zipf (low indexes, the
+	// oldest keys, hot; ZipfS its exponent) or latest (the LatestWindow
+	// newest keys).
+	Dist         string  `yaml:"dist"`
+	ZipfS        float64 `yaml:"zipf_s"`
+	LatestWindow uint64  `yaml:"latest_window"`
 }
 
 type StorageSpec struct {
@@ -256,10 +283,29 @@ func (s *Spec) normalize() error {
 	case w.Keys != 0 && w.Target != 0:
 		fail("workload: give keys or target, not both")
 	}
+	if w.DeletePermille > 1000 || w.UpdatePermille > 1000 {
+		fail("workload: delete_permille and update_permille are thousandths, at most 1000")
+	}
+	if h := w.Hot; h != nil {
+		switch {
+		case h.FromPermille >= h.ToPermille || h.ToPermille > 1000 || h.UpdatePermille == 0 || h.UpdatePermille > 1000:
+			fail("workload.hot: want 0 <= from_permille < to_permille <= 1000 and update_permille from 1 to 1000")
+		case w.UpdatePermille == 0 || w.UpdatePermille == 1000:
+			fail("workload.hot needs update_permille below 1000: every key is written every round otherwise")
+		}
+	}
 	for i := range s.Readers {
 		r := &s.Readers[i]
 		if r.Name == "" {
 			r.Name = "reader-" + strconv.Itoa(i+1)
+		}
+		if r.ScanMin < 0 || (r.ScanMin > 0 && r.ScanLimit > 0 && r.ScanMin > r.ScanLimit) {
+			fail("readers.%s: scan_min must be between 0 and scan_limit", r.Name)
+		}
+		switch r.Dist {
+		case "", "uniform", "zipf", "latest":
+		default:
+			fail("readers.%s: dist %q: want uniform, zipf or latest", r.Name, r.Dist)
 		}
 	}
 	if s.Storage.BucketURL == "" {
@@ -363,16 +409,43 @@ func (s *Spec) Inserted() Size {
 	return Size(float64(s.Workload.Keys) * (16 + d.Mean()))
 }
 
-// Planned returns about the key and value bytes the whole run writes: the
-// insert round and every overwrite round, deletes not counted.
-func (s *Spec) Planned() Size {
-	rounds := Size(1)
+// UpdateRounds returns the update rounds of every phase.
+func (s *Spec) UpdateRounds() uint32 {
+	var rounds uint32
 	for _, p := range s.Phases {
 		if p.Update != nil {
-			rounds += Size(max(p.Update.Rounds, 1))
+			rounds += max(p.Update.Rounds, 1)
 		}
 	}
-	return s.Inserted() * rounds
+	return rounds
+}
+
+// UpdateShare returns the share, in thousandths, of the keys that exist
+// that each update round writes, the hot range included.
+func (s *Spec) UpdateShare() uint64 {
+	w := s.Workload
+	share := w.UpdatePermille
+	if share == 0 {
+		share = 1000
+	}
+	if h := w.Hot; h != nil {
+		hot := h.ToPermille - h.FromPermille
+		share = (share*(1000-hot) + h.UpdatePermille*hot) / 1000
+	}
+	return share
+}
+
+// Planned returns about the key and value bytes the whole run writes: the
+// insert round and every update round, deletes not counted. An update round
+// writes its share of the keys that exist, which its inserts then grow.
+func (s *Spec) Planned() Size {
+	inserted, share, ins := s.Inserted(), s.UpdateShare(), s.Workload.InsertPermille
+	total := inserted
+	for r := range s.UpdateRounds() {
+		existing := 1000 + uint64(r)*ins // thousandths of the insert round's keys
+		total += Size(float64(inserted) * float64(existing*share/1000+ins) / 1000)
+	}
+	return total
 }
 
 // SizeLabel names the run's size for its directory: the target, as 20GiB or

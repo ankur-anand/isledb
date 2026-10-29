@@ -46,6 +46,12 @@ Every read is checked exactly, not against a range of acceptable answers:
 - The load sends batches from a schedule that says, for every batch, which
   keys it writes and what. Values carry their own index, version, length and
   checksum.
+- Round 0 inserts every key. Each update round writes a seeded share of the
+  keys that exist (`update_permille`, all of them by default), or more of
+  those in a hot key range, deletes a share of what it writes, and inserts
+  new keys (`insert_permille`). Whether a round writes a key is a hash of
+  the round and the key, so the last round to write any key, and the batch
+  that did, can always be computed.
 - Each committed batch is recorded with the revision the writer answered.
   Every read answers with the revision it was served at, so the state of
   each key at that revision is known: the last batch writing it at or below
@@ -75,7 +81,13 @@ and the batches that wrote the key. A run with any failure exits non-zero.
   each role's latency proxy, divided by the key and value bytes written. It
   counts the first save of each byte, as RocksDB does. `writer` and
   `compaction` split it by who uploaded.
-- **Latency** of commits, gets and scans, from the client side.
+- **Latency** of commits, gets and scans, from the client side. Reads are
+  paced open loop: each is due at its time whether or not the workers keep
+  up. Response time counts from when a read was due, the wait for a free
+  worker included; service time from when it was sent. A read due longer
+  ago than `max_lag` (5s) when a worker frees up is dropped and counted, so
+  the samples show reads offered against achieved, and how busy the workers
+  were.
 - **Writes refused** (`503`), never saved, and of unknown outcome.
 - **Space amplification**: the SST bytes in the bucket, from a listing every
   `storage.list_every` (5m) and at the end, divided by the key and value
@@ -116,11 +128,15 @@ workload:
   values: mixed          # or fixed:N
   target: 20GiB          # or keys: N
   batch_keys: 16
-  delete_permille: 0     # share each overwrite round deletes
+  update_permille: 20    # share of keys each update round writes; all when unset
+  delete_permille: 100   # share of those it deletes instead
+  insert_permille: 10    # new keys each update round adds, of the first round's
+  hot: {from_permille: 0, to_permille: 100, update_permille: 500}   # a key range written more
   rate: 12MiB            # bytes a second; 0 unlimited
   workers: 128           # batches in flight; each waits for its commit
 readers:
-  - {name: uniform, rate: 200, workers: 16, scan_ratio: 0.05, scan_limit: 100, dist: uniform}
+  - {name: uniform, rate: 200, workers: 16, scan_ratio: 0.05, scan_min: 1, scan_limit: 100, dist: uniform}
+  - {name: newest, rate: 100, max_lag: 5s, dist: latest, latest_window: 1000000}   # or zipf, with zipf_s
 storage:
   bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true
   endpoint: http://127.0.0.1:19000
@@ -136,7 +152,7 @@ phases:
   - load:                # the insert round
       events: [{after: 2m, role: writer, kill: true, down: 5s}]
       faults: [{after: 1m, proxy: writer, set: {methods: [PUT], kinds: [manifest], drop_rate: 0.05}}]
-  - update: {rounds: 1}  # overwrite rounds
+  - update: {rounds: 10} # update rounds
   - settle: {quiet: 5m, max: 3h}
   - restart: {role: maintenance, isledb: main}
   - verify: {parts: 32}
@@ -151,6 +167,15 @@ sample_every: 30s
   `max_used_pct`, and lets them go once it is 2 points below; maintenance
   keeps compacting and deleting meanwhile. Holds show in the samples and
   the log. Point it at the disk storage lives on.
+
+- `update_permille`, `delete_permille`, `insert_permille` and `hot` shape
+  the update rounds. Left out, every round rewrites every key, as before.
+  `hot` ranges are shares of the keyspace from its start, so with `random`
+  keys they are a real key range, as a tenant's prefix would be.
+- A reader group asks each scan for `scan_limit` keys, or a number between
+  `scan_min` and `scan_limit`. `dist: latest` reads the `latest_window`
+  newest keys, inserts after round 0 included; `zipf` makes the oldest keys
+  hot.
 
 - `isledb.config` is passed to each role as its configuration. The runner
   sets `prefix`, the addresses, the directories and auth itself. A version
@@ -175,6 +200,13 @@ sample_every: 30s
 | `local-smoke` | a directory bucket, about a minute: a quick check of the harness and a build |
 | `silo-smoke` | `default` at 512 MiB, a few minutes |
 | `silo-faults` | lost answers and refusals from storage while writing |
+| `balanced` | a production-like mix: each round updates 5% of the keys, more in a hot tenth of the keyspace, deletes some, inserts 2% more; point reads, scans of 1 to 100 keys and reads of the newest keys |
+
+`default` and `l0-batched` only insert: every key is written once, then
+the run settles and verifies. The smoke and fault specs add one update round
+that rewrites every key. `balanced` builds its dataset, settles and verifies
+it, runs its mix of updates, deletes and inserts, then settles and verifies
+again, so a result is never read off work compaction still owes.
 
 ## Storage and monitoring
 

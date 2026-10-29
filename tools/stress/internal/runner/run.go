@@ -59,6 +59,7 @@ type RunInfo struct {
 	Host      string    `json:"host"`
 	CPUs      int       `json:"cpus"`
 	Keys      uint64    `json:"keys"`
+	MaxKeys   uint64    `json:"max_keys,omitempty"` // with inserts after the insert round
 	Batches   uint64    `json:"batches_per_round"`
 	MeanValue float64   `json:"mean_value_bytes"`
 	Spec      *Spec     `json:"spec"`
@@ -112,13 +113,24 @@ type LoadSample struct {
 }
 
 type ReaderSample struct {
-	Gets      int64         `json:"gets"`
-	Scans     int64         `json:"scans"`
-	ScanItems int64         `json:"scan_items"`
-	Retries   int64         `json:"retries"`
-	Errors    int64         `json:"errors"`
-	Get       stats.Latency `json:"get"`
-	Scan      stats.Latency `json:"scan"`
+	Gets      int64 `json:"gets"`
+	Scans     int64 `json:"scans"`
+	ScanItems int64 `json:"scan_items"`
+	Retries   int64 `json:"retries"`
+	Errors    int64 `json:"errors"`
+	// Offered is the reads the rate made due, Dropped those never sent for
+	// being due too long ago, Late those started late; Busy the workers
+	// reading when sampled.
+	Offered int64 `json:"offered,omitempty"`
+	Dropped int64 `json:"dropped,omitempty"`
+	Late    int64 `json:"late,omitempty"`
+	Busy    int64 `json:"busy_workers"`
+	// Get and Scan are service times, from sending to the answer;
+	// GetResponse and ScanResponse response times, from when each was due.
+	Get          stats.Latency `json:"get"`
+	Scan         stats.Latency `json:"scan"`
+	GetResponse  stats.Latency `json:"get_response"`
+	ScanResponse stats.Latency `json:"scan_response"`
 }
 
 type LedgerSample struct {
@@ -264,11 +276,7 @@ func Run(ctx context.Context, opts Options) (*Summary, error) {
 	if n == 0 {
 		n = workload.KeysForBytes(dist, 16, int64(spec.Workload.Target))
 	}
-	sched, err := workload.NewSchedule(n, spec.Workload.BatchKeys, spec.Seed, spec.Workload.DeletePermille, dist)
-	if err != nil {
-		return nil, err
-	}
-	shape, err := workload.NewShape(spec.Workload.Shape, n, spec.Seed)
+	sched, shape, err := newSchedule(spec, n, dist)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +292,9 @@ func Run(ctx context.Context, opts Options) (*Summary, error) {
 		counters: &load.Counters{}, groups: map[string]*read.Reader{}, bins: bins}
 	st.info = RunInfo{Name: name, Dir: dir, Prefix: "stress/" + name, Started: start, Isledb: bin, Host: host,
 		CPUs: runtime.NumCPU(), Keys: n, Batches: sched.BatchesPerRound(), MeanValue: dist.Mean(), Spec: spec}
+	if m := sched.MaxKeys(); m > n {
+		st.info.MaxKeys = m
+	}
 	st.summary = Summary{Run: st.info, Checkpoints: map[string]Sample{}}
 	if err := writeJSON(filepath.Join(dir, "run.json"), st.info); err != nil {
 		return nil, err
@@ -421,7 +432,9 @@ func (st *runState) run(ctx context.Context) error {
 
 	for _, rs := range st.spec.Readers {
 		r, err := read.New(read.Config{Name: rs.Name, Schedule: st.sched, Shape: st.shape, Ledger: st.ledger, Verifier: st.verifier,
-			Readers: st.readers, Rate: rs.Rate, Workers: rs.Workers, ScanRatio: rs.ScanRatio, ScanLimit: rs.ScanLimit, Dist: rs.Dist, Log: st.log})
+			Readers: st.readers, Rate: rs.Rate, MaxLag: rs.MaxLag.D(), Workers: rs.Workers,
+			ScanRatio: rs.ScanRatio, ScanMin: rs.ScanMin, ScanLimit: rs.ScanLimit,
+			Dist: rs.Dist, ZipfS: rs.ZipfS, LatestWindow: rs.LatestWindow, Log: st.log})
 		if err != nil {
 			return err
 		}
@@ -524,10 +537,9 @@ func (st *runState) write(ctx context.Context, p *WritePhase, rounds uint32, res
 	if p.Rate != nil {
 		rate = float64(*p.Rate)
 	}
-	per := st.sched.BatchesPerRound()
-	from := uint64(st.nextRnd) * per
 	l, err := load.New(load.Config{Schedule: st.sched, Shape: st.shape, Ledger: st.ledger, Writer: st.writer,
-		From: from, To: from + uint64(rounds)*per, Rate: rate, Workers: st.spec.Workload.Workers, Log: st.log,
+		From: st.sched.FirstBatch(st.nextRnd), To: st.sched.FirstBatch(st.nextRnd + rounds),
+		Rate: rate, Workers: st.spec.Workload.Workers, Log: st.log,
 		Hold: st.diskHeld.Load})
 	if err != nil {
 		return err
@@ -736,7 +748,10 @@ func (st *runState) sampleOf(ctx context.Context, roles bool) Sample {
 		ByRound: total.RoundBytes(), Commit: total.Commit.Snapshot().Latency()}
 	for name, r := range st.groups {
 		s.Readers[name] = ReaderSample{Gets: r.C.Gets.Load(), Scans: r.C.Scans.Load(), ScanItems: r.C.ScanItems.Load(),
-			Retries: r.C.Retries.Load(), Errors: r.C.Errors.Load(), Get: r.C.Get.Snapshot().Latency(), Scan: r.C.Scan.Snapshot().Latency()}
+			Retries: r.C.Retries.Load(), Errors: r.C.Errors.Load(),
+			Offered: r.C.Offered.Load(), Dropped: r.C.Dropped.Load(), Late: r.C.Late.Load(), Busy: r.C.Busy.Load(),
+			Get: r.C.Get.Snapshot().Latency(), Scan: r.C.Scan.Snapshot().Latency(),
+			GetResponse: r.C.GetResponse.Snapshot().Latency(), ScanResponse: r.C.ScanResponse.Snapshot().Latency()}
 	}
 	if len(st.cluster.Proxies) > 0 {
 		s.Storage = map[string]ProxyStats{}
@@ -939,4 +954,40 @@ func (z Size) String() string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f%ciB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+// newSchedule returns the workload spec describes over n initial keys, and
+// the shape of its keys, over every key its inserts add.
+func newSchedule(spec *Spec, n uint64, dist workload.SizeDist) (*workload.Schedule, workload.Shape, error) {
+	w := spec.Workload
+	rounds := spec.UpdateRounds()
+	var inserts uint64
+	if rounds > 0 {
+		inserts = n * w.InsertPermille / 1000
+	}
+	shape, err := workload.NewShape(w.Shape, n+uint64(rounds)*inserts, spec.Seed)
+	if err != nil {
+		return nil, nil, err
+	}
+	o := workload.Options{UpdatePermille: w.UpdatePermille, InsertsPerRound: inserts, Rounds: rounds}
+	if h := w.Hot; h != nil {
+		from, to := float64(h.FromPermille)/1000, float64(h.ToPermille)/1000
+		o.Hot = func(idx uint64) bool { p := shape.Place(idx); return p >= from && p < to }
+		o.HotPermille, o.HotShare = h.UpdatePermille, h.ToPermille-h.FromPermille
+	}
+	sched, err := workload.NewScheduleWith(n, w.BatchKeys, spec.Seed, w.DeletePermille, dist, o)
+	return sched, shape, err
+}
+
+// groupWorkers returns how many workers reader group name runs.
+func (st *runState) groupWorkers(name string) int {
+	for _, rs := range st.spec.Readers {
+		if rs.Name == name {
+			if rs.Workers > 0 {
+				return rs.Workers
+			}
+			return read.DefaultWorkers
+		}
+	}
+	return 0
 }
