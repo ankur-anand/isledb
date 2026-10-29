@@ -174,10 +174,11 @@ func plannerSSTNamed(id string, size int64, createdAt time.Time) sstMetadata {
 }
 
 func TestL0PlannerWaitsBelowTheDrainRules(t *testing.T) {
-	// Eight merged files well under the overlapped L1, not deep enough, not
-	// old: nothing to do until more arrive. Merging within L0 is the
-	// writer's, so no L0 job is planned.
-	c, m := l0Planner(t, repeat(25<<10, 8), 256<<20)
+	// Eight merged files under the overlapped L1, not deep enough, not old,
+	// and the ratio within the depth limit's 16 of them: nothing to do until
+	// more arrive. Merging within L0 is the writer's, so no L0 job is
+	// planned.
+	c, m := l0Planner(t, repeat(25<<10, 8), 384<<10)
 	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -440,5 +441,63 @@ func TestL0PlannerCombinesTheWritersRealMergedFiles(t *testing.T) {
 	}
 	if plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now()); plan != nil {
 		t.Fatalf("plan %+v, want none: every file is a combine already", plan)
+	}
+}
+
+func TestL0PlannerCombineCountsTheWritersFilesNotTheOutputSize(t *testing.T) {
+	// Merged files of 67 MiB over 4 GiB of L1, as a 1 TiB run's. Whether
+	// they are worth combining is the same whatever size compaction writes
+	// its own files.
+	for _, tc := range []struct {
+		ratio float64
+		depth int
+		want  bool
+	}{
+		// 123 files reach the ratio, the depth limit is 32: combined four at a
+		// time, each byte is rewritten once more but rewrites half as much L1.
+		{2, 32, true},
+		// 245 files against 64: four at a time again, but at four times L1 a
+		// drain rewrites only a quarter as much, less than the combine's own
+		// rewrite saves.
+		{4, 64, false},
+	} {
+		for _, target := range []int64{64 << 20, 256 << 20} {
+			c, m := l0Planner(t, repeat(67<<20, 8), 4<<30)
+			c.opts.Trigger.L0ToBaseRatio = tc.ratio
+			c.opts.Trigger.L0MaxDepth = tc.depth
+			c.opts.Output.TargetSSTBytes = target
+			plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+			if (plan != nil) != tc.want {
+				t.Fatalf("ratio %v, depth %d, %d MiB outputs: plan %+v, want combine=%v",
+					tc.ratio, tc.depth, target>>20, plan, tc.want)
+			}
+			if plan != nil && len(plan.sourceSSTs) != 4 {
+				t.Fatalf("ratio %v, depth %d: combine of %d, want 4", tc.ratio, tc.depth, len(plan.sourceSSTs))
+			}
+		}
+	}
+}
+
+func TestL0PlannerCombinesSmallFilesAtAHighRatio(t *testing.T) {
+	// Merged files of 8 MiB at four times 4 GiB of L1: draining at the depth
+	// limit of 64 rewrites eight bytes of L1 for each of L0. Combined eight at
+	// a time, each byte is rewritten twice instead.
+	c, m := l0Planner(t, repeat(8<<20, 8), 4<<30)
+	c.opts.Trigger.L0ToBaseRatio = 4
+	c.opts.Trigger.L0MaxDepth = 64
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != maxL0CombineGroup {
+		t.Fatalf("plan %+v, want a combine of %d", plan, maxL0CombineGroup)
+	}
+}
+
+func TestL0PlannerCombineGroupFitsUnderTheDepthLimit(t *testing.T) {
+	// A depth limit of four drains L0 at four files, so a group of eight,
+	// which the ratio would want, never gathers; three is the most that does.
+	c, m := l0Planner(t, repeat(1<<20, 3), 4<<30)
+	c.opts.Trigger.L0MaxDepth = 4
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != 3 {
+		t.Fatalf("plan %+v, want a combine of three", plan)
 	}
 }
