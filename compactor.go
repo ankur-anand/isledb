@@ -628,13 +628,15 @@ func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now
 		return nil
 	}
 	var bytes, mergeBytes int64
-	var merges int
+	var merges, others int
 	var oldest time.Time
 	for _, sst := range drainable {
 		bytes += sst.Size
 		if isWriterMergeSSTID(sst.ID) {
 			mergeBytes += sst.Size
 			merges++
+		} else {
+			others++
 		}
 		if t := sst.OldestData(); !t.IsZero() && (oldest.IsZero() || t.Before(oldest)) {
 			oldest = t
@@ -646,8 +648,9 @@ func (c *compactor) planL0Combine(drainable []sstMetadata, m *manifestState, now
 	file := float64(mergeBytes) / float64(merges)
 	needed := int(math.Ceil(ratio * float64(overlap) / file))
 	// A group is ready only while L0 is under the depth limit, which drains
-	// it first.
-	group := min((needed+depth-1)/depth, maxL0CombineGroup, depth-1)
+	// it first, and files no combine takes, earlier combines among them,
+	// hold their places under it.
+	group := min((needed+depth-1)/depth, maxL0CombineGroup, depth-1-others)
 	if group < 2 {
 		return nil
 	}

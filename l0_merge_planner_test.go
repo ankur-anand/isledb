@@ -501,3 +501,37 @@ func TestL0PlannerCombineGroupFitsUnderTheDepthLimit(t *testing.T) {
 		t.Fatalf("plan %+v, want a combine of three", plan)
 	}
 }
+
+func TestL0PlannerCombineGroupLeavesRoomForEarlierCombines(t *testing.T) {
+	// A depth limit of four, a combine already in L0 and two merged files
+	// after it: a group of three would need four files, which the depth rule
+	// drains first, so the two are combined. With two combines in L0, a
+	// group of one is no combine at all.
+	c := plannerOnlyCompactor()
+	c.opts.Trigger.L0SSTCount = 2
+	c.opts.Trigger.L0MaxDepth = 4
+	m := &manifestState{}
+	l1 := plannerSST(1, 0, 100)
+	l1.Size = 4 << 30
+	m.AddLevelSSTs(1, []sstMetadata{l1})
+	now := time.Now()
+	at := now.Add(-time.Minute)
+	m.AddL0SST(plannerSSTNamed(combinedSSTID(1), 3<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 1<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(3), 1<<20, at))
+	plan := c.planL0Combine(c.drainableL0(m, now), m, now)
+	if plan == nil || len(plan.sourceSSTs) != 2 {
+		t.Fatalf("plan %+v, want the two merged files combined", plan)
+	}
+	want := strings.Join([]string{mergedSSTID(3), mergedSSTID(2)}, ",")
+	if got := l0IDList(plan.sourceSSTs); got != want {
+		t.Fatalf("combine %s, want %s", got, want)
+	}
+
+	m.L0SSTs = m.L0SSTs[:1]
+	m.AddL0SST(plannerSSTNamed(combinedSSTID(4), 2<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(5), 1<<20, at))
+	if plan := c.planL0Combine(c.drainableL0(m, now), m, now); plan != nil {
+		t.Fatalf("plan %+v, want none: one place left under the depth limit", plan)
+	}
+}
