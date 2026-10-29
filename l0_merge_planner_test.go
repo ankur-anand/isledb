@@ -331,10 +331,12 @@ func TestL0PlannerDoesNotCombineForTheDefaultL1(t *testing.T) {
 	}
 }
 
-func TestL0PlannerCombineNeedsAGroupOfThree(t *testing.T) {
-	// L1 between one and two depth limits' worth, 1.5 GiB: the group would be
-	// two, and a combine of two rewrites as much as it saves. Smaller merged
-	// files, as compression leaves them, must not change that.
+func TestL0PlannerCombinesOnlyWhenItRewritesLess(t *testing.T) {
+	// At a ratio of 1 a combine costs two rewrites a byte: its own, then the
+	// L1 a drain at the ratio rewrites. Draining at the depth limit of 16
+	// instead rewrites L1 over 16 merged files' worth, which is less until L1
+	// passes twice that. Over 1.5 GiB of L1 it does not: 1.5 a byte with
+	// 64 MiB files, 1.92 with 50 MiB ones, as compression leaves them.
 	for _, size := range []int64{64 << 20, 50 << 20} {
 		c, m := l0Planner(t, repeat(size, 8), 3<<29)
 		c.opts.Trigger.L0SSTCount = 2
@@ -342,7 +344,9 @@ func TestL0PlannerCombineNeedsAGroupOfThree(t *testing.T) {
 			t.Fatalf("%d MiB files over 1.5 GiB: combine %+v, want none", size>>20, plan)
 		}
 	}
-	// Just past twice the depth limit's worth, the group is three.
+	// Just past twice the depth limit's worth, draining at it rewrites 2.06 a
+	// byte, more than a combine's two, and a group of three reaches the
+	// ratio.
 	c, m := l0Planner(t, repeat(64<<20, 8), 33*64<<20)
 	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
 	if plan == nil || len(plan.sourceSSTs) != 3 {
