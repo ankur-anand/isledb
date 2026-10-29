@@ -28,7 +28,7 @@ workload:
   rate: 24MiB
   workers: 256
 readers:
-  - {name: uniform, rate: 300, workers: 32, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
+  - {name: uniform, rate: 300, workers: 64, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
   - {name: latest, rate: 100, workers: 16, dist: latest, latest_window: 1000000}
 storage:
   bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
@@ -47,7 +47,11 @@ isledb:
       # amplification reads lower than production's would.
       policy: {max_pinned_view_age: 10m}
     maintenance:
-      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}
+      # At most 32 L0 files under any key, half bulk-load's, since this
+      # profile reads as much as it writes. L0 still collects four times
+      # the L1 it overlaps: merged files are combined to fit under the
+      # limit, on a version that sizes combines by the writer's files.
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 32, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}
 phases:
   - load: {}
   - settle: {quiet: 5m, max: 3h}
