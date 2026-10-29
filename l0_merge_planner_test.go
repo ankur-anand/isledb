@@ -174,10 +174,11 @@ func plannerSSTNamed(id string, size int64, createdAt time.Time) sstMetadata {
 }
 
 func TestL0PlannerWaitsBelowTheDrainRules(t *testing.T) {
-	// Eight merged files well under the overlapped L1, not deep enough, not
-	// old: nothing to do until more arrive. Merging within L0 is the
-	// writer's, so no L0 job is planned.
-	c, m := l0Planner(t, repeat(25<<10, 8), 256<<20)
+	// Eight merged files under the overlapped L1, not deep enough, not old,
+	// and the ratio within the depth limit's 16 of them: nothing to do until
+	// more arrive. Merging within L0 is the writer's, so no L0 job is
+	// planned.
+	c, m := l0Planner(t, repeat(25<<10, 8), 384<<10)
 	plan, err := plannedCandidateForLevel(c, m, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -330,10 +331,12 @@ func TestL0PlannerDoesNotCombineForTheDefaultL1(t *testing.T) {
 	}
 }
 
-func TestL0PlannerCombineNeedsAGroupOfThree(t *testing.T) {
-	// L1 between one and two depth limits' worth, 1.5 GiB: the group would be
-	// two, and a combine of two rewrites as much as it saves. Smaller merged
-	// files, as compression leaves them, must not change that.
+func TestL0PlannerCombinesOnlyWhenItRewritesLess(t *testing.T) {
+	// At a ratio of 1 a combine costs two rewrites a byte: its own, then the
+	// L1 a drain at the ratio rewrites. Draining at the depth limit of 16
+	// instead rewrites L1 over 16 merged files' worth, which is less until L1
+	// passes twice that. Over 1.5 GiB of L1 it does not: 1.5 a byte with
+	// 64 MiB files, 1.92 with 50 MiB ones, as compression leaves them.
 	for _, size := range []int64{64 << 20, 50 << 20} {
 		c, m := l0Planner(t, repeat(size, 8), 3<<29)
 		c.opts.Trigger.L0SSTCount = 2
@@ -341,7 +344,9 @@ func TestL0PlannerCombineNeedsAGroupOfThree(t *testing.T) {
 			t.Fatalf("%d MiB files over 1.5 GiB: combine %+v, want none", size>>20, plan)
 		}
 	}
-	// Just past twice the depth limit's worth, the group is three.
+	// Just past twice the depth limit's worth, draining at it rewrites 2.06 a
+	// byte, more than a combine's two, and a group of three reaches the
+	// ratio.
 	c, m := l0Planner(t, repeat(64<<20, 8), 33*64<<20)
 	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
 	if plan == nil || len(plan.sourceSSTs) != 3 {
@@ -440,5 +445,97 @@ func TestL0PlannerCombinesTheWritersRealMergedFiles(t *testing.T) {
 	}
 	if plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now()); plan != nil {
 		t.Fatalf("plan %+v, want none: every file is a combine already", plan)
+	}
+}
+
+func TestL0PlannerCombineCountsTheWritersFilesNotTheOutputSize(t *testing.T) {
+	// Merged files of 67 MiB over 4 GiB of L1, as a 1 TiB run's. Whether
+	// they are worth combining is the same whatever size compaction writes
+	// its own files.
+	for _, tc := range []struct {
+		ratio float64
+		depth int
+		want  bool
+	}{
+		// 123 files reach the ratio, the depth limit is 32: combined four at a
+		// time, each byte is rewritten once more but rewrites half as much L1.
+		{2, 32, true},
+		// 245 files against 64: four at a time again, but at four times L1 a
+		// drain rewrites only a quarter as much, less than the combine's own
+		// rewrite saves.
+		{4, 64, false},
+	} {
+		for _, target := range []int64{64 << 20, 256 << 20} {
+			c, m := l0Planner(t, repeat(67<<20, 8), 4<<30)
+			c.opts.Trigger.L0ToBaseRatio = tc.ratio
+			c.opts.Trigger.L0MaxDepth = tc.depth
+			c.opts.Output.TargetSSTBytes = target
+			plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+			if (plan != nil) != tc.want {
+				t.Fatalf("ratio %v, depth %d, %d MiB outputs: plan %+v, want combine=%v",
+					tc.ratio, tc.depth, target>>20, plan, tc.want)
+			}
+			if plan != nil && len(plan.sourceSSTs) != 4 {
+				t.Fatalf("ratio %v, depth %d: combine of %d, want 4", tc.ratio, tc.depth, len(plan.sourceSSTs))
+			}
+		}
+	}
+}
+
+func TestL0PlannerCombinesSmallFilesAtAHighRatio(t *testing.T) {
+	// Merged files of 8 MiB at four times 4 GiB of L1: draining at the depth
+	// limit of 64 rewrites eight bytes of L1 for each of L0. Combined eight at
+	// a time, each byte is rewritten twice instead.
+	c, m := l0Planner(t, repeat(8<<20, 8), 4<<30)
+	c.opts.Trigger.L0ToBaseRatio = 4
+	c.opts.Trigger.L0MaxDepth = 64
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != maxL0CombineGroup {
+		t.Fatalf("plan %+v, want a combine of %d", plan, maxL0CombineGroup)
+	}
+}
+
+func TestL0PlannerCombineGroupFitsUnderTheDepthLimit(t *testing.T) {
+	// A depth limit of four drains L0 at four files, so a group of eight,
+	// which the ratio would want, never gathers; three is the most that does.
+	c, m := l0Planner(t, repeat(1<<20, 3), 4<<30)
+	c.opts.Trigger.L0MaxDepth = 4
+	plan := c.planL0Combine(c.drainableL0(m, time.Now()), m, time.Now())
+	if plan == nil || len(plan.sourceSSTs) != 3 {
+		t.Fatalf("plan %+v, want a combine of three", plan)
+	}
+}
+
+func TestL0PlannerCombineGroupLeavesRoomForEarlierCombines(t *testing.T) {
+	// A depth limit of four, a combine already in L0 and two merged files
+	// after it: a group of three would need four files, which the depth rule
+	// drains first, so the two are combined. With two combines in L0, a
+	// group of one is no combine at all.
+	c := plannerOnlyCompactor()
+	c.opts.Trigger.L0SSTCount = 2
+	c.opts.Trigger.L0MaxDepth = 4
+	m := &manifestState{}
+	l1 := plannerSST(1, 0, 100)
+	l1.Size = 4 << 30
+	m.AddLevelSSTs(1, []sstMetadata{l1})
+	now := time.Now()
+	at := now.Add(-time.Minute)
+	m.AddL0SST(plannerSSTNamed(combinedSSTID(1), 3<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(2), 1<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(3), 1<<20, at))
+	plan := c.planL0Combine(c.drainableL0(m, now), m, now)
+	if plan == nil || len(plan.sourceSSTs) != 2 {
+		t.Fatalf("plan %+v, want the two merged files combined", plan)
+	}
+	want := strings.Join([]string{mergedSSTID(3), mergedSSTID(2)}, ",")
+	if got := l0IDList(plan.sourceSSTs); got != want {
+		t.Fatalf("combine %s, want %s", got, want)
+	}
+
+	m.L0SSTs = m.L0SSTs[:1]
+	m.AddL0SST(plannerSSTNamed(combinedSSTID(4), 2<<20, at))
+	m.AddL0SST(plannerSSTNamed(mergedSSTID(5), 1<<20, at))
+	if plan := c.planL0Combine(c.drainableL0(m, now), m, now); plan != nil {
+		t.Fatalf("plan %+v, want none: one place left under the depth limit", plan)
 	}
 }
