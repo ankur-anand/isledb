@@ -1,4 +1,4 @@
-# A balanced production-like mix. default and l0-batched only insert; this
+# A production-like mix. default and bulk-load only insert; this
 # then updates, deletes and inserts. Each update round writes 5% of the keys,
 # and 30% of those in a hot tenth of the keyspace; deletes a tenth of what
 # it writes, which later rounds write back; and inserts 2% more keys, so
@@ -9,13 +9,13 @@
 # and verifies again, so a result is never read off work compaction still
 # owes. Pick the size on the command line; qualify at 100 GiB before 1 TiB:
 #
-#   stress run -spec specs/balanced.yaml -target 100GiB -isledb origin/main -fetch
-#   stress run -spec specs/balanced.yaml -target 1TiB   -isledb origin/main -fetch
+#   stress run -spec specs/mixed.yaml -target 100GiB -isledb origin/main -fetch
+#   stress run -spec specs/mixed.yaml -target 1TiB   -isledb origin/main -fetch
 #
 # Reads are paced open loop: each is due at its time, and one a worker can't
 # start within max_lag is dropped and counted, so the dashboard shows reads
 # offered against achieved.
-name: balanced
+name: mixed
 workload:
   shape: random
   values: mixed
@@ -25,10 +25,10 @@ workload:
   delete_permille: 100
   insert_permille: 20
   hot: {from_permille: 0, to_permille: 100, update_permille: 300}
-  rate: 12MiB
+  rate: 24MiB
   workers: 256
 readers:
-  - {name: uniform, rate: 300, workers: 32, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
+  - {name: uniform, rate: 300, workers: 64, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
   - {name: latest, rate: 100, workers: 16, dist: latest, latest_window: 1000000}
 storage:
   bucket_url: s3://isledb?endpoint={endpoint}&region=us-east-1&use_path_style=true&request_checksum_calculation=when_required&response_checksum_validation=when_required
@@ -47,7 +47,11 @@ isledb:
       # amplification reads lower than production's would.
       policy: {max_pinned_view_age: 10m}
     maintenance:
-      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}
+      # At most 32 L0 files under any key, half bulk-load's, since this
+      # profile reads as much as it writes. L0 still collects four times
+      # the L1 it overlaps: merged files are combined to fit under the
+      # limit, on a version that sizes combines by the writer's files.
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 32, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}
 phases:
   - load: {}
   - settle: {quiet: 5m, max: 3h}
