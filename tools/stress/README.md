@@ -14,7 +14,7 @@ tree.
 cd tools/stress
 go run . run -spec specs/local-smoke.yaml                                  # the working tree
 go run . run -spec specs/default.yaml -target 20GiB -isledb v0.20.0        # a release
-go run . run -spec specs/l0-batched.yaml -target 1TiB -isledb origin/main -fetch
+go run . run -spec specs/bulk-load.yaml -target 1TiB -isledb origin/main -fetch
 go run . compare results/*/summary.json
 ```
 
@@ -122,7 +122,7 @@ Each run gets `results/<name>-<size>-<version>-<time>/`, such as
 ## Specs
 
 ```yaml
-name: l0-batched
+name: bulk-load
 workload:
   shape: random          # or sequential
   values: mixed          # or fixed:N
@@ -196,15 +196,15 @@ sample_every: 30s
 | Spec | What |
 |---|---|
 | `default` | 12 MiB/s of small writes against SILO, at the version's default settings |
-| `l0-batched` | `default` with fewer rewrites: L0 collects longer, a 4 GiB L1. Needs a version with `maintenance.compaction` |
+| `bulk-load` | `default` with fewer rewrites: L0 collects longer, a 4 GiB L1. Needs a version with `maintenance.compaction` |
 | `local-smoke` | a directory bucket, about a minute: a quick check of the harness and a build |
 | `silo-smoke` | `default` at 512 MiB, a few minutes |
 | `silo-faults` | lost answers and refusals from storage while writing |
-| `balanced` | a production-like mix: each round updates 5% of the keys, more in a hot tenth of the keyspace, deletes some, inserts 2% more; point reads, scans of 1 to 100 keys and reads of the newest keys |
+| `mixed` | a production-like mix: each round updates 5% of the keys, more in a hot tenth of the keyspace, deletes some, inserts 2% more; point reads, scans of 1 to 100 keys and reads of the newest keys |
 
-`default` and `l0-batched` only insert: every key is written once, then
+`default` and `bulk-load` only insert: every key is written once, then
 the run settles and verifies. The smoke and fault specs add one update round
-that rewrites every key. `balanced` builds its dataset, settles and verifies
+that rewrites every key. `mixed` builds its dataset, settles and verifies
 it, runs its mix of updates, deletes and inserts, then settles and verifies
 again, so a result is never read off work compaction still owes.
 
@@ -221,7 +221,7 @@ again, so a result is never read off work compaction still owes.
 ```
 STRESS_DATA=/data/isledb-stress SILO_CPUS=6 deploy/up.sh
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
-go run . run -spec specs/l0-batched.yaml -target 50GiB -rate 24MiB \
+go run . run -spec specs/bulk-load.yaml -target 50GiB -rate 24MiB \
     -isledb origin/main -fetch -out /data/isledb-stress/results
 ```
 

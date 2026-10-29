@@ -4,12 +4,12 @@
 #
 # Pick the size and rate on the command line; qualify at 50 GiB first:
 #
-#   stress run -spec specs/l0-batched.yaml -target 50GiB -rate 24MiB -isledb origin/main -fetch
-#   stress run -spec specs/l0-batched.yaml -target 1TiB  -rate 24MiB -isledb origin/main -fetch
+#   stress run -spec specs/bulk-load.yaml -target 50GiB -rate 24MiB -isledb origin/main -fetch
+#   stress run -spec specs/bulk-load.yaml -target 1TiB  -rate 24MiB -isledb origin/main -fetch
 #
 # Checkpoints follow the ladder (1, 5, 10, 20, 50, 100, 250, 500 GiB, 1 TiB)
 # up to the target. Start SILO with deploy/up.sh, its data on /data.
-name: l0-batched
+name: bulk-load
 workload:
   shape: random
   values: mixed

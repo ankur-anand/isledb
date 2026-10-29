@@ -1,4 +1,4 @@
-# A balanced production-like mix. default and l0-batched only insert; this
+# A production-like mix. default and bulk-load only insert; this
 # then updates, deletes and inserts. Each update round writes 5% of the keys,
 # and 30% of those in a hot tenth of the keyspace; deletes a tenth of what
 # it writes, which later rounds write back; and inserts 2% more keys, so
@@ -9,13 +9,13 @@
 # and verifies again, so a result is never read off work compaction still
 # owes. Pick the size on the command line; qualify at 100 GiB before 1 TiB:
 #
-#   stress run -spec specs/balanced.yaml -target 100GiB -isledb origin/main -fetch
-#   stress run -spec specs/balanced.yaml -target 1TiB   -isledb origin/main -fetch
+#   stress run -spec specs/mixed.yaml -target 100GiB -isledb origin/main -fetch
+#   stress run -spec specs/mixed.yaml -target 1TiB   -isledb origin/main -fetch
 #
 # Reads are paced open loop: each is due at its time, and one a worker can't
 # start within max_lag is dropped and counted, so the dashboard shows reads
 # offered against achieved.
-name: balanced
+name: mixed
 workload:
   shape: random
   values: mixed
