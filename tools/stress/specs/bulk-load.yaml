@@ -1,11 +1,12 @@
-# The default profile with fewer rewrites: L0 collects about four times
-# the L1 it overlaps before merging into it, and L1 is 4 GiB, which saves a
-# level. Needs a version with maintenance.compaction settings.
+# The default profile at 24 MiB/s with fewer rewrites: L0 collects about
+# four times the L1 it overlaps before merging into it, L1 is 4 GiB, which
+# saves a level, and compaction writes 256 MiB files. Needs a version with
+# maintenance.compaction settings.
 #
-# Pick the size and rate on the command line; qualify at 50 GiB first:
+# Pick the size on the command line; qualify at 50 GiB first:
 #
-#   stress run -spec specs/bulk-load.yaml -target 50GiB -rate 24MiB -isledb origin/main -fetch
-#   stress run -spec specs/bulk-load.yaml -target 1TiB  -rate 24MiB -isledb origin/main -fetch
+#   stress run -spec specs/bulk-load.yaml -target 50GiB -isledb origin/main -fetch
+#   stress run -spec specs/bulk-load.yaml -target 1TiB  -isledb origin/main -fetch
 #
 # Checkpoints follow the ladder (1, 5, 10, 20, 50, 100, 250, 500 GiB, 1 TiB)
 # up to the target. Start SILO with deploy/up.sh, its data on /data.
@@ -15,7 +16,7 @@ workload:
   values: mixed
   target: 20GiB
   batch_keys: 16
-  rate: 12MiB
+  rate: 24MiB
   # Requests in flight. Each waits about 300ms for its commit, so 256 of
   # 40KB batches allow about 32MiB/s: room for 24MiB/s when commits slow.
   workers: 256
@@ -39,7 +40,7 @@ isledb:
       # amplification reads lower than production's would.
       policy: {max_pinned_view_age: 10m}
     maintenance:
-      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}
 phases:
   - load: {}
   - settle: {quiet: 5m, max: 3h}

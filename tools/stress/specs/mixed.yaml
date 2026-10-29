@@ -25,7 +25,7 @@ workload:
   delete_permille: 100
   insert_permille: 20
   hot: {from_permille: 0, to_permille: 100, update_permille: 300}
-  rate: 12MiB
+  rate: 24MiB
   workers: 256
 readers:
   - {name: uniform, rate: 300, workers: 32, scan_ratio: 0.1, scan_min: 1, scan_limit: 100}
@@ -47,7 +47,7 @@ isledb:
       # amplification reads lower than production's would.
       policy: {max_pinned_view_age: 10m}
     maintenance:
-      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}
+      compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}
 phases:
   - load: {}
   - settle: {quiet: 5m, max: 3h}

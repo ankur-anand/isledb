@@ -147,7 +147,7 @@ isledb:
   readers: 1
   config:                # each role's section of the isledb configuration
     writer: {memtable: {target_bytes: 3MiB}, flush: {interval: 250ms}}
-    maintenance: {compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB}}
+    maintenance: {compaction: {l0_to_base_ratio: 4, l0_max_depth: 64, base_level_bytes: 4GiB, target_sst_bytes: 256MiB}}
 phases:
   - load:                # the insert round
       events: [{after: 2m, role: writer, kill: true, down: 5s}]
@@ -196,7 +196,7 @@ sample_every: 30s
 | Spec | What |
 |---|---|
 | `default` | 12 MiB/s of small writes against SILO, at the version's default settings |
-| `bulk-load` | `default` with fewer rewrites: L0 collects longer, a 4 GiB L1. Needs a version with `maintenance.compaction` |
+| `bulk-load` | `default` at 24 MiB/s with fewer rewrites: L0 collects longer, a 4 GiB L1, 256 MiB files. Needs a version with `maintenance.compaction` |
 | `local-smoke` | a directory bucket, about a minute: a quick check of the harness and a build |
 | `silo-smoke` | `default` at 512 MiB, a few minutes |
 | `silo-faults` | lost answers and refusals from storage while writing |
@@ -221,7 +221,7 @@ again, so a result is never read off work compaction still owes.
 ```
 STRESS_DATA=/data/isledb-stress SILO_CPUS=6 deploy/up.sh
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
-go run . run -spec specs/bulk-load.yaml -target 50GiB -rate 24MiB \
+go run . run -spec specs/bulk-load.yaml -target 50GiB \
     -isledb origin/main -fetch -out /data/isledb-stress/results
 ```
 
