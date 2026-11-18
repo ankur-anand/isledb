@@ -126,22 +126,23 @@ func (m *metrics) cycle(s isledb.MaintenanceStats) {
 	for _, b := range s.Scheduling.Blocked {
 		m.blocked.WithLabelValues(strconv.FormatUint(uint64(b.SourceLevel), 10)).Inc()
 	}
+	for _, run := range c.Runs {
+		m.levelJobs.WithLabelValues(strconv.FormatUint(uint64(run.SourceLevel), 10)).Inc()
+		m.jobSeconds.WithLabelValues(jobKind(run)).Observe(run.Duration.Seconds())
+	}
 	if c.Jobs > 0 && s.Scheduling.Selected == isledb.MaintenanceTaskSSTCompaction {
-		m.levelJobs.WithLabelValues(strconv.FormatUint(uint64(s.Scheduling.CompactionSourceLevel), 10)).Add(float64(c.Jobs))
-		m.jobSeconds.WithLabelValues(jobKind(s)).Observe(s.Duration.Seconds())
 		m.critical.Set(boolValue(s.Scheduling.CompactionCritical))
 	}
 }
 
-// jobKind names the compaction a cycle ran.
-func jobKind(s isledb.MaintenanceStats) string {
-	c := s.SSTCompaction
+// jobKind names a compaction job.
+func jobKind(run isledb.CompactionRun) string {
 	switch {
-	case c.L0Merges > 0:
-		return "l0_merge"
-	case c.MovedJobs > 0 && c.RewrittenBytes == 0:
+	case run.MetadataOnly:
 		return "move"
-	case s.Scheduling.CompactionSourceLevel == 0:
+	case run.DestinationLevel == 0:
+		return "l0_merge"
+	case run.SourceLevel == 0:
 		return "l0_drain"
 	default:
 		return "level"

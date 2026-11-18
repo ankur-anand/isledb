@@ -38,6 +38,10 @@ const (
 	defaultReclaimIdleMaxInterval             = 5 * time.Minute
 	maxReclaimDeleteConcurrency               = 256
 	maxReclaimObjectsPerPass                  = 4096
+	defaultMaxCompactionJobs                  = 2
+	// maxCompactionJobs bounds MaxJobs. No two jobs share a level, so more
+	// jobs than half the levels could never all run.
+	maxCompactionJobs = 8
 )
 
 // MaintenanceOptions configures one fenced maintenance owner for a DB.
@@ -141,6 +145,13 @@ type SSTCompactionOptions struct {
 	// whatever its size, so a database that stops being written drains L0.
 	// Zero selects 30 minutes.
 	L0MaxAge time.Duration
+	// MaxJobs is how many compaction jobs run at once. A job holds the
+	// levels it reads and writes, and no two jobs share a level, so L0 into
+	// L1 runs beside L2 into L3, for one. Each job adds its own memory for
+	// uploads, up to two and a half times TargetSSTBytes, and its own scratch
+	// space.
+	// Zero selects 2.
+	MaxJobs int
 }
 
 // ManifestCheckpointOptions controls when maintenance snapshots manifest
@@ -274,6 +285,38 @@ type SSTCompactionStats struct {
 	// as orphans.
 	RejectedJobs  int
 	RejectedBytes int64
+	// Runs are the jobs counted in Jobs, one by one.
+	Runs []CompactionRun
+}
+
+// mergeSSTCompactionStats adds b to a.
+func mergeSSTCompactionStats(a, b SSTCompactionStats) SSTCompactionStats {
+	a.Jobs += b.Jobs
+	a.InputSSTs += b.InputSSTs
+	a.OutputSSTs += b.OutputSSTs
+	a.ForcedLevelCreations += b.ForcedLevelCreations
+	a.DeepestForcedLevel = max(a.DeepestForcedLevel, b.DeepestForcedLevel)
+	a.OutputBytes += b.OutputBytes
+	a.MovedJobs += b.MovedJobs
+	a.MovedBytes += b.MovedBytes
+	a.ReadBytes += b.ReadBytes
+	a.L0Merges += b.L0Merges
+	a.RewrittenBytes += b.RewrittenBytes
+	a.OversizedJobs += b.OversizedJobs
+	a.RejectedJobs += b.RejectedJobs
+	a.RejectedBytes += b.RejectedBytes
+	a.Runs = append(a.Runs, b.Runs...)
+	return a
+}
+
+// CompactionRun is one compaction job.
+type CompactionRun struct {
+	SourceLevel      uint32
+	DestinationLevel uint32
+	MetadataOnly     bool
+	// Duration is from the job's start until its command was staged or put
+	// in line.
+	Duration time.Duration
 }
 
 // SSTCleanupStats describes durable retirement handoff and bounded physical
@@ -457,6 +500,7 @@ func DefaultMaintenanceOptions() MaintenanceOptions {
 			L0ToBaseRatio:     compaction.Trigger.L0ToBaseRatio,
 			L0MaxDepth:        compaction.Trigger.L0MaxDepth,
 			L0MaxAge:          compaction.Trigger.L0MaxAge,
+			MaxJobs:           defaultMaxCompactionJobs,
 		},
 		ManifestCheckpoint: ManifestCheckpointOptions{
 			TargetReplayPages: defaultCheckpointReplayPages,
@@ -527,7 +571,14 @@ type Maintenance struct {
 	statsMu       sync.Mutex
 	currentStats  *MaintenanceStats
 	commandStaged bool
-	writerWake    chan<- struct{}
+	// line is the commands of finished jobs waiting to be staged, oldest
+	// first, and carried the compaction of jobs that ended between cycles,
+	// counted in the next. Both under statsMu.
+	line    []queuedCommand
+	carried SSTCompactionStats
+	// loopWake brings the Run loop's next cycle forward.
+	loopWake   chan struct{}
+	writerWake chan<- struct{}
 	// waitingSince is WaitingSince in Unix nanoseconds, 0 when none waits.
 	waitingSince atomic.Int64
 
@@ -599,6 +650,7 @@ func newMaintenance(
 		deleter:    deleter,
 		fenceToken: token,
 		runGate:    make(chan struct{}, 1),
+		loopWake:   make(chan struct{}, 1),
 		reclaimGates: map[ReclamationFamily]chan struct{}{
 			ReclamationSST:        make(chan struct{}, 1),
 			ReclamationChangeFeed: make(chan struct{}, 1),
@@ -618,6 +670,9 @@ func newMaintenance(
 		return nil, fmt.Errorf("open compaction stage: %w", err)
 	}
 	m.compactor.stageCommand = m.stageCommand
+	m.compactor.queueCommand = m.queueCommand
+	m.compactor.jobDone = m.wakeLoop
+	m.compactor.jobFailed = m.reportError
 
 	if normalized.changeFeedRetention != nil {
 		changeFeedOpts := m.changeFeedOptions()
@@ -726,11 +781,15 @@ func normalizeDeleterOptions(name string, opts, defaults DeleterOptions) (Delete
 func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTCompactionOptions, error) {
 	if opts.ReadConcurrency < 0 || opts.L0TriggerSSTs < 0 ||
 		opts.BaseLevelBytes < 0 || opts.LevelGrowthFactor < 0 || opts.TargetSSTBytes < 0 ||
-		opts.L0ToBaseRatio < 0 || opts.L0MaxDepth < 0 || opts.L0MaxAge < 0 {
+		opts.L0ToBaseRatio < 0 || opts.L0MaxDepth < 0 || opts.L0MaxAge < 0 || opts.MaxJobs < 0 {
 		return SSTCompactionOptions{}, fmt.Errorf("%w: invalid SST compaction option", ErrInvalidMaintenanceOptions)
 	}
 	if opts.LevelGrowthFactor == 1 {
 		return SSTCompactionOptions{}, fmt.Errorf("%w: level growth factor must be at least 2", ErrInvalidMaintenanceOptions)
+	}
+	if opts.MaxJobs > maxCompactionJobs {
+		return SSTCompactionOptions{}, fmt.Errorf("%w: max jobs=%d exceeds %d",
+			ErrInvalidMaintenanceOptions, opts.MaxJobs, maxCompactionJobs)
 	}
 	if opts.ReadConcurrency == 0 {
 		opts.ReadConcurrency = defaults.ReadConcurrency
@@ -755,6 +814,9 @@ func normalizeSSTCompactionOptions(opts, defaults SSTCompactionOptions) (SSTComp
 	}
 	if opts.L0MaxAge == 0 {
 		opts.L0MaxAge = defaults.L0MaxAge
+	}
+	if opts.MaxJobs == 0 {
+		opts.MaxJobs = defaults.MaxJobs
 	}
 	return opts, nil
 }
@@ -882,8 +944,13 @@ func (m *Maintenance) Run(ctx context.Context) error {
 	}()
 
 	for {
-		stats, err := m.runControlOnce(runCtx)
+		stats, err := m.runControlOnce(runCtx, false)
 		if err != nil {
+			// The cycle's report is dropped, but the jobs it counted ran:
+			// they count in the next.
+			m.statsMu.Lock()
+			m.carried = mergeSSTCompactionStats(stats.SSTCompaction, m.carried)
+			m.statsMu.Unlock()
 			if m.closed.Load() && (errors.Is(err, context.Canceled) || errors.Is(err, ErrMaintenanceClosed)) {
 				return nil
 			}
@@ -905,7 +972,7 @@ func (m *Maintenance) Run(ctx context.Context) error {
 		}
 
 		delay := m.opts.idleInterval
-		if stats.State == MaintenanceWaitingForWriter {
+		if stats.State == MaintenanceWaitingForWriter || m.inLine() > 0 {
 			delay = min(delay, maintenanceActiveInterval)
 		} else if m.revisitL0(stats) {
 			delay = min(delay, m.l0Interval())
@@ -913,6 +980,8 @@ func (m *Maintenance) Run(ctx context.Context) error {
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+		case <-m.loopWake:
+			stopMaintenanceTimer(timer)
 		case <-runCtx.Done():
 			stopMaintenanceTimer(timer)
 			if m.closed.Load() {
@@ -928,7 +997,7 @@ func (m *Maintenance) Run(ctx context.Context) error {
 // schedules the physical passes independently so slow deletes cannot block
 // compaction, checkpointing, or logical feed retention.
 func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
-	stats, err := m.runControlOnce(ctx)
+	stats, err := m.runControlOnce(ctx, true)
 	if err != nil {
 		return stats, err
 	}
@@ -944,8 +1013,10 @@ func (m *Maintenance) RunOnce(ctx context.Context) (MaintenanceStats, error) {
 	return stats, errors.Join(sstErr, changeErr, metadataErr)
 }
 
-// runControlOnce performs one serialized logical/control cycle.
-func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, error) {
+// runControlOnce performs one serialized logical/control cycle. With
+// several compaction jobs at once, wait makes it wait for the jobs it starts,
+// as RunOnce does; Run leaves them running.
+func (m *Maintenance) runControlOnce(ctx context.Context, wait bool) (MaintenanceStats, error) {
 	if err := checkContext(ctx); err != nil {
 		return MaintenanceStats{}, err
 	}
@@ -956,6 +1027,8 @@ func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, err
 	stats := MaintenanceStats{}
 	start := time.Now()
 	m.statsMu.Lock()
+	// Jobs that ended between cycles count in this one.
+	stats.SSTCompaction, m.carried = m.carried, SSTCompactionStats{}
 	m.currentStats = &stats
 	m.commandStaged = false
 	m.statsMu.Unlock()
@@ -969,6 +1042,9 @@ func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, err
 	waiting, err := m.reconcilePendingCommand(ctx)
 	if err != nil {
 		return m.completeCycleStats(start), fmt.Errorf("reconcile maintenance command: %w", err)
+	}
+	if m.opts.sstCompaction.MaxJobs > 1 {
+		return m.runJobsCycle(ctx, start, wait, waiting)
 	}
 	if waiting {
 		return m.completeCycleStats(start), nil
@@ -992,6 +1068,97 @@ func (m *Maintenance) runControlOnce(ctx context.Context) (MaintenanceStats, err
 	if selected != nil {
 		return m.completeCycleStats(start), nil
 	}
+	return m.finishControlCycle(ctx, start, decision)
+}
+
+// runJobsCycle is a cycle when several compaction jobs may run at once. It
+// starts jobs on the free levels, picked in the order one job at a time
+// would be, and leaves them running. It does so even while the writer has
+// yet to answer the staged command, whose job keeps its levels until then.
+// Then, unless that command still waits, it stages one: the oldest finished
+// job's, or a checkpoint the rules for one job at a time would put first.
+func (m *Maintenance) runJobsCycle(ctx context.Context, start time.Time, wait, waiting bool) (MaintenanceStats, error) {
+	current, _, err := m.compactor.startJobs(ctx, m.opts.sstCompaction.MaxJobs,
+		func(current *manifest.Current, candidates []compactionCandidate) *compactionCandidate {
+			return selectCompactionCandidate(candidates, schedulerState(current))
+		})
+	if err != nil {
+		return m.completeCycleStats(start), fmt.Errorf("compaction planning: %w", err)
+	}
+	if wait {
+		if err := m.compactor.waitJobs(ctx); err != nil {
+			return m.completeCycleStats(start), err
+		}
+	}
+	if waiting {
+		return m.completeCycleStats(start), nil
+	}
+	var next *compactionCandidate
+	m.statsMu.Lock()
+	if len(m.line) > 0 {
+		candidate := m.line[0].candidate
+		next = &candidate
+	}
+	m.statsMu.Unlock()
+	decision := selectMaintenancePrimary(next,
+		calculateCheckpointPressure(current, m.opts.manifestCheckpoint), schedulerState(current))
+	m.recordScheduling(decision)
+	if decision.task == MaintenanceTaskSSTCompaction {
+		if err := m.stageNextInLine(ctx); err != nil {
+			return m.completeCycleStats(start), fmt.Errorf("stage compaction: %w", err)
+		}
+		return m.completeCycleStats(start), nil
+	}
+	return m.finishControlCycle(ctx, start, decision)
+}
+
+func schedulerState(current *manifest.Current) manifest.MaintenanceSchedulerState {
+	if current == nil {
+		return manifest.MaintenanceSchedulerState{}
+	}
+	return current.MaintenanceScheduler
+}
+
+// stageNextInLine stages the oldest finished job's command. On failure it
+// stays in line for the next cycle.
+func (m *Maintenance) stageNextInLine(ctx context.Context) error {
+	m.statsMu.Lock()
+	next := m.line[0]
+	m.statsMu.Unlock()
+	if err := m.stageCommand(ctx, next.command); err != nil {
+		return err
+	}
+	m.statsMu.Lock()
+	m.line = m.line[1:]
+	m.statsMu.Unlock()
+	return nil
+}
+
+// queueCommand puts a finished job's command in line.
+func (m *Maintenance) queueCommand(next queuedCommand) {
+	m.statsMu.Lock()
+	m.line = append(m.line, next)
+	m.statsMu.Unlock()
+}
+
+// inLine reports how many finished jobs wait to be staged.
+func (m *Maintenance) inLine() int {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	return len(m.line)
+}
+
+// wakeLoop brings the Run loop's next cycle forward, as when a job ends.
+func (m *Maintenance) wakeLoop() {
+	select {
+	case m.loopWake <- struct{}{}:
+	default:
+	}
+}
+
+// finishControlCycle runs a checkpoint when decision chose one, then
+// change-feed retention, unless a command is already staged.
+func (m *Maintenance) finishControlCycle(ctx context.Context, start time.Time, decision maintenanceDecision) (MaintenanceStats, error) {
 	if decision.task == MaintenanceTaskManifestCheckpoint {
 		if err := m.checkpointIfNeeded(ctx); err != nil {
 			return m.completeCycleStats(start), fmt.Errorf("checkpoint: %w", err)
@@ -1370,6 +1537,7 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	if current == nil || !current.MaintenanceReceipt.Matches(head.Pending) {
 		return true, nil
 	}
+	m.compactor.release(head.Pending.ID)
 	if current.MaintenanceReceipt.Status == manifest.MaintenanceStatusRejected {
 		m.recordRejection(head.Pending)
 	}
@@ -1601,12 +1769,17 @@ func (m *Maintenance) recordCompaction(job compactionJob, err error) {
 	}
 	m.statsMu.Lock()
 	defer m.statsMu.Unlock()
-	if m.currentStats == nil {
-		return
+	stats := &m.carried
+	if m.currentStats != nil {
+		stats = &m.currentStats.SSTCompaction
 	}
-
-	stats := &m.currentStats.SSTCompaction
 	stats.Jobs++
+	stats.Runs = append(stats.Runs, CompactionRun{
+		SourceLevel:      job.SourceLevel,
+		DestinationLevel: job.DestinationLevel,
+		MetadataOnly:     job.MetadataOnly,
+		Duration:         time.Since(job.Started),
+	})
 	stats.InputSSTs += len(job.InputSSTs)
 	stats.OutputSSTs += len(job.OutputSSTs)
 	if job.ForcedLevelCreation {

@@ -108,6 +108,7 @@ unless `auth.insecure` is set. See [Secure IsleDB](security.md).
 | `maintenance.compaction.l0_to_base_ratio`<br>`--l0-to-base-ratio`<br>`ISLEDB_MAINTENANCE_COMPACTION_L0_TO_BASE_RATIO` | `1` | How much newly saved data collects, as a share of the first level, before it is merged into that level. Higher rewrites less, but leaves more files for a scan to read. Must be positive. |
 | `maintenance.compaction.l0_max_depth`<br>`--l0-max-depth`<br>`ISLEDB_MAINTENANCE_COMPACTION_L0_MAX_DEPTH` | `16` | Newly saved files a single key may be in before they are merged into the first level, whatever their size. Bounds the files a read checks. |
 | `maintenance.compaction.l0_max_age`<br>`--l0-max-age`<br>`ISLEDB_MAINTENANCE_COMPACTION_L0_MAX_AGE` | `30m` | Age of the oldest newly saved data that makes it merge into the first level, whatever its size, so a database that stops being written settles. |
+| `maintenance.compaction.max_jobs`<br>`--max-jobs`<br>`ISLEDB_MAINTENANCE_COMPACTION_MAX_JOBS` | `2` | Compactions that run at the same time, each on levels no other uses. Each needs its own memory and scratch space. From 1 to 8. |
 | `maintenance.admin_listen`<br>`--admin-listen`<br>`ISLEDB_MAINTENANCE_ADMIN_LISTEN` | `127.0.0.1:8061` | Address for health checks and metrics. Empty turns it off. |
 | `maintenance.shutdown_drain`<br>`--shutdown-drain`<br>`ISLEDB_MAINTENANCE_SHUTDOWN_DRAIN` | `0s` | How long to report not ready before stopping. |
 

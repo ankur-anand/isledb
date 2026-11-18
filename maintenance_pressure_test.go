@@ -22,8 +22,14 @@ const (
 // checkpointing eligible while writes, refreshes, scans, point reads, and a
 // pinned snapshot exercise the same database. Every committed generation is
 // compared with an immutable in-memory oracle; no eventually-consistent
-// allowance is used.
+// allowance is used. It runs with one compaction job at a time, and with two
+// at once, which must also run side by side and never be rejected.
 func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
+	t.Run("one job", func(t *testing.T) { testMaintenancePressure(t, 1) })
+	t.Run("two jobs", func(t *testing.T) { testMaintenancePressure(t, 2) })
+}
+
+func testMaintenancePressure(t *testing.T, maxJobs int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -73,6 +79,7 @@ func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
 	counters := &maintenancePressureCounters{}
 	maintenanceErrors := make(chan error, 1)
 	maintenanceOpts := maintenancePressureOptions()
+	maintenanceOpts.SSTCompaction.MaxJobs = maxJobs
 	maintenanceOpts.OnCycle = counters.observe
 	maintenanceOpts.OnError = func(err error) {
 		select {
@@ -85,6 +92,15 @@ func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
 		t.Fatalf("open maintenance: %v", err)
 	}
 	defer func() { _ = maintenance.Close(context.Background()) }()
+	var running, mostRunning atomic.Int64
+	ended := maintenance.compactor.opts.OnCompactionEnd
+	maintenance.compactor.opts.OnCompactionStart = func(compactionJob) {
+		atomicMaxInt64(&mostRunning, running.Add(1))
+	}
+	maintenance.compactor.opts.OnCompactionEnd = func(job compactionJob, err error) {
+		running.Add(-1)
+		ended(job, err)
+	}
 
 	runCtx, stopMaintenance := context.WithCancel(ctx)
 	maintenanceDone := make(chan error, 1)
@@ -181,6 +197,15 @@ func TestMaintenancePressureExactWriteReadCorrectness(t *testing.T) {
 	}
 	assertMaintenancePressureExecuted(t, counters)
 	assertMaintenancePressureTopology(t, ctx, db, maintenanceOpts)
+	// Jobs this small often end before another starts, so only the bound
+	// is checked here; that two are picked to run together is checked apart.
+	if got := mostRunning.Load(); got > int64(maxJobs) {
+		t.Fatalf("%d compaction jobs ran at once, more than %d", got, maxJobs)
+	}
+	t.Logf("at most %d compaction jobs ran at once", mostRunning.Load())
+	if got := counters.rejectedJobs.Load(); got != 0 {
+		t.Fatalf("the writer rejected %d compaction jobs", got)
+	}
 
 	if err := maintenance.Close(ctx); err != nil {
 		t.Fatalf("close maintenance: %v", err)
@@ -237,6 +262,7 @@ type maintenancePressureCounters struct {
 	checkpointSelections   atomic.Uint64
 	checkpointStaged       atomic.Uint64
 	completedCompactions   atomic.Uint64
+	rejectedJobs           atomic.Uint64
 	maxObservedReplayPages atomic.Uint64
 }
 
@@ -265,6 +291,7 @@ func (c *maintenancePressureCounters) observe(stats MaintenanceStats) {
 	if stats.SSTCompaction.Jobs > 0 {
 		c.completedCompactions.Add(uint64(stats.SSTCompaction.Jobs))
 	}
+	c.rejectedJobs.Add(uint64(stats.SSTCompaction.RejectedJobs))
 	atomicMaxUint64(&c.maxObservedReplayPages, stats.Scheduling.ReplayPages)
 }
 
@@ -538,6 +565,14 @@ func assertNoMaintenancePressureError(t *testing.T, errorsCh <-chan error) {
 }
 
 func atomicMaxUint64(value *atomic.Uint64, candidate uint64) {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
+}
+
+func atomicMaxInt64(value *atomic.Int64, candidate int64) {
 	for current := value.Load(); candidate > current; current = value.Load() {
 		if value.CompareAndSwap(current, candidate) {
 			return

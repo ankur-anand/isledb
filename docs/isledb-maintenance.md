@@ -83,6 +83,7 @@ maintenance:
     l0_to_base_ratio: 1
     l0_max_depth: 16
     l0_max_age: 30m
+    max_jobs: 2
 ```
 
 To check a configuration without starting maintenance:
@@ -129,6 +130,19 @@ What this costs:
   while writes are heavy. Reads of single keys are barely affected.
 - **Each merge is larger.** Merges happen less often but take longer, and
   `scratch_dir` needs room for the larger merges.
+
+By default two compactions run at the same time, each on separate levels, so
+merging new data into the first level can run beside compaction further down.
+Each one needs its own memory, up to 2.5 times `target_sst_bytes` for uploads,
+and its own room in `scratch_dir`. To keep up with heavier writes, run more:
+
+```yaml
+maintenance:
+  compaction:
+    max_jobs: 4
+```
+
+To use less memory and scratch space, set `max_jobs: 1`.
 
 Change one setting at a time and compare the rewrite rate and your read
 latency before and after. A change applies to the database from the next

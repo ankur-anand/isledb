@@ -48,6 +48,9 @@ type Compaction struct {
 	// L0MaxAge is the age of L0's oldest data that makes L0 merge into L1
 	// whatever its size.
 	L0MaxAge service.Duration `yaml:"l0_max_age"`
+	// MaxJobs is how many compaction jobs run at once, each on levels no
+	// other uses.
+	MaxJobs int `yaml:"max_jobs"`
 }
 
 type ChangeFeed struct {
@@ -66,6 +69,7 @@ func NewConfig() service.Config {
 			L0ToBaseRatio:  d.L0ToBaseRatio,
 			L0MaxDepth:     d.L0MaxDepth,
 			L0MaxAge:       service.Duration(d.L0MaxAge),
+			MaxJobs:        d.MaxJobs,
 		},
 	}
 	cfg.Server.ShutdownDrain = 0 // no traffic to drain
@@ -94,6 +98,8 @@ func (c *Config) Settings() []service.Setting {
 			Set: func(v string) error { return parseInt(v, &c.Compaction.L0MaxDepth) }},
 		service.Setting{Flag: "l0-max-age", Path: "compaction.l0_max_age", Usage: "age of L0's oldest data that makes L0 merge into L1, e.g. 30m",
 			Set: c.Compaction.L0MaxAge.Parse},
+		service.Setting{Flag: "max-jobs", Path: "compaction.max_jobs", Usage: "compaction jobs that run at once, each on levels no other uses",
+			Set: func(v string) error { return parseInt(v, &c.Compaction.MaxJobs) }},
 	)
 }
 
@@ -132,6 +138,7 @@ func (c *Config) options() isledb.MaintenanceOptions {
 	sc.L0ToBaseRatio = c.Compaction.L0ToBaseRatio
 	sc.L0MaxDepth = c.Compaction.L0MaxDepth
 	sc.L0MaxAge = time.Duration(c.Compaction.L0MaxAge)
+	sc.MaxJobs = c.Compaction.MaxJobs
 	if c.ChangeFeed.RetainFor > 0 {
 		opts.ChangeFeedRetention = &isledb.ChangeFeedRetentionOptions{RetainFor: time.Duration(c.ChangeFeed.RetainFor)}
 	}
@@ -162,6 +169,9 @@ func (c *Config) Validate() error {
 	}
 	if cc.L0MaxDepth <= 0 || cc.L0MaxAge <= 0 {
 		fail("compaction.l0_max_depth and compaction.l0_max_age must be positive")
+	}
+	if cc.MaxJobs < 1 || cc.MaxJobs > 8 {
+		fail("compaction.max_jobs must be from 1 to 8")
 	}
 	return errors.Join(append(errs, c.Server.Validate())...)
 }

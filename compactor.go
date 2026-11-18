@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/ankur-anand/isledb/internal"
 	"github.com/ankur-anand/isledb/internal/manifest"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/segmentio/ksuid"
 )
 
 // A compaction is published in one manifest entry. The manifest format bounds
@@ -45,7 +47,9 @@ type compactionJob struct {
 	// an unchecked move.
 	ReadBytes int64
 
+	SourceLevel         uint32
 	DestinationLevel    uint32
+	Started             time.Time
 	InputSSTs           []string
 	OutputSSTs          []compactionOutput
 	MetadataOnly        bool
@@ -73,6 +77,18 @@ type compactor struct {
 	lifecycleMu sync.Mutex
 	activeRuns  sync.WaitGroup
 	runGate     chan struct{}
+
+	// locks are the levels of jobs maintenance has yet to see answered, and
+	// running counts those still merging. Both under mu.
+	locks   map[*levelLock]struct{}
+	running int
+	// queueCommand, when set, takes the command of a job run beside the
+	// cycle, to be staged later; jobDone is told when such a job ends, and
+	// jobFailed when it fails.
+	queueCommand func(queuedCommand)
+	jobDone      func()
+	jobFailed    func(error)
+	jobs         sync.WaitGroup
 
 	fenced     atomic.Bool
 	fenceToken *manifest.FenceToken
@@ -116,6 +132,7 @@ func newCompactorWithFence(ctx context.Context, store *blobstore.Store, manifest
 		opts:        opts,
 		manifest:    m,
 		runGate:     make(chan struct{}, 1),
+		locks:       map[*levelLock]struct{}{},
 	}
 
 	scratchOwner := compactionScratchMaintenance
@@ -232,14 +249,7 @@ func (c *compactor) runSelected(
 	if c.fenced.Load() {
 		return nil, manifest.ErrFenced
 	}
-	current, err := c.refreshWithCurrent(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("refresh manifest: %w", err)
-	}
-	c.mu.Lock()
-	m := c.manifest.Clone()
-	c.mu.Unlock()
-	candidates, err := c.planCompactionCandidates(m)
+	current, m, candidates, err := c.planUnlocked(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +258,9 @@ func (c *compactor) runSelected(
 		return nil, nil
 	}
 	chosen := *selected
-	if err := c.executeCompaction(ctx, m, chosen.plan); err != nil {
+	lock := c.lock(chosen, false)
+	if err := c.executeCompaction(ctx, m, chosen.plan, lock); err != nil {
+		c.unlock(lock)
 		if isFenceError(err) {
 			c.fenced.Store(true)
 			return nil, err
@@ -256,7 +268,225 @@ func (c *compactor) runSelected(
 		return nil, fmt.Errorf("compact L%d to L%d: %w",
 			chosen.plan.sourceLevel, chosen.plan.destinationLevel, err)
 	}
+	if c.stageCommand == nil {
+		// Published already: no receipt follows.
+		c.unlock(lock)
+	}
 	return &chosen, nil
+}
+
+// planUnlocked reads the manifest again and plans on it, leaving out the
+// candidates unlocked rules out.
+func (c *compactor) planUnlocked(ctx context.Context) (*manifest.Current, *manifestState, []compactionCandidate, error) {
+	current, err := c.refreshWithCurrent(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("refresh manifest: %w", err)
+	}
+	c.mu.Lock()
+	m := c.manifest.Clone()
+	c.mu.Unlock()
+	candidates, err := c.planCompactionCandidates(m)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return current, m, c.unlocked(candidates), nil
+}
+
+// startJobs plans, then starts the jobs selector picks one after another,
+// each on levels no job before it holds, until slots jobs run. The jobs run
+// beside the cycle, and each one's command joins the line through
+// queueCommand. It returns CURRENT as planning read it.
+func (c *compactor) startJobs(
+	ctx context.Context,
+	slots int,
+	selector func(*manifest.Current, []compactionCandidate) *compactionCandidate,
+) (*manifest.Current, []compactionCandidate, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	if err := c.beginRun(ctx); err != nil {
+		return nil, nil, err
+	}
+	defer c.finishRun()
+
+	if c.fenced.Load() {
+		return nil, nil, manifest.ErrFenced
+	}
+	current, m, candidates, err := c.planUnlocked(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.mu.Lock()
+	free := slots - c.running
+	c.mu.Unlock()
+	var started []compactionCandidate
+	for _, chosen := range pickJobs(current, candidates, free, selector) {
+		lock := c.lock(chosen, true)
+		if err := c.startJob(ctx, m.Clone(), chosen.plan, lock); err != nil {
+			c.unlock(lock)
+			return current, started, err
+		}
+		started = append(started, chosen)
+	}
+	return current, started, nil
+}
+
+// pickJobs picks up to free candidates, one after another in the order
+// selector picks them, each on levels no candidate picked before it uses.
+func pickJobs(
+	current *manifest.Current,
+	candidates []compactionCandidate,
+	free int,
+	selector func(*manifest.Current, []compactionCandidate) *compactionCandidate,
+) []compactionCandidate {
+	var picked []compactionCandidate
+	for len(picked) < free && len(candidates) > 0 {
+		selected := selector(current, candidates)
+		if selected == nil {
+			break
+		}
+		chosen := *selected
+		picked = append(picked, chosen)
+		taken := planLevels(chosen.plan)
+		candidates = slices.DeleteFunc(candidates, func(other compactionCandidate) bool {
+			return levelsOverlap(planLevels(other.plan), taken)
+		})
+	}
+	return picked
+}
+
+// startJob runs plan in the background under lock.
+func (c *compactor) startJob(ctx context.Context, m *manifestState, plan *levelCompactionPlan, lock *levelLock) error {
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		return errCompactorClosed
+	}
+	c.activeRuns.Add(1)
+	c.jobs.Add(1)
+	c.lifecycleMu.Unlock()
+	c.mu.Lock()
+	c.running++
+	c.mu.Unlock()
+	go func() {
+		defer c.activeRuns.Done()
+		defer c.jobs.Done()
+		err := c.executeCompaction(ctx, m, plan, lock)
+		c.mu.Lock()
+		c.running--
+		c.mu.Unlock()
+		if err != nil {
+			c.unlock(lock)
+			if isFenceError(err) {
+				c.fenced.Store(true)
+			}
+			if c.jobFailed != nil && ctx.Err() == nil {
+				c.jobFailed(fmt.Errorf("compact L%d to L%d: %w", plan.sourceLevel, plan.destinationLevel, err))
+			}
+		}
+		if c.jobDone != nil {
+			c.jobDone()
+		}
+	}()
+	return nil
+}
+
+// waitJobs waits until no job started by startJobs runs.
+func (c *compactor) waitJobs(ctx context.Context) error {
+	return waitGroupContext(ctx, &c.jobs)
+}
+
+// levelLock is the levels one job holds, from planning until maintenance has
+// read its receipt and the manifest again. No other job is planned on them
+// meanwhile, so no two jobs share a file, and none is planned on a level the
+// manifest it read may not show as it now is.
+type levelLock struct {
+	// levels are the job's source and destination, the same level twice for
+	// a combine of L0 files.
+	levels    [2]uint32
+	commandID string
+	// queued is set for a job run beside the cycle: its command joins the
+	// line rather than being staged at once.
+	queued    bool
+	candidate compactionCandidate
+}
+
+func planLevels(plan *levelCompactionPlan) [2]uint32 {
+	return [2]uint32{plan.sourceLevel, plan.destinationLevel}
+}
+
+func levelsOverlap(a, b [2]uint32) bool {
+	return a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1]
+}
+
+func (c *compactor) lock(candidate compactionCandidate, queued bool) *levelLock {
+	lock := &levelLock{levels: planLevels(candidate.plan), queued: queued, candidate: candidate}
+	c.mu.Lock()
+	c.locks[lock] = struct{}{}
+	c.mu.Unlock()
+	return lock
+}
+
+func (c *compactor) unlock(lock *levelLock) {
+	c.mu.Lock()
+	delete(c.locks, lock)
+	c.mu.Unlock()
+}
+
+// release lets go of the levels the job behind commandID holds, once
+// maintenance has read its receipt. The next plan reads the manifest again
+// before it looks at those levels.
+func (c *compactor) release(commandID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for lock := range c.locks {
+		if lock.commandID == commandID {
+			delete(c.locks, lock)
+		}
+	}
+}
+
+// l0Held reports whether a job holds L0. L0 is not planned then: m still
+// lists the files that job merges, and planned on again they would show L0
+// waiting for L1, or critical, while its job already runs, and hold the
+// levels below back as for an L0 that waits. One job at a time never plans
+// while a job holds a level.
+func (c *compactor) l0Held() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for lock := range c.locks {
+		if lock.levels[0] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// unlocked returns the candidates on levels no job holds. While L0's
+// candidate waits for a held level, no other candidate may take its levels
+// either: jobs on L1 could otherwise follow one another, and L0 never get its
+// turn.
+func (c *compactor) unlocked(candidates []compactionCandidate) []compactionCandidate {
+	c.mu.Lock()
+	var held [][2]uint32
+	for lock := range c.locks {
+		held = append(held, lock.levels)
+	}
+	c.mu.Unlock()
+	if len(held) == 0 {
+		return candidates
+	}
+	blocked := func(levels [2]uint32) bool {
+		return slices.ContainsFunc(held, func(h [2]uint32) bool { return levelsOverlap(h, levels) })
+	}
+	for _, candidate := range candidates {
+		if candidate.forL0 && blocked(planLevels(candidate.plan)) {
+			held = append(held, planLevels(candidate.plan))
+		}
+	}
+	return slices.DeleteFunc(slices.Clone(candidates), func(candidate compactionCandidate) bool {
+		return blocked(planLevels(candidate.plan))
+	})
 }
 
 // lsmShape returns m's files by level, with the targets this compactor
@@ -433,7 +663,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 	l0Waits, l0Critical := false, false
 	now := time.Now()
 	drainable := c.drainableL0(m, now)
-	if c.l0NeedsPlanning(drainable) {
+	if !c.l0Held() && c.l0NeedsPlanning(drainable) {
 		// Criticality is a property of L0's depth, not of whether a plan could
 		// be built for it. Computing it before the attempt means a level that
 		// cannot be planned still reports as critical, instead of going quiet
@@ -468,6 +698,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 					plan:      plan,
 					workUnits: 1,
 					critical:  critical,
+					forL0:     true,
 				}
 				// A lower-level plan here is a prerequisite selected
 				// specifically to unblock L0. Run it before unrelated level
@@ -480,7 +711,7 @@ func (c *compactor) planCompactionCandidates(m *manifestState) ([]compactionCand
 		} else if plan := c.planL0Combine(drainable, m, now); plan != nil {
 			// A large L1: the ratio needs more merged files than the depth
 			// limit allows, so combine finished ones first.
-			candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical})
+			candidates = append(candidates, compactionCandidate{plan: plan, workUnits: 1, critical: critical, forL0: true})
 		}
 	}
 	plannedLevels := make(map[uint32]struct{}, len(candidates))
@@ -1044,9 +1275,11 @@ func sstsDoNotOverlap(ssts []sstMetadata) bool {
 	return true
 }
 
-func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan) (err error) {
+func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, plan *levelCompactionPlan, lock *levelLock) (err error) {
 	job := compactionJob{
+		SourceLevel:         plan.sourceLevel,
 		DestinationLevel:    plan.destinationLevel,
+		Started:             time.Now(),
 		MetadataOnly:        plan.metadataOnly,
 		ForcedLevelCreation: plan.forcedLevelCreation,
 		Oversized:           plan.oversized,
@@ -1144,7 +1377,7 @@ func (c *compactor) executeCompaction(ctx context.Context, m *manifestState, pla
 		DestinationLevel: plan.destinationLevel,
 		AddSSTables:      outputs,
 	}
-	return c.appendCompaction(ctx, m, payload)
+	return c.appendCompaction(ctx, m, payload, lock)
 }
 
 // warnOversized reports a job run over maxRewriteInputBytes: the destination
@@ -1164,7 +1397,7 @@ func (c *compactor) warnOversized(plan *levelCompactionPlan) {
 		"suppressed_since_last_log", suppressed)
 }
 
-func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload) error {
+func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payload manifest.CompactionLogPayload, lock *levelLock) error {
 	added := make(map[string]struct{}, len(payload.AddSSTables))
 	for _, sst := range payload.AddSSTables {
 		added[sst.ID] = struct{}{}
@@ -1180,7 +1413,8 @@ func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payl
 		return err
 	}
 	if c.stageCommand != nil {
-		return c.stageCommand(ctx, manifest.MaintenanceCommand{
+		command := manifest.MaintenanceCommand{
+			ID:   ksuid.New().String(),
 			Kind: manifest.MaintenanceCommandCompaction,
 			Scheduling: manifest.MaintenanceScheduling{
 				WorkUnits: 1,
@@ -1189,7 +1423,17 @@ func (c *compactor) appendCompaction(ctx context.Context, m *manifestState, payl
 				Payload:        payload,
 				RetiredObjects: retired,
 			},
-		})
+		}
+		if lock != nil {
+			c.mu.Lock()
+			lock.commandID = command.ID
+			c.mu.Unlock()
+			if lock.queued {
+				c.queueCommand(queuedCommand{command: command, candidate: lock.candidate})
+				return nil
+			}
+		}
+		return c.stageCommand(ctx, command)
 	}
 	_, err = c.manifestLog.AppendCompactionWithFence(ctx, payload, retired)
 	if err != nil && isFenceError(err) {
