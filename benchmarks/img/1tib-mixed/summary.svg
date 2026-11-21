@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="IsleDB at 1 TiB: 0 wrong answers with every read checked, 503 million keys, 1.94 TiB written, 24 MiB/s writes never throttled, 465 ms p99 point reads, a 29.5-hour run">
+  <rect width="1200" height="630" fill="#181b1f"/>
+  <rect x="0" y="0" width="1200" height="6" fill="#73bf69"/>
+  <g font-family="Inter, -apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+    <text x="60" y="104" font-size="52" font-weight="700" fill="#f0f2f5">IsleDB at 1 TiB</text>
+    <text x="60" y="148" font-size="24" fill="#9fa7b3">On object storage: a 1 TiB load, then 10 rounds of updates, deletes and inserts</text>
+
+    <g font-size="68" font-weight="700">
+      <text x="60" y="290" fill="#73bf69">0</text>
+      <text x="440" y="290" fill="#f0f2f5">503M</text>
+      <text x="820" y="290" fill="#f0f2f5">1.94 TiB</text>
+      <text x="60" y="470" fill="#f0f2f5">24 MiB/s</text>
+      <text x="440" y="470" fill="#f0f2f5">465 ms</text>
+      <text x="820" y="470" fill="#f0f2f5">29.5 h</text>
+    </g>
+    <g font-size="22" fill="#9fa7b3">
+      <text x="60" y="328">wrong answers</text>
+      <text x="440" y="328">keys at the end</text>
+      <text x="820" y="328">written in total</text>
+      <text x="60" y="508">writes, never throttled</text>
+      <text x="440" y="508">p99 point reads, end to end</text>
+      <text x="820" y="508">run, start to finish</text>
+    </g>
+
+    <line x1="60" y1="560" x2="1140" y2="560" stroke="#2c3138" stroke-width="2"/>
+    <text x="60" y="598" font-size="20" fill="#9fa7b3">github.com/ankur-anand/isledb</text>
+  </g>
+</svg>
