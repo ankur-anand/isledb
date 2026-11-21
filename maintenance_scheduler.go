@@ -24,6 +24,16 @@ type compactionCandidate struct {
 	plan      *levelCompactionPlan
 	workUnits uint32
 	critical  bool
+	// forL0 marks L0's candidate: a job on L0, or the drain below it that L0
+	// waits for.
+	forL0 bool
+}
+
+// queuedCommand is the command of a finished job, waiting in line to be
+// staged.
+type queuedCommand struct {
+	command   manifest.MaintenanceCommand
+	candidate compactionCandidate
 }
 
 type maintenanceDecision struct {

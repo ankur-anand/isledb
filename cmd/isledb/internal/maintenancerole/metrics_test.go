@@ -42,7 +42,8 @@ func TestShapeMetrics(t *testing.T) {
 func TestCompactionCyclesAreTimedAndMarked(t *testing.T) {
 	m := newMetrics()
 	compaction := isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskSSTCompaction, CompactionCritical: true}
-	m.cycle(isledb.MaintenanceStats{Scheduling: compaction, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1}, Duration: 42 * time.Second})
+	m.cycle(isledb.MaintenanceStats{Scheduling: compaction, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1,
+		Runs: []isledb.CompactionRun{{DestinationLevel: 1, Duration: 42 * time.Second}}}})
 	if testutil.ToFloat64(m.critical) != 1 || testutil.CollectAndCount(m.jobSeconds) != 1 {
 		t.Fatalf("critical %v, histograms %d", testutil.ToFloat64(m.critical), testutil.CollectAndCount(m.jobSeconds))
 	}
@@ -62,8 +63,9 @@ func TestCompactionJobsAndBlocksByLevel(t *testing.T) {
 	m := newMetrics()
 	fromL2 := isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskSSTCompaction, CompactionSourceLevel: 2,
 		Blocked: []isledb.CompactionBlocked{{SourceLevel: 3}}}
-	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1}})
-	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1}})
+	fromL2Run := []isledb.CompactionRun{{SourceLevel: 2, DestinationLevel: 3}}
+	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1, Runs: fromL2Run}})
+	m.cycle(isledb.MaintenanceStats{Scheduling: fromL2, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 1, Runs: fromL2Run}})
 	// A checkpoint ran instead: no job, but L3 was still blocked.
 	m.cycle(isledb.MaintenanceStats{Scheduling: isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskManifestCheckpoint,
 		Blocked: []isledb.CompactionBlocked{{SourceLevel: 3}}}})
@@ -81,17 +83,30 @@ func TestCompactionJobsAndBlocksByLevel(t *testing.T) {
 }
 
 func TestJobKind(t *testing.T) {
-	compaction := isledb.MaintenanceScheduleStats{Selected: isledb.MaintenanceTaskSSTCompaction}
-	level := compaction
-	level.CompactionSourceLevel = 2
-	for want, s := range map[string]isledb.MaintenanceStats{
-		"l0_drain": {Scheduling: compaction, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 5}},
-		"l0_merge": {Scheduling: compaction, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, L0Merges: 1, RewrittenBytes: 5}},
-		"move":     {Scheduling: level, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, MovedJobs: 1}},
-		"level":    {Scheduling: level, SSTCompaction: isledb.SSTCompactionStats{Jobs: 1, RewrittenBytes: 5}},
+	for want, run := range map[string]isledb.CompactionRun{
+		"l0_drain": {SourceLevel: 0, DestinationLevel: 1},
+		"l0_merge": {SourceLevel: 0, DestinationLevel: 0},
+		"move":     {SourceLevel: 2, DestinationLevel: 3, MetadataOnly: true},
+		"level":    {SourceLevel: 2, DestinationLevel: 3},
 	} {
-		if got := jobKind(s); got != want {
+		if got := jobKind(run); got != want {
 			t.Errorf("jobKind = %s, want %s", got, want)
 		}
+	}
+}
+
+// Jobs run beside the cycle are counted one by one, each by its own level
+// and duration, however many end in one cycle.
+func TestCompactionRunsCountOneByOne(t *testing.T) {
+	m := newMetrics()
+	m.cycle(isledb.MaintenanceStats{SSTCompaction: isledb.SSTCompactionStats{Jobs: 2, Runs: []isledb.CompactionRun{
+		{SourceLevel: 0, DestinationLevel: 1, Duration: time.Minute},
+		{SourceLevel: 2, DestinationLevel: 3, Duration: 2 * time.Minute},
+	}}})
+	if testutil.ToFloat64(m.levelJobs.WithLabelValues("0")) != 1 || testutil.ToFloat64(m.levelJobs.WithLabelValues("2")) != 1 {
+		t.Fatal("each job was not counted by its own level")
+	}
+	if n := testutil.CollectAndCount(m.jobSeconds); n != 2 {
+		t.Fatalf("job durations for %d kinds, want l0_drain and level", n)
 	}
 }

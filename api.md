@@ -1417,6 +1417,7 @@ type SSTCompactionOptions struct {
     L0ToBaseRatio     float64
     L0MaxDepth        int
     L0MaxAge          time.Duration
+    MaxJobs           int
 }
 
 type ManifestCheckpointOptions struct {
@@ -1456,6 +1457,7 @@ func DefaultMaintenanceOptions() MaintenanceOptions
 | `SSTCompaction.L0ToBaseRatio` | 1 |
 | `SSTCompaction.L0MaxDepth` | 16 L0 files |
 | `SSTCompaction.L0MaxAge` | 30 minutes |
+| `SSTCompaction.MaxJobs` | 2 |
 | `ManifestCheckpoint.TargetReplayPages` | 64 pages |
 | `ManifestCheckpoint.TargetReplayBytes` | 32 MiB |
 | `ChangeFeedRetention` | `nil`: history kept forever |
@@ -1493,6 +1495,13 @@ things:
 
 With random keys, L0 overlaps nearly all of L1, so `L0ToBaseRatio` rarely
 triggers and `L0MaxDepth` decides when L0 is merged into L1.
+
+**Jobs at once.** `MaxJobs` compaction jobs run at the same time, each on
+levels no other job uses: L0 into L1 can run beside L2 into L3, but not beside
+L1 into L2. While L0 waits for a level another job holds, no new job takes
+that level. Each job needs its own scratch space and up to 2.5 times
+`TargetSSTBytes` of memory for uploads. `SSTCompactionStats.Runs` lists each
+job a cycle counted, with its levels and how long it took.
 
 While L0 has work and is changing, maintenance runs a cycle every 2 seconds
 (5 seconds on Cloud Storage) instead of every `IdleInterval`.
@@ -1944,6 +1953,14 @@ type SSTCompactionStats struct {
     ReadBytes            int64
     L0Merges             int
     RewrittenBytes       int64
+    Runs                 []CompactionRun
+}
+
+type CompactionRun struct {
+    SourceLevel      uint32
+    DestinationLevel uint32
+    MetadataOnly     bool
+    Duration         time.Duration
 }
 
 type SSTCleanupStats struct {
